@@ -408,12 +408,51 @@ static int tile_fam_is_vectorisable(int fam)
            fam == TILE_FAM_STRIDE;
 }
 
+/* Staging buffer: 16 head + up to 256 tile + 32 pad. */
+#define ZPSE_TILE_STG_LEN 304u
+
+/* Accumulate one 32-byte chunk's exception bits into `words`. `p` is a
+ * multiple of 32, so the 32 mask bits land in exactly one word and no
+ * straddling shift is needed; `MASK` is all ones for a full chunk and the
+ * validity vector for the last, partial one. */
+#define TILE_CL_CHUNK(v_, pv_, MASK_)                                       \
+    do {                                                                    \
+        __m256i _eq = _mm256_cmpeq_epi8(v_, pv_);                           \
+        __m256i _ex = _mm256_and_si256(                                     \
+            _mm256_xor_si256(_eq, _mm256_set1_epi8((char)-1)), MASK_);      \
+        words[(uint32_t)p >> 5] |= (uint32_t)_mm256_movemask_epi8(_ex);     \
+    } while (0)
+
 /* Classify one vectorisable tile: fills cl->words / cl->k / cl->at_pred /
  * cl->res_at_exc / cl->seen / cl->rmax / cl->dmin / cl->dmax / cl->nu and
  * advances the lane state to exactly the state the scalar path leaves.
  * Caller has already reset the lanes, zeroed words/seen and set
- * constant_C, and has captured ent_last/ent_second from BEFORE the
- * tile. Requires nt >= 32. */
+ * constant_C, and has captured ent_last/ent_second from AFTER that reset.
+ * Requires nt >= 32, and for the STRIDE family seg_pos >= 16.
+ *
+ * The whole tile is one pass over a staging buffer, so there is no scalar
+ * prologue, no scalar tail and no per-position lane state to track -- the
+ * trap the previous prologue/body/tail split had to keep re-deriving:
+ *
+ *   head[0, 8)    second_last[] at tile entry
+ *   head[8, 16)   last[] at tile entry
+ *   body[16,..)   the tile's own bytes
+ *   pad[..,+32)   zeros, so the last partial chunk can be read as full
+ *
+ * For the LANEHIST family those first 16 bytes are exactly the entry lane
+ * state, which is what the scalar loop's `last[lane]` / `second_last[lane]`
+ * hold for the positions below 8 and 16 (every tile resets its lanes, but
+ * this works for a non-resetting tile too because the caller captures the
+ * state this tile actually starts from). Past 16 the identities
+ * last[lane] == a[p-8] and second_last[lane] == a[p-16] hold, which is the
+ * same thing the previous scalar body relied on.
+ *
+ * For the STRIDE family the head instead holds the 16 real plane bytes
+ * before the tile, because `seg_base[d - s]` is a plain `a[p - s]` that
+ * reads them for p < s. That is why the caller only takes this path when
+ * seg_pos >= 16: it makes the scalar `d < s` fallback to `init`
+ * unreachable. This function therefore requires a == seg_base + seg_pos,
+ * which is how zpse_segment_encode calls it (and the only caller). */
 static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                                               const uint8_t *actual,
                                               uint16_t nt,
@@ -426,94 +465,59 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                                               const uint8_t ent_second[8])
 {
     uint32_t *words = cl->words;
-    /* Predictions for the positions that turn out to be exceptions are
-     * read back by the ascending mask walk at the end. The prologue and
-     * the vector body between them write [0, nt) on every path, but the
-     * zero initialiser makes that explicitly defined (one 256-byte store
-     * per tile) rather than something the optimiser has to prove. */
-    uint8_t pred[256] = { 0 };
-    const uint8_t *sb = 0;
-    uint8_t c = 0u;
+    uint8_t stg[ZPSE_TILE_STG_LEN];
     uint32_t s = 0u;
+    uint8_t c = 0u;
     uint16_t k = 0;
     uint16_t p = 0;
     uint8_t _rmax = 0;
     uint8_t _dmin = 255u;
     uint8_t _dmax = 0u;
-    unsigned l;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i all = _mm256_cmpeq_epi8(zero, zero);
+
+    (void)seg_base;
+    (void)seg_pos;
+    (void)initial_literal;
 
     if (fam == TILE_FAM_CONST) {
         c = (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
                 ? cl->constant_C : 0u;
     } else if (fam == TILE_FAM_STRIDE) {
         s = tile_stride_of(predictor_id);
-        sb = seg_base + seg_pos;
     }
 
-    /* Scalar prologue [0, 16): the histories are the entry state here,
-     * so they are tracked incrementally exactly as the scalar branches
-     * do. The final state is re-derived by tile_history_fixup below. */
-    {
-        uint8_t last[8];
-        uint8_t second[8];
-        uint16_t stop = (nt < 16u) ? nt : 16u;
-
-        for (l = 0; l < 8u; l++) {
-            last[l] = lanes->last[l];
-            second[l] = lanes->second_last[l];
-        }
-        for (p = 0; p < stop; p++) {
-            unsigned lane = (unsigned)p & 7u;
-            uint8_t hl = last[lane];
-            uint8_t hs = second[lane];
-            uint8_t x = actual[p];
-            uint8_t xhat;
-
-            if (fam == TILE_FAM_CONST) {
-                xhat = c;
-            } else if (fam == TILE_FAM_STRIDE) {
-                /* Absolute position index into seg_base, exactly as the
-                 * scalar branch does -- `sb` is already seg_pos bytes in,
-                 * so using it here would count seg_pos twice. */
-                uint32_t d = seg_pos + (uint32_t)p;
-                xhat = (d < s) ? initial_literal : seg_base[d - s];
-            } else if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
-                xhat = hl;
-            } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
-                xhat = (uint8_t)((2u * (unsigned)hl - (unsigned)hs) & 0xFFu);
-            } else { /* ZPSE_P_LANE_AVERAGE */
-                xhat = (uint8_t)(((unsigned)hl + (unsigned)hs + 1u) >> 1);
-            }
-            pred[p] = xhat;
-            if (x != xhat)
-                TILE_SET_EXC_BIT(p);
-            second[lane] = hl;
-            last[lane] = x;
-        }
+    if (fam == TILE_FAM_STRIDE) {
+        /* Real preceding plane bytes; requires seg_pos >= 16. */
+        memcpy(stg, actual - 16, 16);
+    } else {
+        memcpy(stg, ent_second, 8);
+        memcpy(stg + 8, ent_last, 8);
     }
+    memcpy(stg + 16, actual, nt);
+    memset(stg + 16 + nt, 0, 32);
 
-    /* Vector body [16, nt) in 32-byte chunks: prediction, comparison and
-     * mask are one pass; the prediction is parked in `pred` so the
-     * exception walk below can read xhat without recomputing it. */
     {
-        const __m256i vconst = _mm256_set1_epi8((char)c);
+        const __m256i cvec = _mm256_set1_epi8((char)c);
+        const __m256i idx = _mm256_setr_epi8(
+            0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+            16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31);
 
-        while ((uint32_t)p + 32u <= (uint32_t)nt) {
-            const __m256i av = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(actual + p));
+        while (p + 32u <= (uint32_t)nt) {
+            __m256i v = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + 16u + p));
             __m256i pv;
 
             if (fam == TILE_FAM_CONST) {
-                pv = vconst;
+                pv = cvec;
             } else if (fam == TILE_FAM_STRIDE) {
-                /* >= 16 > s, so never the initial_literal case. */
                 pv = _mm256_loadu_si256(
-                    (const __m256i *)(const void *)(sb + p - s));
+                    (const __m256i *)(const void *)(stg + 16u + p - s));
             } else {
                 const __m256i h8 = _mm256_loadu_si256(
-                    (const __m256i *)(const void *)(actual + p - 8u));
+                    (const __m256i *)(const void *)(stg + 8u + p));
                 const __m256i h16 = _mm256_loadu_si256(
-                    (const __m256i *)(const void *)(actual + p - 16u));
+                    (const __m256i *)(const void *)(stg + p));
 
                 if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
                     pv = h8;
@@ -524,56 +528,46 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                     pv = _mm256_avg_epu8(h8, h16);
                 }
             }
-            _mm256_storeu_si256((__m256i *)(void *)(pred + p), pv);
-            {
-                /* The body starts at p = 16 (not 0), so a 32-bit
-                 * movemask covers positions p..p+31 and can straddle a
-                 * mask word. Shift it to its true bit offset and split
-                 * the overflow into the next word. p is always
-                 * 16 mod 32 here except at p = 224, and p + 32 <= nt
-                 * <= 256 keeps the second index at most 7. */
-                /* movemask sets a bit where the bytes are EQUAL, i.e.
-                 * where the prediction HIT; the exception mask is the
-                 * complement of that. */
-                uint32_t m = ~(uint32_t)_mm256_movemask_epi8(
-                    _mm256_cmpeq_epi8(av, pv));
-                unsigned off = (unsigned)p & 31u;
-
-                words[(uint32_t)p >> 5] |= m << off;
-                if (off != 0u) {
-                    words[((uint32_t)p >> 5) + 1u] |= m >> (32u - off);
-                }
-            }
+            TILE_CL_CHUNK(v, pv, all);
             p = (uint16_t)(p + 32u);
         }
-    }
+        if (p < nt) {
+            uint32_t rem = (uint32_t)nt - (uint32_t)p;
+            __m256i valid = _mm256_cmpgt_epi8(
+                _mm256_set1_epi8((char)rem), idx);
+            __m256i v = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + 16u + p));
+            __m256i pv;
 
-    /* Scalar tail [p, nt): p >= 16 here, so the plane identities hold. */
-    for (; p < nt; p++) {
-        uint8_t x = actual[p];
-        uint8_t xhat;
+            if (fam == TILE_FAM_CONST) {
+                pv = cvec;
+            } else if (fam == TILE_FAM_STRIDE) {
+                pv = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(stg + 16u + p - s));
+            } else {
+                const __m256i h8 = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(stg + 8u + p));
+                const __m256i h16 = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(stg + p));
 
-        if (fam == TILE_FAM_CONST) {
-            xhat = c;
-        } else if (fam == TILE_FAM_STRIDE) {
-            xhat = sb[(uint32_t)p - s];
-        } else if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
-            xhat = actual[p - 8u];
-        } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
-            xhat = (uint8_t)((2u * (unsigned)actual[p - 8u] -
-                              (unsigned)actual[p - 16u]) & 0xFFu);
-        } else {
-            xhat = (uint8_t)(((unsigned)actual[p - 8u] +
-                              (unsigned)actual[p - 16u] + 1u) >> 1);
+                if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+                    pv = h8;
+                } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
+                    pv = _mm256_sub_epi8(_mm256_add_epi8(h8, h8), h16);
+                } else {
+                    pv = _mm256_avg_epu8(h8, h16);
+                }
+            }
+            TILE_CL_CHUNK(v, pv, valid);
         }
-        pred[p] = xhat;
-        if (x != xhat)
-            TILE_SET_EXC_BIT(p);
     }
 
     /* Only the positions that differ need the bookkeeping, and the mask
      * already says which they are: walk it ascending so at_pred and
-     * res_at_exc stay in position order, which the packers rely on. */
+     * res_at_exc stay in position order, which the packers rely on. The
+     * prediction is re-read from the staging buffer rather than stored for
+     * every position during the vector pass -- the pass would otherwise
+     * write 256 bytes per tile that are thrown away whenever k is small. */
     {
         unsigned wi;
 
@@ -582,8 +576,27 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
 
             while (w != 0u) {
                 uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
+                uint8_t xhat;
 
-                TILE_TAKE_EXC(pos, pred[pos], actual[pos]);
+                if (fam == TILE_FAM_CONST) {
+                    xhat = c;
+                } else if (fam == TILE_FAM_STRIDE) {
+                    xhat = stg[16u + (uint32_t)pos - s];
+                } else {
+                    uint8_t h8 = stg[8u + (uint32_t)pos];
+                    uint8_t h16 = stg[pos];
+
+                    if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+                        xhat = h8;
+                    } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
+                        xhat = (uint8_t)((2u * (unsigned)h8 -
+                                          (unsigned)h16) & 0xFFu);
+                    } else {
+                        xhat = (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
+                                         >> 1);
+                    }
+                }
+                TILE_TAKE_EXC(pos, xhat, actual[pos]);
                 w &= w - 1u;
             }
         }
@@ -649,6 +662,9 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
 
 #if ZPSE_TILE_HAVE_AVX2
     if (nt >= 32u && tile_fam_is_vectorisable(fam) &&
+        /* STRIDE reads the 16 real plane bytes before the tile; */
+        /* LANEHIST takes them from the entry lane state. */
+        (fam != TILE_FAM_STRIDE || seg_pos >= 16u) &&
         (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         uint8_t vl[8];
         uint8_t vs[8];
