@@ -312,14 +312,27 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 }
 
 /* Encode one transform trial into dst[0..cap). Returns PSE_OK with
- * *total_out set, or a negative status / skip code. */
+ * *total_out set, or a negative status / skip code. *budget_hit is set
+ * when the trial was stopped by the RAW-envelope budget below rather
+ * than by a real error, because the caller has to count that case
+ * exactly like a completed trial that failed to beat RAW. */
 static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                               uint32_t in_crc,
                               uint8_t tid, uint8_t sc,
                               const uint8_t *meta_bytes, uint16_t meta_len,
                               int is_last, uint32_t seq,
-                              uint8_t *dst, uint32_t cap, uint32_t *total_out)
+                              uint8_t *dst, uint32_t cap, uint32_t *total_out,
+                              int *budget_hit)
 {
+    /* A trial is only ever chosen when its total is below the RAW
+     * envelope (32 + N), so it cannot matter once it has reached it:
+     * every payload byte written is committed and later segments only add
+     * to the total. Handing the segment encoder that remaining budget
+     * lets it stop instead of finishing a payload that is thrown away.
+     * The envelope is also a strict upper bound on the budget, and the
+     * cap the caller passes is the candidate buffer, which is larger than
+     * any envelope a valid block can have, so an overflow with an active
+     * budget is always the budget -- never the cap. */
     ZpseTransformMeta tm;
     uint8_t w = 0;
     uint32_t lens[16];
@@ -332,6 +345,9 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint8_t flags;
     int rc;
 
+    if (budget_hit != 0) {
+        *budget_hit = 0;
+    }
     rc = zpse_transform_width(tid, sc, &w);
     if (rc != PSE_OK) {
         return rc;
@@ -385,15 +401,22 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     for (s = 0; s < sc; s++) {
         uint8_t lit = lens[s] > 0 ? planes[s][0] : 0;
         uint64_t at = base + cum;
+        uint64_t raw = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n;
         uint32_t room;
+        uint32_t budget;
         int wlen;
         if (at > (uint64_t)cap) {
             return PSE_OUTPUT_OVERFLOW;
         }
         room = (uint32_t)((uint64_t)cap - at);
+        budget = (raw > at) ? (uint32_t)(raw - at) : 0u;
         wlen = zpse_segment_encode(e, &lanes, planes[s], lens[s], lit,
-                                   dst + at, room);
+                                   dst + at, room, budget);
         if (wlen < 0) {
+            if (wlen == PSE_OUTPUT_OVERFLOW && budget != 0u &&
+                budget_hit != 0) {
+                *budget_hit = 1;
+            }
             return wlen;
         }
         if (wlen < (int)ZPSE_SEGMENT_HEADER_SIZE) {
@@ -543,11 +566,23 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
     for (i = 0; i < ncand; i++) {
         uint32_t t = 0;
+        int budget_hit = 0;
         const uint8_t *mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq,
-                                e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t);
+                                e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
+                                &budget_hit);
         if (rc != PSE_OK) {
+            /* A trial the budget stopped had already reached the RAW
+             * envelope, which is exactly the condition the completed
+             * trial's `t + 1 > 32 + N` test below would have counted, so
+             * count it here and the sweep decides as it always did. */
+            if (budget_hit) {
+                fails++;
+                if (fails >= 2) {
+                    break;
+                }
+            }
             continue;
         }
         if (!have_best || t < best_total) {

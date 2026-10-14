@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "zpse/bits.h"
+#include "zpse/mask.h"
+#include "zpse/residual.h"
 #include "zpse/status.h"
 #include "zpse/tile.h"
 #include "zpse/types.h"
@@ -391,10 +393,14 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
  *
  * The head exists because `seg_base[d - s]` for the STRIDE family is a
  * plain `a[p - s]` (a[p-s] == stg[16+p-s] for p >= s, and for p < s it is
- * one of the head bytes), which is exactly why the caller only uses this
- * path when seg_pos >= 16: that makes the scalar `d < s` fallback to
- * `init` unreachable, so the head is always real plane data. Note this
- * function therefore requires `a == seg_base + seg_pos`, which is how
+ * one of the head bytes) and because the LANEHIST family needs the entry
+ * lane state. Both are real plane data once the segment has 16 bytes
+ * behind the tile, and both collapse to `init` at seg_pos == 0, where
+ * the encoder's reset makes the lane state `init` and the scalar
+ * `d < s` fallback (d == p) covers exactly the bytes before the plane
+ * start: the caller only uses this path for those two positions, and
+ * this function fills the head with `init` for the second. Note it
+ * requires `a == seg_base + seg_pos`, which is how
  * zpse_segment_encode calls it (and the only caller).
  *
  * The pad exists so the last, partial chunk can be evaluated as a full
@@ -430,10 +436,21 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
     uint32_t p = 0;
 
     (void)seg_base;
-    (void)seg_pos;
     a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = zero;
 
-    memcpy(stg, a - 16, 16);
+    if (seg_pos == 0u) {
+        /* A segment's first tile. The encoder resets the lane state for
+         * every tile, so both things this head has to stand for are
+         * `init` here: the STRIDE `d < s` fallback, and the LANEHIST
+         * entry state (whose first 8 and first 16 lanes the p == 0
+         * blends below force to `init` regardless of what the head
+         * holds). Reading a - 16 would step outside the plane, so fill
+         * the head instead -- it is the same value the scalar loop
+         * would have used. */
+        memset(stg, init, 16);
+    } else {
+        memcpy(stg, a - 16, 16);
+    }
     memcpy(stg + 16, a, nt);
     memset(stg + 16 + nt, 0, 32);
 
@@ -513,9 +530,17 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
 {
 #if ZPSE_PS_HAVE_AVX2
     /* The vector path folds the tile boundaries into the whole-tile
-     * pass and reads 16 real plane bytes before the tile, so it is
-     * only valid once a segment has that much history. */
-    if (have_avx2 && seg_pos >= 16u) {
+     * pass and reads 16 plane bytes before the tile: real ones once the
+     * segment has that much history, and `init` for a segment's first
+     * tile, where the reset lane state and the STRIDE `d < s` fallback
+     * both make every byte before the tile `init` (seg_prescreen_avx2
+     * fills the head for that case). Those are the only two positions
+     * that occur -- seg_pos is a tile index times 256 -- and any other
+     * keeps the scalar path rather than silently widening the
+     * contract. The scalar first-tile prescreen this replaces cost
+     * 853 ns against 30 ns for every later tile, i.e. ~13 us per block
+     * on the 16-segment transform trial. */
+    if (have_avx2 && (seg_pos == 0u || seg_pos >= 16u)) {
         seg_prescreen_avx2(a, nt, seg_base, seg_pos, init, ks);
         return;
     }
@@ -525,10 +550,32 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
     seg_prescreen_counts(a, nt, seg_base, seg_pos, init, ks);
 }
 
+/* Emit the minimal all-hit tile record: mask ALL_HIT and residual
+ * EXCLUSION_U8 with k == 0, so the whole tile is prediction and both
+ * payloads are empty. This is byte for byte what zpse_tile_pack's own
+ * k == 0 arm writes for that pair, which is the pair
+ * zpse_tile_choose_modes picks whenever k == 0. 10 bytes including the
+ * u16 record-length prefix; the caller has checked the capacity. `nt` is
+ * the tile length, so the last tile of a segment still writes nt-1 into
+ * tile_length_minus_1. */
+static void seg_write_all_hit(uint8_t *dst, uint8_t predictor_id,
+                              uint16_t nt)
+{
+    zpse_store_u16le(dst, (uint16_t)ZPSE_TILE_HEADER_SIZE);
+    dst[2] = zpse_tile_flags_make((uint8_t)ZPSE_M_ALL_HIT,
+                                  (uint8_t)ZPSE_R_EXCLUSION_U8, 1);
+    dst[3] = predictor_id;
+    dst[4] = (uint8_t)(nt - (uint16_t)1u);
+    dst[5] = 0u; /* exception count: unused by both extreme mask modes */
+    zpse_store_u16le(dst + 6, 0u); /* mask payload size */
+    zpse_store_u16le(dst + 8, 0u); /* residual payload size */
+}
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
-                        uint8_t *payload_out, uint32_t payload_cap)
+                        uint8_t *payload_out, uint32_t payload_cap,
+                        uint32_t byte_budget)
 {
     ZpseSegmentHeader h;
     uint32_t tc;
@@ -581,9 +628,19 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         uint32_t ncand = 0;
         uint32_t ci;
         int best_len = -1;
+        uint16_t best_k = 0u;
         uint8_t best_p = 0;
         uint8_t *bst = e->input; /* staging for the winning record */
         int n;
+
+        /* Bound check for the byte budget, before any work for this
+         * tile: `pos` grows monotonically, so once it is past the budget
+         * nothing later could come back under it. No exception path can
+         * be skipped by this -- the caller only passes a budget when a
+         * total that large cannot win -- and no tile is half-written. */
+        if (byte_budget != 0u && pos > byte_budget) {
+            return PSE_OUTPUT_OVERFLOW;
+        }
 
         seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
                       have_avx2, ks);
@@ -598,6 +655,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                     best_p = seg_screen_pred[i];
                 }
             }
+            best_k = bk;
             cand[ncand++] = best_p;
 
             /* Second trial only when it is genuinely competitive. */
@@ -636,6 +694,76 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             if ((uint32_t)bk * 8u >= (uint32_t)nt * 7u) {
                 ncand = 1u;
             }
+        }
+
+        /* ---- All-hit run ------------------------------------------ *
+         * best_k == 0 means the winning screened predictor predicts the
+         * whole tile: mask ALL_HIT with an empty residual, i.e. exactly
+         * the 8-byte record the packer writes for (k == 0, ALL_HIT,
+         * EXCLUSION_U8). Neither the mode search nor the packer can turn
+         * that classification into any other record, no second candidate
+         * is ever appended when bk == 0, and 8 bytes is the smallest
+         * record a tile can have, so the winner byte and the record are
+         * both forced -- which is what lets this write them directly
+         * instead of classifying, choosing and packing per tile.
+         *
+         * A run is just more of the same: past the first tile the
+         * prescreen is the only thing that decides which predictor byte
+         * the general path would have written, so stay here while it
+         * keeps reporting k == 0 for the same winner. Any other tile
+         * falls out to the general path, which re-derives everything
+         * from the same prescreen result -- each tile is written by
+         * exactly one of the two paths, and the bytes agree, so the
+         * payload is unchanged. The lane state needs no update: the
+         * classify call for the next tile is always made with
+         * tile_reset == 1, which resets the histories and tables itself,
+         * and nothing after this loop reads `lanes`.
+         *
+         * The run stops (rather than overflowing) on the same capacity
+         * condition the general path returns PSE_OUTPUT_OVERFLOW for. */
+        if (best_k == 0u) {
+            uint8_t pred = best_p;
+
+            if (payload_cap - pos < 10u) {
+                return PSE_OUTPUT_OVERFLOW;
+            }
+            seg_write_all_hit(payload_out + pos, pred, nt);
+            pos += 10u;
+
+            while (t + 1u < tc) {
+                uint32_t nsseg_pos = (t + 1u) * 256u;
+                uint16_t nnt = (uint16_t)((t + 2u < tc)
+                                              ? 256u
+                                              : (plane_len - nsseg_pos));
+                uint16_t nks[11];
+                uint16_t nbk;
+                uint8_t npred = seg_screen_pred[0];
+                uint32_t i;
+
+                if (byte_budget != 0u && pos > byte_budget) {
+                    return PSE_OUTPUT_OVERFLOW;
+                }
+                if (payload_cap - pos < 10u) {
+                    return PSE_OUTPUT_OVERFLOW;
+                }
+                seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
+                              initial_literal, have_avx2, nks);
+                nbk = nks[npred];
+                for (i = 1; i < 8u; i++) {
+                    uint16_t c = nks[seg_screen_pred[i]];
+                    if (c < nbk) {
+                        nbk = c;
+                        npred = seg_screen_pred[i];
+                    }
+                }
+                if (nbk != 0u || npred != pred) {
+                    break;
+                }
+                seg_write_all_hit(payload_out + pos, npred, nnt);
+                pos += 10u;
+                t++;
+            }
+            continue;
         }
 
         for (ci = 0; ci < ncand; ci++) {

@@ -1165,6 +1165,164 @@ int zpse_tile_encode(ZpseLaneState *lanes, const uint8_t *actual, uint16_t nt,
         }                                                                    \
     } while (0)
 
+/* ------------------------------------------------------------------ *
+ * Vectorised reconstruction for tiles that have exceptions.
+ *
+ * A tile with K exceptions walks all Nt positions one byte at a time in
+ * the loops at the end of zpse_tile_decode, and for the two families whose
+ * prediction is a pure function of the tile's own lane histories -- CONST
+ * and LANEHIST -- every position performs the same three steps: derive
+ * x_hat, invert the residual if the mask marks an exception there, keep
+ * x_hat otherwise.
+ *
+ * The recurrence is what makes this vectorisable at all. position p
+ * reads last[p & 7] and second_last[p & 7], and those hold the bytes its
+ * own lane wrote 8 and 16 positions back -- so the eight lanes are eight
+ * *independent* chains, each advancing one step every eight positions.
+ * A group of eight positions is therefore exactly one step of all eight
+ * chains at once, and the group's predictions need nothing but the
+ * previous two groups' results:
+ *
+ *   LANE_PREVIOUS   x_hat(g) = x(g-1)
+ *   LANE_DELTA      x_hat(g) = 2*x(g-1) - x(g-2)
+ *   LANE_AVERAGE    x_hat(g) = (x(g-1) + x(g-2) + 1) >> 1
+ *
+ * with x(-1) and x(-2) the entry lane histories, which is precisely the
+ * state the scalar loops start from. That also means the entry state is
+ * honoured for a non-resetting tile and the whole tile is covered -- no
+ * prologue, no staging buffer, no head, and no assumption about where in
+ * the segment the tile sits.
+ *
+ * The last, partial group is one more vector step with the mask bits past
+ * Nt cleared, so exactly the same residual units are consumed in exactly
+ * the same ascending position order as the scalar loop consumes them, and
+ * its bytes past Nt are dropped by a byte copy rather than an 8-byte
+ * store.
+ *
+ * The STRIDE family is deliberately NOT here: its prediction reads
+ * out[p - s] for s in {1,2,4,8}, which for s < 8 is a byte the same group
+ * is still producing, so a group's predictions would need the group's own
+ * result. That lane-crossing recurrence is the scalar loop's business.
+ *
+ * Residual units reach this kernel already in the exclusion domain: modes
+ * 0/2/3 give r with x = r + (r >= x_hat), mode 1 gives x itself, mode 4
+ * gives an int8 delta with x = x_hat + delta. Those are the three branches
+ * below.
+ * ------------------------------------------------------------------ */
+#if ZPSE_TILE_HAVE_AVX2
+
+/* Reconstruct a whole CONST or LANEHIST tile eight positions at a time,
+ * consuming residual units from units[unit_off..] and returning the new
+ * unit count. ent_last/ent_second are the lane histories on entry, which
+ * are the first two "groups" the recurrence needs. */
+static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
+                                              int fam, uint8_t predictor_id,
+                                              uint8_t constant_C,
+                                              const uint32_t words[8],
+                                              const uint8_t *units,
+                                              uint8_t res_mode,
+                                              const uint8_t ent_last[8],
+                                              const uint8_t ent_second[8],
+                                              uint16_t unit_off)
+{
+    /* Per-lane bit value of the group's mask byte. The upper eight lanes
+     * carry zero, which the mask expansion below turns into "set"; only
+     * the low eight lanes are ever stored, so that is harmless. */
+    const __m128i bitv = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)0x80,
+                                       0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i one = _mm_set1_epi8((char)1);
+    const __m128i cvec = _mm_set1_epi8((char)constant_C);
+    __m128i prev1 = _mm_loadl_epi64((const __m128i *)(const void *)ent_last);
+    __m128i prev2 =
+        _mm_loadl_epi64((const __m128i *)(const void *)ent_second);
+    uint16_t consumed = unit_off;
+    uint32_t g;
+    uint32_t ngroups = ((uint32_t)nt + 7u) >> 3u;
+
+    for (g = 0; g < ngroups; g++) {
+        uint32_t at = g * 8u;
+        uint32_t rem = (uint32_t)nt - at;
+        uint32_t valid = (rem >= 8u) ? 0xFFu : ((UINT32_C(1) << rem) - 1u);
+        uint32_t m8 = (words[g >> 2u] >> ((g & 3u) * 8u)) & valid;
+        uint32_t wg = m8;
+        uint8_t tmp[8];
+        uint32_t cnt = 0;
+        __m128i xhat;
+        __m128i r;
+        __m128i x;
+        __m128i mb;
+        __m128i res;
+
+        /* The group's units, placed at the lane of the position they
+         * belong to. A fully set mask byte is a contiguous run, which is
+         * the common case on a dense mask; otherwise walk its set bits
+         * LSB first, which is ascending position order, and drop each
+         * unit into its own lane. Compacting them into tmp[0..cnt) would
+         * be wrong: lane j must hold the unit of position at + j, not the
+         * j-th unit. */
+        if (m8 == 0xFFu) {
+            memcpy(tmp, units + consumed, 8);
+            cnt = 8u;
+        } else {
+            uint32_t bit = 0;
+
+            while (wg != 0u) {
+                if ((wg & 1u) != 0u) {
+                    tmp[bit] = units[consumed + cnt];
+                    cnt++;
+                }
+                wg >>= 1;
+                bit++;
+            }
+        }
+
+        if (fam == TILE_FAM_CONST) {
+            xhat = cvec;
+        } else if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+            xhat = prev1;
+        } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
+            xhat = _mm_sub_epi8(_mm_add_epi8(prev1, prev1), prev2);
+        } else { /* LANE_AVERAGE rounds up, as scalar. */
+            xhat = _mm_avg_epu8(prev1, prev2);
+        }
+
+        r = _mm_loadl_epi64((const __m128i *)(const void *)tmp);
+        if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+            x = r;
+        } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+            x = _mm_add_epi8(xhat, r);
+        } else {
+            /* Exclusion inverse: r < x_hat ? r : r + 1, unsigned. */
+            __m128i ge = _mm_cmpeq_epi8(_mm_max_epu8(r, xhat), r);
+
+            x = _mm_add_epi8(r, _mm_and_si128(ge, one));
+        }
+
+        /* Expand the group's eight mask bits into a byte mask: bit j of
+         * the byte is exactly the bit value of lane j, so broadcasting
+         * the byte and comparing the AND against those per-lane values
+         * leaves 0xFF where the bit is set. */
+        mb = _mm_cmpeq_epi8(_mm_and_si128(_mm_set1_epi8((char)m8), bitv),
+                            bitv);
+        res = _mm_or_si128(_mm_and_si128(mb, x),
+                           _mm_andnot_si128(mb, xhat));
+
+        consumed = (uint16_t)(consumed + (uint16_t)cnt);
+        if (rem >= 8u) {
+            _mm_storel_epi64((__m128i *)(void *)(out + (size_t)at), res);
+        } else {
+            uint8_t ob[16];
+
+            _mm_storeu_si128((__m128i *)(void *)ob, res);
+            memcpy(out + (size_t)at, ob, (size_t)rem);
+        }
+        prev2 = prev1;
+        prev1 = res;
+    }
+    return consumed;
+}
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
 /* Resolve one predicted/residual stream in position order, family by
  * family, with the predictor dispatch hoisted out of the byte loop. */
 int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
@@ -1296,6 +1454,41 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
 
     /* ---- General path: dispatch once, then run the family loop ---- */
     fam = tile_family(th.predictor_id);
+
+#if ZPSE_TILE_HAVE_AVX2
+    /* Vectorised reconstruction for the two families whose prediction is
+     * a pure function of the tile's own lane histories (see
+     * tile_recon_avx2). Only the byte-writing loops are replaced:
+     * validation, the mask and residual decode above and every status they
+     * produced are untouched, and the j != k test below is this path's
+     * version of the scalar loops' own residual-consumption check, taken
+     * only once the output bytes for the whole tile have been produced --
+     * exactly as the scalar loops leave it. ORDER1/ORDER2 (stateful
+     * tables), STRIDE (a lane-crossing recurrence), Nt < 32 and every
+     * machine without AVX2 fall through to the scalar loops. */
+    if ((uint32_t)nt >= 32u &&
+        (fam == TILE_FAM_CONST || fam == TILE_FAM_LANEHIST) &&
+        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        uint8_t ent_last[8];
+        uint8_t ent_second[8];
+
+        /* Captured before anything writes, for the O(8) history epilogue
+         * that both the all-hit fast path and the scalar loops use as
+         * their end state. */
+        tile_capture_hist(lanes, ent_last, ent_second);
+        j = tile_recon_avx2(out, nt, fam, th.predictor_id, constant_C,
+                            words,
+                            (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
+                                ? (const uint8_t *)(const void *)deltas
+                                : resid,
+                            res_mode, ent_last, ent_second, 0u);
+        tile_history_fixup(lanes, out, nt, ent_last, ent_second);
+        if (j != k)
+            return PSE_BAD_MASK;
+        return (int)nt;
+    }
+#endif
+
     if (fam == TILE_FAM_CONST || fam == TILE_FAM_STRIDE) {
         uint8_t ent_last[8];
         uint8_t ent_second[8];
