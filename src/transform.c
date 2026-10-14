@@ -99,6 +99,105 @@ static void zpse_t16x16(__m128i r[16])
 }
 #endif /* ZPSE_T_HAVE_SSE2 */
 
+/* ------------------------------------------------------------------ *
+ * SSE2 prefix scans for the delta8 / xor8 chains.
+ *
+ * A delta8 or xor8 stream is a prefix scan: out[j] = enc[j] (op) out[j-1]
+ * with out[-1] = seed, so byte j needs byte j-1. But only the *carry*
+ * truly chains: inside one 16-byte block the four log-shift steps build
+ * every lane's partial prefix with no cross-lane dependency at all, and
+ * the block's total is just its last lane. So the scan runs over a chunk
+ * of eight such blocks -- eight completely independent ladders, each
+ * producing both its prefix and its total -- then a short scalar carry
+ * chain over the eight block totals, then one broadcast-and-op per block.
+ * That puts eight independent ladders and eight independent stores
+ * between two links of the carry chain instead of one; the arithmetic per
+ * byte is exactly the arithmetic the scalar loop does.
+ *
+ * SSE2, like every other fast path in this file: architectural on x86-64,
+ * so there is no runtime dispatch, the -DZPSE_FORCE_SCALAR conformance
+ * build runs these very intrinsics, and the scalar/SIMD parity test
+ * cannot observe a difference here by construction. Every length is
+ * handled: whole 128-byte chunks, then whole 16-byte blocks, then the
+ * scalar remainder, all three continuing from the same carry.
+ * ------------------------------------------------------------------ */
+#if ZPSE_T_HAVE_SSE2
+#define ZPSE_ADD8(a_, b_) ((uint8_t)((uint8_t)(a_) + (uint8_t)(b_)))
+#define ZPSE_XOR8(a_, b_) ((uint8_t)((uint8_t)(a_) ^ (uint8_t)(b_)))
+
+/* Defines `kernel_name(src, dst, n, seed)` for one of the two operators:
+ * OPV is the 128-bit byte-wise op and OP8 its scalar twin. */
+#define ZPSE_DEFINE_PREFIX_SCAN(kernel_name, OPV, OP8)                       \
+static void kernel_name(const uint8_t *src, uint8_t *dst, uint32_t n,        \
+                        uint8_t seed)                                       \
+{                                                                           \
+    uint32_t j = 0;                                                         \
+    uint8_t pv = seed;                                                      \
+                                                                            \
+    if (src == 0 || dst == 0 || n == 0u) {                                  \
+        return;                                                             \
+    }                                                                       \
+    /* Whole 128-byte chunks: eight independent ladders, then the block    \
+     * totals folded into one carry per block, then the blocks rebased.    \
+     * The carry for block b is the running value BEFORE block b, which    \
+     * is the exclusive prefix of the totals over the chunks before it     \
+     * plus the seed, and every lane of the block is missing exactly that  \
+     * constant, so one broadcast add/xor per block applies it. */         \
+    for (; (size_t)j + 128u <= (size_t)n; j += 128u) {                      \
+        __m128i v[8];                                                       \
+        uint8_t tot[8];                                                     \
+        uint8_t acc = pv;                                                   \
+        unsigned b;                                                         \
+                                                                            \
+        for (b = 0; b < 8u; b++) {                                          \
+            __m128i x = _mm_loadu_si128((const __m128i *)(const void *)     \
+                                        (src + (size_t)j +                  \
+                                         (size_t)b * 16u));                 \
+            x = OPV(x, _mm_slli_si128(x, 1));                               \
+            x = OPV(x, _mm_slli_si128(x, 2));                               \
+            x = OPV(x, _mm_slli_si128(x, 4));                               \
+            x = OPV(x, _mm_slli_si128(x, 8));                               \
+            v[b] = x;                                                       \
+            /* Word 7 holds bytes 14 and 15, so the total is its HIGH      \
+             * byte: a plain uint8_t cast of the word would keep byte 14    \
+             * and carry the wrong value into every later block. */         \
+            tot[b] = (uint8_t)(_mm_extract_epi16(x, 7) >> 8);               \
+        }                                                                   \
+        for (b = 0; b < 8u; b++) {                                          \
+            uint8_t c = acc;                                                \
+            acc = OP8(acc, tot[b]);                                         \
+            tot[b] = c;                                                     \
+        }                                                                   \
+        for (b = 0; b < 8u; b++) {                                          \
+            _mm_storeu_si128((__m128i *)(void *)(dst + (size_t)j +          \
+                                               (size_t)b * 16u),            \
+                             OPV(v[b], _mm_set1_epi8((char)tot[b])));        \
+        }                                                                   \
+        pv = acc;                                                           \
+    }                                                                       \
+    /* Whole 16-byte blocks: one ladder plus its carry. */                  \
+    for (; (size_t)j + 16u <= (size_t)n; j += 16u) {                        \
+        __m128i x = _mm_loadu_si128(                                        \
+            (const __m128i *)(const void *)(src + (size_t)j));              \
+        x = OPV(x, _mm_slli_si128(x, 1));                                   \
+        x = OPV(x, _mm_slli_si128(x, 2));                                   \
+        x = OPV(x, _mm_slli_si128(x, 4));                                   \
+        x = OPV(x, _mm_slli_si128(x, 8));                                   \
+        x = OPV(x, _mm_set1_epi8((char)pv));                                \
+        _mm_storeu_si128((__m128i *)(void *)(dst + (size_t)j), x);          \
+        pv = (uint8_t)(_mm_extract_epi16(x, 7) >> 8);                       \
+    }                                                                       \
+    /* Scalar remainder (fewer than 16 bytes left, or n < 16 overall). */   \
+    for (; j < n; j++) {                                                    \
+        pv = OP8(pv, src[j]);                                               \
+        dst[j] = pv;                                                        \
+    }                                                                       \
+}
+
+ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_sum16, _mm_add_epi8, ZPSE_ADD8)
+ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_xor16, _mm_xor_si128, ZPSE_XOR8)
+#endif /* ZPSE_T_HAVE_SSE2 */
+
 static int zpse_valid_count(uint8_t v)
 {
     return (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) ? 1 : 0;
@@ -516,53 +615,30 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
     if (w == 1u) {
         const uint8_t *src = segs[0];
         uint8_t pv = prev[0];
-        uint32_t j = 0;
 
 #if ZPSE_T_HAVE_SSE2
         /* out[j] = seed + sum(enc[0..j]) for delta, the xor prefix for
-         * xor: a prefix scan. SSE2 does 16 bytes at a time with the
-         * standard log-shift ladder (1, 2, 4, 8) to build the within-
-         * block prefix sums, then one broadcast of the running carry
-         * added to all 16 lanes -- valid because the carry is exactly
-         * the constant every lane's prefix is missing. The carry for the
-         * next block is lane 15 of the result. */
-        {
-            __m128i carry = _mm_set1_epi8((char)pv);
-
-            for (; (size_t)j + 16u <= (size_t)n; j += 16u) {
-                __m128i v = _mm_loadu_si128(
-                    (const __m128i *)(const void *)(src + j));
-
-                v = delta ? _mm_add_epi8(v, _mm_slli_si128(v, 1))
-                          : _mm_xor_si128(v, _mm_slli_si128(v, 1));
-                v = delta ? _mm_add_epi8(v, _mm_slli_si128(v, 2))
-                          : _mm_xor_si128(v, _mm_slli_si128(v, 2));
-                v = delta ? _mm_add_epi8(v, _mm_slli_si128(v, 4))
-                          : _mm_xor_si128(v, _mm_slli_si128(v, 4));
-                v = delta ? _mm_add_epi8(v, _mm_slli_si128(v, 8))
-                          : _mm_xor_si128(v, _mm_slli_si128(v, 8));
-                v = delta ? _mm_add_epi8(v, carry) : _mm_xor_si128(v, carry);
-                _mm_storeu_si128((__m128i *)(void *)(out + j), v);
-                /* Word 7 holds bytes 14 and 15, so the carry is its HIGH
-                 * byte: a plain uint8_t cast of the word would keep byte
-                 * 14 and carry the wrong value into every later block. */
-                carry = _mm_set1_epi8(
-                    (char)(uint8_t)(_mm_extract_epi16(v, 7) >> 8));
-            }
-            /* Every lane of `carry` holds the same byte, so lane 0 is
-             * the running value the scalar tail must continue from --
-             * and if n < 16 the block above never ran, leaving the seed
-             * itself, which is what the scalar loop starts from too. */
-            pv = (uint8_t)_mm_extract_epi16(carry, 0);
-        }
-#endif /* ZPSE_T_HAVE_SSE2 */
-        for (; j < n; j++) {
-            uint8_t e = src[j];
-            uint8_t d = delta ? (uint8_t)(e + pv) : (uint8_t)(e ^ pv);
-            pv = d;
-            out[j] = d;
+         * xor, from the seed exactly like the scalar loop below: the
+         * 128-byte-per-carry prefix scans defined above. */
+        if (delta) {
+            zpse_prefix_sum16(src, out, n, pv);
+        } else {
+            zpse_prefix_xor16(src, out, n, pv);
         }
         return PSE_OK;
+#else
+        {
+            uint32_t j;
+
+            for (j = 0; j < n; j++) {
+                uint8_t e = src[j];
+                uint8_t d = delta ? (uint8_t)(e + pv) : (uint8_t)(e ^ pv);
+                pv = d;
+                out[j] = d;
+            }
+        }
+        return PSE_OK;
+#endif /* ZPSE_T_HAVE_SSE2 */
     }
     for (s = 0; s < w; s++) {
         const uint8_t *src = segs[s];
@@ -583,72 +659,111 @@ void zpse_delta8_encode(const uint8_t *in, uint8_t *enc, uint32_t n,
                         uint8_t seed)
 {
     uint32_t i;
-    uint8_t prev;
 
     if (in == 0 || enc == 0 || n == 0) {
         return;
     }
-    prev = in[0];
     enc[0] = (uint8_t)(in[0] - seed);
-    for (i = 1; i < n; i++) {
-        uint8_t cur = in[i];
-        enc[i] = (uint8_t)(cur - prev);
-        prev = cur;
+#if ZPSE_T_HAVE_SSE2
+    /* Only enc[0] touches the seed. For j >= 1 the stored value is
+     * in[j] - in[j-1], a byte-wise op between the stream and itself
+     * shifted by one byte, so there is no chain to serialise -- the same
+     * idiom zpse_transform_forward already uses for this transform. */
+    i = 1;
+    for (; (size_t)i + 16u <= (size_t)n; i += 16u) {
+        __m128i cur = _mm_loadu_si128(
+            (const __m128i *)(const void *)(in + i));
+        __m128i prv = _mm_loadu_si128(
+            (const __m128i *)(const void *)(in + i - 1u));
+        _mm_storeu_si128((__m128i *)(void *)(enc + i),
+                         _mm_sub_epi8(cur, prv));
+    }
+#else
+    i = 1;
+#endif /* ZPSE_T_HAVE_SSE2 */
+    for (; i < n; i++) {
+        enc[i] = (uint8_t)(in[i] - in[i - 1u]);
     }
 }
 
 void zpse_delta8_decode(const uint8_t *enc, uint8_t *out, uint32_t n,
                         uint8_t seed)
 {
-    uint32_t i;
-    uint8_t prev;
-
     if (enc == 0 || out == 0 || n == 0) {
         return;
     }
-    out[0] = (uint8_t)(enc[0] + seed);
-    prev = out[0];
-    for (i = 1; i < n; i++) {
-        uint8_t e = enc[i];
-        uint8_t d = (uint8_t)(e + prev);
-        out[i] = d;
-        prev = d;
+#if ZPSE_T_HAVE_SSE2
+    /* Same scan as the w == 1 inverse: out[0] = enc[0] + seed, then the
+     * byte-wise prefix sum. */
+    zpse_prefix_sum16(enc, out, n, seed);
+#else
+    {
+        uint32_t i;
+        uint8_t prev;
+
+        out[0] = (uint8_t)(enc[0] + seed);
+        prev = out[0];
+        for (i = 1; i < n; i++) {
+            uint8_t e = enc[i];
+            uint8_t d = (uint8_t)(e + prev);
+            out[i] = d;
+            prev = d;
+        }
     }
+#endif /* ZPSE_T_HAVE_SSE2 */
 }
 
 void zpse_xor8_encode(const uint8_t *in, uint8_t *enc, uint32_t n,
                       uint8_t seed)
 {
     uint32_t i;
-    uint8_t prev;
 
     if (in == 0 || enc == 0 || n == 0) {
         return;
     }
-    prev = in[0];
     enc[0] = (uint8_t)(in[0] ^ seed);
-    for (i = 1; i < n; i++) {
-        uint8_t cur = in[i];
-        enc[i] = (uint8_t)(cur ^ prev);
-        prev = cur;
+#if ZPSE_T_HAVE_SSE2
+    /* As above, with xor: enc[j] = in[j] ^ in[j-1] for j >= 1. */
+    i = 1;
+    for (; (size_t)i + 16u <= (size_t)n; i += 16u) {
+        __m128i cur = _mm_loadu_si128(
+            (const __m128i *)(const void *)(in + i));
+        __m128i prv = _mm_loadu_si128(
+            (const __m128i *)(const void *)(in + i - 1u));
+        _mm_storeu_si128((__m128i *)(void *)(enc + i),
+                         _mm_xor_si128(cur, prv));
+    }
+#else
+    i = 1;
+#endif /* ZPSE_T_HAVE_SSE2 */
+    for (; i < n; i++) {
+        enc[i] = (uint8_t)(in[i] ^ in[i - 1u]);
     }
 }
 
 void zpse_xor8_decode(const uint8_t *enc, uint8_t *out, uint32_t n,
                       uint8_t seed)
 {
-    uint32_t i;
-    uint8_t prev;
-
     if (enc == 0 || out == 0 || n == 0) {
         return;
     }
-    out[0] = (uint8_t)(enc[0] ^ seed);
-    prev = out[0];
-    for (i = 1; i < n; i++) {
-        uint8_t e = enc[i];
-        uint8_t d = (uint8_t)(e ^ prev);
-        out[i] = d;
-        prev = d;
+#if ZPSE_T_HAVE_SSE2
+    /* Same scan as the w == 1 inverse: out[0] = enc[0] ^ seed, then the
+     * byte-wise prefix xor. */
+    zpse_prefix_xor16(enc, out, n, seed);
+#else
+    {
+        uint32_t i;
+        uint8_t prev;
+
+        out[0] = (uint8_t)(enc[0] ^ seed);
+        prev = out[0];
+        for (i = 1; i < n; i++) {
+            uint8_t e = enc[i];
+            uint8_t d = (uint8_t)(e ^ prev);
+            out[i] = d;
+            prev = d;
+        }
     }
+#endif /* ZPSE_T_HAVE_SSE2 */
 }

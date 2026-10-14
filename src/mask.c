@@ -181,10 +181,22 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
             return PSE_BAD_MASK;
         /* The dense mask IS a 256-bit little-endian bitmap: payload
          * byte b carries bits 8b..8b+7, which is exactly byte lane
-         * (b & 3) of words[b >> 2]. Take the bytes a word at a time
-         * instead of testing one position per iteration. `words` was
-         * zeroed above, so lanes past `need` stay zero. */
-        for (byte_i = 0; byte_i < (unsigned)need; byte_i++) {
+         * (b & 3) of words[b >> 2]. `words` was zeroed above, so byte
+         * lane b of word b>>2 is zero before the OR and the four bytes
+         * of a whole word can simply be assembled into one store instead
+         * of four read-modify-writes with a variable shift each. Only
+         * whole words are assembled that way; the tail (at most three
+         * bytes) keeps the byte loop, so no byte past the payload -- whose
+         * length is exactly `need` here -- is ever read. Identical bytes
+         * either way, and lanes past `need` stay zero. */
+        for (byte_i = 0; byte_i + 4u <= (unsigned)need; byte_i += 4u) {
+            words[byte_i >> 2] =
+                (uint32_t)payload[byte_i] |
+                ((uint32_t)payload[byte_i + 1u] << 8) |
+                ((uint32_t)payload[byte_i + 2u] << 16) |
+                ((uint32_t)payload[byte_i + 3u] << 24);
+        }
+        for (; byte_i < (unsigned)need; byte_i++) {
             words[byte_i >> 2] |=
                 (uint32_t)payload[byte_i] << ((byte_i & 3u) * 8u);
         }
@@ -204,14 +216,25 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
             return PSE_BAD_MASK;
         if (payload_len != k)
             return PSE_BAD_MASK;
-        for (j = 0; j < k; j++) {
-            uint16_t v = payload[j];
+        {
+            /* The ascending-order test compares against the previous
+             * decoded position. Keeping it in a local removes the reload
+             * of payload[j - 1] per iteration and cannot change any
+             * decision: the loop has already returned unless every
+             * earlier byte was < nt <= 256, so the local holds exactly
+             * the byte the reload would have produced. */
+            uint16_t prev = 0;
 
-            if (v >= nt)
-                return PSE_BAD_MASK;
-            if (j > 0 && v <= (uint16_t)payload[j - 1])
-                return PSE_BAD_MASK;
-            zpse_mask_set_at(words, v);
+            for (j = 0; j < k; j++) {
+                uint16_t v = payload[j];
+
+                if (v >= nt)
+                    return PSE_BAD_MASK;
+                if (j > 0 && v <= prev)
+                    return PSE_BAD_MASK;
+                prev = v;
+                zpse_mask_set_at(words, v);
+            }
         }
         return PSE_OK;
     }

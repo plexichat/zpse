@@ -10,6 +10,23 @@
 #include "zpse/types.h"
 #include "zpse/vector.h"
 
+/* STRIDE period of an all-hit STRIDE record (predictor ids 5..8). Mirrors
+ * tile_stride_of in src/tile.c, spelled out here so a change to the enum
+ * ordering cannot silently change what a batched run fills. */
+static uint32_t seg_all_hit_stride(uint8_t predictor_id)
+{
+    switch (predictor_id) {
+    case ZPSE_P_STRIDE_1:
+        return 1u;
+    case ZPSE_P_STRIDE_2:
+        return 2u;
+    case ZPSE_P_STRIDE_4:
+        return 4u;
+    default:
+        return 8u; /* ZPSE_P_STRIDE_8 */
+    }
+}
+
 int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                         const uint8_t *payload, uint32_t payload_len,
                         uint8_t *decoded_out, uint32_t decoded_cap,
@@ -88,11 +105,10 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
          * The record below is the entire tile header with every mode bit
          * clear except the reset flag: mask mode ALL_HIT, residual mode
          * EXCLUSION_U8, a zero exception count, both payload sizes zero,
-         * and one of the CONST / lane-history predictors. Such a tile
-         * decodes to a single repeated byte -- 0 for CONST_ZERO, the
-         * initial literal otherwise -- and leaves the lane state at that
-         * byte's fixed point, which is the state one tile leaves. A
-         * maximal run of them is therefore one memset over the run's
+         * and one of the CONST, lane-history or STRIDE predictors. Such a
+         * tile is pure prediction: a single repeated byte for the CONST
+         * and lane-history families, and a period-s pattern for STRIDE.
+         * A maximal run of them is therefore one fill of the run's
          * contiguous output plus one history update, instead of one
          * zpse_tile_decode call and one tile_header_validate per tile.
          *
@@ -105,19 +121,31 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
          * the same position with the same status.
          *
          * The predictor byte is tested FIRST because it is the selective
-         * one: a STRIDE tile (the whole point of the STRIDE family -- a
-         * constant-period plane) is rejected by one compare against the
-         * range [CONST_ZERO, LANE_DELTA] plus one against LANE_AVERAGE,
-         * instead of after eight byte comparisons for the fields that
-         * only the rare all-hit record has. */
+         * one: an ORDER1/ORDER2/TILE_CONSTANT tile fails it on the first
+         * (or third) compare, instead of after eight byte comparisons for
+         * the fields that only an all-hit record has.
+         *
+         * The STRIDE family (ids 5..8) is batched here too, and it is the
+         * one case whose fill is not a single byte. An all-hit STRIDE tile
+         * is exactly the constant-period recurrence
+         *
+         *     out[d] = (d < s) ? literal : out[d - s],   s in {1,2,4,8},
+         *
+         * over segment-absolute positions d, and that rule does not depend
+         * on where a tile starts. A run of R such tiles therefore fills
+         * [run_start, run_start + 256*R) with one ascending evaluation of
+         * it: an s-byte seed, read from decoded_out (which already holds
+         * every byte before the run -- in-place is what the per-tile path
+         * relies on as well), then the same repeated doubling the per-tile
+         * path uses to expand a seed to a whole tile. */
         if ((rec[1] <= (uint8_t)ZPSE_P_LANE_DELTA ||
-             rec[1] == (uint8_t)ZPSE_P_LANE_AVERAGE) &&
+             rec[1] == (uint8_t)ZPSE_P_LANE_AVERAGE ||
+             (rec[1] >= (uint8_t)ZPSE_P_STRIDE_1 &&
+              rec[1] <= (uint8_t)ZPSE_P_STRIDE_8)) &&
             rsz == 8u && nt_exp == 256u &&
             rec[0] == (uint8_t)ZPSE_TILE_FLAG_RESET &&
             rec[2] == 255u && rec[3] == 0u && rec[4] == 0u &&
             rec[5] == 0u && rec[6] == 0u && rec[7] == 0u) {
-            uint8_t fill = (rec[1] == (uint8_t)ZPSE_P_CONST_ZERO)
-                               ? 0u : literal;
             uint32_t run = 1u;
             uint32_t rpos = pos + 10u;
             uint32_t rprod = produced + 256u;
@@ -161,13 +189,68 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                 rt++;
             }
 
-            memset(decoded_out + produced, fill, (size_t)run * 256u);
-            {
-                unsigned l;
+            if (rec[1] >= (uint8_t)ZPSE_P_STRIDE_1) {
+                /* STRIDE run: one ascending evaluation of the period-s
+                 * recurrence over the whole run (see the comment above).
+                 * Every tile of the run is a full 256-byte tile -- the
+                 * scan below stops at the first one that is not -- and
+                 * every one of them was already bounded against
+                 * decoded_cap and seg_size by that same scan. */
+                uint32_t s = seg_all_hit_stride(rec[1]);
+                uint32_t run_len = run * 256u;
+                uint8_t *base = decoded_out + produced;
+                uint32_t seed = (run_len < s) ? run_len : s;
+                uint32_t filled;
+                uint32_t i;
 
-                for (l = 0; l < 8u; l++) {
-                    lanes->last[l] = fill;
-                    lanes->second_last[l] = fill;
+                for (i = 0; i < seed; i++) {
+                    uint32_t d = produced + i;
+
+                    base[i] = (d < s) ? literal : decoded_out[d - s];
+                }
+                filled = seed;
+                while (filled < run_len) {
+                    uint32_t chunk = filled;
+
+                    if (chunk > run_len - filled) {
+                        chunk = run_len - filled;
+                    }
+                    memcpy(base + filled, base, chunk);
+                    filled += chunk;
+                }
+                /* End state = the state the run's LAST tile leaves, which
+                 * is what a following non-resetting tile reads. For a full
+                 * tile the epilogue of tile_history_fixup (src/tile.c)
+                 * reduces to: lane l ends on position 248 + l of that tile
+                 * (every lastp is >= 8 for nt == 256, so no entry state is
+                 * involved) and its second history is 8 positions back. */
+                {
+                    unsigned l;
+                    uint32_t base_last = produced + run_len - 256u;
+
+                    for (l = 0; l < 8u; l++) {
+                        lanes->last[l] =
+                            decoded_out[base_last + 248u + l];
+                        lanes->second_last[l] =
+                            decoded_out[base_last + 240u + l];
+                    }
+                }
+            } else {
+                /* CONST / lane-history tile: 0 for CONST_ZERO, the initial
+                 * literal otherwise, and a freshly reset lane state is a
+                 * fixed point at that byte (which is what one tile
+                 * leaves). */
+                uint8_t fill = (rec[1] == (uint8_t)ZPSE_P_CONST_ZERO)
+                                   ? 0u : literal;
+
+                memset(decoded_out + produced, fill, (size_t)run * 256u);
+                {
+                    unsigned l;
+
+                    for (l = 0; l < 8u; l++) {
+                        lanes->last[l] = fill;
+                        lanes->second_last[l] = fill;
+                    }
                 }
             }
             produced = rprod;
