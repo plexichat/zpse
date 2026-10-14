@@ -132,6 +132,21 @@ static uint32_t zpse_crc32c_slice8(uint32_t crc, const uint8_t *p, size_t len)
 /* ------------------------------------------------------------------ *
  * SSE4.2 hardware `crc32` path.  One 64-bit chain: 8 bytes per
  * instruction, 3-cycle latency floor => ~2.67 B/cycle sustained.
+ *
+ * That is a LATENCY bound, not a throughput bound: the chain cannot
+ * issue faster than one `crc32` per 3 cycles no matter how wide the
+ * core is.  So anything sizeable is split into three contiguous chunks
+ * driven by three crc32 chains that are stepped inside ONE loop -- the
+ * three instructions are independent, so the core issues them back to
+ * back and the same 3 cycles now retire 24 bytes instead of 8.  (Three
+ * chains run as three separate loops would be no faster than one: each
+ * loop is still serialised against its own chain latency.)  The chunks
+ * are contiguous rather than interleaved so every stream still walks
+ * memory forwards, and they stay inside the block, which is at most
+ * 64 KiB and therefore cache-resident.
+ *
+ * Sewing the chunks back together needs the GF(2) "append L zero
+ * bytes" operator below.
  * ------------------------------------------------------------------ */
 #if defined(__x86_64__) || defined(_M_X64)
 #define ZPSE_CRC32C_HAVE_HW 1
@@ -186,9 +201,123 @@ static int zpse_crc32c_hw_present(void)
     return present;
 }
 
-static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_hw(uint32_t crc,
-                                                  const uint8_t *p,
-                                                  size_t len)
+/* ---- GF(2) zero-byte operator (zlib's crc32_combine recipe) --------
+ *
+ * The chain is a state machine over bytes: raw(I, X||Y) =
+ * raw(raw(I, X), Y).  For the reflected CRC, "append L zero bytes" is a
+ * linear map S(., 8L) on the 32-bit state, which is what lets chunks
+ * computed by independent chains be sewn back together.
+ *
+ * A map is 32 rows of 32 bits over GF(2); row n is the image of the
+ * state with only bit n set, and applying it is an XOR of the selected
+ * rows.  Row 0 is the reflected polynomial (state shifted down by one
+ * with the polynomial fed in) and row n is bit n-1, i.e. the plain shift
+ * -- squaring builds "two zero bits", "four", "eight", and so on.
+ *
+ * The powers-of-two-byte operators depend only on the polynomial and
+ * never change, so they are built once, lazily, up to the width the
+ * caller actually needs.  Per call only the small conditional apply
+ * loop costs anything.  The lazy init follows the same pattern as
+ * zpse_crc32c_s8_init() above (and carries the same benign race).
+ */
+static uint32_t zpse_crc32c_gf2_times(const uint32_t mat[32], uint32_t vec)
+{
+    uint32_t sum = 0u;
+    unsigned n = 0u;
+
+    while (vec != 0u) {
+        if ((vec & 1u) != 0u) {
+            sum ^= mat[n];
+        }
+        vec >>= 1;
+        n++;
+    }
+    return sum;
+}
+
+static void zpse_crc32c_gf2_square(uint32_t sq[32], const uint32_t m[32])
+{
+    unsigned n;
+
+    for (n = 0u; n < 32u; n++) {
+        sq[n] = zpse_crc32c_gf2_times(m, m[n]);
+    }
+}
+
+/* pow[b] = the operator for 2^b zero BYTES.  pow_top is the highest
+ * index built so far; -1 means nothing built yet. */
+static uint32_t zpse_crc32c_pow[32][32];
+static int zpse_crc32c_pow_top = -1;
+
+static void zpse_crc32c_pow_ensure(int top)
+{
+    uint32_t tmp[32];
+    unsigned n;
+
+    if (zpse_crc32c_pow_top >= top) {
+        return;
+    }
+    if (zpse_crc32c_pow_top < 0) {
+        uint32_t onebit[32];
+        uint32_t row = 1u;
+
+        onebit[0] = 0x82F63B78u; /* reflected Castagnoli */
+        for (n = 1u; n < 32u; n++) {
+            onebit[n] = row;
+            row <<= 1;
+        }
+        /* Three squarings: one zero BIT -> one zero BYTE. */
+        zpse_crc32c_gf2_square(tmp, onebit);
+        zpse_crc32c_gf2_square(onebit, tmp);
+        zpse_crc32c_gf2_square(tmp, onebit);
+        for (n = 0u; n < 32u; n++) {
+            zpse_crc32c_pow[0][n] = tmp[n];
+        }
+        zpse_crc32c_pow_top = 0;
+    }
+    while (zpse_crc32c_pow_top < top) {
+        int b = zpse_crc32c_pow_top;
+
+        zpse_crc32c_gf2_square(tmp, zpse_crc32c_pow[b]);
+        for (n = 0u; n < 32u; n++) {
+            zpse_crc32c_pow[b + 1][n] = tmp[n];
+        }
+        zpse_crc32c_pow_top = b + 1;
+    }
+}
+
+/* S(c, len): the state after appending `len` zero bytes.  The operator
+ * is applied once per set bit of len, using the byte-granular powers
+ * (8*len bits == len zero bytes). */
+static uint32_t zpse_crc32c_shift_bytes(uint32_t c, uint64_t len)
+{
+    uint64_t v = len;
+    int top = -1;
+    int b = 0;
+
+    while (v != 0u) {
+        top++;
+        v >>= 1;
+    }
+    if (top < 0) {
+        return c; /* zero bytes: the identity map */
+    }
+    zpse_crc32c_pow_ensure(top);
+    while (len != 0u) {
+        if ((len & 1u) != 0u) {
+            c = zpse_crc32c_gf2_times(zpse_crc32c_pow[b], c);
+        }
+        len >>= 1;
+        b++;
+    }
+    return c;
+}
+
+/* One 64-bit chain, 8 bytes per step then a byte tail.  Returns the
+ * running (pre-xorout) value, exactly as the hardware path always has. */
+static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_hw_chain(uint32_t crc,
+                                                        const uint8_t *p,
+                                                        size_t len)
 {
     while (len >= 8u) {
         uint64_t v;
@@ -203,6 +332,97 @@ static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_hw(uint32_t crc,
         len--;
     }
     return crc;
+}
+
+/* Below this length the three-way split's combine costs more than the
+ * chain time it saves: the saving grows with the length, the combine
+ * does not. */
+#define ZPSE_CRC32C_SPLIT_MIN 8192u
+
+/* Largest length the split accepts: lenA + lenB + lenC must stay inside
+ * the 32-bit width of the shift operators' power table.  Anything
+ * longer still hashes correctly, just on the single chain. */
+#define ZPSE_CRC32C_SPLIT_MAX UINT64_C(0xFFFFFFFD)
+
+/* Fold three independently chained contiguous chunks back into the
+ * running (pre-xorout) value zpse_crc32c_hw must return.
+ *
+ * Write fX for the FINISHED crc of X (fX = rawX ^ 0xFFFFFFFF) and K for
+ * the finished-domain crc of whatever preceded chunk A.  Then
+ *
+ *   F(A||B||C)        = S(fA, lenB+lenC) ^ S(fB, lenC) ^ fC
+ *   raw(crc, A||B||C) = S(K, lenA+lenB+lenC) ^ F(A||B||C)
+ *
+ * The first line is zlib's combine used associatively; the second is
+ * S(I ^ 0xFFFFFFFF, |X|) ^ raw(0xFFFFFFFF, X), which is what makes a
+ * RUNNING incoming crc work -- it enters as a prefix.  When the caller
+ * started from 0xFFFFFFFF (zpse_crc32c and zpse_crc32c_copy both do)
+ * that term is zero and is skipped outright.
+ */
+static uint32_t zpse_crc32c_hw_combine3(uint32_t crc, uint32_t rawA,
+                                        uint32_t rawB, uint32_t rawC,
+                                        uint64_t lenA, uint64_t lenB,
+                                        uint64_t lenC)
+{
+    uint32_t r;
+
+    r = zpse_crc32c_shift_bytes(rawA ^ 0xFFFFFFFFu, lenB + lenC);
+    r ^= zpse_crc32c_shift_bytes(rawB ^ 0xFFFFFFFFu, lenC);
+    r ^= rawC;
+    if (crc != 0xFFFFFFFFu) {
+        r ^= zpse_crc32c_shift_bytes(crc ^ 0xFFFFFFFFu, lenA + lenB + lenC);
+    }
+    return r;
+}
+
+static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_hw(uint32_t crc,
+                                                  const uint8_t *p,
+                                                  size_t len)
+{
+    if (len >= (size_t)ZPSE_CRC32C_SPLIT_MIN &&
+        (uint64_t)len <= ZPSE_CRC32C_SPLIT_MAX) {
+        size_t lenA = len / 3u;
+        size_t lenB = len / 3u;
+        size_t lenC = len - lenA - lenB; /* lenA <= lenB <= lenC <= lenA+2 */
+        const uint8_t *a = p;
+        const uint8_t *b = p + lenA;
+        const uint8_t *c = p + lenA + lenB;
+        uint32_t crcA = 0xFFFFFFFFu;
+        uint32_t crcB = 0xFFFFFFFFu;
+        uint32_t crcC = 0xFFFFFFFFu;
+        size_t i = 0u;
+
+        /* One loop, three chains: see the section comment.  Stepping
+         * them together is the entire point -- three separate loops
+         * would each pay the 3-cycle chain latency in turn. */
+        while (i + 8u <= lenA) {
+            uint64_t va;
+            uint64_t vb;
+            uint64_t vc;
+
+            memcpy(&va, a + i, 8);
+            memcpy(&vb, b + i, 8);
+            memcpy(&vc, c + i, 8);
+            crcA = (uint32_t)_mm_crc32_u64((unsigned long long)crcA,
+                                           (unsigned long long)va);
+            crcB = (uint32_t)_mm_crc32_u64((unsigned long long)crcB,
+                                           (unsigned long long)vb);
+            crcC = (uint32_t)_mm_crc32_u64((unsigned long long)crcC,
+                                           (unsigned long long)vc);
+            i += 8u;
+        }
+        /* Sub-8-byte tails, one chain each: A and B are exactly lenA
+         * long and C carries the remainder, so each finishes in its own
+         * byte order and the remainder is picked up in the C chain. */
+        crcA = zpse_crc32c_hw_chain(crcA, a + i, lenA - i);
+        crcB = zpse_crc32c_hw_chain(crcB, b + i, lenB - i);
+        crcC = zpse_crc32c_hw_chain(crcC, c + i, lenC - i);
+
+        return zpse_crc32c_hw_combine3(crc, crcA, crcB, crcC,
+                                       (uint64_t)lenA, (uint64_t)lenB,
+                                       (uint64_t)lenC);
+    }
+    return zpse_crc32c_hw_chain(crc, p, len);
 }
 
 /* Fused copy + CRC32-C. One pass over the source: each 16-byte load
@@ -227,6 +447,19 @@ static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_copy_hw(uint8_t *dst,
     uint8_t *d = dst;
     size_t len = n;
     unsigned k;
+
+    /* Above the split threshold the fused form is the slow one: one
+     * chain serialised against the store traffic reaches ~11 GB/s, while
+     * memcpy plus the three-chain hasher reaches ~3x that.  The extra
+     * read of the source is nearly free because a block is at most
+     * 64 KiB and so survives in L1/L2 between the two passes.  Delegating
+     * to zpse_crc32c_hw also makes the two paths bit-identical by
+     * construction. */
+    if (n >= (size_t)ZPSE_CRC32C_SPLIT_MIN &&
+        (uint64_t)n <= ZPSE_CRC32C_SPLIT_MAX) {
+        memcpy(dst, src, n);
+        return zpse_crc32c_hw(0xFFFFFFFFu, src, n) ^ 0xFFFFFFFFu;
+    }
 
     while (len >= 64u) {
         for (k = 0u; k < 4u; k++) {
