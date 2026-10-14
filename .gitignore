@@ -1,0 +1,10 @@
+# build artefacts
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.pdb
+build/
+gmon.out
