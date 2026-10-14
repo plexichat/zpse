@@ -53,7 +53,7 @@ static unsigned zpse_popcount8(uint8_t v)
     return n;
 }
 
-#if ZPSE_HAVE_X86 && !defined(_MSC_VER)
+#if ZPSE_HAVE_X86 && !defined(_MSC_VER) && !defined(ZPSE_FORCE_SCALAR)
 static unsigned long long zpse_xgetbv_gcc(void)
 {
     uint32_t lo = 0;
@@ -66,14 +66,28 @@ static unsigned long long zpse_xgetbv_gcc(void)
 
 uint32_t zpse_cpu_caps(void)
 {
-    uint32_t caps = 0;
-
 #ifdef ZPSE_FORCE_SCALAR
     /* Conformance builds: pretend no SIMD exists so the scalar reference
      * paths run. tests/test_parity.c builds the same corpus both ways
      * and requires byte-identical output. */
     return 0;
-#endif
+#else
+    /* CPUID is a serialising instruction and an expensive one under
+     * virtualisation: measured at ~2.5 us per call on the development
+     * machine, which is more than the work of an entire 256-byte tile.
+     * Dispatch that asks once per tile therefore spends more on the
+     * question than on the code it selects -- the AVX2 classify path was
+     * 17x slower than the scalar one for exactly this reason. The answer
+     * cannot change while the process runs, so compute it once and cache
+     * it; the computation is idempotent and a racing thread can at worst
+     * repeat it. */
+    static uint32_t cached = 0xFFFFFFFFu; /* sentinel: not yet computed */
+    uint32_t caps;
+
+    if (cached != 0xFFFFFFFFu) {
+        return cached;
+    }
+    caps = 0;
 
 #if ZPSE_HAVE_NEON_BASELINE
     /* AArch64/NEON builds: ASIMD is an architectural baseline. */
@@ -154,7 +168,9 @@ uint32_t zpse_cpu_caps(void)
 #endif
 #endif
 
+    cached = caps;
     return caps;
+#endif /* ZPSE_FORCE_SCALAR */
 }
 
 /* ---- Inverse transpose-8 ---- */

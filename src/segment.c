@@ -212,6 +212,12 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
  * histories still at `init`, stride reads possibly before seg_pos), so
  * they stay scalar; the vector loop starts at p = 16, where
  * last[l] = a[p-8+l] and second[l] = a[p-16+l] hold identically.
+ *
+ * Note that this boundary is anchored by the per-tile lane reset, not
+ * by seg_pos: the encoder resets every tile to `initial_literal`, so at
+ * p < 8 the lane histories are `init` even in the middle of a segment
+ * and the prologue cannot be skipped there. Only the STRIDE reads look
+ * back into the plane.
  * ------------------------------------------------------------------ */
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) && !defined(_MSC_VER)
@@ -480,7 +486,17 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         second_p = seg_screen_pred[i];
                     }
                 }
-                if (second_p != 0xFFu &&
+                /* Second trial only when it is genuinely competitive,
+                 * and never when the best candidate is already perfect:
+                 * bk == 0 selects mask ALL_HIT with residual
+                 * EXCLUSION_U8, whose payloads are both empty, so
+                 * zpse_tile_pack returns exactly ZPSE_TILE_HEADER_SIZE
+                 * -- the smallest record that can exist. The candidate
+                 * loop replaces the winner only on a strictly smaller
+                 * packed size, which no second candidate can be against
+                 * an 8-byte record, so appending one here could not have
+                 * changed the output. */
+                if (bk != 0u && second_p != 0xFFu &&
                     (uint32_t)sk <= (uint32_t)bk + 4u) {
                     cand[ncand++] = second_p;
                 }

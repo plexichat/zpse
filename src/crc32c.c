@@ -151,17 +151,39 @@ static uint32_t zpse_crc32c_slice8(uint32_t crc, const uint8_t *p, size_t len)
 
 static int zpse_crc32c_hw_present(void)
 {
-#if defined(_MSC_VER)
-    int info[4];
-    __cpuid(info, 1);
-    return (info[2] >> 20) & 1;
-#else
-    unsigned int a = 0, b = 0, c = 0, d = 0;
-    if (!__get_cpuid(1, &a, &b, &c, &d)) {
-        return 0;
+    /* Cached for the same reason as zpse_cpu_caps(): CPUID is serialising
+     * and costs microseconds under virtualisation, and this is asked on
+     * every CRC and every fused copy+checksum -- i.e. once per block, in
+     * both directions, where the answer would otherwise rival the cost of
+     * the checksum itself. The answer cannot change while the process
+     * runs. */
+    static int cached = -1; /* -1 = not yet computed */
+    int present;
+
+    if (cached >= 0) {
+        return cached;
     }
-    return (int)((c >> 20) & 1u);
+#if defined(_MSC_VER)
+    {
+        int info[4];
+        __cpuid(info, 1);
+        present = (info[2] >> 20) & 1;
+    }
+#else
+    {
+        unsigned int a = 0;
+        unsigned int b = 0;
+        unsigned int c = 0;
+        unsigned int d = 0;
+
+        present = 0;
+        if (__get_cpuid(1, &a, &b, &c, &d)) {
+            present = (int)((c >> 20) & 1u);
+        }
+    }
 #endif
+    cached = present;
+    return present;
 }
 
 static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_hw(uint32_t crc,
