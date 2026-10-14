@@ -214,18 +214,33 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
  * last[l] = a[p-8+l] and second[l] = a[p-16+l] hold identically.
  * ------------------------------------------------------------------ */
 #if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#define ZPSE_PS_HAVE_AVX2 1
 #if defined(__GNUC__) && !defined(_MSC_VER)
+/* GCC/clang accept a per-function target attribute, so AVX2 is enabled
+ * for this one routine and the rest of the translation unit stays at the
+ * baseline ISA. The runtime capability check still decides whether it
+ * runs. */
 #define ZPSE_PS_AVX2 __attribute__((target("avx2")))
+#define ZPSE_PS_HAVE_AVX2 1
+#elif defined(__AVX2__)
+/* MSVC has no per-function target attribute: the AVX2 intrinsics exist
+ * only when the whole translation unit is built with /arch:AVX2, which
+ * is what defines __AVX2__. Build with it and this prescreen is used;
+ * build without it and the file compiles to the verified-equivalent
+ * scalar path rather than failing outright. Either way the runtime
+ * check in seg_prescreen() gates execution, so a /arch:AVX2 binary is
+ * still correct on a CPU without AVX2. */
+#define ZPSE_PS_AVX2
+#define ZPSE_PS_HAVE_AVX2 1
 #else
 #define ZPSE_PS_AVX2
+#define ZPSE_PS_HAVE_AVX2 0
 #endif
 #else
 #define ZPSE_PS_HAVE_AVX2 0
 #endif
 
 #if ZPSE_PS_HAVE_AVX2
+#include <immintrin.h>
 static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
                                             const uint8_t *seg_base,
                                             uint32_t seg_pos, uint8_t init,
