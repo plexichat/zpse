@@ -1,6 +1,7 @@
 #include "zpse/transform.h"
 #include "zpse/constants.h"
 #include "zpse/status.h"
+#include "zpse/vector.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -197,6 +198,144 @@ static void kernel_name(const uint8_t *src, uint8_t *dst, uint32_t n,        \
 ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_sum16, _mm_add_epi8, ZPSE_ADD8)
 ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_xor16, _mm_xor_si128, ZPSE_XOR8)
 #endif /* ZPSE_T_HAVE_SSE2 */
+
+/* ------------------------------------------------------------------ *
+ * AVX2 prefix scans: the same eight-ladders-per-carry structure as the
+ * SSE2 kernels above, one width wider, so a carry link now covers 256
+ * bytes instead of 128.
+ *
+ * A 32-byte block needs five log steps where a 16-byte block needs four.
+ * The first four are the in-lane shifts (1, 2, 4, 8) that build each
+ * 16-byte lane's own inclusive prefix, exactly as in the SSE2 ladder.
+ * The fifth is the step ACROSS the 128-bit lane boundary, which
+ * `_mm256_permute2x128_si256(x, x, 0x08)` supplies: imm bit 3 zeroes the
+ * low half of the result, and imm[7:4] == 0 selects the low half of `x`
+ * for the high half, so the result is `x` shifted toward higher byte
+ * indices by 16 with a zero fill. Adding it byte-wise puts lane 0's
+ * prefix into lane 1's corresponding bytes (and adds nothing to lane 0),
+ * which is exactly the 16-byte step of the scan. The block's total is
+ * byte 31, the HIGH byte of 16-bit word 15 -- a plain cast of the word
+ * would keep byte 30, the same trap the SSE2 kernels document.
+ *
+ * Unlike the SSE2 kernels this needs runtime dispatch, because AVX2 is
+ * not architectural: each kernel carries the per-function target
+ * attribute so a translation unit built without -mavx2 still compiles
+ * them, and execution is gated on zpse_cpu_caps(), which answers from a
+ * cache and returns 0 under -DZPSE_FORCE_SCALAR. A machine without AVX2,
+ * a non-x86 build and the conformance build therefore keep the SSE2 or
+ * scalar loops, and since all three are bit-exact the scalar/SIMD parity
+ * test still compares like for like.
+ * ------------------------------------------------------------------ */
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_T_AVX2 __attribute__((target("avx2")))
+#define ZPSE_T_HAVE_AVX2 1
+#elif defined(__AVX2__)
+#define ZPSE_T_AVX2
+#define ZPSE_T_HAVE_AVX2 1
+#else
+#define ZPSE_T_AVX2
+#define ZPSE_T_HAVE_AVX2 0
+#endif
+#else
+#define ZPSE_T_AVX2
+#define ZPSE_T_HAVE_AVX2 0
+#endif
+
+#if ZPSE_T_HAVE_AVX2
+#include <immintrin.h>
+
+/* Runtime gate for the AVX2 kernels, cached by zpse_cpu_caps(). */
+static int zpse_t_avx2(void)
+{
+    return (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u;
+}
+
+/* Defines `kernel_name(src, dst, n, seed)` for one of the two operators:
+ * OPV is the 256-bit byte-wise op and OP8 its scalar twin. The tail is
+ * scalar, which is what keeps every length exact, so no masked store or
+ * over-read is needed anywhere. */
+/* After the four in-lane shift/op steps each 128-bit half of x holds its
+ * own inclusive prefix, so the high half still needs the low half's TOTAL
+ * added to every byte of it -- not the low half's prefixes, which is what
+ * adding the shifted vector would do. Broadcast that single byte (the low
+ * half's last byte) into the high half and leave the low half zero. */
+static ZPSE_T_AVX2 __m256i zpse_avx2_lane_total(__m256i x)
+{
+    uint8_t t = (uint8_t)(_mm_extract_epi16(_mm256_castsi256_si128(x), 7)
+                          >> 8);
+    return _mm256_inserti128_si256(_mm256_setzero_si256(),
+                                   _mm_set1_epi8((char)t), 1);
+}
+
+#define ZPSE_DEFINE_PREFIX_SCAN32(kernel_name, OPV, OP8)                     \
+static ZPSE_T_AVX2 void kernel_name(const uint8_t *src, uint8_t *dst,        \
+                                    uint32_t n, uint8_t seed)               \
+{                                                                           \
+    uint32_t j = 0;                                                         \
+    uint8_t pv = seed;                                                      \
+                                                                            \
+    if (src == 0 || dst == 0 || n == 0u) {                                  \
+        return;                                                             \
+    }                                                                       \
+    /* Whole 256-byte chunks: eight independent 32-byte ladders, then the  \
+     * eight block totals folded into one exclusive carry per block, then  \
+     * the blocks rebased with one broadcast op each. */                   \
+    for (; (size_t)j + 256u <= (size_t)n; j += 256u) {                      \
+        __m256i v[8];                                                       \
+        uint8_t tot[8];                                                     \
+        uint8_t acc = pv;                                                   \
+        unsigned b;                                                         \
+                                                                            \
+        for (b = 0; b < 8u; b++) {                                          \
+            __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)  \
+                                           (src + (size_t)j +               \
+                                            (size_t)b * 32u));              \
+            x = OPV(x, _mm256_slli_si256(x, 1));                            \
+            x = OPV(x, _mm256_slli_si256(x, 2));                            \
+            x = OPV(x, _mm256_slli_si256(x, 4));                            \
+            x = OPV(x, _mm256_slli_si256(x, 8));                            \
+            x = OPV(x, zpse_avx2_lane_total(x));                            \
+            v[b] = x;                                                       \
+            /* Word 15 holds bytes 30 and 31, so the block total is its     \
+             * HIGH byte. */                                                \
+            tot[b] = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);           \
+        }                                                                   \
+        for (b = 0; b < 8u; b++) {                                          \
+            uint8_t c = acc;                                                \
+            acc = OP8(acc, tot[b]);                                         \
+            tot[b] = c;                                                     \
+        }                                                                   \
+        for (b = 0; b < 8u; b++) {                                          \
+            _mm256_storeu_si256((__m256i *)(void *)(dst + (size_t)j +       \
+                                                   (size_t)b * 32u),        \
+                                OPV(v[b], _mm256_set1_epi8((char)tot[b]))); \
+        }                                                                   \
+        pv = acc;                                                           \
+    }                                                                       \
+    /* Whole 32-byte blocks: one ladder plus its carry. */                  \
+    for (; (size_t)j + 32u <= (size_t)n; j += 32u) {                        \
+        __m256i x = _mm256_loadu_si256(                                     \
+            (const __m256i *)(const void *)(src + (size_t)j));              \
+        x = OPV(x, _mm256_slli_si256(x, 1));                                \
+        x = OPV(x, _mm256_slli_si256(x, 2));                                \
+        x = OPV(x, _mm256_slli_si256(x, 4));                                \
+        x = OPV(x, _mm256_slli_si256(x, 8));                                \
+        x = OPV(x, zpse_avx2_lane_total(x));                                \
+        x = OPV(x, _mm256_set1_epi8((char)pv));                             \
+        _mm256_storeu_si256((__m256i *)(void *)(dst + (size_t)j), x);       \
+        pv = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);                   \
+    }                                                                       \
+    /* Scalar remainder (fewer than 32 bytes left, or n < 32 overall). */   \
+    for (; j < n; j++) {                                                    \
+        pv = OP8(pv, src[j]);                                               \
+        dst[j] = pv;                                                        \
+    }                                                                       \
+}
+
+ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_sum32, _mm256_add_epi8, ZPSE_ADD8)
+ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_xor32, _mm256_xor_si256, ZPSE_XOR8)
+#endif /* ZPSE_T_HAVE_AVX2 */
 
 static int zpse_valid_count(uint8_t v)
 {
@@ -619,10 +758,23 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
 #if ZPSE_T_HAVE_SSE2
         /* out[j] = seed + sum(enc[0..j]) for delta, the xor prefix for
          * xor, from the seed exactly like the scalar loop below: the
-         * 128-byte-per-carry prefix scans defined above. */
+         * prefix scans defined above, 256 bytes per carry link when AVX2
+         * is available and 128 bytes otherwise. */
         if (delta) {
+#if ZPSE_T_HAVE_AVX2
+            if (zpse_t_avx2()) {
+                zpse_prefix_sum32(src, out, n, pv);
+                return PSE_OK;
+            }
+#endif
             zpse_prefix_sum16(src, out, n, pv);
         } else {
+#if ZPSE_T_HAVE_AVX2
+            if (zpse_t_avx2()) {
+                zpse_prefix_xor32(src, out, n, pv);
+                return PSE_OK;
+            }
+#endif
             zpse_prefix_xor16(src, out, n, pv);
         }
         return PSE_OK;
@@ -695,6 +847,12 @@ void zpse_delta8_decode(const uint8_t *enc, uint8_t *out, uint32_t n,
 #if ZPSE_T_HAVE_SSE2
     /* Same scan as the w == 1 inverse: out[0] = enc[0] + seed, then the
      * byte-wise prefix sum. */
+#if ZPSE_T_HAVE_AVX2
+    if (zpse_t_avx2()) {
+        zpse_prefix_sum32(enc, out, n, seed);
+        return;
+    }
+#endif
     zpse_prefix_sum16(enc, out, n, seed);
 #else
     {
@@ -750,6 +908,12 @@ void zpse_xor8_decode(const uint8_t *enc, uint8_t *out, uint32_t n,
 #if ZPSE_T_HAVE_SSE2
     /* Same scan as the w == 1 inverse: out[0] = enc[0] ^ seed, then the
      * byte-wise prefix xor. */
+#if ZPSE_T_HAVE_AVX2
+    if (zpse_t_avx2()) {
+        zpse_prefix_xor32(enc, out, n, seed);
+        return;
+    }
+#endif
     zpse_prefix_xor16(enc, out, n, seed);
 #else
     {

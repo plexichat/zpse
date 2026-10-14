@@ -1321,6 +1321,145 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
     }
     return consumed;
 }
+
+/* Reconstruct a whole CONST tile 32 positions at a time.
+ *
+ * A CONST tile has no recurrence at all: every prediction is the same
+ * byte (0 for CONST_ZERO, constant_C for TILE_CONSTANT), so unlike the
+ * lane-history kernel above there is nothing to chain and a full AVX2
+ * register can be produced per step. The 256 positions are eight steps of
+ * the loop below with no dependency between them.
+ *
+ * Same contract as tile_recon_avx2: one residual unit per set mask bit,
+ * consumed in ascending position order, each placed in the lane of ITS
+ * position (not compacted into the low lanes - that mistake makes every
+ * non-adjacent exception decode to the wrong byte), and the new unit
+ * count returned. The horizontal boundary is handled by the caller: only
+ * whole 32-byte chunks go through the vector loop, the remaining
+ * nt % 32 positions are finished positionally below so the units keep
+ * their order. */
+static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
+                                                     uint8_t constant_C,
+                                                     const uint32_t words[8],
+                                                     const uint8_t *units,
+                                                     uint8_t res_mode)
+{
+    /* Per-byte lane bit value of the chunk's mask word: byte lane i tests
+     * bit (i & 7), so the pattern repeats four times across the register.
+     * Lane 7's value must be (char)0x80, the sign-extended byte of the
+     * cast, because that is what the AND keeps when bit 7 is set. */
+    const __m256i bitv = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80);
+    /* Byte lane i must be tested against bit i of the 32-bit word, and
+     * that bit lives in the word's byte i >> 3. Broadcasting the word as
+     * 32-bit lanes gives byte i the word's byte (i & 3), which is the
+     * wrong byte: four consecutive lanes have to hold the SAME byte of
+     * the word, so duplicate each of its four bytes four times first.
+     * (vpshufb is per 128-bit lane, and both lanes of the broadcast hold
+     * the same four bytes, so one shuffle table serves both.)
+     *
+     * Eight consecutive lanes share a byte of the word, not four: lane i
+     * holds byte i >> 3, and each 32-bit lane of the broadcast supplies
+     * the word's bytes at source indices 0..3 of its own 128-bit half. */
+    const __m256i dup8 = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i one = _mm256_set1_epi8((char)1);
+    const __m256i xhat = _mm256_set1_epi8((char)constant_C);
+    uint16_t consumed = 0u;
+    uint32_t at = 0u;
+    uint32_t full = ((uint32_t)nt / 32u) * 32u;
+
+    while (at < full) {
+        uint32_t w = words[at >> 5u];
+        uint8_t tmp[32];
+        __m256i r;
+        __m256i x;
+        __m256i mb;
+        __m256i res;
+
+        /* No exceptions in this chunk: the whole result is the
+         * prediction, with no units to consume and nothing to blend. */
+        if (w == 0u) {
+            _mm256_storeu_si256((__m256i *)(void *)(out + (size_t)at), xhat);
+            at += 32u;
+            continue;
+        }
+        if (w == UINT32_C(0xFFFFFFFF)) {
+            /* Every position is an exception: the units are contiguous
+             * and already in position order. */
+            memcpy(tmp, units + consumed, 32);
+            consumed = (uint16_t)(consumed + 32u);
+        } else {
+            uint32_t wg = w;
+            uint32_t bit = 0u;
+            uint16_t cnt = 0u;
+
+            /* Lanes with no unit are never selected by mb below, but they
+             * must still be defined: zero them rather than leave the
+             * vector load reading an uninitialised buffer. */
+            memset(tmp, 0, sizeof tmp);
+            while (wg != 0u) {
+                if ((wg & 1u) != 0u) {
+                    tmp[bit] = units[consumed + cnt];
+                    cnt++;
+                }
+                wg >>= 1;
+                bit++;
+            }
+            consumed = (uint16_t)(consumed + cnt);
+        }
+
+        r = _mm256_loadu_si256((const __m256i *)(const void *)tmp);
+        if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+            x = r;
+        } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+            x = _mm256_add_epi8(xhat, r);
+        } else {
+            /* Exclusion inverse: r < x_hat ? r : r + 1, unsigned. */
+            __m256i ge = _mm256_cmpeq_epi8(_mm256_max_epu8(r, xhat), r);
+
+            x = _mm256_add_epi8(r, _mm256_and_si256(ge, one));
+        }
+
+        /* Expand the chunk's 32 mask bits to a byte mask: byte lane i
+         * holds the word's byte i >> 3, so ANDing with bitv (1 << (i & 7))
+         * keeps exactly bitv's bit when bit i of the word is set. */
+        mb = _mm256_cmpeq_epi8(
+            _mm256_and_si256(
+                _mm256_shuffle_epi8(_mm256_set1_epi32((int)w), dup8),
+                bitv),
+            bitv);
+        res = _mm256_or_si256(_mm256_and_si256(mb, x),
+                              _mm256_andnot_si256(mb, xhat));
+        _mm256_storeu_si256((__m256i *)(void *)(out + (size_t)at), res);
+        at += 32u;
+    }
+
+    /* Tail: the same order of units, position by position, mirroring the
+     * scalar CONST branch rather than duplicating its masking rules. */
+    while (at < (uint32_t)nt) {
+        uint8_t c = constant_C;
+        uint8_t x;
+
+        if (((words[at >> 5u] >> (at & 31u)) & 1u) == 0u) {
+            x = c;
+        } else if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+            x = units[consumed++];
+        } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+            x = (uint8_t)(((unsigned)c + (int)(int8_t)units[consumed++]) &
+                          0xFFu);
+        } else {
+            x = zpse_exclusion_inverse(units[consumed++], c);
+        }
+        out[at] = x;
+        at++;
+    }
+    return consumed;
+}
 #endif /* ZPSE_TILE_HAVE_AVX2 */
 
 /* Resolve one predicted/residual stream in position order, family by
@@ -1472,16 +1611,24 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         uint8_t ent_last[8];
         uint8_t ent_second[8];
 
+        const uint8_t *units =
+            (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
+                ? (const uint8_t *)(const void *)deltas
+                : resid;
+
         /* Captured before anything writes, for the O(8) history epilogue
          * that both the all-hit fast path and the scalar loops use as
          * their end state. */
         tile_capture_hist(lanes, ent_last, ent_second);
-        j = tile_recon_avx2(out, nt, fam, th.predictor_id, constant_C,
-                            words,
-                            (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
-                                ? (const uint8_t *)(const void *)deltas
-                                : resid,
-                            res_mode, ent_last, ent_second, 0u);
+        /* CONST has no recurrence, so it takes the 32-wide kernel; the
+         * lane-history family needs the 8-lane one, whose step is the
+         * recurrence's own width. */
+        j = (fam == TILE_FAM_CONST)
+                ? tile_recon_const_avx2(out, nt, constant_C, words, units,
+                                        res_mode)
+                : tile_recon_avx2(out, nt, fam, th.predictor_id, constant_C,
+                                  words, units, res_mode, ent_last,
+                                  ent_second, 0u);
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
         if (j != k)
             return PSE_BAD_MASK;
