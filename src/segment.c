@@ -18,6 +18,9 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     uint32_t expect_tc;
     uint32_t pos;
     uint32_t produced;
+    uint32_t tile_count;
+    uint32_t seg_size;
+    uint8_t literal;
     uint16_t t;
 
     if (d == 0 || lanes == 0 || payload == 0 || decoded_out == 0 ||
@@ -46,6 +49,9 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
 
     pos = 16u;
     produced = 0u;
+    tile_count = (uint32_t)h.tile_count;
+    seg_size = h.segment_decoded_size;
+    literal = h.initial_literal;
     for (t = 0; t < h.tile_count; t++) {
         uint16_t nt_exp;
         uint16_t rsz;
@@ -53,10 +59,10 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         int tile_reset;
         int got;
 
-        if (t + 1u < (uint32_t)h.tile_count) {
+        if ((uint32_t)t + 1u < tile_count) {
             nt_exp = 256u;
         } else {
-            nt_exp = (uint16_t)(h.segment_decoded_size - produced);
+            nt_exp = (uint16_t)(seg_size - produced);
         }
         if (pos + 2u > payload_len) {
             return PSE_BAD_TILE_SIZE;
@@ -68,16 +74,109 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         if ((uint32_t)rsz > payload_len - pos - 2u) {
             return PSE_BAD_TILE_SIZE;
         }
-        if ((uint32_t)nt_exp > h.segment_decoded_size - produced) {
+        if ((uint32_t)nt_exp > seg_size - produced) {
             return PSE_BAD_TILE_SIZE;
         }
         if (produced + (uint32_t)nt_exp > decoded_cap) {
             return PSE_OUTPUT_OVERFLOW;
         }
         rec = payload + pos + 2u;
+
+        /* ---- Batched all-hit run -------------------------------- *
+         * The record below is the entire tile header with every mode bit
+         * clear except the reset flag: mask mode ALL_HIT, residual mode
+         * EXCLUSION_U8, a zero exception count, both payload sizes zero,
+         * and one of the CONST / lane-history predictors. Such a tile
+         * decodes to a single repeated byte -- 0 for CONST_ZERO, the
+         * initial literal otherwise -- and leaves the lane state at that
+         * byte's fixed point, which is the state one tile leaves. A
+         * maximal run of them is therefore one memset over the run's
+         * contiguous output plus one history update, instead of one
+         * zpse_tile_decode call and one tile_header_validate per tile.
+         *
+         * ONLY this exact byte pattern is taken here. Anything else -- in
+         * particular every malformed record -- falls through to the
+         * general path below, which re-derives and re-checks everything,
+         * so not one rejection changes. The scan makes the same four
+         * per-tile checks the loop above makes and simply STOPS at the
+         * first one that fails, leaving the general path to report it at
+         * the same position with the same status.
+         *
+         * The predictor byte is tested FIRST because it is the selective
+         * one: a STRIDE tile (the whole point of the STRIDE family -- a
+         * constant-period plane) is rejected by one compare against the
+         * range [CONST_ZERO, LANE_DELTA] plus one against LANE_AVERAGE,
+         * instead of after eight byte comparisons for the fields that
+         * only the rare all-hit record has. */
+        if ((rec[1] <= (uint8_t)ZPSE_P_LANE_DELTA ||
+             rec[1] == (uint8_t)ZPSE_P_LANE_AVERAGE) &&
+            rsz == 8u && nt_exp == 256u &&
+            rec[0] == (uint8_t)ZPSE_TILE_FLAG_RESET &&
+            rec[2] == 255u && rec[3] == 0u && rec[4] == 0u &&
+            rec[5] == 0u && rec[6] == 0u && rec[7] == 0u) {
+            uint8_t fill = (rec[1] == (uint8_t)ZPSE_P_CONST_ZERO)
+                               ? 0u : literal;
+            uint32_t run = 1u;
+            uint32_t rpos = pos + 10u;
+            uint32_t rprod = produced + 256u;
+            uint32_t rt = (uint32_t)t + 1u;
+
+            while (rt < tile_count) {
+                uint16_t nt2;
+                const uint8_t *r2;
+
+                if (rpos + 2u > payload_len) {
+                    break;
+                }
+                if (zpse_load_u16le(payload + rpos) != 8u) {
+                    break;
+                }
+                if (payload_len - rpos - 2u < 8u) {
+                    break;
+                }
+                nt2 = ((rt + 1u < tile_count)
+                           ? 256u
+                           : (uint16_t)(seg_size - rprod));
+                if (nt2 != 256u) {
+                    break;
+                }
+                if ((uint32_t)nt2 > seg_size - rprod) {
+                    break;
+                }
+                if (rprod + (uint32_t)nt2 > decoded_cap) {
+                    break;
+                }
+                r2 = payload + rpos + 2u;
+                if (r2[1] != rec[1] ||
+                    r2[0] != (uint8_t)ZPSE_TILE_FLAG_RESET ||
+                    r2[2] != 255u || r2[3] != 0u || r2[4] != 0u ||
+                    r2[5] != 0u || r2[6] != 0u || r2[7] != 0u) {
+                    break;
+                }
+                run++;
+                rpos += 10u;
+                rprod += 256u;
+                rt++;
+            }
+
+            memset(decoded_out + produced, fill, (size_t)run * 256u);
+            {
+                unsigned l;
+
+                for (l = 0; l < 8u; l++) {
+                    lanes->last[l] = fill;
+                    lanes->second_last[l] = fill;
+                }
+            }
+            produced = rprod;
+            pos = rpos;
+            t = (uint16_t)(rt - 1u);
+            continue;
+        }
+
         tile_reset = (rec[0] & ZPSE_TILE_FLAG_RESET) != 0 ? 1 : 0;
         got = zpse_tile_decode(lanes, rec, (uint32_t)rsz,
-                               h.initial_literal, tile_reset,
+                               literal, tile_reset,
                                decoded_out, produced,
                                decoded_out + produced,
                                decoded_cap - produced, d->comb);
