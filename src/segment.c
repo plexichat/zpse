@@ -247,136 +247,162 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
 
 #if ZPSE_PS_HAVE_AVX2
 #include <immintrin.h>
+
+/* Partition of the staging buffer below. */
+#define ZPSE_PS_STG_LEN 304u /* 16 head + 256 body + 32 pad */
+
+/* Accumulate one 32-byte chunk's hits into the eight counters.
+ * Each comparison contributes 0xFF (-1) per matching byte, so a byte-lane
+ * counter sums the hits directly: no movemask plus popcount round trip per
+ * comparison, and no 3-cycle latency chain to serialise on. `MASK` is all
+ * ones for a full chunk and the validity vector for the last, partial one
+ * (whose bytes past the tile end are zero padding that must not match). */
+#define SEG_PS_CHUNK(v_, h8L_, h8S_, h16_, MASK_)                          \
+    do {                                                                   \
+        __m256i _d2 = _mm256_sub_epi8(_mm256_add_epi8(h8L_, h8L_), h16_);  \
+        __m256i _av = _mm256_avg_epu8(h8L_, h16_);                         \
+        a0 = _mm256_sub_epi8(a0, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, zero), MASK_));                     \
+        a1 = _mm256_sub_epi8(a1, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, h8L_), MASK_));                     \
+        a2 = _mm256_sub_epi8(a2, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, _d2), MASK_));                      \
+        a3 = _mm256_sub_epi8(a3, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
+                 _mm256_loadu_si256((const __m256i *)(const void *)        \
+                     (stg + 15u + (size_t)p))), MASK_));                   \
+        a4 = _mm256_sub_epi8(a4, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
+                 _mm256_loadu_si256((const __m256i *)(const void *)        \
+                     (stg + 14u + (size_t)p))), MASK_));                   \
+        a5 = _mm256_sub_epi8(a5, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
+                 _mm256_loadu_si256((const __m256i *)(const void *)        \
+                     (stg + 12u + (size_t)p))), MASK_));                   \
+        a6 = _mm256_sub_epi8(a6, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, h8S_), MASK_));                     \
+        a7 = _mm256_sub_epi8(a7, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, _av), MASK_));                      \
+    } while (0)
+
+/* One pass for the whole tile, so there is no scalar prologue or tail to
+ * pay for and no per-position lane state at all: the staging buffer makes
+ * every prediction a constant-offset load.
+ *
+ *   stg[0, 16)        the 16 plane bytes BEFORE the tile
+ *   stg[16, 16+nt)    the tile itself
+ *   stg[16+nt, ...)   32 zero bytes of pad
+ *
+ * The head exists because `seg_base[d - s]` for the STRIDE family is a
+ * plain `a[p - s]` (a[p-s] == stg[16+p-s] for p >= s, and for p < s it is
+ * one of the head bytes), which is exactly why the caller only uses this
+ * path when seg_pos >= 16: that makes the scalar `d < s` fallback to
+ * `init` unreachable, so the head is always real plane data. Note this
+ * function therefore requires `a == seg_base + seg_pos`, which is how
+ * zpse_segment_encode calls it (and the only caller).
+ *
+ * The pad exists so the last, partial chunk can be evaluated as a full
+ * 32-byte chunk; its accidental matches are masked out.
+ *
+ * The two lane-history predictions need the tile's ENTRY state at the
+ * start (every tile resets its lanes, SPEC Sec. 7), so for p < 8 the
+ * LANE_PREVIOUS operand is `init` and for p < 16 so is the LANE_DELTA /
+ * LANE_AVERAGE second operand. Those are the first 8 and first 16 lanes
+ * of the first chunk, so one blend each fixes chunk 0 and every later
+ * chunk uses the plain shifted load. STRIDE_8 uses the same shifted load
+ * but WITHOUT the blend: `seg_base[d-8]` is a real preceding byte even
+ * for p < 8, so sharing LANE_PREVIOUS's blended operand there would be
+ * wrong (they are distinct candidates and are counted separately). */
 static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
                                             const uint8_t *seg_base,
                                             uint32_t seg_pos, uint8_t init,
                                             uint16_t ks[11])
 {
-    uint32_t c[8]; /* k0 k1 k2 k5 k6 k7 k8 k10 */
-    uint8_t last[8];
-    uint8_t second[8];
-    unsigned l;
-    uint16_t p = 0;
-    uint16_t stop = (nt < 16u) ? nt : 16u;
+    uint8_t stg[ZPSE_PS_STG_LEN];
+    __m256i a0, a1, a2, a3, a4, a5, a6, a7;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i all = _mm256_cmpeq_epi8(zero, zero);
+    const __m256i initv = _mm256_set1_epi8((char)init);
+    const __m256i idx = _mm256_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                                         16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31);
+    const __m256i m8 = _mm256_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,
+                                        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                                        0,0,0,0,0,0,0,0);
+    const __m256i m16 = _mm256_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,
+                                         -1,-1,-1,-1,-1,-1,-1,-1,
+                                         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+    uint32_t p = 0;
 
-    for (l = 0; l < 8u; l++) {
-        c[l] = 0u;
-        last[l] = init;
-        second[l] = init;
-    }
+    (void)seg_base;
+    (void)seg_pos;
+    a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = zero;
 
-    /* Scalar prologue [0, 16). */
-    for (; p < stop; p++) {
-        unsigned lane = (unsigned)p & 7u;
-        uint8_t x = a[p];
-        uint8_t h8 = last[lane];
-        uint8_t h16 = second[lane];
-        uint32_t d = seg_pos + (uint32_t)p;
-        uint8_t s1 = (d < 1u) ? init : seg_base[d - 1u];
-        uint8_t s2 = (d < 2u) ? init : seg_base[d - 2u];
-        uint8_t s4 = (d < 4u) ? init : seg_base[d - 4u];
-        uint8_t s8 = (d < 8u) ? init : seg_base[d - 8u];
+    memcpy(stg, a - 16, 16);
+    memcpy(stg + 16, a, nt);
+    memset(stg + 16 + nt, 0, 32);
 
-        c[0] += (uint32_t)(x != 0u);
-        c[1] += (uint32_t)(x != h8);
-        c[2] += (uint32_t)(x != (uint8_t)((2u * (unsigned)h8 -
-                              (unsigned)h16) & 0xFFu));
-        c[3] += (uint32_t)(x != s1);
-        c[4] += (uint32_t)(x != s2);
-        c[5] += (uint32_t)(x != s4);
-        c[6] += (uint32_t)(x != s8);
-        c[7] += (uint32_t)(x != (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
-                                          >> 1));
-        second[lane] = h8;
-        last[lane] = x;
-    }
+    while (p + 32u <= (uint32_t)nt) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + 16u + p));
+        __m256i h8S = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + 8u + p));
+        __m256i h8L = h8S;
+        __m256i h16 = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + p));
 
-    /* Vector body [16, nt) in 32-byte chunks. */
-    if (p == 16u) {
-        const __m256i zero = _mm256_setzero_si256();
-        while ((uint32_t)p + 32u <= (uint32_t)nt) {
-            const uint8_t *q = a + p;
-            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)q);
-            __m256i h8 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(q - 8));
-            __m256i h16 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(q - 16));
-            __m256i q1 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(q - 1));
-            __m256i q2 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(q - 2));
-            __m256i q4 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(q - 4));
-            __m256i d2 = _mm256_sub_epi8(_mm256_add_epi8(h8, h8), h16);
-            __m256i av = _mm256_avg_epu8(h8, h16);
-            /* These are exception counts, so each chunk contributes
-             * (32 - hits). Every chunk is full, so the width is fixed. */
-            uint32_t m1 = (uint32_t)_mm256_movemask_epi8(
-                _mm256_cmpeq_epi8(v, h8));
-
-            c[0] += 32u - (uint32_t)__builtin_popcount(
-                (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
-            c[1] += 32u - (uint32_t)__builtin_popcount((unsigned)m1);
-            c[2] += 32u - (uint32_t)__builtin_popcount(
-                (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, d2)));
-            c[3] += 32u - (uint32_t)__builtin_popcount(
-                (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q1)));
-            c[4] += 32u - (uint32_t)__builtin_popcount(
-                (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q2)));
-            c[5] += 32u - (uint32_t)__builtin_popcount(
-                (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q4)));
-            /* STRIDE_8 reads the same byte LANE_PREVIOUS predicts for
-             * every p >= 8, so the count is shared. */
-            c[6] += 32u - (uint32_t)__builtin_popcount((unsigned)m1);
-            c[7] += 32u - (uint32_t)__builtin_popcount(
-                (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, av)));
-            p = (uint16_t)(p + 32u);
+        if (p == 0u) {
+            h8L = _mm256_blendv_epi8(h8L, initv, m8);
+            h16 = _mm256_blendv_epi8(h16, initv, m16);
         }
-        if (p > 16u) {
-            /* Lane histories at p are plain memory: a[p-8+l], a[p-16+l]. */
-            for (l = 0; l < 8u; l++) {
-                last[l] = a[p - 8u + l];
-                second[l] = a[p - 16u + l];
+        SEG_PS_CHUNK(v, h8L, h8S, h16, all);
+        p += 32u;
+    }
+    if (p < (uint32_t)nt) {
+        uint32_t rem = (uint32_t)nt - p;
+        __m256i valid = _mm256_cmpgt_epi8(_mm256_set1_epi8((char)rem), idx);
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + 16u + p));
+        __m256i h8S = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + 8u + p));
+        __m256i h8L = h8S;
+        __m256i h16 = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + p));
+
+        if (p == 0u) {
+            h8L = _mm256_blendv_epi8(h8L, initv, m8);
+            h16 = _mm256_blendv_epi8(h16, initv, m16);
+        }
+        SEG_PS_CHUNK(v, h8L, h8S, h16, valid);
+    }
+
+    {
+        __m256i acc[8];
+        uint64_t hits[8];
+        uint64_t lane[4];
+        int i;
+        int j;
+
+        acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
+        acc[4] = a4; acc[5] = a5; acc[6] = a6; acc[7] = a7;
+        for (i = 0; i < 8; i++) {
+            hits[i] = 0u;
+            /* Sum of absolute differences from zero is the sum of the
+             * byte-lane counters, i.e. the total number of hits. */
+            _mm256_storeu_si256((__m256i *)(void *)lane,
+                                _mm256_sad_epu8(acc[i], zero));
+            for (j = 0; j < 4; j++) {
+                hits[i] += lane[j];
             }
         }
+        ks[0] = (uint16_t)((uint32_t)nt - (uint32_t)hits[0]);
+        ks[1] = (uint16_t)((uint32_t)nt - (uint32_t)hits[1]);
+        ks[2] = (uint16_t)((uint32_t)nt - (uint32_t)hits[2]);
+        ks[5] = (uint16_t)((uint32_t)nt - (uint32_t)hits[3]);
+        ks[6] = (uint16_t)((uint32_t)nt - (uint32_t)hits[4]);
+        ks[7] = (uint16_t)((uint32_t)nt - (uint32_t)hits[5]);
+        ks[8] = (uint16_t)((uint32_t)nt - (uint32_t)hits[6]);
+        ks[10] = (uint16_t)((uint32_t)nt - (uint32_t)hits[7]);
+        ks[3] = 0xFFFFu;
+        ks[4] = 0xFFFFu;
+        ks[9] = 0xFFFFu;
     }
-
-    /* Scalar tail (< 32 bytes). */
-    for (; p < nt; p++) {
-        unsigned lane = (unsigned)p & 7u;
-        uint8_t x = a[p];
-        uint8_t h8 = last[lane];
-        uint8_t h16 = second[lane];
-        uint8_t s1 = a[p - 1u];
-        uint8_t s2 = a[p - 2u];
-        uint8_t s4 = a[p - 4u];
-        uint8_t s8 = a[p - 8u];
-
-        c[0] += (uint32_t)(x != 0u);
-        c[1] += (uint32_t)(x != h8);
-        c[2] += (uint32_t)(x != (uint8_t)((2u * (unsigned)h8 -
-                              (unsigned)h16) & 0xFFu));
-        c[3] += (uint32_t)(x != s1);
-        c[4] += (uint32_t)(x != s2);
-        c[5] += (uint32_t)(x != s4);
-        c[6] += (uint32_t)(x != s8);
-        c[7] += (uint32_t)(x != (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
-                                          >> 1));
-        second[lane] = h8;
-        last[lane] = x;
-    }
-
-    ks[0] = (uint16_t)c[0];
-    ks[1] = (uint16_t)c[1];
-    ks[2] = (uint16_t)c[2];
-    ks[5] = (uint16_t)c[3];
-    ks[6] = (uint16_t)c[4];
-    ks[7] = (uint16_t)c[5];
-    ks[8] = (uint16_t)c[6];
-    ks[10] = (uint16_t)c[7];
-    ks[3] = 0xFFFFu;
-    ks[4] = 0xFFFFu;
-    ks[9] = 0xFFFFu;
 }
 #endif /* ZPSE_PS_HAVE_AVX2 */
 
@@ -387,7 +413,10 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
                           uint8_t init, int have_avx2, uint16_t ks[11])
 {
 #if ZPSE_PS_HAVE_AVX2
-    if (have_avx2) {
+    /* The vector path folds the tile boundaries into the whole-tile
+     * pass and reads 16 real plane bytes before the tile, so it is
+     * only valid once a segment has that much history. */
+    if (have_avx2 && seg_pos >= 16u) {
         seg_prescreen_avx2(a, nt, seg_base, seg_pos, init, ks);
         return;
     }
