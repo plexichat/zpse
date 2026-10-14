@@ -633,6 +633,142 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
     seg_prescreen_counts(a, nt, seg_base, seg_pos, init, ks);
 }
 
+/* ------------------------------------------------------------------ *
+ * Cheap run continuation for the all-hit batch in zpse_segment_encode.
+ *
+ * Once an all-hit run is under way, the only thing the general path would
+ * still consult for the next tile is seg_prescreen, and a tile that keeps
+ * satisfying the run's own predictor cannot change the winner. For the
+ * cases below that follows from the tile's own bytes plus the segment
+ * literal, so a single broadcast compare can replace the whole
+ * eight-predictor pass (~30 ns per tile, the dominant cost of encoding a
+ * constant or periodic stream). The winner of the prescreen's scan is the
+ * FIRST predictor of seg_screen_pred[] whose miss count is 0, so each
+ * case also has to exclude every predictor that precedes it:
+ *
+ *   CONST_ZERO     (first of all) all bytes are 0.
+ *   LANE_PREVIOUS  all bytes equal the tile's entry lane value, which for
+ *                  the encoder's always-reset tiles is the segment
+ *                  literal; requires a nonzero literal, otherwise
+ *                  CONST_ZERO would also be all-hit and would precede it.
+ *   STRIDE_1       the tile is constant and equal to the plane byte just
+ *                  before it, which is exactly what `d - 1` predicts for
+ *                  every position since seg_pos >= 1 throughout the scan.
+ *                  That byte must be neither 0 (CONST_ZERO would be
+ *                  all-hit and precedes) nor the literal (LANE_PREVIOUS
+ *                  would be all-hit and precedes - and LANE_DELTA and
+ *                  LANE_AVERAGE too: their prediction starts from the
+ *                  literal while the histories still hold it, so a run
+ *                  that never departs from the literal keeps agreeing).
+ *
+ * LANE_DELTA / LANE_AVERAGE / the other STRIDE periods are deliberately
+ * not here: a tile all-hit for LANE_DELTA or LANE_AVERAGE is constant at
+ * the literal, which makes LANE_PREVIOUS all-hit as well, and STRIDE_2/4/8
+ * would additionally have to exclude the shorter strides. Both fall
+ * through to seg_prescreen, which stays authoritative.
+ *
+ * Returns 1 only when the tile provably keeps the run's predictor and its
+ * k == 0; 0 means "ask the prescreen". Being wrong towards 0 only costs
+ * time, while returning 1 for a tile the prescreen would have rejected
+ * would change the encoded bytes - so every condition above is a proof,
+ * not a heuristic.
+ * ------------------------------------------------------------------ */
+static int seg_all_hit_cheap_scalar(const uint8_t *a, uint16_t nt,
+                                    uint8_t pred, uint8_t literal,
+                                    uint32_t seg_pos, const uint8_t *plane)
+{
+    uint16_t i;
+
+    if (pred == (uint8_t)ZPSE_P_CONST_ZERO) {
+        for (i = 0; i < nt; i++) {
+            if (a[i] != 0u)
+                return 0;
+        }
+        return 1;
+    }
+    if (pred == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+        if (literal == 0u)
+            return 0;
+        for (i = 0; i < nt; i++) {
+            if (a[i] != literal)
+                return 0;
+        }
+        return 1;
+    }
+    if (pred == (uint8_t)ZPSE_P_STRIDE_1 && seg_pos >= 1u) {
+        uint8_t v = plane[seg_pos - 1u];
+
+        if (v == 0u || v == literal)
+            return 0;
+        for (i = 0; i < nt; i++) {
+            if (a[i] != v)
+                return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+#if ZPSE_PS_HAVE_AVX2
+/* Same three proofs, one broadcast compare each: 32 bytes per step. */
+static ZPSE_PS_AVX2 int seg_all_hit_cheap_avx2(const uint8_t *a, uint16_t nt,
+                                               uint8_t pred, uint8_t literal,
+                                               uint32_t seg_pos,
+                                               const uint8_t *plane)
+{
+    uint8_t v;
+    uint32_t p = 0;
+    __m256i want;
+
+    if (pred == (uint8_t)ZPSE_P_CONST_ZERO) {
+        v = 0u;
+    } else if (pred == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+        if (literal == 0u)
+            return 0;
+        v = literal;
+    } else if (pred == (uint8_t)ZPSE_P_STRIDE_1 && seg_pos >= 1u) {
+        v = plane[seg_pos - 1u];
+        if (v == 0u || v == literal)
+            return 0;
+    } else {
+        return 0;
+    }
+
+    want = _mm256_set1_epi8((char)v);
+    while (p + 32u <= (uint32_t)nt) {
+        __m256i cur = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(a + p));
+
+        /* All 32 bytes equal: movemask of the compare is all ones. */
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, want)) != -1)
+            return 0;
+        p += 32u;
+    }
+    while (p < (uint32_t)nt) {
+        if (a[p] != v)
+            return 0;
+        p++;
+    }
+    return 1;
+}
+#endif /* ZPSE_PS_HAVE_AVX2 */
+
+/* Dispatch helper, mirroring seg_prescreen: `have_avx2` is computed once
+ * per segment encode. */
+static int seg_all_hit_cheap_ok(const uint8_t *a, uint16_t nt, uint8_t pred,
+                                uint8_t literal, uint32_t seg_pos,
+                                const uint8_t *plane, int have_avx2)
+{
+#if ZPSE_PS_HAVE_AVX2
+    if (have_avx2) {
+        return seg_all_hit_cheap_avx2(a, nt, pred, literal, seg_pos, plane);
+    }
+#else
+    (void)have_avx2;
+#endif
+    return seg_all_hit_cheap_scalar(a, nt, pred, literal, seg_pos, plane);
+}
+
 /* Emit the minimal all-hit tile record: mask ALL_HIT and residual
  * EXCLUSION_U8 with k == 0, so the whole tile is prediction and both
  * payloads are empty. This is byte for byte what zpse_tile_pack's own
@@ -793,11 +929,14 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * A run is just more of the same: past the first tile the
          * prescreen is the only thing that decides which predictor byte
          * the general path would have written, so stay here while it
-         * keeps reporting k == 0 for the same winner. Any other tile
-         * falls out to the general path, which re-derives everything
-         * from the same prescreen result -- each tile is written by
-         * exactly one of the two paths, and the bytes agree, so the
-         * payload is unchanged. The lane state needs no update: the
+         * keeps reporting k == 0 for the same winner. For the three cases
+         * seg_all_hit_cheap_ok can settle from the tile's own bytes that
+         * answer is already known and the prescreen is skipped
+         * altogether; for everything else it is asked, exactly as before.
+         * Any other tile falls out to the general path, which re-derives
+         * everything from the same prescreen result -- each tile is
+         * written by exactly one of the two paths, and the bytes agree,
+         * so the payload is unchanged. The lane state needs no update: the
          * classify call for the next tile is always made with
          * tile_reset == 1, which resets the histories and tables itself,
          * and nothing after this loop reads `lanes`.
@@ -819,9 +958,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                                               ? 256u
                                               : (plane_len - nsseg_pos));
                 uint16_t nks[11];
-                uint16_t nbk;
-                uint8_t npred = seg_screen_pred[0];
-                uint32_t i;
+                uint8_t npred = pred;
 
                 if (byte_budget != 0u && pos > byte_budget) {
                     return PSE_OUTPUT_OVERFLOW;
@@ -829,18 +966,34 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 if (payload_cap - pos < 10u) {
                     return PSE_OUTPUT_OVERFLOW;
                 }
-                seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
-                              initial_literal, have_avx2, nks);
-                nbk = nks[npred];
-                for (i = 1; i < 8u; i++) {
-                    uint16_t c = nks[seg_screen_pred[i]];
-                    if (c < nbk) {
-                        nbk = c;
-                        npred = seg_screen_pred[i];
+                /* The tile keeps the run's predictor and its k == 0 only
+                 * when the cheap proof holds; otherwise the prescreen is
+                 * authoritative, exactly as it was before. When the cheap
+                 * proof holds the winner is unchanged, so npred stays
+                 * `pred` -- which is what the prescreen branch would also
+                 * have concluded, since no other predictor can have a
+                 * lower (negative) count and the scan order cannot
+                 * promote one that precedes it. */
+                if (!seg_all_hit_cheap_ok(plane + nsseg_pos, nnt, pred,
+                                          initial_literal, nsseg_pos, plane,
+                                          have_avx2)) {
+                    uint16_t nbk;
+                    uint32_t i;
+
+                    npred = seg_screen_pred[0];
+                    seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
+                                  initial_literal, have_avx2, nks);
+                    nbk = nks[npred];
+                    for (i = 1; i < 8u; i++) {
+                        uint16_t c = nks[seg_screen_pred[i]];
+                        if (c < nbk) {
+                            nbk = c;
+                            npred = seg_screen_pred[i];
+                        }
                     }
-                }
-                if (nbk != 0u || npred != pred) {
-                    break;
+                    if (nbk != 0u || npred != pred) {
+                        break;
+                    }
                 }
                 seg_write_all_hit(payload_out + pos, npred, nnt);
                 pos += 10u;

@@ -169,21 +169,37 @@ verified with a CRC32-C and the RAW fallback is a copy. The bench itself uses
 
 ### Performance
 
-Measured with `./bench.exe 300 5` on a desktop x86-64 machine, 64 KiB blocks,
-single core. Run the command above on your own machine to fill this in:
+Measured with `./bench.exe 300 4` on a desktop x86-64 machine (best of four
+rounds, single core, 64 KiB blocks). Reproduce with the command above; the
+absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encode GB/s | decode GB/s |
 | --- | --- | --- | --- |
-| zeros | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| incr | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| random | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| sparse | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| strided | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| const5A | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| alt00FF | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| sawtooth | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| lowentropy | run tests/bench.c | run tests/bench.c | run tests/bench.c |
-| sparse2 | run tests/bench.c | run tests/bench.c | run tests/bench.c |
+| zeros | 0.040 | 12.8 | 14.6 |
+| incr | 0.040 | 1.1 | 6.9 |
+| random | 1.000 | 0.15 | 20.9 |
+| sparse | 0.060 | 0.35 | 3.7 |
+| strided | 0.040 | 1.0 | 6.9 |
+| const5A | 0.040 | 12.8 | 14.9 |
+| alt00FF | 0.040 | 2.5 | 13.0 |
+| sawtooth | 0.163 | 0.16 | 1.1 |
+| lowentropy | 0.688 | 0.06 | 0.29 |
+| sparse2 | 0.048 | 0.52 | 5.0 |
+
+The same run reports this machine's ceilings for the same 64 KiB working
+set: memcpy 51-69 GB/s, memset 87-127 GB/s and CRC32-C 24-31 GB/s. The
+CRC32-C rate matters because every block carries a checksum of its
+decoded bytes, so on the fastest paths (14.9 GB/s with a 30 GB/s CRC) the
+checksum alone is about a third of the decode time.
+
+What sets each direction: encode is dominated by the per-tile predictor
+search - the AVX2 prescreen computes the exception count of eight
+predictors in one whole-tile pass, and a run of all-hit tiles is written
+as its 8-byte record directly. Decode is dominated by reconstruction
+(exception tiles), the segment transforms, and the CRC; all-hit runs of a
+segment coalesce into a single fill, the delta8/xor8 inverses are AVX2
+prefix scans, and a single-segment raw-bytes block decodes straight into
+the caller's buffer.
 
 ## License
 

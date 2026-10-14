@@ -89,6 +89,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     uint8_t init_lit[16];
     const uint8_t *csegs[16];
     uint32_t cum, s;
+    int identity_shape;
     int rc;
 
     if (d == 0 || in == 0 || output == 0) {
@@ -249,7 +250,28 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         return rc;
     }
 
-    /* PHASE3: decode segments into recon planes. */
+    /* A single-segment ZPSE_T_RAW_BYTES block has an inverse transform that
+     * is exactly `memcpy(out, segs[0], n)`: zpse_transform_meta_parse only
+     * accepts that id with segment_count == 1, an empty metadata region and
+     * width_W == 1, and the delta/xor wrap is keyed on ids 1, 2, 7..10 and
+     * 11-with-flag-bit-0, so id 0 is neither. The plane for such a block is
+     * therefore the caller's buffer itself: decoding the segment straight
+     * into it produces the same bytes the copy would have produced, and
+     * PHASE4 then becomes a copy of a buffer onto itself, which the
+     * transform's own overlap guard refuses. So for this shape the copy is
+     * not just redundant, it is not expressible at all - and it is the
+     * shape the encoder's identity trial produces, i.e. the common case for
+     * a smooth or constant block. Nothing the inverse would have validated
+     * is skipped: this function already established that meta, segs and out
+     * are non-null, that n is in [ZPSE_MIN_BLOCK_SIZE,
+     * ZPSE_MAX_BLOCK_SIZE], that the width agrees with the parse, and that
+     * zpse_transform_validate_sizes() passes for exactly these arguments;
+     * the overlap guard exists to protect the copy that no longer happens. */
+    identity_shape = (h.transform_id == (uint8_t)ZPSE_T_RAW_BYTES &&
+                      scount == 1u) ? 1 : 0;
+
+    /* PHASE3: decode segments into recon planes (or straight into the
+     * caller's buffer for the identity shape above). */
     {
         ZpseLaneState lanes;
         lanes.order1 = d->order1;
@@ -264,6 +286,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             uint32_t sz = zpse_load_u32le(dir + (size_t)s * 8 + 4);
             uint8_t *plane = d->recon + cum;
             uint32_t got = 0;
+
+            if (identity_shape != 0) {
+                plane = output;
+            }
             /* One full init per segment: zpse_lane_reset covers
              * histories + order1/o2val/o2conf (same values as the
              * memsets it replaces). Segment predictors vary per
@@ -290,11 +316,16 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 
     /* PHASE4: inverse transform straight into the caller's buffer (the
      * segment planes live in d->recon, so there is no overlap and the
-     * 64 KiB staging copy is unnecessary). */
-    rc = zpse_transform_inverse(&meta, h.segment_count, csegs, seg_lens,
-                                output, n);
-    if (rc != PSE_OK) {
-        return rc;
+     * 64 KiB staging copy is unnecessary). The identity shape above has no
+     * transform left to apply - its plane IS the output - so this phase is
+     * skipped for it, which is also the only way to express it (see the
+     * identity_shape comment). */
+    if (identity_shape == 0) {
+        rc = zpse_transform_inverse(&meta, h.segment_count, csegs, seg_lens,
+                                    output, n);
+        if (rc != PSE_OK) {
+            return rc;
+        }
     }
 
     /* PHASE5: payload CRC iff the block flag tags it. */
