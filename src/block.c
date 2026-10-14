@@ -440,6 +440,34 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return PSE_OK;
 }
 
+/* Smallest size a trial with this (transform, segment count, metadata)
+ * shape can possibly produce: the envelope (block header, metadata, the
+ * segment directory, each segment's 16-byte header) plus 2 length-prefix
+ * bytes and the 8-byte tile header for every tile. Used to stop the
+ * transform sweep as soon as nothing left can beat the running best. */
+static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
+                                 uint16_t meta_len)
+{
+    uint32_t lens[16];
+    uint32_t tiles = 0u;
+    uint8_t w = 0;
+    uint8_t s;
+
+    if (zpse_transform_width(tid, sc, &w) != PSE_OK) {
+        return UINT32_MAX;
+    }
+    if (zpse_segment_lengths(n, w, lens) != PSE_OK) {
+        return UINT32_MAX;
+    }
+    for (s = 0; s < sc; s++) {
+        tiles += (lens[s] + 255u) / 256u;
+    }
+    return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + (uint32_t)meta_len +
+           (uint32_t)sc * ((uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE +
+                           (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) +
+           10u * tiles;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -466,13 +494,26 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_BAD_BLOCK_SIZE;
     }
 
-    /* Trial 1: RAW_BYTES. */
+    /* Trial 1: RAW_BYTES (the identity, as a single segment).
+     *
+     * Ordered FIRST because it carries the smallest envelope of any
+     * candidate -- one segment and no transform metadata -- so it is the
+     * one that can reach the absolute floor of 32 + 8 + 16 + 10 per tile.
+     * Reaching a candidate's floor is what lets the sweep stop, so a
+     * constant or all-one block costs exactly one trial. */
     tids[0] = 0;
     scounts[0] = 1;
     meta_lens[0] = 0;
     ncand = 1;
 
-    /* Trial 2: width-appropriate plain transpose. */
+    /* Trial 2: DELTA8 with seed = first input byte. */
+    tids[ncand] = 1;
+    scounts[ncand] = 1;
+    meta_bufs[ncand][0] = in[0];
+    meta_lens[ncand] = 1;
+    ncand++;
+
+    /* Trial 3: width-appropriate plain transpose. */
     if (n >= 16) {
         tids[ncand] = 6;
         scounts[ncand] = 16;
@@ -494,13 +535,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         meta_lens[ncand] = 0;
         ncand++;
     }
-
-    /* Trial 3: DELTA8 with seed = first input byte. */
-    tids[ncand] = 1;
-    scounts[ncand] = 1;
-    meta_bufs[ncand][0] = in[0];
-    meta_lens[ncand] = 1;
-    ncand++;
 
     /* Every candidate writes the same decoded CRC into its header (it is
      * the CRC of the uncompressed block), so it is computed once here
@@ -524,18 +558,27 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             best_total = t;
             have_best = 1;
         }
-        /* Early exit: every tile record is at least 2 + 8 bytes (its
-         * u16 length prefix plus the fixed tile header) and a one-segment
-         * envelope adds at most 32 + 16 + 8. Once the best trial reaches
-         * that absolute floor no remaining candidate can beat it, so the
-         * transform sweep stops. For data the format already compresses
-         * to the floor (constant/ramp blocks) this skips two thirds of
-         * the encode work. */
+        /* Early exit over the candidates that are LEFT, not over all of
+         * them: a trial whose own envelope is bigger (16 segments, or a
+         * metadata byte) cannot reach a size the identity trial can, so
+         * comparing the running best against each remaining candidate's
+         * own floor stops the sweep as soon as nothing left could be
+         * strictly smaller. That is why the identity runs first -- it is
+         * the only candidate that can reach the global minimum, so for
+         * constant/ramp blocks the sweep ends here after one trial while a
+         * ramp whose winner is DELTA8 still gets its second trial. */
         {
-            uint32_t tiles = (n + 255u) / 256u;
-            uint32_t floor_total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 24u
-                                 + 10u * tiles;
-            if (best_total <= floor_total) {
+            uint32_t min_floor = UINT32_MAX;
+            int j;
+
+            for (j = i + 1; j < ncand; j++) {
+                uint32_t f = zpse_block_floor(n, tids[j], scounts[j],
+                                              meta_lens[j]);
+                if (f < min_floor) {
+                    min_floor = f;
+                }
+            }
+            if (have_best && best_total <= min_floor) {
                 break;
             }
             /* Two candidates that both fail to beat the raw envelope
