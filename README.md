@@ -186,10 +186,11 @@ absolute numbers move with the machine and the clock, the shape does not.
 | lowentropy | 0.688 | 0.10 | 0.7 |
 | sparse2 | 0.048 | 0.44 | 4.3 |
 
-The encode column moved this round by 1.04-1.15x per row (measured as
-best-of-25 pairs of the same binary before and after, so the ratios do not
-depend on the clock state). This table is one run, so its fastest rows sit
-about 7% below the same binaries measured earlier on this machine.
+The encode column moved this round by 1.04-1.15x per row in a paired
+best-of-25 rdtsc harness (both binaries alternating in the same clock
+state), and by 1.10-1.27x on the seven slowest rows under `bench.exe`
+best of six. This table is one run, so its fastest rows sit about 7%
+below the same binaries measured earlier on this machine.
 
 The same run reports this machine's ceilings for the same 64 KiB working
 set: memcpy 69 GB/s, memset 123 GB/s and CRC32-C 30.5 GB/s. The CRC32-C
