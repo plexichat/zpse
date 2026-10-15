@@ -1,7 +1,11 @@
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <time.h>
+#endif
 #include "zpse/zpse.h"
 #include "zpse/predictor.h"
 #include "zpse/mask.h"
@@ -11,11 +15,17 @@
 static uint8_t o1[8*256], o2v[8*4096], o2c[8*4096];
 static uint8_t scratch[8192];
 static double now_ns(void) {
+#if defined(_WIN32)
     static LARGE_INTEGER f = {{0}};
     LARGE_INTEGER c;
     if (f.QuadPart == 0) QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart * 1e9 / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+#endif
 }
 #define TIMEIT(name, n, stmt) do { \
     double t0 = now_ns(); \

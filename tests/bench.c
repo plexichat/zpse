@@ -14,8 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <time.h>
+#endif
 #include "zpse/zpse.h"
 #include "zpse/crc32c.h"
 
@@ -35,11 +39,19 @@ static uint32_t clen_of[MAXP];
 static int np = 0;
 
 static double now_ns(void) {
+#if defined(_WIN32)
     static LARGE_INTEGER freq = {{0}};
     LARGE_INTEGER c;
     if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart * 1e9 / (double)freq.QuadPart;
+#else
+    /* CLOCK_MONOTONIC: unaffected by the wall clock being set, and the
+     * widest-resolution timer available without platform extras. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+#endif
 }
 
 /* Fill `in` with pattern number idx (order matches `names`). */

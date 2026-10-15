@@ -55,8 +55,9 @@ amalgamation has no duplicate names.
 
 ## Requirements and build
 
-* A C11 compiler. The suites expect `gcc` on `PATH` and a PowerShell host;
-  the same translation units build with clang or MSVC.
+* A C11 compiler. The suites expect `gcc` on `PATH` and either a PowerShell
+  host (`tests/run.ps1`) or a POSIX shell (`tests/run.sh`); the same
+  translation units build with clang or MSVC.
 * Nothing else: no libc beyond `string.h`/`stdint.h`/`stddef.h` in the library
   itself, no allocation, no threads, no I/O.
 * x86-64 gets runtime-dispatched SIMD (SSE4.2 CRC32-C, SSSE3, AVX2) with the
@@ -121,11 +122,15 @@ success and a negative `PseStatus` (see `include/zpse/status.h`) on failure.
 ## Testing
 
 ```sh
-powershell -NoProfile -File tests/run.ps1
+powershell -NoProfile -File tests/run.ps1   # Windows
+bash tests/run.sh                           # Linux / macOS / Git Bash
 ```
 
-`tests/run.ps1` builds and runs each suite against `src/zpse_unity.c` and
-stops with a non-zero exit code if any of them fails:
+The two runners are twins: same suites, same flags, same checks, and each
+captures every build's and every program's exit status directly (never
+through a pipe), so a failing suite cannot be filtered into a passing one.
+They build and run each suite against `src/zpse_unity.c` and stop with a
+non-zero exit code if any of them fails:
 
 | suite | coverage |
 | --- | --- |
@@ -133,16 +138,25 @@ stops with a non-zero exit code if any of them fails:
 | `test_combinadic.c` | exact binomial values, rank/unrank round trips, hostile ranks |
 | `test_hostile.c` | truncations, bit flips, reserved bits, bad transform ids, bad mask/residual payloads, output-overflow, random garbage — all must return a status, never crash |
 | `test_units.c` | CRC, arena layout, header parse/serialize, K derivation, tables, tile round trips over every predictor and residual mode |
-| `test_parity.c` | the full corpus plus a per-primitive sweep |
+| `test_parity.c` | the full corpus plus four per-primitive sweeps (uniform, small-`nt`/mask-word boundary, stateful-table ids, and the state a classification leaves) |
 
 The parity step is the important one: `test_parity.c` is compiled twice, once
 with the default runtime SIMD dispatch and once with `-DZPSE_FORCE_SCALAR`,
-and `run.ps1` requires the two runs to print byte-identical output and the
+and the runner requires the two runs to print byte-identical output and the
 same `DIGEST` line. The SIMD paths are therefore checked to be bit-exact
-replacements for the scalar reference, and the per-primitive sweep in the same
-file folds `k`, `nu`, `rmax`, `dmin`, `dmax`, the mask words, the packed
+replacements for the scalar reference, and the per-primitive sweeps in the same
+file fold `k`, `nu`, `rmax`, `dmin`, `dmax`, the mask words, the packed
 record and the chosen modes into a second digest for every predictor id, so a
-divergence names the predictor that caused it. A successful run ends with:
+divergence names the predictor that caused it. The four sweeps are:
+
+| sweep | what it drives |
+| --- | --- |
+| `tileclass` | every predictor id over twelve tile shapes at `Nt = 256`, three literals, `tile_reset` 0/1 and two `seg_pos` offsets |
+| `tilesmall` | `Nt` from 1 to 256 (so the 32-wide chunking's masked partial tail is exercised, and `Nt < 32` stays on the scalar classifier) over shapes built to land on the dense path's 31/32/33-exception boundary, a completely set first/last/only mask word, and pseudorandom fills; it also asserts that no mask bit at or above `Nt` is ever set |
+| `tiletable` | the ids the encoder's prescreen never ranks (`ORDER1`, `ORDER2`, `TILE_LOCAL_CONSTANT`) at a full chunk, a partial tail and a sub-chunk length |
+| `tilechain` | two tiles classified back to back on ONE lane state, the second without a reset - the histories and every byte of the table the predictor reads are folded in, and both records are then decoded in sequence, the second from the state the first decode leaves. Nothing else observes what a classification LEAVES behind, which is what made a grouped `ORDER1` scan look good and measure badly; see the performance note below |
+
+A successful run ends with:
 
 ```
 parity ok: DIGEST <value> (identical streams)
@@ -164,33 +178,37 @@ single-core, and reports the best of `reps` rounds for each direction (decode
 is measured ten times per round) as GB/s plus the ratio and compressed size.
 It then prints the machine's `memcpy`, `memset` and CRC32-C rates for the same
 working set: those bound any codec on this format, because every block is
-verified with a CRC32-C and the RAW fallback is a copy. The bench itself uses
-`QueryPerformanceCounter`, so it is Windows-only as written.
+verified with a CRC32-C and the RAW fallback is a copy. The bench times
+itself with `QueryPerformanceCounter` on Windows and `clock_gettime`
+(`CLOCK_MONOTONIC`) elsewhere, so the same command works on any platform
+the library builds on.
 
 ### Performance
 
-Measured with `./bench.exe 300 4` on a desktop x86-64 machine (best of four
-rounds, single core, 64 KiB blocks). Reproduce with the command above; the
+Measured with `./bench.exe 60 5` on a desktop x86-64 machine (best of four
+such runs, single core, 64 KiB blocks). Reproduce with the command above; the
 absolute numbers move with the machine and the clock, the shape does not.
 
-| pattern | ratio | encode GB/s | decode GB/s |
-| --- | --- | --- | --- |
-| zeros | 0.040 | 12.5 | 14.7 |
-| incr | 0.040 | 1.0 | 7.4 |
-| random | 1.000 | 0.38 | 18.8 |
-| sparse | 0.060 | 0.28 | 3.7 |
-| strided | 0.040 | 1.0 | 7.2 |
-| const5A | 0.040 | 12.2 | 14.6 |
-| alt00FF | 0.040 | 2.2 | 12.2 |
-| sawtooth | 0.163 | 0.22 | 1.0 |
-| lowentropy | 0.688 | 0.10 | 0.7 |
-| sparse2 | 0.048 | 0.44 | 4.3 |
+| pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
+| --- | --- | --- | --- | --- |
+| zeros | 0.040 | 2616 | 12.8 | 16.5 |
+| incr | 0.040 | 2619 | 1.2 | 8.6 |
+| random | 1.000 | 65568 | 0.45 | 20.8 |
+| sparse | 0.060 | 3962 | 0.38 | 4.7 |
+| strided | 0.040 | 2625 | 1.1 | 8.6 |
+| const5A | 0.040 | 2616 | 12.3 | 16.8 |
+| alt00FF | 0.040 | 2618 | 2.5 | 13.9 |
+| sawtooth | 0.163 | 10656 | 0.26 | 1.2 |
+| lowentropy | 0.688 | 45058 | 0.13 | 0.9 |
+| sparse2 | 0.048 | 3126 | 0.54 | 5.2 |
 
-The encode column moved this round by 1.04-1.15x per row in a paired
-best-of-25 rdtsc harness (both binaries alternating in the same clock
-state), and by 1.10-1.27x on the seven slowest rows under `bench.exe`
-best of six. This table is one run, so its fastest rows sit about 7%
-below the same binaries measured earlier on this machine.
+This round's encode change is in the block-level trial sweep, and it moved
+three rows: measured by alternating the two binaries in the same clock
+state (best of three rounds of 900 compressions, min per pattern), the
+`sparse` row is 1.12x, `lowentropy` 1.12x and `sparse2` 1.06x, with every
+other row within 1% (including `random`, whose incompressible path is
+deliberately untouched) and all ten compressed sizes byte-identical. The
+decode column is unchanged code this round and measures within 2%.
 
 The same run reports this machine's ceilings for the same 64 KiB working
 set: memcpy 69 GB/s, memset 123 GB/s and CRC32-C 30.5 GB/s. The CRC32-C
@@ -226,6 +244,45 @@ decodes straight into the caller's buffer. On the exception-heavy rows the
 work moved into wide code: a dense tile's residual units are placed with a
 shuffle instead of a per-bit walk, and palette residual payloads unpack
 sixteen values at a time (which is most of the `lowentropy` row's 3.2x).
+
+That trial sweep is where this round's encode win comes from, and it is
+worth recording what it can and cannot do. Every block runs the candidate
+transforms in turn and keeps the smallest; an instrumented build shows
+`lowentropy` running all three to completion (identity 45058 bytes,
+delta8 57241, transpose-16 45392 - the identity wins, and the other two
+produce a payload that is thrown away). A candidate's total only grows as
+its remaining segments are written, so the moment the bytes it has already
+produced reach the running winner it has lost by the same strict-`<` test
+the sweep applies at the end, and the rest of that payload is work for
+nothing. The sweep now hands each trial that bound (`min(RAW envelope,
+running winner)`) instead of just the RAW envelope, which stops `delta8`
+and the transpose trial at the winner's size rather than at the envelope;
+the two cases stay distinct, because only the RAW bound still means "this
+block is incompressible" for the sweep's own early exit. That is an exact
+bound, not an estimate: it skips only payloads the sweep could not have
+chosen. What it cannot do is prune a trial *early* on a large block - a
+losing candidate still has to be encoded up to the winner's size to prove
+it loses, and no data-derived lower bound does better, since an
+enumerative mask could in principle take any single tile down to ~25
+bytes.
+
+The `ORDER1` and `ORDER2` predictor arms are the only classification paths
+that stay scalar, because their prediction reads a per-lane table whose
+chains cannot be evaluated 32 positions at a time (`ORDER1` 709 ns and
+`ORDER2` 420 ns per 256-position tile, against 180-240 ns for the vector
+arms). Both were written as grouped 8-lane scans and both were measured
+before being kept: `ORDER1`'s scan is 1.15-1.23x faster in isolation, but
+adding it to the unity build slowed the incompressible encode path by 4.5%
+through code generation, and no codec path selects either id - the tile
+encoder's prescreen ranks the other eight predictors and the encoder never
+passes `ORDER1`/`ORDER2` - so the speedup would have been paid for by the
+hot path and collected by nobody. `ORDER2`'s scan was 35% *slower* than its
+per-position loop (its two tables cost the eight lanes more live state
+than a group can hold), which the resetting regime hides: with the per-tile
+reset that regime spends ~1300 of the arm's ~1740 ns clearing 2 x 8 KiB of
+tables, so the memset, not the loop, is what `ORDER2` classification costs.
+Neither scan shipped; `tilechain` exists to keep the state they would have
+had to reproduce honest.
 
 ## License
 

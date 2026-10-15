@@ -1,8 +1,12 @@
 /* Profiler: attribute encode/decode cost to components. */
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <time.h>
+#endif
 #include "zpse/zpse.h"
 #include "zpse/arena.h"
 #include "zpse/predictor.h"
@@ -18,11 +22,17 @@ static uint8_t scratch[8192];
 static uint8_t big[66*1024];
 
 static double now_ns(void) {
+#if defined(_WIN32)
     static LARGE_INTEGER f = {{0}};
     LARGE_INTEGER c;
     if (f.QuadPart == 0) QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart * 1e9 / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+#endif
 }
 #define TIMEIT(name, n, stmt) do { \
     double t0 = now_ns(); \

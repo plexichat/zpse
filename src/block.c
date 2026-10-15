@@ -346,14 +346,27 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
  * *total_out set, or a negative status / skip code. *budget_hit is set
  * when the trial was stopped by the RAW-envelope budget below rather
  * than by a real error, because the caller has to count that case
- * exactly like a completed trial that failed to beat RAW. */
+ * exactly like a completed trial that failed to beat RAW.
+ *
+ * `have_best` / `best_total` carry the sweep's running winner: this trial
+ * is only ever chosen on a STRICTLY smaller total, so once the bytes it
+ * has produced already reach `best_total` it has lost and the rest of the
+ * payload is work for nothing. That bound is the tighter of the two
+ * whenever a previous trial completed, and stopping on it is exact -- a
+ * trial's total only grows as its remaining segments are written, so
+ * `at >= best_total` (or a segment that crosses it) is a proof, not an
+ * estimate. The raw-envelope case keeps its own meaning: it is the only
+ * one that sets `*budget_hit`, because it is the only one that means
+ * "reached the size where RAW wins" for the caller's incompressible
+ * heuristic. */
 static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                               uint32_t in_crc,
                               uint8_t tid, uint8_t sc,
                               const uint8_t *meta_bytes, uint16_t meta_len,
                               int is_last, uint32_t seq,
                               uint8_t *dst, uint32_t cap, uint32_t *total_out,
-                              int *budget_hit)
+                              int *budget_hit, int have_best,
+                              uint32_t best_total)
 {
     /* A trial is only ever chosen when its total is below the RAW
      * envelope (32 + N), so it cannot matter once it has reached it:
@@ -435,17 +448,36 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint64_t raw = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n;
         uint32_t room;
         uint32_t budget;
+        int budget_is_raw = 1;
         int wlen;
         if (at > (uint64_t)cap) {
             return PSE_OUTPUT_OVERFLOW;
         }
+        /* Already at or past the running best before this segment writes
+         * a byte: every remaining payload byte only adds to the total, so
+         * this trial cannot be strictly smaller than the winner. A loss,
+         * not a budget hit -- nothing here says anything about RAW. */
+        if (have_best && (uint64_t)best_total <= at) {
+            return PSE_OUTPUT_OVERFLOW;
+        }
         room = (uint32_t)((uint64_t)cap - at);
         budget = (raw > at) ? (uint32_t)(raw - at) : 0u;
+        if (have_best && (uint64_t)best_total < raw) {
+            /* RAW is out of the running (the winner is already smaller
+             * than it), so the tighter cap is the winner itself, and it
+             * is the one that counts now -- a segment stopped by it is a
+             * known loss, never an incompressible-block signal. */
+            uint32_t bb = (uint32_t)((uint64_t)best_total - at);
+            if (budget == 0u || bb < budget) {
+                budget = bb;
+                budget_is_raw = 0;
+            }
+        }
         wlen = zpse_segment_encode(e, &lanes, planes[s], lens[s], lit,
                                    dst + at, room, budget);
         if (wlen < 0) {
             if (wlen == PSE_OUTPUT_OVERFLOW && budget != 0u &&
-                budget_hit != 0) {
+                budget_is_raw != 0 && budget_hit != 0) {
                 *budget_hit = 1;
             }
             return wlen;
@@ -602,7 +634,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq,
                                 e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
-                                &budget_hit);
+                                &budget_hit, have_best, best_total);
         if (rc != PSE_OK) {
             /* A trial the budget stopped had already reached the RAW
              * envelope, which is exactly the condition the completed
