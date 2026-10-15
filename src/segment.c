@@ -53,6 +53,8 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     uint32_t seg_size;
     uint8_t literal;
     uint16_t t;
+    int o1_seed;
+    int o2_seed;
 
     if (d == 0 || lanes == 0 || payload == 0 || decoded_out == 0 ||
         decoded_len_out == 0) {
@@ -75,11 +77,25 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     }
 
     /* First tile of the segment always re-seeds lane state,
-     * regardless of that tile's reset bit (Sec. 6.2 / 7). */
-    zpse_lane_reset(lanes, h.initial_literal);
+     * regardless of that tile's reset bit (Sec. 6.2 / 7). What is
+     * established here is the HISTORIES: they are what every tile reads
+     * as its entry state, and they are 16 bytes. The ORDER1/ORDER2
+     * tables are 66 KiB of memset that only predictors 3 and 4 read, and
+     * a resetting tile re-seeds the tables it reads itself (inside
+     * zpse_tile_decode -> zpse_lane_reset_for), so a segment whose tiles
+     * all reset -- which is every segment the encoder emits, and the only
+     * shape the format's own encoder produces -- never touches them. A
+     * tile that does NOT reset reads the state the segment start
+     * establishes, so that state is seeded below, lazily, before the
+     * first such tile that can read a table: same values, same order of
+     * observations as the eager reset, without the 66 KiB for tables no
+     * tile in the segment reads. */
+    zpse_lane_reset_hist(lanes, h.initial_literal);
 
     pos = 16u;
     produced = 0u;
+    o1_seed = 0;
+    o2_seed = 0;
     tile_count = (uint32_t)h.tile_count;
     seg_size = h.segment_decoded_size;
     literal = h.initial_literal;
@@ -305,6 +321,31 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         }
 
         tile_reset = (rec[0] & ZPSE_TILE_FLAG_RESET) != 0 ? 1 : 0;
+        /* Lazy table seeding (see the reset above). A tile that reads a
+         * table it does not reset reads this segment's initial state for
+         * it, so seed exactly that table here, once. rec[1] is the
+         * predictor byte and is read only when the record has one; a
+         * predictor that is not 3 or 4 reads no table, and an invalid
+         * predictor byte fails validation below whatever this does. */
+        if (rsz >= 2u) {
+            uint8_t pid = rec[1];
+
+            if (pid == (uint8_t)ZPSE_P_ORDER1) {
+                if (o1_seed == 0) {
+                    if (tile_reset == 0) {
+                        zpse_lane_seed_table(lanes, literal, pid);
+                    }
+                    o1_seed = 1;
+                }
+            } else if (pid == (uint8_t)ZPSE_P_ORDER2) {
+                if (o2_seed == 0) {
+                    if (tile_reset == 0) {
+                        zpse_lane_seed_table(lanes, literal, pid);
+                    }
+                    o2_seed = 1;
+                }
+            }
+        }
         got = zpse_tile_decode(lanes, rec, (uint32_t)rsz,
                                literal, tile_reset,
                                decoded_out, produced,
@@ -887,8 +928,15 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     tmp_cap = 4096u;
 
     /* Reset-first lane discipline; the per-tile reset bit is always 1
-     * (simplest legal choice, keeps every tile independent). */
-    zpse_lane_reset(lanes, initial_literal);
+     * (simplest legal choice, keeps every tile independent). Only the
+     * histories need establishing here: every tile below is classified
+     * with tile_reset == 1, so zpse_tile_classify calls
+     * zpse_lane_reset_for for it (histories + the table its predictor
+     * reads), and no predictor this encoder ever classifies -- the eight
+     * in seg_screen_pred[] -- reads a table at all. The 66 KiB table
+     * memset zpse_lane_reset would do for ORDER1/ORDER2 here was for a
+     * classification this encoder never asks for. */
+    zpse_lane_reset_hist(lanes, initial_literal);
 
     pos = 16u;
     for (t = 0; t < tc; t++) {

@@ -39,6 +39,20 @@ void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal);
 void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
                          uint8_t predictor_id);
 
+/* The history half of the reset on its own: last[]/second_last[] set to
+ * the literal, 16 bytes, no tables. This is the entry state every tile
+ * reads, and it is the only part of zpse_lane_reset that every tile
+ * depends on. */
+void zpse_lane_reset_hist(ZpseLaneState *s, uint8_t initial_literal);
+
+/* The table half of the reset on its own: exactly the memsets
+ * zpse_lane_reset_for performs for the same predictor_id (order1 for
+ * ORDER1; o2val and o2conf for ORDER2; nothing otherwise). 66 KiB, so a
+ * caller should only reach for it when the predictor it names is really
+ * about to read one of those tables. */
+void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
+                          uint8_t predictor_id);
+
 /* ORDER2 index: ((second*251) ^ (last*17)) & 0xFFF. */
 static inline uint16_t zpse_order2_index(uint8_t second_last, uint8_t last) {
     return (uint16_t)(((uint16_t)((uint16_t)second_last * 251u) ^

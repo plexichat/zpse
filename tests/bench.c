@@ -1,6 +1,10 @@
 /* Throughput bench: compress + decompress GB/s per pattern, 64 KiB
- * blocks, single core. Usage: bench.exe [iters] [reps]. Links
- * zpse_unity.c. Exit 0.
+ * blocks, single core. Usage: bench.exe [iters] [reps] [pattern ...].
+ * Links zpse_unity.c. Exit 0.
+ *
+ * With no pattern arguments all ten run; naming them restricts the run to
+ * those, in the order given, which is what makes a profiler run (or any
+ * single-row check) concentrate on the path of interest.
  *
  * Every pattern is measured `reps` times and the best result is kept.
  * A single long pass is not a fair comparison: the CPU clock drops
@@ -176,16 +180,35 @@ int main(int argc, char **argv) {
     const int npat = (int)(sizeof pat_names / sizeof pat_names[0]);
     int iters = argc > 1 ? atoi(argv[1]) : 200;
     int reps = argc > 2 ? atoi(argv[2]) : 5;
-    int rep, i;
+    int order[MAXP];
+    int nord = 0;
+    int rep, i, j;
 
-    for (i = 0; i < npat; i++) names[i] = pat_names[i];
+    /* Every named pattern resolves to its index, or the run is refused:
+     * a typo silently benchmarking nothing would look like a pass. */
+    for (i = 3; i < argc; i++) {
+        int found = -1;
+        for (j = 0; j < npat; j++) {
+            if (strcmp(argv[i], pat_names[j]) == 0) { found = j; break; }
+        }
+        if (found < 0) {
+            fprintf(stderr, "unknown pattern: %s\n", argv[i]);
+            return 2;
+        }
+        if (nord >= MAXP) return 2;
+        order[nord++] = found;
+    }
+    if (nord == 0) {
+        for (j = 0; j < npat; j++) order[nord++] = j;
+    }
+    for (j = 0; j < nord; j++) names[j] = pat_names[order[j]];
     printf("iters=%d reps=%d (decode x10), block=65536 B, single core, best-of-reps\n",
            iters, reps);
 
     for (rep = 0; rep < reps; rep++) {
-        for (i = 0; i < npat; i++) {
-            make_pattern(i);
-            if (bench(i, iters) != 0) return 1;
+        for (j = 0; j < nord; j++) {
+            make_pattern(order[j]);
+            if (bench(j, iters) != 0) return 1;
         }
     }
     report();

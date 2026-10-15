@@ -86,7 +86,6 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     uint64_t dir_end, area;
     const uint8_t *dir, *payloads;
     uint32_t seg_lens[16];
-    uint8_t init_lit[16];
     const uint8_t *csegs[16];
     uint32_t cum, s;
     int identity_shape;
@@ -236,7 +235,6 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                 return PSE_BAD_SEGMENT_DIRECTORY;
             }
             seg_lens[s] = sh.segment_decoded_size;
-            init_lit[s] = sh.initial_literal;
             sum += (uint64_t)sh.segment_decoded_size;
         }
         if (sum != (uint64_t)n) {
@@ -290,11 +288,16 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             if (identity_shape != 0) {
                 plane = output;
             }
-            /* One full init per segment: zpse_lane_reset covers
-             * histories + order1/o2val/o2conf (same values as the
-             * memsets it replaces). Segment predictors vary per
-             * tile, so no selective reset here. */
-            zpse_lane_reset(&lanes, init_lit[s]);
+            /* No lane reset here. zpse_segment_decode established the
+             * segment's entry state itself, from the initial_literal of
+             * the very header this loop just parsed the decoded size out
+             * of, so resetting from init_lit[s] here was the same state
+             * memoized a second time in front of every segment -- and the
+             * expensive half of it (the ORDER tables) 66 KiB a segment.
+             * The histories and the lazily seeded tables that
+             * zpse_segment_decode sets up are exactly what this call would
+             * have produced, and it can see everything it needs: lanes
+             * below already points at the decoder's own tables. */
             if ((uint64_t)cum + (uint64_t)seg_lens[s] > ZPSE_MAX_BLOCK_SIZE) {
                 return PSE_BAD_SEGMENT_DIRECTORY;
             }

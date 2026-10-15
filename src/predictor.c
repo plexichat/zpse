@@ -6,7 +6,11 @@
 #include <stdint.h>
 #include <string.h>
 
-void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal)
+/* Histories only: 16 bytes, and the part of the entry state that every
+ * tile's classify and decode depend on. Split out of zpse_lane_reset so
+ * a caller can establish the entry state without paying the 66 KiB of
+ * tables that only predictors 3 and 4 ever read. */
+void zpse_lane_reset_hist(ZpseLaneState *s, uint8_t initial_literal)
 {
     size_t l;
 
@@ -16,29 +20,17 @@ void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal)
     for (l = 0; l < 8u; l++) {
         s->last[l] = initial_literal;
         s->second_last[l] = initial_literal;
-    }
-    if (s->order1 != NULL) {
-        memset(s->order1, initial_literal, (size_t)8u * 256u);
-    }
-    if (s->o2val != NULL) {
-        memset(s->o2val, initial_literal, (size_t)8u * 4096u);
-    }
-    if (s->o2conf != NULL) {
-        memset(s->o2conf, 0, (size_t)8u * 4096u);
     }
 }
 
-void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
-                           uint8_t predictor_id)
+/* The tables one predictor reads, in the reset state: the same values
+ * zpse_lane_reset_for writes for that predictor, and nothing for the
+ * predictors that read no table at all. */
+void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
+                          uint8_t predictor_id)
 {
-    size_t l;
-
     if (s == NULL) {
         return;
-    }
-    for (l = 0; l < 8u; l++) {
-        s->last[l] = initial_literal;
-        s->second_last[l] = initial_literal;
     }
     /* pid 3 (ORDER1) is the only reader of order1; pid 4 (ORDER2) the
      * only reader of o2val (predict) / o2conf (update). All other
@@ -55,6 +47,20 @@ void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
             memset(s->o2conf, 0, (size_t)8u * 4096u);
         }
     }
+}
+
+void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal)
+{
+    zpse_lane_reset_hist(s, initial_literal);
+    zpse_lane_seed_table(s, initial_literal, (uint8_t)ZPSE_P_ORDER1);
+    zpse_lane_seed_table(s, initial_literal, (uint8_t)ZPSE_P_ORDER2);
+}
+
+void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
+                           uint8_t predictor_id)
+{
+    zpse_lane_reset_hist(s, initial_literal);
+    zpse_lane_seed_table(s, initial_literal, predictor_id);
 }
 
 static uint32_t zpse_stride_of(uint8_t predictor_id)
