@@ -1674,6 +1674,45 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
  * ------------------------------------------------------------------ */
 #if ZPSE_TILE_HAVE_AVX2
 
+/* The two unit arrays in zpse_tile_decode -- resid[] and deltas[] -- are
+ * exactly this many bytes, and that is the only buffer the kernels below
+ * ever read units from. Knowing the length is what lets them take an
+ * eight-byte window at `consumed` when that window is still inside the
+ * array, and fall back to the per-bit walk when it is not. */
+#define ZPSE_TILE_UNIT_BYTES 256u
+
+/* Per-lane exclusive popcount of one group's eight mask bits, i.e. the
+ * index, inside the group's eight-byte unit window, of the unit that
+ * position consumes. Lane j of the result counts only the mask bits BELOW
+ * j, so it is in 0..7 for every mask: that is why the window can be a
+ * single aligned slice of eight units and every lane's fetch stays inside
+ * it.
+ *
+ * `bits` is the broadcast mask byte already ANDed with `bitv`, which is
+ * also what the caller's blend tests against `bitv`, so the compare here
+ * costs nothing extra; the ladder is the usual byte prefix sum, three
+ * shift-and-add steps. Deliberately not a 256x8 lookup table: a table
+ * would be 2 KiB of constants whose only definition is "row m lists its
+ * set bits' exclusive counts", and this form is about ten register ops
+ * that the recurrence around it hides anyway.
+ *
+ * Lanes the mask does not mark get an index too. Their unit byte is
+ * fetched and processed but never selected: the blend at the end of the
+ * group takes `x_hat` for those lanes, and lanes past rem are cleared out
+ * of `m8` by the caller's `valid` mask, so a zero there means "no
+ * exception" just as it does in the middle of a tile. */
+static ZPSE_TILE_AVX2 __m128i tile_unit_index(__m128i bits, __m128i bitv,
+                                              __m128i one)
+{
+    __m128i x = _mm_and_si128(_mm_cmpeq_epi8(bits, bitv), one);
+
+    x = _mm_slli_si128(x, 1);
+    x = _mm_add_epi8(x, _mm_slli_si128(x, 1));
+    x = _mm_add_epi8(x, _mm_slli_si128(x, 2));
+    x = _mm_add_epi8(x, _mm_slli_si128(x, 4));
+    return x;
+}
+
 /* Reconstruct a whole CONST or LANEHIST tile eight positions at a time,
  * consuming residual units from units[unit_off..] and returning the new
  * unit count. ent_last/ent_second are the lane histories on entry, which
@@ -1707,37 +1746,9 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
         uint32_t rem = (uint32_t)nt - at;
         uint32_t valid = (rem >= 8u) ? 0xFFu : ((UINT32_C(1) << rem) - 1u);
         uint32_t m8 = (words[g >> 2u] >> ((g & 3u) * 8u)) & valid;
-        uint32_t wg = m8;
-        uint8_t tmp[8];
-        uint32_t cnt = 0;
+        uint32_t cnt = 0u;
         __m128i xhat;
-        __m128i r;
-        __m128i x;
-        __m128i mb;
         __m128i res;
-
-        /* The group's units, placed at the lane of the position they
-         * belong to. A fully set mask byte is a contiguous run, which is
-         * the common case on a dense mask; otherwise walk its set bits
-         * LSB first, which is ascending position order, and drop each
-         * unit into its own lane. Compacting them into tmp[0..cnt) would
-         * be wrong: lane j must hold the unit of position at + j, not the
-         * j-th unit. */
-        if (m8 == 0xFFu) {
-            memcpy(tmp, units + consumed, 8);
-            cnt = 8u;
-        } else {
-            uint32_t bit = 0;
-
-            while (wg != 0u) {
-                if ((wg & 1u) != 0u) {
-                    tmp[bit] = units[consumed + cnt];
-                    cnt++;
-                }
-                wg >>= 1;
-                bit++;
-            }
-        }
 
         if (fam == TILE_FAM_CONST) {
             xhat = cvec;
@@ -1749,26 +1760,76 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
             xhat = _mm_avg_epu8(prev1, prev2);
         }
 
-        r = _mm_loadl_epi64((const __m128i *)(const void *)tmp);
-        if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
-            x = r;
-        } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
-            x = _mm_add_epi8(xhat, r);
+        /* A group with no exception in it needs no units and no blend:
+         * the blend below returns x_hat for every lane, which is what res
+         * is set to here. Sparse tiles (a handful of exceptions in 256
+         * positions) take this branch for almost every group. */
+        if (m8 == 0u) {
+            res = xhat;
         } else {
-            /* Exclusion inverse: r < x_hat ? r : r + 1, unsigned. */
-            __m128i ge = _mm_cmpeq_epi8(_mm_max_epu8(r, xhat), r);
+            const __m128i bits =
+                _mm_and_si128(_mm_set1_epi8((char)m8), bitv);
+            __m128i mb;
+            __m128i r;
+            __m128i x;
 
-            x = _mm_add_epi8(r, _mm_and_si128(ge, one));
+            /* The group's units, placed at the lane of the position they
+             * belong to: lane j takes unit popcount(m8 below j), which is
+             * what tile_unit_index() produces. Compacting them into the
+             * low lanes instead would be wrong -- lane j must hold the
+             * unit of position at + j, not the j-th unit. A fully set mask
+             * byte is the identity case: the indices come out 0..7, so the
+             * eight units are taken in order.
+             *
+             * The window is the eight bytes at `consumed`, which is the
+             * most any group can consume, so every index is inside it. It
+             * is only read when those eight bytes are still inside the
+             * unit array; the last groups of a tile with more than 248
+             * exceptions would run past its end, and those keep the per-bit
+             * walk, which never reads beyond the units the group consumes
+             * (consumed + popcount(m8) <= k <= ZPSE_TILE_UNIT_BYTES). */
+            cnt = (uint32_t)tile_popcount32(m8);
+            if ((uint32_t)consumed + 8u <= ZPSE_TILE_UNIT_BYTES) {
+                r = _mm_shuffle_epi8(
+                    _mm_loadl_epi64(
+                        (const __m128i *)(const void *)(units + consumed)),
+                    tile_unit_index(bits, bitv, one));
+            } else {
+                uint8_t tmp[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+                uint32_t got = 0u;
+                uint32_t wg = m8;
+                uint32_t bit = 0u;
+
+                while (wg != 0u) {
+                    if ((wg & 1u) != 0u) {
+                        tmp[bit] = units[consumed + got];
+                        got++;
+                    }
+                    wg >>= 1u;
+                    bit++;
+                }
+                r = _mm_loadl_epi64((const __m128i *)(const void *)tmp);
+            }
+
+            if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+                x = r;
+            } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+                x = _mm_add_epi8(xhat, r);
+            } else {
+                /* Exclusion inverse: r < x_hat ? r : r + 1, unsigned. */
+                __m128i ge = _mm_cmpeq_epi8(_mm_max_epu8(r, xhat), r);
+
+                x = _mm_add_epi8(r, _mm_and_si128(ge, one));
+            }
+
+            /* Expand the group's eight mask bits into a byte mask: bit j
+             * of the byte is exactly the bit value of lane j, so
+             * broadcasting the byte and comparing the AND against those
+             * per-lane values leaves 0xFF where the bit is set. */
+            mb = _mm_cmpeq_epi8(bits, bitv);
+            res = _mm_or_si128(_mm_and_si128(mb, x),
+                               _mm_andnot_si128(mb, xhat));
         }
-
-        /* Expand the group's eight mask bits into a byte mask: bit j of
-         * the byte is exactly the bit value of lane j, so broadcasting
-         * the byte and comparing the AND against those per-lane values
-         * leaves 0xFF where the bit is set. */
-        mb = _mm_cmpeq_epi8(_mm_and_si128(_mm_set1_epi8((char)m8), bitv),
-                            bitv);
-        res = _mm_or_si128(_mm_and_si128(mb, x),
-                           _mm_andnot_si128(mb, xhat));
 
         consumed = (uint16_t)(consumed + (uint16_t)cnt);
         if (rem >= 8u) {

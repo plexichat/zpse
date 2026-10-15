@@ -259,13 +259,58 @@ static int zpse_t_avx2(void)
  * own inclusive prefix, so the high half still needs the low half's TOTAL
  * added to every byte of it -- not the low half's prefixes, which is what
  * adding the shifted vector would do. Broadcast that single byte (the low
- * half's last byte) into the high half and leave the low half zero. */
-static ZPSE_T_AVX2 __m256i zpse_avx2_lane_total(__m256i x)
+ * half's last byte) into the high half and leave the low half zero.
+ *
+ * The byte to broadcast is byte 15, the high byte of word 7 of the LOW
+ * half. Selecting it with `vpshufb` and then moving that half up costs two
+ * shuffle-port ops and leaves the total in the vector domain, where the
+ * obvious `_mm_extract_epi16` / `_mm_set1_epi8` / `_mm256_inserti128_si256`
+ * form pays a vector->GPR->vector round trip (two extra shuffle-port ops
+ * plus three to five cycles of latency) on the critical path of every
+ * 32-byte block. Shuffles are the binding resource in this kernel -- four
+ * in-lane `vpslldq` per 32 bytes cannot be avoided, everything else can --
+ * so the round trip goes. */
+static const uint8_t zpse_avx2_ctl15[32] = {
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80
+};
+
+/* Same idea as the control above, but with byte 15 selected in BOTH lanes,
+ * for `zpse_avx2_bcast_hi_byte` (the high half's byte 15 is mirrored into
+ * the low half first, so one table serves both halves). */
+static const uint8_t zpse_avx2_ctl15_all[32] = {
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15
+};
+
+/* Both helpers take their shuffle control as a parameter: it is one of the
+ * two constant tables above, loaded once by the kernel, because a byte-wise
+ * scan runs these helpers twice per 32-byte block and a register the kernel
+ * already holds beats a memory operand in that position. */
+static ZPSE_T_AVX2 __m256i zpse_avx2_lane_total(__m256i ctl, __m256i x)
 {
-    uint8_t t = (uint8_t)(_mm_extract_epi16(_mm256_castsi256_si128(x), 7)
-                          >> 8);
-    return _mm256_inserti128_si256(_mm256_setzero_si256(),
-                                   _mm_set1_epi8((char)t), 1);
+    /* vpshufb is per 128-bit lane, so index 15 in the low lane copies
+     * byte 15 into every byte of that lane, and the 0x80 indices (bit 7
+     * set) zero the high lane. The permute then puts that broadcast into
+     * the high half and zeroes the low one. */
+    __m256i t = _mm256_shuffle_epi8(x, ctl);
+
+    return _mm256_permute2x128_si256(t, t, 0x08);
+}
+
+/* Broadcast a 32-byte block's LAST byte (its total, for this scan) to all
+ * 32 bytes of the result. Byte 31 is the high byte of word 15 in the high
+ * 128-bit lane, so the permute first mirrors that lane into the low one
+ * (imm 0x11 selects a.high for both halves) and the shuffle then copies
+ * byte 15 of each lane into every byte of that lane. Two shuffle-port ops
+ * and no vector->GPR round trip, which is what lets the chunk loop below
+ * keep the whole carry chain in vector registers. */
+static ZPSE_T_AVX2 __m256i zpse_avx2_bcast_hi_byte(__m256i ctl, __m256i x)
+{
+    __m256i m = _mm256_permute2x128_si256(x, x, 0x11);
+
+    return _mm256_shuffle_epi8(m, ctl);
 }
 
 #define ZPSE_DEFINE_PREFIX_SCAN32(kernel_name, OPV, OP8)                     \
@@ -278,40 +323,54 @@ static ZPSE_T_AVX2 void kernel_name(const uint8_t *src, uint8_t *dst,        \
     if (src == 0 || dst == 0 || n == 0u) {                                  \
         return;                                                             \
     }                                                                       \
-    /* Whole 256-byte chunks: eight independent 32-byte ladders, then the  \
-     * eight block totals folded into one exclusive carry per block, then  \
-     * the blocks rebased with one broadcast op each. */                   \
+    const __m256i ctl_lo = _mm256_loadu_si256(                              \
+        (const __m256i *)(const void *)zpse_avx2_ctl15);                    \
+    const __m256i ctl_all = _mm256_loadu_si256(                             \
+        (const __m256i *)(const void *)zpse_avx2_ctl15_all);                \
+    /* Whole 256-byte chunks: eight independent 32-byte ladders, the carry  \
+     * chain kept in a vector register, and one broadcast op per block. */ \
     for (; (size_t)j + 256u <= (size_t)n; j += 256u) {                      \
-        __m256i v[8];                                                       \
-        uint8_t tot[8];                                                     \
-        uint8_t acc = pv;                                                   \
+        /* The carry lives in a vector register as a 32-byte broadcast of   \
+         * the running value, one block at a time: block b is rebased by    \
+         * the broadcast of everything before it, and the broadcast for     \
+         * the next block is this block's own total, which is final as      \
+         * soon as its five ladder steps are done. Nothing leaves the       \
+         * vector domain inside the chunk -- no per-block 256-bit extract,  \
+         * no eight-byte `tot[]` array and no second pass over the blocks   \
+         * -- which is what a byte-wise scan wants, because its binding     \
+         * resource is shuffle-port throughput: four `vpslldq` per 32       \
+         * bytes are irreducible, and the per-block bookkeeping around      \
+         * them is the part that can be made cheaper. The op below is the   \
+         * same op the scalar chain used, applied to a broadcast, and       \
+         * broadcasting commutes with it, so this is the same arithmetic.   \
+         */                                                                 \
+        __m256i c = _mm256_set1_epi8((char)pv);                             \
         unsigned b;                                                         \
                                                                             \
         for (b = 0; b < 8u; b++) {                                          \
             __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)  \
                                            (src + (size_t)j +               \
                                             (size_t)b * 32u));              \
+            __m256i nb;                                                     \
+                                                                            \
             x = OPV(x, _mm256_slli_si256(x, 1));                            \
             x = OPV(x, _mm256_slli_si256(x, 2));                            \
             x = OPV(x, _mm256_slli_si256(x, 4));                            \
             x = OPV(x, _mm256_slli_si256(x, 8));                            \
-            x = OPV(x, zpse_avx2_lane_total(x));                            \
-            v[b] = x;                                                       \
-            /* Word 15 holds bytes 30 and 31, so the block total is its     \
-             * HIGH byte. */                                                \
-            tot[b] = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);           \
-        }                                                                   \
-        for (b = 0; b < 8u; b++) {                                          \
-            uint8_t c = acc;                                                \
-            acc = OP8(acc, tot[b]);                                         \
-            tot[b] = c;                                                     \
-        }                                                                   \
-        for (b = 0; b < 8u; b++) {                                          \
+            x = OPV(x, zpse_avx2_lane_total(ctl_lo, x));                    \
+            /* The block's total, broadcast, taken BEFORE the carry is      \
+             * folded in: byte 31 of the rebased block is the total op the  \
+             * carry, and `c` is the carry broadcast, so folding first      \
+             * would fold it in twice for the additive scan. */             \
+            nb = zpse_avx2_bcast_hi_byte(ctl_all, x);                       \
             _mm256_storeu_si256((__m256i *)(void *)(dst + (size_t)j +       \
                                                    (size_t)b * 32u),        \
-                                OPV(v[b], _mm256_set1_epi8((char)tot[b]))); \
+                                OPV(x, c));                                 \
+            c = OPV(c, nb);                                                 \
         }                                                                   \
-        pv = acc;                                                           \
+        /* Every byte of c is the running value after the chunk, so any     \
+         * one of them is the scalar `pv` the tail loops continue from. */  \
+        pv = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c));         \
     }                                                                       \
     /* Whole 32-byte blocks: one ladder plus its carry. */                  \
     for (; (size_t)j + 32u <= (size_t)n; j += 32u) {                        \
@@ -321,9 +380,11 @@ static ZPSE_T_AVX2 void kernel_name(const uint8_t *src, uint8_t *dst,        \
         x = OPV(x, _mm256_slli_si256(x, 2));                                \
         x = OPV(x, _mm256_slli_si256(x, 4));                                \
         x = OPV(x, _mm256_slli_si256(x, 8));                                \
-        x = OPV(x, zpse_avx2_lane_total(x));                                \
+        x = OPV(x, zpse_avx2_lane_total(ctl_lo, x));                        \
         x = OPV(x, _mm256_set1_epi8((char)pv));                             \
         _mm256_storeu_si256((__m256i *)(void *)(dst + (size_t)j), x);       \
+        /* The carry into the next block is this block's last byte, which  \
+         * is byte 31 == the high byte of word 15 as in the chunk loop. */ \
         pv = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);                   \
     }                                                                       \
     /* Scalar remainder (fewer than 32 bytes left, or n < 32 overall). */   \
