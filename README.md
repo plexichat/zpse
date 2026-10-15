@@ -175,22 +175,27 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encode GB/s | decode GB/s |
 | --- | --- | --- | --- |
-| zeros | 0.040 | 12.8 | 14.8 |
-| incr | 0.040 | 1.1 | 6.9 |
-| random | 1.000 | 0.41 | 21.2 |
-| sparse | 0.060 | 0.32 | 3.7 |
-| strided | 0.040 | 1.0 | 6.8 |
-| const5A | 0.040 | 12.8 | 14.9 |
-| alt00FF | 0.040 | 2.5 | 12.4 |
-| sawtooth | 0.163 | 0.23 | 1.1 |
-| lowentropy | 0.688 | 0.08 | 0.5 |
-| sparse2 | 0.048 | 0.49 | 5.1 |
+| zeros | 0.040 | 12.5 | 16.0 |
+| incr | 0.040 | 1.0 | 8.6 |
+| random | 1.000 | 0.42 | 20.4 |
+| sparse | 0.060 | 0.32 | 4.7 |
+| strided | 0.040 | 1.0 | 8.6 |
+| const5A | 0.040 | 12.1 | 16.2 |
+| alt00FF | 0.040 | 2.4 | 13.7 |
+| sawtooth | 0.163 | 0.23 | 1.2 |
+| lowentropy | 0.688 | 0.08 | 0.9 |
+| sparse2 | 0.048 | 0.48 | 5.1 |
 
 The same run reports this machine's ceilings for the same 64 KiB working
-set: memcpy 51-69 GB/s, memset 87-127 GB/s and CRC32-C 24-31 GB/s. The
-CRC32-C rate matters because every block carries a checksum of its
-decoded bytes, so on the fastest paths (14.9 GB/s with a 30 GB/s CRC) the
-checksum alone is about a third of the decode time.
+set: memcpy 69 GB/s, memset 123 GB/s and CRC32-C 30.5 GB/s. The CRC32-C
+rate matters because every block carries a checksum of its decoded bytes,
+so on the fastest paths - 16.2 GB/s against a 30.5 GB/s checksum - the
+checksum is about half of the decode time, and it is now the floor under
+this table: `crc32 r64,r64` retires one instruction per cycle here, which
+is 8 B/cycle = 30 GB/s, and a PCLMULQDQ fold cannot beat that on a core
+that retires one carry-less multiply per cycle (a fold-by-4 needs eight of
+them per 64 bytes, the same 8 B/cycle). Holding the checksum down would
+take a machine with two clmul per cycle or AVX-512 `VPCLMULQDQ`.
 
 What sets each direction: encode is dominated by the per-tile predictor
 search - the AVX2 prescreen computes the exception count of eight
@@ -202,10 +207,14 @@ residuals and the signed-delta range come out of one AVX2 pass, and the
 predictions and residuals are compacted into position order with a
 256-entry byte-shuffle table. Decode is dominated by reconstruction
 (exception tiles), the segment transforms, and the CRC; all-hit runs of a
-segment coalesce into a single fill, the delta8/xor8 inverses are AVX2
-prefix scans, strided reconstruction is branchless (which is what lifts
-the exception-heavy `lowentropy` row), and a single-segment raw-bytes
-block decodes straight into the caller's buffer.
+segment coalesce into a single fill (and a run's records are now compared
+two at a time), the delta8/xor8 inverses are AVX2 prefix scans whose carry
+never leaves the vector domain, strided reconstruction is branchless and
+interleaves its residue classes, and a single-segment raw-bytes block
+decodes straight into the caller's buffer. On the exception-heavy rows the
+work moved into wide code: a dense tile's residual units are placed with a
+shuffle instead of a per-bit walk, and palette residual payloads unpack
+sixteen values at a time (which is most of the `lowentropy` row's 3.2x).
 
 ## License
 
