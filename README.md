@@ -65,7 +65,10 @@ amalgamation has no duplicate names.
   Under MSVC the AVX2 intrinsics compile only when the translation unit is
   built with `/arch:AVX2` — without it the verified-equivalent scalar paths
   are used instead. Defining `ZPSE_FORCE_SCALAR` disables SIMD dispatch
-  entirely (this is what the parity test builds).
+  entirely (this is what the parity test builds). `ZPSE_FORCE_TRIAL_SWAP`
+  is the other test hook: it makes the block encoder attempt its width-1
+  candidates in the opposite order on every block, which changes no output
+  (see the testing and performance sections).
 
 Build the library together with any program of yours:
 
@@ -139,13 +142,21 @@ non-zero exit code if any of them fails:
 | `test_hostile.c` | truncations, bit flips, reserved bits, bad transform ids, bad mask/residual payloads, output-overflow, random garbage — all must return a status, never crash |
 | `test_units.c` | CRC, arena layout, header parse/serialize, K derivation, tables, tile round trips over every predictor and residual mode |
 | `test_parity.c` | the full corpus plus four per-primitive sweeps (uniform, small-`nt`/mask-word boundary, stateful-table ids, and the state a classification leaves) |
+| `test_fuzz.c` | a randomized differential corpus: every size 1 to 64, every tile and segment boundary and its neighbours up to 64 KiB, 60 pseudo-random sizes, 18 shapes each (2718 blocks) plus 6 frames, each block round-tripped and its size, compressed length and compressed bytes folded into one digest |
 
-The parity step is the important one: `test_parity.c` is compiled twice, once
-with the default runtime SIMD dispatch and once with `-DZPSE_FORCE_SCALAR`,
-and the runner requires the two runs to print byte-identical output and the
-same `DIGEST` line. The SIMD paths are therefore checked to be bit-exact
-replacements for the scalar reference, and the per-primitive sweeps in the same
-file fold `k`, `nu`, `rmax`, `dmin`, `dmax`, the mask words, the packed
+The parity step is the important one, and it is two checks over three builds
+of the same two suites: `test_parity.c` and `test_fuzz.c` are each compiled
+with the default runtime SIMD dispatch, with `-DZPSE_FORCE_SCALAR` and with
+`-DZPSE_FORCE_TRIAL_SWAP`, and the runner requires all three builds of each to
+exit 0, to print the same digest line, and to be byte-identical everywhere
+else too, so a divergence also names the case that caused it. The first two builds prove the SIMD paths are bit-exact
+replacements for the scalar reference. The third takes the encoder's
+candidate-attempt order and permutes it on every block (see the performance
+note below), which proves that order cannot change a single compressed byte:
+`test_parity.c` does that over the fixed corpus, `test_fuzz.c` over the wide
+randomized one, so the invariant is not a property of the patterns someone
+happened to list. The per-primitive sweeps in `test_parity.c`
+fold `k`, `nu`, `rmax`, `dmin`, `dmax`, the mask words, the packed
 record and the chosen modes into a second digest for every predictor id, so a
 divergence names the predictor that caused it. The four sweeps are:
 
@@ -159,7 +170,10 @@ divergence names the predictor that caused it. The four sweeps are:
 A successful run ends with:
 
 ```
-parity ok: DIGEST <value> (identical streams)
+parity ok (scalar): DIGEST <value> identical streams
+parity ok (swap): DIGEST <value> identical streams
+fuzz ok (scalar): FUZZ cases=2718 frames=6 digest=<value> identical streams
+fuzz ok (swap): FUZZ cases=2718 frames=6 digest=<value> identical streams
 ALL SUITES PASS
 ```
 
@@ -191,19 +205,54 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.040 | 2616 | 12.8 | 16.5 |
-| incr | 0.040 | 2619 | 1.2 | 8.6 |
-| random | 1.000 | 65568 | 0.45 | 20.8 |
+| zeros | 0.040 | 2616 | 12.7 | 16.3 |
+| incr | 0.040 | 2619 | 1.5 | 8.6 |
+| random | 1.000 | 65568 | 0.45 | 20.9 |
 | sparse | 0.060 | 3962 | 0.38 | 4.7 |
-| strided | 0.040 | 2625 | 1.1 | 8.6 |
-| const5A | 0.040 | 2616 | 12.3 | 16.8 |
-| alt00FF | 0.040 | 2618 | 2.5 | 13.9 |
-| sawtooth | 0.163 | 10656 | 0.26 | 1.2 |
+| strided | 0.040 | 2625 | 1.3 | 8.6 |
+| const5A | 0.040 | 2616 | 12.4 | 16.5 |
+| alt00FF | 0.040 | 2618 | 2.4 | 13.9 |
+| sawtooth | 0.163 | 10656 | 0.33 | 1.2 |
 | lowentropy | 0.688 | 45058 | 0.13 | 0.9 |
-| sparse2 | 0.048 | 3126 | 0.54 | 5.2 |
+| sparse2 | 0.048 | 3126 | 0.54 | 5.1 |
 
-This round's encode change is in the block-level trial sweep, and it moved
-three rows: measured by alternating the two binaries in the same clock
+The table is one session and the deltas below are paired measurements, so the
+absolute columns move between machines and runs while the sizes and the ratios
+do not: all ten `clen` values are the ones this format has always produced,
+and the compressed bytes of the whole test corpus are the same digest the
+previous round printed.
+
+This round's encode change is a candidate-attempt order picked from the
+tile encoder's own prescreen. The sweep's result does not depend on the order
+it tries its candidates in - the winner is the smallest total, ties going to
+the earlier candidate in the list, and that is applied explicitly - so the
+order is a free knob, and it pays because a later candidate is handed the
+running winner as a size bound: attempting the likely winner first is what
+makes the losers stop early. Only the two width-1 candidates can be swapped,
+which keeps the argument tight: the attempted set is the same in both orders,
+so the floor-based exit sees a superset of what it saw before and can only
+stop later (never earlier), the two-failure exit still costs exactly two
+attempts over the same two candidates, and no tie can resolve differently.
+The estimate that picks the order samples six tiles spread across the block,
+prescreens each on both planes with the same call the segment encoder makes,
+and swaps only when DELTA8's plane is at least four times more predictable
+than the raw bytes - a clear margin, because a wrong swap costs the trial the
+other order would have stopped, and low-entropy data can look equally bad on
+both planes. It is a sample, not a bound: it is used only to pick an order, so
+a bad estimate costs time, never a different block. On a block too small to
+lose a tile's worth of work it is not run at all, and it bails out as soon as
+a plane looks like it will hit the global floor. Measured the same way as the
+trial bound (paired, alternating binaries, min per pattern): `incr` 1.24x,
+`strided` 1.16x, `sawtooth` 1.27x, every other row within the 1% noise floor
+and all ten compressed sizes identical - the rows it moves are exactly the
+ramps and strides, where the identity trial is a full block of the most
+expensive tiles the encoder has and loses to DELTA8 by a factor of four or
+more. `-DZPSE_FORCE_TRIAL_SWAP` is the test hook that takes the other
+decision on every block, so the difference between the two orders is covered
+by the parity step above rather than by inspection.
+
+This round's earlier encode change is in the block-level trial sweep, and it
+moved three rows: measured by alternating the two binaries in the same clock
 state (best of three rounds of 900 compressions, min per pattern), the
 `sparse` row is 1.12x, `lowentropy` 1.12x and `sparse2` 1.06x, with every
 other row within 1% (including `random`, whose incompressible path is
@@ -211,12 +260,12 @@ deliberately untouched) and all ten compressed sizes byte-identical. The
 decode column is unchanged code this round and measures within 2%.
 
 The same run reports this machine's ceilings for the same 64 KiB working
-set: memcpy 69 GB/s, memset 123 GB/s and CRC32-C 30.5 GB/s. The CRC32-C
+set: memcpy 69 GB/s, memset 126 GB/s and CRC32-C 30.9 GB/s. The CRC32-C
 rate matters because every block carries a checksum of its decoded bytes,
-so on the fastest paths - 16.2 GB/s against a 30.5 GB/s checksum - the
+so on the fastest paths - 16.3 GB/s against a 30.9 GB/s checksum - the
 checksum is about half of the decode time, and it is now the floor under
 this table: `crc32 r64,r64` retires one instruction per cycle here, which
-is 8 B/cycle = 30 GB/s, and a PCLMULQDQ fold cannot beat that on a core
+is 8 B/cycle = ~31 GB/s, and a PCLMULQDQ fold cannot beat that on a core
 that retires one carry-less multiply per cycle (a fold-by-4 needs eight of
 them per 64 bytes, the same 8 B/cycle). Holding the checksum down would
 take a machine with two clmul per cycle or AVX-512 `VPCLMULQDQ`.
@@ -245,7 +294,7 @@ work moved into wide code: a dense tile's residual units are placed with a
 shuffle instead of a per-bit walk, and palette residual payloads unpack
 sixteen values at a time (which is most of the `lowentropy` row's 3.2x).
 
-That trial sweep is where this round's encode win comes from, and it is
+That trial sweep is where the previous round's encode win came from, and it is
 worth recording what it can and cannot do. Every block runs the candidate
 transforms in turn and keeps the smallest; an instrumented build shows
 `lowentropy` running all three to completion (identity 45058 bytes,

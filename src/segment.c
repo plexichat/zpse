@@ -835,6 +835,15 @@ static void seg_write_all_hit(uint8_t *dst, uint8_t predictor_id,
     zpse_store_u16le(dst + 8, 0u); /* residual payload size */
 }
 
+void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
+                            const uint8_t *seg_base, uint32_t seg_pos,
+                            uint8_t initial_literal, uint16_t ks[11])
+{
+    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+
+    seg_prescreen(a, nt, seg_base, seg_pos, initial_literal, have_avx2, ks);
+}
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,

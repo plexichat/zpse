@@ -554,6 +554,135 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
            10u * tiles;
 }
 
+/* ------------------------------------------------------------------ *
+ * Candidate attempt order.
+ *
+ * The sweep's result does not depend on the order the candidates are
+ * attempted in, which makes that order a free performance knob:
+ *
+ *   - the winner is the smallest total with ties going to the earlier
+ *     candidate in the LIST (index) order, which is applied explicitly at
+ *     the comparison below;
+ *   - the running-winner bound hands a later candidate the tightest size
+ *     it must beat, so attempting the likely winner first is what makes
+ *     the losers stop early;
+ *   - the floor-based exit is evaluated over the candidates NOT yet
+ *     attempted, and the two-failure exit needs two attempts, so the two
+ *     exits fire at the same points their candidate sets allow.
+ *
+ * Only the two width-1 candidates can be swapped, and that is what makes
+ * the argument tight: the attempted SET is {0, 1, ...} in both orders, so
+ * the two-failure exit still costs exactly two attempts over the same two
+ * candidates, while the floor check after the first attempt sees a
+ * superset of what it saw before (the identity's floor is one byte below
+ * DELTA8's, so its threshold is never the higher one and the sweep can
+ * only stop later, never earlier). No candidate is ever skipped that the
+ * other order would have attempted, and no tie can resolve differently.
+ * Defaulting to the identity first is therefore safe, and swapping is safe
+ * whenever the sample below says DELTA8's plane is much more predictable
+ * than the raw bytes -- which is the case for ramps and strides, where the
+ * identity trial is a full block of near-all-exception tiles -- the most
+ * expensive work the tile encoder does -- that loses to DELTA8 by a
+ * factor of four or more.
+ *
+ * The estimate is a sample, not a bound: it is used only to pick the
+ * order, so a bad estimate costs the work the other order would have
+ * saved, never a different block. A bound strong enough to PRUNE a
+ * candidate cannot be built this cheaply -- a tile's floor given its
+ * exception count k is roughly 8 + (mask bits) + k/8 bytes, about 40
+ * bytes even for k near Nt, against the ~200 bytes such a tile actually
+ * packs to, so no sum of per-tile floors reaches the sizes this format
+ * produces. Ordering is the only use of the prescreen that pays.
+ *
+ * The sample: six tiles spread across the block, prescreened on both
+ * planes. The identity's plane is the input; DELTA8's is
+ * in[q] - in[q - 1] (its first byte is 0 because its seed is in[0]), so a
+ * sample tile at plane offset p needs only in[p - 17, p + 256) and both
+ * planes are prescreened with the same call the segment encoder makes,
+ * with seg_pos == 16 so a locally-built 16-byte head stands in for the
+ * plane bytes before the tile.
+ * ------------------------------------------------------------------ */
+#define ZPSE_ORDER_SAMPLES 6
+#define ZPSE_ORDER_MIN_TILES 16u
+
+static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
+{
+    uint32_t tc = n / (uint32_t)ZPSE_TILE_SIZE;
+    uint32_t est_id = 0u;
+    uint32_t est_d1 = 0u;
+    unsigned ns;
+    uint8_t loc[16u + ZPSE_TILE_SIZE];
+    unsigned i;
+    unsigned j;
+    unsigned c;
+
+    /* The estimate costs a fixed handful of prescreens while the work it
+     * can save is proportional to the block, so it only runs once a block
+     * has enough tiles to lose: below ZPSE_ORDER_MIN_TILES the identity
+     * trial cannot waste more than its own few tiles and the sweep's floor
+     * test usually ends it after one trial anyway. */
+    if (tc < ZPSE_ORDER_MIN_TILES) {
+        return 0;
+    }
+    ns = (tc >= 8u * ZPSE_ORDER_MIN_TILES) ? (unsigned)ZPSE_ORDER_SAMPLES : 3u;
+
+    for (i = 0; i < ns; i++) {
+        uint32_t t = ((uint32_t)(i + 1u) * tc) / (uint32_t)(ns + 1u);
+        uint32_t p = t * (uint32_t)ZPSE_TILE_SIZE;
+        uint16_t ks[11];
+        uint32_t kmin;
+
+        /* Interior tiles only: the head has to be real plane bytes, and
+         * the DELTA8 window reaches one byte further back still. */
+        if (p < 17u || (uint64_t)p + (uint64_t)ZPSE_TILE_SIZE > (uint64_t)n) {
+            continue;
+        }
+
+        /* Identity plane. `in[0]` is the segment's initial literal. */
+        memcpy(loc, in + p - 16u, 16u);
+        memcpy(loc + 16u, in + p, (size_t)ZPSE_TILE_SIZE);
+        zpse_segment_prescreen(loc + 16u, (uint16_t)ZPSE_TILE_SIZE, loc, 16u,
+                               in[0], ks);
+        kmin = ks[0];
+        for (c = 1u; c < 11u; c++) {
+            if (ks[c] < kmin) {
+                kmin = ks[c];
+            }
+        }
+        est_id += kmin;
+        /* A raw plane that predicts every sampled tile so far is about to
+         * reach the global floor and end the sweep -- and it is the
+         * cheap kind of block (constant, all-hit), where the estimate's
+         * own cost would be the largest part of the encode. Stop before
+         * paying for the other plane. */
+        if (est_id == 0u) {
+            return 0;
+        }
+
+        /* DELTA8 plane over the same window, one byte behind itself. */
+        for (j = 0; j < 16u + (unsigned)ZPSE_TILE_SIZE; j++) {
+            uint32_t q = p - 16u + j;
+
+            loc[j] = (uint8_t)(in[q] - in[q - 1u]);
+        }
+        zpse_segment_prescreen(loc + 16u, (uint16_t)ZPSE_TILE_SIZE, loc, 16u,
+                               0u, ks);
+        kmin = ks[0];
+        for (c = 1u; c < 11u; c++) {
+            if (ks[c] < kmin) {
+                kmin = ks[c];
+            }
+        }
+        est_d1 += kmin;
+    }
+
+    /* Needs a clear margin, not a hair: the two candidates can be close
+     * (low-entropy data favours the identity while both planes look
+     * equally bad to a prescreen), and a wrong swap costs the trial the
+     * other order would have stopped early. */
+    return (est_d1 * 4u <= est_id) ? 1 : 0;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -562,12 +691,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint8_t scounts[4];
     uint8_t meta_bufs[4][2];
     uint16_t meta_lens[4];
+    uint8_t order[4];
     uint32_t in_crc;
     int ncand = 0;
     uint32_t best_total = 0;
+    uint32_t best_idx = 0;
     int have_best = 0;
     int fails = 0;
-    int i;
+    int oi;
     int rc;
 
     if (e == 0 || in == 0 || out == 0) {
@@ -627,7 +758,33 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * instead of once per trial over the same 64 KiB. */
     in_crc = zpse_crc32c(in, n);
 
-    for (i = 0; i < ncand; i++) {
+    /* Attempt order: identity first unless the sample says DELTA8's plane
+     * is much more predictable, and never anything but a swap of those
+     * two (see the argument above the sample). */
+    order[0] = 0;
+    order[1] = 1;
+    order[2] = 2;
+    order[3] = 3;
+    if (ncand >= 2) {
+        int swap = zpse_block_delta_trial_first(in, n);
+
+#if defined(ZPSE_FORCE_TRIAL_SWAP)
+        /* Test hook: take the other decision wherever a decision exists,
+         * so a build with this macro attempts these two candidates in the
+         * opposite order from the default build for every block. The
+         * parity suite builds test_parity.c and test_fuzz.c this way and
+         * requires their streams and digests to be identical to the
+         * default build's, which is what proves the order neutral. */
+        swap = swap ? 0 : 1;
+#endif
+        if (swap) {
+            order[0] = 1;
+            order[1] = 0;
+        }
+    }
+
+    for (oi = 0; oi < ncand; oi++) {
+        int i = order[oi];
         uint32_t t = 0;
         int budget_hit = 0;
         const uint8_t *mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
@@ -648,12 +805,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
             continue;
         }
-        if (!have_best || t < best_total) {
+        /* Smallest total wins; a tie goes to the candidate EARLIER in
+         * the list, so the attempt order cannot change the winner. */
+        if (!have_best || t < best_total ||
+            (t == best_total && (uint32_t)i < best_idx)) {
             if (t > (uint32_t)ZPSE_E_SZ_BEST) {
                 continue;
             }
             memcpy(e->best, e->cand, t);
             best_total = t;
+            best_idx = (uint32_t)i;
             have_best = 1;
         }
         /* Early exit over the candidates that are LEFT, not over all of
@@ -667,9 +828,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * ramp whose winner is DELTA8 still gets its second trial. */
         {
             uint32_t min_floor = UINT32_MAX;
-            int j;
+            int oj;
 
-            for (j = i + 1; j < ncand; j++) {
+            for (oj = oi + 1; oj < ncand; oj++) {
+                int j = order[oj];
                 uint32_t f = zpse_block_floor(n, tids[j], scounts[j],
                                               meta_lens[j]);
                 if (f < min_floor) {

@@ -2,10 +2,13 @@
 # Expects a C compiler on PATH (CC, default gcc). POSIX twin of
 # tests/run.ps1: same suites, same flags, same checks, same exit
 # convention -- build each suite against src/zpse_unity.c and run it,
-# then build tests/test_parity.c twice (default (runtime SIMD dispatch)
-# and -DZPSE_FORCE_SCALAR) and require the two compressed corpora
-# digests and the per-case output to match, proving the SIMD paths are
-# bit-exact replacements for the scalar reference.
+# then build tests/test_parity.c and tests/test_fuzz.c in three modes
+# (default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
+# -DZPSE_FORCE_TRIAL_SWAP) and require every mode's digest and per-case
+# output to match. The first two modes prove the SIMD paths are bit-exact
+# replacements for the scalar reference; the third permutes the encoder's
+# candidate-attempt order and proves that order cannot change a single
+# compressed byte.
 #
 # Run from anywhere. Exit 0 with "ALL SUITES PASS" only when every suite
 # passed; otherwise prints "FAILURES PRESENT" and exits 1.
@@ -48,51 +51,59 @@ for t in test_roundtrip test_combinadic test_hostile test_units; do
     fi
 done
 
-echo "=== scalar/SIMD parity ==="
-parity="$repo/tests/test_parity.c"
-binS="$tmp/parity_simd$exe"
-binR="$tmp/parity_scalar$exe"
-if ! "$CC" -std=c11 -O2 -Wall -Wextra -I "$inc" "$parity" "$unity" -o "$binS"; then
-    echo "BUILD FAILED: parity (simd)"
-    fail=1
-fi
-if ! "$CC" -std=c11 -O2 -Wall -Wextra -DZPSE_FORCE_SCALAR -I "$inc" \
-    "$parity" "$unity" -o "$binR"; then
-    echo "BUILD FAILED: parity (scalar)"
-    fail=1
-fi
+echo "=== scalar/SIMD/order parity ==="
 
-if [ "$fail" -eq 0 ]; then
-    "$binS" >"$tmp/parity_simd.log" 2>&1
-    rcS=$?
-    "$binR" >"$tmp/parity_scalar.log" 2>&1
-    rcR=$?
-    if [ "$rcS" -ne 0 ]; then
-        echo "SUITE FAILED: parity (simd)"
-        fail=1
-    fi
-    if [ "$rcR" -ne 0 ]; then
-        echo "SUITE FAILED: parity (scalar)"
-        fail=1
-    fi
-    grep '^DIGEST' "$tmp/parity_simd.log" >"$tmp/parity_simd.dig" || :
-    grep '^DIGEST' "$tmp/parity_scalar.log" >"$tmp/parity_scalar.dig" || :
-    grep -v '^DIGEST' "$tmp/parity_simd.log" >"$tmp/parity_simd.body" || :
-    grep -v '^DIGEST' "$tmp/parity_scalar.log" >"$tmp/parity_scalar.body" || :
-    digS="$(cat "$tmp/parity_simd.dig")"
-    digR="$(cat "$tmp/parity_scalar.dig")"
-    if [ "$fail" -eq 0 ]; then
-        if ! cmp -s "$tmp/parity_simd.dig" "$tmp/parity_scalar.dig"; then
-            echo "PARITY FAILED: digest $digS vs $digR"
+# `parity` compares whole compressed corpora; `fuzz` does the same over a
+# randomized corpus. Both print one digest line (DIGEST / FUZZ cases=) that
+# must match across the three builds, and the rest of their output must
+# match too, so a divergence names the case that caused it.
+for suite in parity fuzz; do
+    src="$repo/tests/test_$suite.c"
+    built=1
+    for mode in def scalar swap; do
+        case "$mode" in
+        def) fl="" ;;
+        scalar) fl="-DZPSE_FORCE_SCALAR" ;;
+        swap) fl="-DZPSE_FORCE_TRIAL_SWAP" ;;
+        esac
+        echo "=== build $suite ($mode) ==="
+        # shellcheck disable=SC2086
+        if ! "$CC" -std=c11 -O2 -Wall -Wextra $fl -I "$inc" "$src" "$unity" \
+            -o "$tmp/$suite.$mode$exe"; then
+            echo "BUILD FAILED: $suite ($mode)"
             fail=1
-        elif ! cmp -s "$tmp/parity_simd.body" "$tmp/parity_scalar.body"; then
-            echo "PARITY FAILED: per-case output differs"
+            built=0
+        fi
+    done
+    [ "$built" -eq 1 ] || continue
+
+    for mode in def scalar swap; do
+        "$tmp/$suite.$mode$exe" >"$tmp/$suite.$mode.log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "SUITE FAILED: $suite ($mode)"
+            fail=1
+        fi
+    done
+
+    key='^DIGEST'
+    [ "$suite" = fuzz ] && key='^FUZZ cases='
+    grep "$key" "$tmp/$suite.def.log" >"$tmp/$suite.def.dig" || :
+    grep -v "$key" "$tmp/$suite.def.log" >"$tmp/$suite.def.body" || :
+    for mode in scalar swap; do
+        grep "$key" "$tmp/$suite.$mode.log" >"$tmp/$suite.$mode.dig" || :
+        grep -v "$key" "$tmp/$suite.$mode.log" >"$tmp/$suite.$mode.body" || :
+        if ! cmp -s "$tmp/$suite.def.dig" "$tmp/$suite.$mode.dig"; then
+            echo "$suite FAILED: digest $(cat "$tmp/$suite.def.dig") vs $mode $(cat "$tmp/$suite.$mode.dig")"
+            fail=1
+        elif ! cmp -s "$tmp/$suite.def.body" "$tmp/$suite.$mode.body"; then
+            echo "$suite FAILED: per-case output differs in $mode"
             fail=1
         else
-            echo "parity ok: $digS (identical streams)"
+            echo "$suite ok ($mode): $(cat "$tmp/$suite.def.dig") identical streams"
         fi
-    fi
-fi
+    done
+done
 
 if [ "$fail" -eq 0 ]; then
     echo "ALL SUITES PASS"

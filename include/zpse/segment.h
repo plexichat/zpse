@@ -32,4 +32,15 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         uint8_t *payload_out, uint32_t payload_cap,
                         uint32_t byte_budget);
 
+/* The cheap eight-predictor screen zpse_segment_encode runs per tile,
+ * exposed so a caller can ask how predictable a candidate plane is
+ * without encoding it: ks[] receives the exact exception count of each
+ * screened predictor (ids 3, 4 and 9 are unreachable sentinels). `a` is
+ * the tile, `seg_base`/`seg_pos` the plane it sits in (the STRIDE
+ * predictors read seg_base[seg_pos + p - s], and seg_pos == 0 means the
+ * table's first tile, whose preceding plane bytes do not exist). */
+void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
+                            const uint8_t *seg_base, uint32_t seg_pos,
+                            uint8_t initial_literal, uint16_t ks[11]);
+
 #endif /* ZPSE_SEGMENT_H */

@@ -1,10 +1,12 @@
 # Expects gcc on PATH. Run from anywhere; builds each test against
 # src/zpse_unity.c and executes it. Fails on first failing suite.
 #
-# Also builds tests/test_parity.c twice -- default (runtime SIMD
-# dispatch) and -DZPSE_FORCE_SCALAR -- and requires the two compressed
-# corpora digests to match, proving the SIMD paths are bit-exact
-# replacements for the scalar reference.
+# Also builds tests/test_parity.c and tests/test_fuzz.c in three modes --
+# default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
+# -DZPSE_FORCE_TRIAL_SWAP -- and requires every mode's digest and per-case
+# output to match. The first two modes prove the SIMD paths are bit-exact
+# replacements for the scalar reference; the third permutes the encoder's
+# candidate-attempt order and proves order cannot change a compressed byte.
 $repo = Split-Path -Parent $PSScriptRoot
 $inc = Join-Path $repo "include"
 $unity = Join-Path $repo "src/zpse_unity.c"
@@ -21,33 +23,49 @@ foreach ($t in @("test_roundtrip", "test_combinadic", "test_hostile", "test_unit
     if ($LASTEXITCODE -ne 0) { Write-Output "SUITE FAILED: $t"; $fail = 1 }
 }
 
-Write-Output "=== scalar/SIMD parity ==="
-$parity = Join-Path $PSScriptRoot "test_parity.c"
-$exeS = Join-Path $tmp "parity_simd.exe"
-$exeR = Join-Path $tmp "parity_scalar.exe"
-gcc -std=c11 -O2 -Wall -Wextra -I $inc $parity $unity -o $exeS 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Output "BUILD FAILED: parity (simd)"; $fail = 1 }
-gcc -std=c11 -O2 -Wall -Wextra -DZPSE_FORCE_SCALAR -I $inc $parity $unity -o $exeR 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Output "BUILD FAILED: parity (scalar)"; $fail = 1 }
-if ($fail -eq 0) {
-    $outS = & $exeS 2>&1
-    $rcS = $LASTEXITCODE
-    $outR = & $exeR 2>&1
-    $rcR = $LASTEXITCODE
-    if ($rcS -ne 0) { Write-Output "SUITE FAILED: parity (simd)"; $fail = 1 }
-    if ($rcR -ne 0) { Write-Output "SUITE FAILED: parity (scalar)"; $fail = 1 }
-    $digS = ($outS | Select-String '^DIGEST').Line
-    $digR = ($outR | Select-String '^DIGEST').Line
-    $bodyS = $outS | Where-Object { $_ -notmatch '^DIGEST' }
-    $bodyR = $outR | Where-Object { $_ -notmatch '^DIGEST' }
-    if ($digS -ne $digR) {
-        Write-Output "PARITY FAILED: digest $digS vs $digR"
-        $fail = 1
-    } elseif (Compare-Object $bodyS $bodyR) {
-        Write-Output "PARITY FAILED: per-case output differs"
-        $fail = 1
-    } else {
-        Write-Output "parity ok: $digS (identical streams)"
+Write-Output "=== scalar/SIMD/order parity ==="
+# `parity` compares whole compressed corpora; `fuzz` does the same over a
+# randomized corpus. Both print one digest line (DIGEST / FUZZ cases=) that
+# must match across the three builds, and the rest of their output must
+# match too, so a divergence names the case that caused it.
+foreach ($suite in @("parity", "fuzz")) {
+    $src = Join-Path $PSScriptRoot "test_$suite.c"
+    $built = $true
+    foreach ($mode in @("def", "scalar", "swap")) {
+        $exe = Join-Path $tmp "$suite.$mode.exe"
+        Write-Output "=== build $suite ($mode) ==="
+        switch ($mode) {
+            "def" { gcc -std=c11 -O2 -Wall -Wextra -I $inc $src $unity -o $exe 2>&1 }
+            "scalar" { gcc -std=c11 -O2 -Wall -Wextra -DZPSE_FORCE_SCALAR -I $inc $src $unity -o $exe 2>&1 }
+            "swap" { gcc -std=c11 -O2 -Wall -Wextra -DZPSE_FORCE_TRIAL_SWAP -I $inc $src $unity -o $exe 2>&1 }
+        }
+        if ($LASTEXITCODE -ne 0) { Write-Output "BUILD FAILED: $suite ($mode)"; $fail = 1; $built = $false }
+    }
+    if (-not $built) { continue }
+
+    $logs = @{}
+    foreach ($mode in @("def", "scalar", "swap")) {
+        $out = & (Join-Path $tmp "$suite.$mode.exe") 2>&1
+        $rc = $LASTEXITCODE
+        $logs[$mode] = $out
+        if ($rc -ne 0) { Write-Output "SUITE FAILED: $suite ($mode)"; $fail = 1 }
+    }
+
+    $key = if ($suite -eq "fuzz") { '^FUZZ cases=' } else { '^DIGEST' }
+    $digDef = ($logs["def"] | Select-String $key).Line
+    $bodyDef = $logs["def"] | Where-Object { $_ -notmatch $key }
+    foreach ($mode in @("scalar", "swap")) {
+        $dig = ($logs[$mode] | Select-String $key).Line
+        $body = $logs[$mode] | Where-Object { $_ -notmatch $key }
+        if ($dig -ne $digDef) {
+            Write-Output "$suite FAILED: digest $digDef vs $mode $dig"
+            $fail = 1
+        } elseif (Compare-Object $bodyDef $body) {
+            Write-Output "$suite FAILED: per-case output differs in $mode"
+            $fail = 1
+        } else {
+            Write-Output "$suite ok ($mode): $digDef identical streams"
+        }
     }
 }
 
