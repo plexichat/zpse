@@ -417,9 +417,10 @@ static int tile_fam_is_vectorisable(int fam)
 #define TILE_CL_CHUNK(v_, pv_, MASK_)                                       \
     do {                                                                    \
         __m256i _eq = _mm256_cmpeq_epi8(v_, pv_);                           \
-        __m256i _ex = _mm256_and_si256(                                     \
-            _mm256_xor_si256(_eq, _mm256_set1_epi8((char)-1)), MASK_);      \
-        words[(uint32_t)p >> 5] |= (uint32_t)_mm256_movemask_epi8(_ex);     \
+        /* andnot is ~_eq & MASK, i.e. the same 32 exception bits as        \
+         * XOR-against-all-ones followed by an AND, in one instruction. */  \
+        words[(uint32_t)p >> 5] |= (uint32_t)_mm256_movemask_epi8(          \
+            _mm256_andnot_si256(_eq, MASK_));                               \
     } while (0)
 
 /* ------------------------------------------------------------------ *
@@ -694,6 +695,24 @@ static const uint8_t tile_cmp_lut[256][8] = {
     {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07}
 };
 
+/* Horizontal maximum of a 32-byte vector of unsigned bytes: the fold the
+ * dense bookkeeping used to spell out as 32 scalar compares, in five
+ * min/max steps. A zero-fill shift is safe here because this is a
+ * maximum of unsigned bytes and a zero can never raise one -- which is
+ * also why the SMALLEST delta is accumulated as the maximum of its
+ * complement below. */
+static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
+{
+    __m128i m = _mm_max_epu8(_mm256_castsi256_si128(v),
+                             _mm256_extracti128_si256(v, 1));
+
+    m = _mm_max_epu8(m, _mm_srli_si128(m, 8));
+    m = _mm_max_epu8(m, _mm_srli_si128(m, 4));
+    m = _mm_max_epu8(m, _mm_srli_si128(m, 2));
+    m = _mm_max_epu8(m, _mm_srli_si128(m, 1));
+    return (uint8_t)_mm_cvtsi128_si32(m);
+}
+
 static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
     const uint8_t *stg, uint16_t nt, uint8_t predictor_id, int fam,
     uint8_t c, uint32_t s, const uint32_t words[8], ZpseTileClass *cl,
@@ -701,7 +720,6 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
 {
     uint8_t tp[272];
     uint8_t tr[272];
-    uint32_t sn[4][8];
     uint32_t k = 0u;
     unsigned ch;
     unsigned i;
@@ -713,7 +731,15 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
         16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31);
     __m256i rmaxv = _mm256_setzero_si256();
     __m256i dmaxv = _mm256_setzero_si256();
-    __m256i dminv = all;
+    /* The smallest signed-delta byte is accumulated as the largest
+     * COMPLEMENT: an excluded lane contributes 0x00, which is neutral for
+     * a maximum, and the minimum comes back out as ~max at the end. All
+     * three reductions are therefore maxima and the horizontal fold above
+     * can zero-fill. When there is at least one exception -- which is why
+     * this function was called -- the fold returns exactly
+     * min(db over exceptions), the value the old all-ones-seeded minimum
+     * returned. */
+    __m256i ndminv = _mm256_setzero_si256();
 
     for (ch = 0; ch * 32u < (unsigned)nt; ch++) {
         unsigned p = ch * 32u;
@@ -755,7 +781,10 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
         db = _mm256_add_epi8(_mm256_sub_epi8(v, pv), b128);
         rmaxv = _mm256_max_epu8(rmaxv, _mm256_and_si256(r, ex));
         dmaxv = _mm256_max_epu8(dmaxv, _mm256_and_si256(db, ex));
-        dminv = _mm256_min_epu8(dminv, _mm256_or_si256(db, _mm256_xor_si256(ex, all)));
+        ndminv = _mm256_max_epu8(
+            ndminv,
+            _mm256_xor_si256(_mm256_or_si256(db, _mm256_xor_si256(ex, all)),
+                             all));
 
         for (h = 0; h < 2u; h++) {
             __m128i pd = h ? _mm256_extracti128_si256(pv, 1) : _mm256_castsi256_si128(pv);
@@ -776,42 +805,49 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
     memcpy(cl->at_pred, tp, k);
     memcpy(cl->res_at_exc, tr, k);
 
-    /* distinct-residual set, four interleaved bitmaps to break the
-     * load-modify-store dependency chain. cl->seen is the COMPLETE set --
-     * cl->nu is its popcount and callers test it -- so every unit is
-     * counted; stopping early once 17 values are known would leave the set
-     * a strict subset, which is not what the scalar path returns and is
-     * what the scalar/SIMD parity suite compares. */
-    memset(sn, 0, sizeof sn);
-    for (i = 0; i < k; ) {
-        unsigned lim = i + 32u < k ? i + 32u : k;
-        for (; i + 4u <= lim; i += 4u) {
-            unsigned r0 = tr[i], r1 = tr[i + 1u], r2 = tr[i + 2u], r3 = tr[i + 3u];
-            sn[0][r0 >> 5] |= 1u << (r0 & 31u);
-            sn[1][r1 >> 5] |= 1u << (r1 & 31u);
-            sn[2][r2 >> 5] |= 1u << (r2 & 31u);
-            sn[3][r3 >> 5] |= 1u << (r3 & 31u);
-        }
-        for (; i < lim; i++) {
-            unsigned r0 = tr[i];
-            sn[0][r0 >> 5] |= 1u << (r0 & 31u);
-        }
-    }
-    for (i = 0; i < 8u; i++)
-        cl->seen[i] = sn[0][i] | sn[1][i] | sn[2][i] | sn[3][i];
-
+    /* distinct-residual set. cl->seen is the COMPLETE set -- cl->nu is its
+     * popcount and callers test it -- so every unit is stored; stopping
+     * early once 17 values are known would leave the set a strict subset,
+     * which is not what the scalar path returns and is what the scalar/
+     * SIMD parity suite compares.
+     *
+     * A 256-byte presence array needs one independent byte store per
+     * exception and no read-modify-write, where the four-bitmap form paid
+     * a load and a store through a data-dependent address for each unit.
+     * Word w bit j of cl->seen is then "value 32*w + j is present", which
+     * is the bit the scalar path sets: the compare against zero marks the
+     * ABSENT values and the complement of its movemask has a one exactly
+     * where a presence byte is nonzero. */
     {
-        uint8_t t8[32];
-        unsigned j;
-        uint8_t rm = 0, dn = 255u, dx = 0;
-        _mm256_storeu_si256((__m256i *)(void *)t8, rmaxv);
-        for (j = 0; j < 32u; j++) if (t8[j] > rm) rm = t8[j];
-        _mm256_storeu_si256((__m256i *)(void *)t8, dmaxv);
-        for (j = 0; j < 32u; j++) if (t8[j] > dx) dx = t8[j];
-        _mm256_storeu_si256((__m256i *)(void *)t8, dminv);
-        for (j = 0; j < 32u; j++) if (t8[j] < dn) dn = t8[j];
-        *rmax_o = rm; *dmin_o = dn; *dmax_o = dx;
+        uint8_t pres[256];
+        const __m256i z = _mm256_setzero_si256();
+
+        memset(pres, 0, sizeof pres);
+        for (i = 0; i + 4u <= k; i += 4u) {
+            pres[tr[i]] = 1u;
+            pres[tr[i + 1u]] = 1u;
+            pres[tr[i + 2u]] = 1u;
+            pres[tr[i + 3u]] = 1u;
+        }
+        for (; i < k; i++)
+            pres[tr[i]] = 1u;
+
+        for (i = 0; i < 8u; i++) {
+            const __m256i q = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(pres + i * 32u));
+
+            cl->seen[i] = (uint32_t)~_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(q, z));
+        }
     }
+
+    /* Three horizontal folds instead of three 32-iteration byte scans.
+     * rmax/dmax start from a zero accumulator and can only be raised, so
+     * a maximum over all 32 lanes is the scalar result; dmin is the
+     * complement of the maximum complement accumulated above. */
+    *rmax_o = tile_hmax_u8x32(rmaxv);
+    *dmax_o = tile_hmax_u8x32(dmaxv);
+    *dmin_o = (uint8_t)~tile_hmax_u8x32(ndminv);
     return (uint16_t)k;
 }
 
@@ -962,43 +998,106 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
      * write 256 bytes per tile that are thrown away whenever k is small. */
     {
         unsigned wi;
-        unsigned nexc = 0;
+        unsigned nexc;
 
-        for (wi = 0; wi < 8u; wi++)
-            nexc += (unsigned)tile_popcount32(words[wi]);
+        /* Population count of the whole mask, which is what decides
+         * between the dense compaction and the per-exception walk below:
+         * a nibble table and one SAD reduction instead of eight SWAR
+         * popcounts. Bits at or above nt are never set (the chunk macro
+         * masks them), so every set bit is an exception. */
+        {
+            const __m256i nib = _mm256_set1_epi8(0x0F);
+            const __m256i plo = _mm256_setr_epi8(
+                0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,
+                0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4);
+            const __m256i wv = _mm256_loadu_si256(
+                (const __m256i *)(const void *)words);
+            const __m256i pl = _mm256_shuffle_epi8(
+                plo, _mm256_and_si256(wv, nib));
+            const __m256i ph = _mm256_shuffle_epi8(
+                plo, _mm256_and_si256(_mm256_srli_epi16(wv, 4), nib));
+            const __m256i ps = _mm256_sad_epu8(_mm256_add_epi8(pl, ph),
+                                               _mm256_setzero_si256());
 
+            nexc = (unsigned)((uint64_t)_mm256_extract_epi64(ps, 0) +
+                              (uint64_t)_mm256_extract_epi64(ps, 1) +
+                              (uint64_t)_mm256_extract_epi64(ps, 2) +
+                              (uint64_t)_mm256_extract_epi64(ps, 3));
+        }
+
+        /* One walk per prediction formula, so the family and predictor
+         * tests are made once per tile instead of once per exception.
+         * Every arm computes the prediction and the position exactly as
+         * the single mixed loop did, and visits the positions in the same
+         * ascending order. */
         if (nexc >= 32u) {
             k = tile_dense_bk_avx2(stg, nt, predictor_id, fam, c, s, words, cl,
                                    &_rmax, &_dmin, &_dmax);
-            wi = 8u; /* skip the scalar walk */
-        } else
-        for (wi = 0; wi < 8u; wi++) {
-            uint32_t w = words[wi];
+        } else if (fam == TILE_FAM_CONST) {
+            for (wi = 0; wi < 8u; wi++) {
+                uint32_t w = words[wi];
 
-            while (w != 0u) {
-                uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
-                uint8_t xhat;
+                while (w != 0u) {
+                    uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
 
-                if (fam == TILE_FAM_CONST) {
-                    xhat = c;
-                } else if (fam == TILE_FAM_STRIDE) {
-                    xhat = stg[16u + (uint32_t)pos - s];
-                } else {
+                    TILE_TAKE_EXC(pos, c, actual[pos]);
+                    w &= w - 1u;
+                }
+            }
+        } else if (fam == TILE_FAM_STRIDE) {
+            for (wi = 0; wi < 8u; wi++) {
+                uint32_t w = words[wi];
+
+                while (w != 0u) {
+                    uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
+
+                    TILE_TAKE_EXC(pos, stg[16u + (uint32_t)pos - s],
+                                  actual[pos]);
+                    w &= w - 1u;
+                }
+            }
+        } else if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+            for (wi = 0; wi < 8u; wi++) {
+                uint32_t w = words[wi];
+
+                while (w != 0u) {
+                    uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
+
+                    TILE_TAKE_EXC(pos, stg[8u + (uint32_t)pos], actual[pos]);
+                    w &= w - 1u;
+                }
+            }
+        } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
+            for (wi = 0; wi < 8u; wi++) {
+                uint32_t w = words[wi];
+
+                while (w != 0u) {
+                    uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
                     uint8_t h8 = stg[8u + (uint32_t)pos];
                     uint8_t h16 = stg[pos];
 
-                    if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
-                        xhat = h8;
-                    } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
-                        xhat = (uint8_t)((2u * (unsigned)h8 -
-                                          (unsigned)h16) & 0xFFu);
-                    } else {
-                        xhat = (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
-                                         >> 1);
-                    }
+                    TILE_TAKE_EXC(pos,
+                                  (uint8_t)((2u * (unsigned)h8 -
+                                            (unsigned)h16) & 0xFFu),
+                                  actual[pos]);
+                    w &= w - 1u;
                 }
-                TILE_TAKE_EXC(pos, xhat, actual[pos]);
-                w &= w - 1u;
+            }
+        } else { /* ZPSE_P_LANE_AVERAGE */
+            for (wi = 0; wi < 8u; wi++) {
+                uint32_t w = words[wi];
+
+                while (w != 0u) {
+                    uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
+                    uint8_t h8 = stg[8u + (uint32_t)pos];
+                    uint8_t h16 = stg[pos];
+
+                    TILE_TAKE_EXC(pos,
+                                  (uint8_t)(((unsigned)h8 + (unsigned)h16 +
+                                             1u) >> 1),
+                                  actual[pos]);
+                    w &= w - 1u;
+                }
             }
         }
     }

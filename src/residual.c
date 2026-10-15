@@ -621,10 +621,86 @@ int zpse_residual_decode(uint8_t mode, const uint8_t *payload,
     }
 }
 
+#if ZPSE_RES_HAVE_SSSE3
+
+/* Sixteen mode-2 palette indices per step, from the residual bytes
+ * themselves, for the dense half of the palette: b == 4 means one nibble
+ * per value, and `idx_of` is the value -> index table the scalar packer
+ * reads one byte at a time.
+ *
+ * Two shuffles do sixteen lookups. The table is split into its two 16-byte
+ * halves and pshufb addresses a half by the low nibble of each byte, so for
+ * a residual below 32 the low half answers values 0..15 directly and the
+ * high half answers 16..31 as idx_of[16 + (v & 15)] == idx_of[v] -- the
+ * caller guarantees no residual reaches 32, which is what keeps both halves
+ * in range (and pshufb's zeroing for a byte with bit 7 set can never be
+ * triggered by a byte of 31 or less). The halves are selected by the high
+ * nibble with a signed compare, exact for values below 128.
+ *
+ * Each pair of adjacent index bytes is then merged into the payload byte
+ * that holds it: maddubs multiplies the even lane by 1 and the odd lane by
+ * 16 and adds them, which is exactly (idx_2j | idx_2j+1 << 4) -- 255 at the
+ * most, so the packing widening saturates nothing -- and sixteen values are
+ * eight whole payload bytes, stored as one 64-bit lane. That is the same
+ * byte the scalar loop writes for those two values, so the payload is
+ * identical whichever path produced it.
+ *
+ * Values are consumed in ascending order in blocks of sixteen, always
+ * starting at value 0, so what it consumes is a prefix of the tile and the
+ * scalar loop can finish the rest unchanged. */
+static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_simd(
+    const uint8_t *idx_of, const uint8_t *exc_in, uint16_t k, uint8_t *dst)
+{
+    uint8_t lo[16];
+    uint8_t hi[16];
+    __m128i tlo;
+    __m128i thi;
+    __m128i mult;
+    __m128i nibv;
+    uint16_t i = 0u;
+
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+        return 0u;
+    }
+    memcpy(lo, idx_of, sizeof lo);
+    memcpy(hi, idx_of + 16, sizeof hi);
+    tlo = _mm_loadu_si128((const __m128i *)(const void *)lo);
+    thi = _mm_loadu_si128((const __m128i *)(const void *)hi);
+    mult = _mm_setr_epi8(1, 16, 1, 16, 1, 16, 1, 16,
+                         1, 16, 1, 16, 1, 16, 1, 16);
+    nibv = _mm_set1_epi8((char)0x0F);
+
+    while ((uint32_t)i + 16u <= (uint32_t)k) {
+        __m128i v = _mm_loadu_si128(
+            (const __m128i *)(const void *)(exc_in + (uint32_t)i));
+        __m128i sel = _mm_cmpgt_epi8(v, nibv);
+        __m128i l = _mm_shuffle_epi8(tlo, v);
+        __m128i h = _mm_shuffle_epi8(thi, v);
+        __m128i idx = _mm_or_si128(_mm_and_si128(sel, h),
+                                   _mm_andnot_si128(sel, l));
+        __m128i merged = _mm_maddubs_epi16(idx, mult);
+        __m128i packedv = _mm_packus_epi16(merged, merged);
+
+        /* Sixteen 4-bit fields are eight whole bytes and the block starts
+         * at value 0, so its byte offset is value >> 1. */
+        _mm_storel_epi64((__m128i *)(void *)(dst + ((uint32_t)i >> 1u)),
+                         packedv);
+        i = (uint16_t)((uint32_t)i + 16u);
+    }
+    return i;
+}
+
+#endif /* ZPSE_RES_HAVE_SSSE3 */
+
 static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
                                  uint8_t *out, uint16_t cap)
 {
-    uint8_t pal[16];
+    /* pal has one byte of slack: the membership test below cannot be a
+     * branch (see the loop), so a repeat stores its dead "next slot"
+     * unconditionally, and with sixteen distinct values already recorded
+     * that slot is pal[16]. Every live entry is above that index, so the
+     * spare byte is the only thing a repeat can ever write. */
+    uint8_t pal[17];
     uint8_t idx_of[256];
     unsigned nu = 0;
     uint8_t m;
@@ -633,6 +709,9 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
     uint32_t total;
     uint16_t i;
     unsigned s;
+#if ZPSE_RES_HAVE_SSSE3
+    int wide = 0; /* set when a residual reaches the high index-table half */
+#endif
 
     /* Palette membership and value->index are both direct table lookups.
      * The obvious linear scans are O(k*M) with a data-dependent branch
@@ -643,26 +722,48 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
      * idx_of[255] == 0xFF is the "absent" sentinel, which is safe
      * because residuals above 254 are rejected below. First-appearance
      * index is preserved, so the payload is byte-identical to what the
-     * scan produced. */
+     * scan produced.
+     *
+     * The sentinel test itself is not a branch: a dense tile answers "not
+     * new" for all but about sixteen of its ~240 values, so the branch is
+     * unpredictable at exactly the positions that matter, while the select
+     * has nothing to hide behind. The three stores are the same ones the
+     * branchy form performs, only unconditional: idx_of[v] is written back
+     * with the index it already had on a repeat, nu advances by is_new, and
+     * pal[nu] holds the dead next slot on a repeat -- which is pal[16] once
+     * sixteen values are recorded, above every live entry. */
     memset(idx_of, 0xFF, sizeof idx_of);
     for (i = 0; i < k; i++) {
-        uint8_t v = exc_in[i];
+        unsigned v = exc_in[i];
+        unsigned is_new;
 
         if (v > 254u) {
             return PSE_BAD_RESIDUAL;
         }
-        if (idx_of[v] == 0xFFu) {
-            if (nu == 16u) {
-                return PSE_BAD_RESIDUAL;
-            }
-            idx_of[v] = (uint8_t)nu;
-            pal[nu++] = v;
+        is_new = (idx_of[v] == 0xFFu) ? 1u : 0u;
+        if (is_new != 0u && nu == 16u) {
+            return PSE_BAD_RESIDUAL;
         }
+        idx_of[v] = (uint8_t)(is_new != 0u ? nu : (unsigned)idx_of[v]);
+        pal[nu] = (uint8_t)(is_new != 0u ? v : 0u);
+        nu += is_new;
     }
     m = (nu < 2u) ? 2u : (uint8_t)nu;
     for (s = nu; s < m; s++) {
         pal[s] = 0;
     }
+    /* The wide pack below shuffles a 16-entry half of the value -> index
+     * table with the residual byte itself, so it addresses the right half
+     * only while every residual is below 32. The palette holds at most 16
+     * values, so one short pass settles it. */
+#if ZPSE_RES_HAVE_SSSE3
+    for (s = 0; s < nu; s++) {
+        if (pal[s] >= 32u) {
+            wide = 1;
+            break;
+        }
+    }
+#endif
     b = zpse_ceil_log2_u32(m);
     packed = ((uint32_t)k * b + 7u) / 8u;
     total = 1u + (uint32_t)m + packed;
@@ -691,9 +792,19 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
     {
         uint8_t *dst = out + 1u + m;
         uint32_t g = 0u;
-        uint16_t gi;
+        uint16_t gi = 0u;
 
-        for (gi = 0u; (uint32_t)gi + 8u <= (uint32_t)k;
+#if ZPSE_RES_HAVE_SSSE3
+        /* The dense palette (a nibble per value, every residual below 32)
+         * retires sixteen values per step; everything it does not consume,
+         * including the tail of the block, is left to the byte loop. */
+        if (b == 4u && wide == 0) {
+            gi = residual_encode_mode2_simd(idx_of, exc_in, k, dst);
+            g = (uint32_t)gi >> 1u;
+        }
+#endif
+
+        for (; (uint32_t)gi + 8u <= (uint32_t)k;
              gi = (uint16_t)(gi + 8u)) {
             uint32_t w = (uint32_t)idx_of[exc_in[gi]];
             unsigned j;
@@ -701,13 +812,31 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
             for (j = 1u; j < 8u; j++) {
                 w |= (uint32_t)idx_of[exc_in[gi + j]] << (j * b);
             }
-            for (j = 0; j < b; j++) {
-                dst[g + j] = (uint8_t)(w >> (8u * j));
+            /* The group is b whole little-endian bytes of w, so the widest
+             * store that fits writes it: 4, 2 or 1 byte instead of b of
+             * them. b == 3 (a palette of 5..8 values) is the only width
+             * with no such store and keeps its three bytes. */
+            switch (b) {
+            case 1:
+                dst[g] = (uint8_t)w;
+                break;
+            case 2:
+                zpse_store_u16le(dst + g, (uint16_t)w);
+                break;
+            case 4:
+                zpse_store_u32le(dst + g, w);
+                break;
+            default:
+                dst[g] = (uint8_t)w;
+                dst[g + 1u] = (uint8_t)(w >> 8);
+                dst[g + 2u] = (uint8_t)(w >> 16);
+                break;
             }
             g += b;
         }
         /* Fewer than eight values left. The groups above consumed whole
-         * bytes, so this tail starts on a byte boundary as well. */
+         * bytes -- 8*b bits is b bytes and every group starts on a byte
+         * boundary -- so this tail starts on a byte boundary as well. */
         for (; gi < k; gi++) {
             residual_put_bits(dst, (uint32_t)gi * b, b,
                               (unsigned)idx_of[exc_in[gi]]);
