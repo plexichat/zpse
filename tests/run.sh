@@ -2,8 +2,8 @@
 # Expects a C compiler on PATH (CC, default gcc). POSIX twin of
 # tests/run.ps1: same suites, same flags, same checks, same exit
 # convention -- build each suite against src/zpse_unity.c and run it,
-# then build tests/test_parity.c and tests/test_fuzz.c in three modes
-# (default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
+# then build tests/test_parity.c, tests/test_fuzz.c and tests/test_lseed.c
+# in three modes (default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
 # -DZPSE_FORCE_TRIAL_SWAP) and require every mode's digest and per-case
 # output to match. The first two modes prove the SIMD paths are bit-exact
 # replacements for the scalar reference; the third permutes the encoder's
@@ -54,10 +54,12 @@ done
 echo "=== scalar/SIMD/order parity ==="
 
 # `parity` compares whole compressed corpora; `fuzz` does the same over a
-# randomized corpus. Both print one digest line (DIGEST / FUZZ cases=) that
-# must match across the three builds, and the rest of their output must
-# match too, so a divergence names the case that caused it.
-for suite in parity fuzz; do
+# randomized corpus; `lseed` decodes hand-built foreign segments whose
+# ORDER tiles do not reset, against a reference that hardcodes the
+# documented segment-start state. Each prints one summary line (DIGEST / FUZZ
+# cases= / LSEED:) that must match across the three builds, and the rest of
+# their output must match too, so a divergence names the case that caused it.
+for suite in parity fuzz lseed; do
     src="$repo/tests/test_$suite.c"
     built=1
     for mode in def scalar swap; do
@@ -88,6 +90,7 @@ for suite in parity fuzz; do
 
     key='^DIGEST'
     [ "$suite" = fuzz ] && key='^FUZZ cases='
+    [ "$suite" = lseed ] && key='^LSEED:'
     grep "$key" "$tmp/$suite.def.log" >"$tmp/$suite.def.dig" || :
     grep -v "$key" "$tmp/$suite.def.log" >"$tmp/$suite.def.body" || :
     for mode in scalar swap; do

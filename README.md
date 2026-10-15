@@ -143,13 +143,15 @@ non-zero exit code if any of them fails:
 | `test_units.c` | CRC, arena layout, header parse/serialize, K derivation, tables, tile round trips over every predictor and residual mode |
 | `test_parity.c` | the full corpus plus four per-primitive sweeps (uniform, small-`nt`/mask-word boundary, stateful-table ids, and the state a classification leaves) |
 | `test_fuzz.c` | a randomized differential corpus: every size 1 to 64, every tile and segment boundary and its neighbours up to 64 KiB, 60 pseudo-random sizes, 18 shapes each (2718 blocks) plus 6 frames, each block round-tripped and its size, compressed length and compressed bytes folded into one digest |
+| `test_lseed.c` | hand-built foreign segments whose ORDER1/ORDER2 tiles deliberately do NOT reset (non-resetting first tile, chains, mixed ORDER/STRIDE), each decoded by the library and by a reference in the file that hardcodes the documented segment-start state — the shape the lane-state seeding above exists for, and one this encoder cannot produce |
 
 The parity step is the important one, and it is two checks over three builds
-of the same two suites: `test_parity.c` and `test_fuzz.c` are each compiled
-with the default runtime SIMD dispatch, with `-DZPSE_FORCE_SCALAR` and with
-`-DZPSE_FORCE_TRIAL_SWAP`, and the runner requires all three builds of each to
-exit 0, to print the same digest line, and to be byte-identical everywhere
-else too, so a divergence also names the case that caused it. The first two builds prove the SIMD paths are bit-exact
+of the same three suites: `test_parity.c`, `test_fuzz.c` and `test_lseed.c`
+are each compiled with the default runtime SIMD dispatch, with
+`-DZPSE_FORCE_SCALAR` and with `-DZPSE_FORCE_TRIAL_SWAP`, and the runner
+requires all three builds of each to exit 0, to print the same digest line,
+and to be byte-identical everywhere else too, so a divergence also names the
+case that caused it. The first two builds prove the SIMD paths are bit-exact
 replacements for the scalar reference. The third takes the encoder's
 candidate-attempt order and permutes it on every block (see the performance
 note below), which proves that order cannot change a single compressed byte:
@@ -174,6 +176,8 @@ parity ok (scalar): DIGEST <value> identical streams
 parity ok (swap): DIGEST <value> identical streams
 fuzz ok (scalar): FUZZ cases=2718 frames=6 digest=<value> identical streams
 fuzz ok (swap): FUZZ cases=2718 frames=6 digest=<value> identical streams
+lseed ok (scalar): LSEED: ALL OK (10 cases) identical streams
+lseed ok (swap): LSEED: ALL OK (10 cases) identical streams
 ALL SUITES PASS
 ```
 

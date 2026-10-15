@@ -1,8 +1,8 @@
 # Expects gcc on PATH. Run from anywhere; builds each test against
 # src/zpse_unity.c and executes it. Fails on first failing suite.
 #
-# Also builds tests/test_parity.c and tests/test_fuzz.c in three modes --
-# default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
+# Also builds tests/test_parity.c, tests/test_fuzz.c and tests/test_lseed.c
+# in three modes -- default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
 # -DZPSE_FORCE_TRIAL_SWAP -- and requires every mode's digest and per-case
 # output to match. The first two modes prove the SIMD paths are bit-exact
 # replacements for the scalar reference; the third permutes the encoder's
@@ -25,10 +25,12 @@ foreach ($t in @("test_roundtrip", "test_combinadic", "test_hostile", "test_unit
 
 Write-Output "=== scalar/SIMD/order parity ==="
 # `parity` compares whole compressed corpora; `fuzz` does the same over a
-# randomized corpus. Both print one digest line (DIGEST / FUZZ cases=) that
-# must match across the three builds, and the rest of their output must
-# match too, so a divergence names the case that caused it.
-foreach ($suite in @("parity", "fuzz")) {
+# randomized corpus; `lseed` decodes hand-built foreign segments whose
+# ORDER tiles do not reset, against a reference that hardcodes the
+# documented segment-start state. Each prints one summary line (DIGEST / FUZZ
+# cases= / LSEED:) that must match across the three builds, and the rest of
+# their output must match too, so a divergence names the case that caused it.
+foreach ($suite in @("parity", "fuzz", "lseed")) {
     $src = Join-Path $PSScriptRoot "test_$suite.c"
     $built = $true
     foreach ($mode in @("def", "scalar", "swap")) {
@@ -51,7 +53,7 @@ foreach ($suite in @("parity", "fuzz")) {
         if ($rc -ne 0) { Write-Output "SUITE FAILED: $suite ($mode)"; $fail = 1 }
     }
 
-    $key = if ($suite -eq "fuzz") { '^FUZZ cases=' } else { '^DIGEST' }
+    $key = if ($suite -eq "fuzz") { '^FUZZ cases=' } elseif ($suite -eq "lseed") { '^LSEED:' } else { '^DIGEST' }
     $digDef = ($logs["def"] | Select-String $key).Line
     $bodyDef = $logs["def"] | Where-Object { $_ -notmatch $key }
     foreach ($mode in @("scalar", "swap")) {
