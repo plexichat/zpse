@@ -1605,6 +1605,17 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
     uint32_t p = 0u;
     uint8_t prev = 0u;
     uint32_t head = (s < (uint32_t)nt) ? s : (uint32_t)nt;
+    /* This loop reads a mask bit per position while storing that position's
+     * byte through `out`, which is a uint8_t*, so the compiler has to treat
+     * every store as a possible write to `words` and reload it: the mask
+     * read comes back out of memory once per position even though nothing
+     * here writes it. A local copy is an object no pointer in this function
+     * can reach, so its eight words stay in registers (or at worst in a
+     * stack slot the stores provably cannot touch). Same argument, and the
+     * same hoist, in the two AVX2 kernels below. */
+    uint32_t mw[8];
+
+    memcpy(mw, words, sizeof mw);
 
     /* One position `PP`: take its prediction, invert the residual if the
      * mask marks the position, store, and leave the result as the front of
@@ -1619,7 +1630,7 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
     do {                                                                    \
         uint32_t pp_ = (uint32_t)(PP);                                      \
         uint8_t xh_ = (uint8_t)(XHAT);                                      \
-        uint32_t m_ = (words[pp_ >> 5] >> (pp_ & 31u)) & 1u;                \
+        uint32_t m_ = (mw[pp_ >> 5] >> (pp_ & 31u)) & 1u;                   \
         uint8_t mk_ = (uint8_t)(0u - m_);                                   \
         uint8_t x_;                                                         \
         if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {                       \
@@ -1823,12 +1834,18 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
     uint16_t consumed = unit_off;
     uint32_t g;
     uint32_t ngroups = ((uint32_t)nt + 7u) >> 3u;
+    /* The mask is read once per group and the group's bytes are stored
+     * through `out` in between, so `words` has to be treated as aliased by
+     * those stores unless it is copied somewhere unreachable from `out`. */
+    uint32_t mw[8];
+
+    memcpy(mw, words, sizeof mw);
 
     for (g = 0; g < ngroups; g++) {
         uint32_t at = g * 8u;
         uint32_t rem = (uint32_t)nt - at;
         uint32_t valid = (rem >= 8u) ? 0xFFu : ((UINT32_C(1) << rem) - 1u);
-        uint32_t m8 = (words[g >> 2u] >> ((g & 3u) * 8u)) & valid;
+        uint32_t m8 = (mw[g >> 2u] >> ((g & 3u) * 8u)) & valid;
         uint32_t cnt = 0u;
         __m128i xhat;
         __m128i res;
@@ -1849,6 +1866,33 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
          * positions) take this branch for almost every group. */
         if (m8 == 0u) {
             res = xhat;
+        } else if (m8 == 0xFFu && (uint32_t)consumed + 8u <= ZPSE_TILE_UNIT_BYTES) {
+            /* The other extreme, and the common group of a dense tile (235
+             * exceptions in 256 positions): every lane is an exception, so
+             * the indices the ladder would produce are 0..7 -- the units
+             * are simply the eight contiguous bytes at `consumed` -- and
+             * the byte mask the blend would build is all ones, so its
+             * result is `x` for every lane. Skipping the expansion, the
+             * index and the blend removes the whole mask side of the group,
+             * which is what this kernel is short of: with a dense mask
+             * every position costs the same handful of uops whether or not
+             * anyone reads them. `m8 == 0xFF` also implies rem >= 8, since
+             * `valid` is not all ones for a partial group. */
+            __m128i r = _mm_loadl_epi64(
+                (const __m128i *)(const void *)(units + consumed));
+            __m128i x;
+
+            cnt = 8u;
+            if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+                x = r;
+            } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+                x = _mm_add_epi8(xhat, r);
+            } else {
+                __m128i ge = _mm_cmpeq_epi8(_mm_max_epu8(r, xhat), r);
+
+                x = _mm_add_epi8(r, _mm_and_si128(ge, one));
+            }
+            res = x;
         } else {
             const __m128i bits =
                 _mm_and_si128(_mm_set1_epi8((char)m8), bitv);
@@ -2004,9 +2048,15 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
     uint16_t consumed = 0u;
     uint32_t at = 0u;
     uint32_t full = ((uint32_t)nt / 32u) * 32u;
+    /* Mask hoist, as in the 8-lane kernel: the chunk's bytes are stored
+     * through `out` between mask reads, so a copy is what keeps them from
+     * being reloaded. */
+    uint32_t mw[8];
+
+    memcpy(mw, words, sizeof mw);
 
     while (at < full) {
-        uint32_t w = words[at >> 5u];
+        uint32_t w = mw[at >> 5u];
         __m256i mb;
         __m256i r;
         __m256i x;
@@ -2016,6 +2066,34 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
          * prediction, with no units to consume and nothing to blend. */
         if (w == 0u) {
             _mm256_storeu_si256((__m256i *)(void *)(out + (size_t)at), xhat);
+            at += 32u;
+            continue;
+        }
+
+        /* The dense extreme: every position in the chunk is an exception,
+         * so the byte mask is all ones (the blend would return `x` for all
+         * 32 lanes) and the 32 contiguous bytes at `consumed` are already
+         * the units in position order. A dense tile takes this branch for
+         * seven of its eight chunks, and it removes the expansion, the
+         * 16-lane index ladder, the two window loads and the blend from
+         * all of them. */
+        if (w == UINT32_C(0xFFFFFFFF) &&
+            (uint32_t)consumed + 32u <= ZPSE_TILE_UNIT_BYTES) {
+            __m256i r = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(units + consumed));
+            __m256i x;
+
+            consumed = (uint16_t)(consumed + 32u);
+            if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+                x = r;
+            } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+                x = _mm256_add_epi8(xhat, r);
+            } else {
+                __m256i ge = _mm256_cmpeq_epi8(_mm256_max_epu8(r, xhat), r);
+
+                x = _mm256_add_epi8(r, _mm256_and_si256(ge, one));
+            }
+            _mm256_storeu_si256((__m256i *)(void *)(out + (size_t)at), x);
             at += 32u;
             continue;
         }
@@ -2107,7 +2185,7 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
         uint8_t c = constant_C;
         uint8_t x;
 
-        if (((words[at >> 5u] >> (at & 31u)) & 1u) == 0u) {
+        if (((mw[at >> 5u] >> (at & 31u)) & 1u) == 0u) {
             x = c;
         } else if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
             x = units[consumed++];

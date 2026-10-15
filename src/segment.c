@@ -896,6 +896,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         uint8_t best_p = 0;
         uint8_t *bst = e->input; /* staging for the winning record */
         int n;
+        int direct;    /* packing the single candidate in place */
+        uint8_t *wout; /* where the candidate's record is packed */
+        uint32_t wcap; /* and the capacity it is packed with */
 
         /* Bound check for the byte budget, before any work for this
          * tile: `pos` grows monotonically, so once it is past the budget
@@ -1047,6 +1050,24 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             continue;
         }
 
+        /* One candidate and room for the worst record: pack it straight
+         * into the output instead of into the 4 KiB scratch and copying
+         * the winner back out of it. That is the dense-tile case (every
+         * tile of a text, code or noise block) and the single-candidate
+         * case generally, and it removes a per-tile read-modify-write of
+         * up to 4096 bytes plus the copy.
+         *
+         * `direct` is only taken when the room that is left is at least
+         * the scratch capacity, so the packer is handed a capacity it
+         * cannot exhaust and returns exactly what it would have returned
+         * for `tmp`; the overflow decision stays where it was, on the
+         * final record size below. With two candidates the second one
+         * still needs somewhere to be packed before the sizes are
+         * compared, so that case keeps the staging buffer. */
+        direct = (ncand == 1u && payload_cap - pos - 2u >= tmp_cap) ? 1 : 0;
+        wout = direct ? (payload_out + pos + 2u) : tmp;
+        wcap = direct ? (payload_cap - pos - 2u) : tmp_cap;
+
         for (ci = 0; ci < ncand; ci++) {
             uint8_t pred = cand[ci];
             ZpseTileClass cl;
@@ -1059,23 +1080,25 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
-            n = zpse_tile_pack(pred, &cl, nt, actual, mm, rr, 1, tmp,
-                               tmp_cap, e->comb);
+            n = zpse_tile_pack(pred, &cl, nt, actual, mm, rr, 1, wout,
+                               wcap, e->comb);
             if (n < 8) {
                 /* Defensive fallback: the always-legal minimal pair. */
                 mm = (cl.k == 0u) ? 0u
                      : (cl.k == nt) ? 6u
                      : ((uint32_t)cl.k <= (((uint32_t)nt + 7u) >> 3) ? 2u
                                                                      : 1u);
-                n = zpse_tile_pack(pred, &cl, nt, actual, mm, 0u, 1, tmp,
-                                   tmp_cap, e->comb);
+                n = zpse_tile_pack(pred, &cl, nt, actual, mm, 0u, 1, wout,
+                                   wcap, e->comb);
                 rr = 0u;
             }
             if (n < 8) {
                 continue;
             }
             if (best_len < 0 || n < best_len) {
-                memcpy(bst, tmp, (size_t)n);
+                if (!direct) {
+                    memcpy(bst, tmp, (size_t)n);
+                }
                 best_len = n;
                 best_p = pred;
             }
@@ -1097,7 +1120,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             (uint32_t)best_len > payload_cap - pos - 2u) {
             return PSE_OUTPUT_OVERFLOW;
         }
-        memcpy(payload_out + pos + 2u, bst, (size_t)best_len);
+        if (!direct) {
+            memcpy(payload_out + pos + 2u, bst, (size_t)best_len);
+        }
         zpse_store_u16le(payload_out + pos, (uint16_t)best_len);
         pos += 2u + (uint32_t)best_len;
     }

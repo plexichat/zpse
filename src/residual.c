@@ -676,12 +676,42 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
     for (s = 0; s < m; s++) {
         out[1u + s] = pal[s];
     }
-    for (s = 0; s < packed; s++) {
-        out[1u + m + s] = 0;
-    }
-    for (i = 0; i < k; i++) {
-        residual_put_bits(out + 1u + m, (uint32_t)i * b, b,
-                          (unsigned)idx_of[exc_in[i]]);
+    /* Zero the packed region in one go: the wide path below stores whole
+     * bytes over it and the tail only ORs bits into it. */
+    memset(out + 1u + m, 0, (size_t)packed);
+
+    /* Eight values are b bytes together (8*b bits) and every 8-value group
+     * starts on a byte boundary (group g begins at bit 8*b*g), so a group
+     * is exactly the little-endian store of the 8b-bit word
+     * sum(idx_i << (i*b)). That is bit-for-bit what residual_put_bits
+     * writes for those eight values: value i's b bits land at bit i*b of
+     * a zeroed target, which is this word's bit range for the group. m is
+     * at most 16, so b <= 4 and every index is below 2^b; the accumulator
+     * and the largest shift (7*4 = 28 bits) stay inside 32 bits. */
+    {
+        uint8_t *dst = out + 1u + m;
+        uint32_t g = 0u;
+        uint16_t gi;
+
+        for (gi = 0u; (uint32_t)gi + 8u <= (uint32_t)k;
+             gi = (uint16_t)(gi + 8u)) {
+            uint32_t w = (uint32_t)idx_of[exc_in[gi]];
+            unsigned j;
+
+            for (j = 1u; j < 8u; j++) {
+                w |= (uint32_t)idx_of[exc_in[gi + j]] << (j * b);
+            }
+            for (j = 0; j < b; j++) {
+                dst[g + j] = (uint8_t)(w >> (8u * j));
+            }
+            g += b;
+        }
+        /* Fewer than eight values left. The groups above consumed whole
+         * bytes, so this tail starts on a byte boundary as well. */
+        for (; gi < k; gi++) {
+            residual_put_bits(dst, (uint32_t)gi * b, b,
+                              (unsigned)idx_of[exc_in[gi]]);
+        }
     }
     return (int)total;
 }
@@ -798,32 +828,71 @@ static int residual_encode_mode4(const uint8_t *actual_in,
     out[0] = sub;
     if (sub == 0u) {
         uint32_t packed = ((uint32_t)k + 1u) / 2u;
-        uint32_t s;
+        uint32_t g = 0u;
+        uint16_t gi;
 
-        for (s = 0; s < packed; s++) {
-            out[1u + s] = 0;
+        memset(out + 1u, 0, (size_t)packed);
+        /* Four-bit fields. Eight of them are exactly four bytes and a
+         * group always starts on a byte boundary, so one little-endian
+         * store of sum(enc_i << (4*i)) is what the nibble form below
+         * wrote: value 2j in the low nibble of byte j, value 2j+1 in the
+         * high one, which is the same bit positions. */
+        for (gi = 0u; (uint32_t)gi + 8u <= (uint32_t)k;
+             gi = (uint16_t)(gi + 8u)) {
+            uint32_t w = 0u;
+            unsigned j;
+
+            for (j = 0; j < 8u; j++) {
+                int d =
+                    residual_delta(actual_in[gi + j], pred_at_exc[gi + j]);
+
+                w |= (uint32_t)(uint8_t)(d & 0xF) << (4u * j);
+            }
+            for (j = 0; j < 4u; j++) {
+                out[1u + g + j] = (uint8_t)(w >> (8u * j));
+            }
+            g += 4u;
         }
-        for (i = 0; i < k; i++) {
-            int d = residual_delta(actual_in[i], pred_at_exc[i]);
+        for (; gi < k; gi++) {
+            int d = residual_delta(actual_in[gi], pred_at_exc[gi]);
             uint8_t enc = (uint8_t)(d & 0xF);
 
-            if ((i & 1u) == 0u) {
-                out[1u + (i >> 1u)] = (uint8_t)enc;
+            if ((gi & 1u) == 0u) {
+                out[1u + (gi >> 1u)] = enc;
             } else {
-                out[1u + (i >> 1u)] |= (uint8_t)(enc << 4u);
+                out[1u + (gi >> 1u)] |= (uint8_t)(enc << 4u);
             }
         }
     } else if (sub == 1u) {
         uint32_t packed = (6u * (uint32_t)k + 7u) / 8u;
-        uint32_t s;
+        uint32_t g = 0u;
+        uint16_t gi;
 
-        for (s = 0; s < packed; s++) {
-            out[1u + s] = 0;
+        memset(out + 1u, 0, (size_t)packed);
+        /* Six-bit fields. Eight are 48 bits, again a whole number of bytes
+         * per group, so a group is one 64-bit little-endian store and the
+         * tail keeps the bit form (which also starts on a byte boundary,
+         * because the groups consumed whole bytes). */
+        for (gi = 0u; (uint32_t)gi + 8u <= (uint32_t)k;
+             gi = (uint16_t)(gi + 8u)) {
+            uint64_t w = 0u;
+            unsigned j;
+
+            for (j = 0; j < 8u; j++) {
+                int d =
+                    residual_delta(actual_in[gi + j], pred_at_exc[gi + j]);
+
+                w |= (uint64_t)(uint8_t)(d & 0x3F) << (6u * j);
+            }
+            for (j = 0; j < 6u; j++) {
+                out[1u + g + j] = (uint8_t)(w >> (8u * j));
+            }
+            g += 6u;
         }
-        for (i = 0; i < k; i++) {
-            int d = residual_delta(actual_in[i], pred_at_exc[i]);
+        for (; gi < k; gi++) {
+            int d = residual_delta(actual_in[gi], pred_at_exc[gi]);
 
-            residual_put_bits(out + 1u, (uint32_t)i * 6u, 6u,
+            residual_put_bits(out + 1u, (uint32_t)gi * 6u, 6u,
                               (unsigned)(d & 0x3F));
         }
     } else {
@@ -899,35 +968,41 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
         *len_out = k;
         return PSE_OK;
     case ZPSE_R_PALETTE_BITS: {
-        uint8_t seen[16];
+        uint8_t seen[8];
         unsigned nu = 0;
         uint8_t m;
         unsigned b;
         uint16_t i;
-        unsigned s;
 
         if (k > 0u && exc_in == 0) {
             return PSE_BAD_ARG;
         }
+        /* Membership as a 256-bit bitmap rather than a linear probe of the
+         * values seen so far: the probe is O(k*nu) with a data-dependent
+         * branch per value (~1900 probes for a 235-exception tile) and
+         * this is the encoder's mode-search length estimator, so it runs
+         * once per candidate mode per tile. v <= 254, so v >> 5 is in
+         * 0..7 and the bitmap is eight bytes. The statuses are unchanged
+         * and are still decided in ascending value order: a value above
+         * 254 is rejected before it is tested for membership, and the
+         * seventeenth distinct value is the one that is rejected. */
+        memset(seen, 0, sizeof seen);
         for (i = 0; i < k; i++) {
-            unsigned found = 0;
             uint8_t v = exc_in[i];
+            uint8_t bit;
 
             if (v > 254u) {
                 return PSE_BAD_RESIDUAL;
             }
-            for (s = 0; s < nu; s++) {
-                if (seen[s] == v) {
-                    found = 1;
-                    break;
-                }
+            bit = (uint8_t)(1u << (v & 31u));
+            if ((seen[v >> 5u] & bit) != 0u) {
+                continue;
             }
-            if (!found) {
-                if (nu == 16u) {
-                    return PSE_BAD_RESIDUAL;
-                }
-                seen[nu++] = v;
+            if (nu == 16u) {
+                return PSE_BAD_RESIDUAL;
             }
+            seen[v >> 5u] |= bit;
+            nu++;
         }
         m = (nu < 2u) ? 2u : (uint8_t)nu;
         b = zpse_ceil_log2_u32(m);
