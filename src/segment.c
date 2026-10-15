@@ -27,6 +27,18 @@ static uint32_t seg_all_hit_stride(uint8_t predictor_id)
     }
 }
 
+/* One unaligned 64-bit load. A tile record's 8-byte header is compared as
+ * a single word below; loading it through memcpy is how the rest of the
+ * codebase reads unaligned words (crc32c.c, residual.c), and it compiles
+ * to one load on the targets that matter. */
+static uint64_t seg_load_u64(const uint8_t *p)
+{
+    uint64_t w;
+
+    memcpy(&w, p, sizeof w);
+    return w;
+}
+
 int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                         const uint8_t *payload, uint32_t payload_len,
                         uint8_t *decoded_out, uint32_t decoded_cap,
@@ -150,6 +162,39 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
             uint32_t rpos = pos + 10u;
             uint32_t rprod = produced + 256u;
             uint32_t rt = (uint32_t)t + 1u;
+            /* Every record of the run is the same ten bytes -- [u16 size]
+             * followed by the 8-byte header that opened it -- so membership
+             * is one size compare plus ONE word compare against that header,
+             * instead of the byte-at-a-time comparisons below. The word
+             * covers the whole header (reset flag, predictor, both payload
+             * sizes), which is exactly what those comparisons test, and the
+             * run's first record has already passed them, so a record whose
+             * word matches is a member for the same reason it was. */
+            uint64_t pat = seg_load_u64(rec);
+
+            /* Two records per step, and only while the scalar loop below
+             * would accept both. The three checks it makes beyond the
+             * record's own bytes are all implied here, which is why they are
+             * not repeated: a step requires rt + 2 < tile_count, so neither
+             * record is the segment's LAST tile, and for any tile but the
+             * last `nt2 == 256`, `seg_size - rprod >= 256` (the tile count
+             * is ceil(seg_size/256), so rprod + 256 <= 256*(tile_count-1) <
+             * seg_size) and `rprod + 256 <= seg_size <= decoded_cap` (the
+             * entry check) all hold by construction. The payload bound is
+             * tested before any load, so both records are inside it. A step
+             * that cannot be taken -- the last tile, a short tail, a record
+             * that differs -- leaves rpos/rprod/rt on that record and the
+             * loop below re-decides it exactly as before. */
+            while (rt + 2u < tile_count && payload_len - rpos >= 20u &&
+                   zpse_load_u16le(payload + rpos) == 8u &&
+                   zpse_load_u16le(payload + rpos + 10u) == 8u &&
+                   seg_load_u64(payload + rpos + 2u) == pat &&
+                   seg_load_u64(payload + rpos + 12u) == pat) {
+                run += 2u;
+                rpos += 20u;
+                rprod += 512u;
+                rt += 2u;
+            }
 
             while (rt < tile_count) {
                 uint16_t nt2;

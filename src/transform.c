@@ -207,15 +207,17 @@ ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_xor16, _mm_xor_si128, ZPSE_XOR8)
  * A 32-byte block needs five log steps where a 16-byte block needs four.
  * The first four are the in-lane shifts (1, 2, 4, 8) that build each
  * 16-byte lane's own inclusive prefix, exactly as in the SSE2 ladder.
- * The fifth is the step ACROSS the 128-bit lane boundary, which
- * `_mm256_permute2x128_si256(x, x, 0x08)` supplies: imm bit 3 zeroes the
- * low half of the result, and imm[7:4] == 0 selects the low half of `x`
- * for the high half, so the result is `x` shifted toward higher byte
- * indices by 16 with a zero fill. Adding it byte-wise puts lane 0's
- * prefix into lane 1's corresponding bytes (and adds nothing to lane 0),
- * which is exactly the 16-byte step of the scan. The block's total is
- * byte 31, the HIGH byte of 16-bit word 15 -- a plain cast of the word
- * would keep byte 30, the same trap the SSE2 kernels document.
+ * The fifth is the step ACROSS the 128-bit lane boundary, and it is NOT a
+ * plain 16-byte shift of the register: after the four in-lane steps the
+ * high lane still needs the low lane's TOTAL -- its last byte, byte 15 --
+ * added to every one of its bytes, while shifting the low lane up by 16
+ * bytes would add the low lane's per-position prefixes and leave every
+ * position but the last one wrong. So the low lane's total is broadcast
+ * (`zpse_avx2_lane_total`: one vpshufb plus one lane permute) and added to
+ * the high lane, and because that helper zeroes the low lane the low lane
+ * is left untouched. The block's total is byte 31, the HIGH byte of
+ * 16-bit word 15 -- a plain cast of the word would keep byte 30, the same
+ * trap the SSE2 kernels document.
  *
  * Unlike the SSE2 kernels this needs runtime dispatch, because AVX2 is
  * not architectural: each kernel carries the per-function target
@@ -396,6 +398,128 @@ static ZPSE_T_AVX2 void kernel_name(const uint8_t *src, uint8_t *dst,        \
 
 ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_sum32, _mm256_add_epi8, ZPSE_ADD8)
 ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_xor32, _mm256_xor_si256, ZPSE_XOR8)
+
+/* ------------------------------------------------------------------ *
+ * AVX2 16x16 byte transpose.
+ *
+ * The 128-bit network in zpse_t16x16 above is op-optimal -- four stages of
+ * unpack operations, four per input row -- but it needs sixteen live
+ * 16-byte values per stage, and a 16-entry stage array plus the caller's
+ * row array will not fit the SSE2 register file, so the intermediates
+ * live in memory: measured, the inverse of a 16-segment block (transform
+ * id 6) costs 8.2 us per 64 KiB, about 2.8x the unpack-op floor for the
+ * shape, and store/reload traffic is most of the difference. This kernel
+ * runs the same network on 256-bit registers, where one unpack processes
+ * both 128-bit lanes and therefore does two rows' worth of work, and it
+ * keeps at most nine live registers, so nothing needs to spill.
+ *
+ * Layout: a[k] = [row k | row k+8]. Every unpack in the network acts per
+ * 128-bit lane with identical immediate semantics, so the low lane
+ * transposes rows 0..7 by itself while the high lane transposes rows
+ * 8..15, both following the same index pattern:
+ *
+ *   stage 1  t = unpack{lo,hi}_epi8   on the (a0,a1) (a2,a3) (a4,a5) (a6,a7) pairs
+ *   stage 2  u = unpack{lo,hi}_epi16  on the (t0,t2) (t1,t3) (t4,t6) (t5,t7) pairs
+ *   stage 3  v = unpack{lo,hi}_epi32  on the (u0,u4) (u1,u5) (u2,u6) (u3,u7) pairs
+ *   stage 4  w = unpack{lo,hi}_epi64  on the (v0,v4) (v1,v5) (v2,v6) (v3,v7) pairs
+ *
+ * which leaves w[k] = [column k of its eight rows | column k+8 of them],
+ * eight bytes each: the low lane carries rows 0..7's two columns and the
+ * high lane rows 8..15's. Column k is therefore [w[k].low[0..7] |
+ * w[k].high[0..7]] and column k+8 is [w[k].low[8..15] |
+ * w[k].high[8..15]] -- one extract and two 64-bit unpacks per register,
+ * so 16 columns come out of 8 registers.
+ *
+ * Same contract as zpse_t16x16: in[r] is row r on entry, out[c] receives
+ * column c, so the two are bit-identical. The AVX2 form runs when
+ * zpse_cpu_caps() reports AVX2 and the 128-bit one otherwise, including
+ * under -DZPSE_FORCE_SCALAR -- which is what lets the parity suite keep
+ * comparing two builds.
+ * ------------------------------------------------------------------ */
+#define ZPSE_T16_ROW128(p_) ((const __m128i *)(const void *)(p_))
+
+static ZPSE_T_AVX2 void zpse_t16x16_avx2(const uint8_t *const in[16],
+                                         uint8_t *const out[16])
+{
+    const __m256i a0 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[8]),
+                                           ZPSE_T16_ROW128(in[0]));
+    const __m256i a1 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[9]),
+                                           ZPSE_T16_ROW128(in[1]));
+    const __m256i a2 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[10]),
+                                           ZPSE_T16_ROW128(in[2]));
+    const __m256i a3 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[11]),
+                                           ZPSE_T16_ROW128(in[3]));
+    const __m256i a4 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[12]),
+                                           ZPSE_T16_ROW128(in[4]));
+    const __m256i a5 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[13]),
+                                           ZPSE_T16_ROW128(in[5]));
+    const __m256i a6 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[14]),
+                                           ZPSE_T16_ROW128(in[6]));
+    const __m256i a7 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[15]),
+                                           ZPSE_T16_ROW128(in[7]));
+    __m256i t0, t1, t2, t3, t4, t5, t6, t7;
+    __m256i u0, u1, u2, u3, u4, u5, u6, u7;
+    __m256i v0, v1, v2, v3, v4, v5, v6, v7;
+    __m256i w0, w1, w2, w3, w4, w5, w6, w7;
+
+    t0 = _mm256_unpacklo_epi8(a0, a1);
+    t1 = _mm256_unpackhi_epi8(a0, a1);
+    t2 = _mm256_unpacklo_epi8(a2, a3);
+    t3 = _mm256_unpackhi_epi8(a2, a3);
+    t4 = _mm256_unpacklo_epi8(a4, a5);
+    t5 = _mm256_unpackhi_epi8(a4, a5);
+    t6 = _mm256_unpacklo_epi8(a6, a7);
+    t7 = _mm256_unpackhi_epi8(a6, a7);
+    u0 = _mm256_unpacklo_epi16(t0, t2);
+    u1 = _mm256_unpackhi_epi16(t0, t2);
+    u2 = _mm256_unpacklo_epi16(t1, t3);
+    u3 = _mm256_unpackhi_epi16(t1, t3);
+    u4 = _mm256_unpacklo_epi16(t4, t6);
+    u5 = _mm256_unpackhi_epi16(t4, t6);
+    u6 = _mm256_unpacklo_epi16(t5, t7);
+    u7 = _mm256_unpackhi_epi16(t5, t7);
+    v0 = _mm256_unpacklo_epi32(u0, u4);
+    v1 = _mm256_unpackhi_epi32(u0, u4);
+    v2 = _mm256_unpacklo_epi32(u1, u5);
+    v3 = _mm256_unpackhi_epi32(u1, u5);
+    v4 = _mm256_unpacklo_epi32(u2, u6);
+    v5 = _mm256_unpackhi_epi32(u2, u6);
+    v6 = _mm256_unpacklo_epi32(u3, u7);
+    v7 = _mm256_unpackhi_epi32(u3, u7);
+    w0 = _mm256_unpacklo_epi64(v0, v4);
+    w1 = _mm256_unpackhi_epi64(v0, v4);
+    w2 = _mm256_unpacklo_epi64(v1, v5);
+    w3 = _mm256_unpackhi_epi64(v1, v5);
+    w4 = _mm256_unpacklo_epi64(v2, v6);
+    w5 = _mm256_unpackhi_epi64(v2, v6);
+    w6 = _mm256_unpacklo_epi64(v3, v7);
+    w7 = _mm256_unpackhi_epi64(v3, v7);
+
+    /* w[k] carries column k in its two first 64-bit halves, one per row
+     * group, so column k is their low-low join and column k+8 their
+     * high-high join. */
+#define ZPSE_T16_EMIT(WK, IDX)                                                \
+    do {                                                                      \
+        const __m128i lo_ = _mm256_castsi256_si128(WK);                       \
+        const __m128i hi_ = _mm256_extracti128_si256(WK, 1);                  \
+        _mm_storeu_si128((__m128i *)(void *)(out[IDX]),                       \
+                         _mm_unpacklo_epi64(lo_, hi_));                       \
+        _mm_storeu_si128((__m128i *)(void *)(out[(IDX) + 8u]),                \
+                         _mm_unpackhi_epi64(lo_, hi_));                       \
+    } while (0)
+
+    ZPSE_T16_EMIT(w0, 0u);
+    ZPSE_T16_EMIT(w1, 1u);
+    ZPSE_T16_EMIT(w2, 2u);
+    ZPSE_T16_EMIT(w3, 3u);
+    ZPSE_T16_EMIT(w4, 4u);
+    ZPSE_T16_EMIT(w5, 5u);
+    ZPSE_T16_EMIT(w6, 6u);
+    ZPSE_T16_EMIT(w7, 7u);
+#undef ZPSE_T16_EMIT
+}
+
+#undef ZPSE_T16_ROW128
 #endif /* ZPSE_T_HAVE_AVX2 */
 
 static int zpse_valid_count(uint8_t v)
@@ -635,18 +759,34 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
          * uses the SHORTEST segment, so every segment still has all 16
          * rows and every load stays inside the input. */
         for (g = 0; (g + 1u) * 16u <= rows; g++) {
-            __m128i r[16];
-            unsigned t;
+#if ZPSE_T_HAVE_AVX2
+            if (zpse_t_avx2()) {
+                const uint8_t *tin[16];
+                uint8_t *tout[16];
+                unsigned t;
 
-            for (t = 0; t < 16u; t++) {
-                r[t] = _mm_loadu_si128((const __m128i *)(const void *)
-                                       (in + (size_t)g * 256u +
-                                        (size_t)t * 16u));
-            }
-            zpse_t16x16(r);
-            for (t = 0; t < 16u; t++) {
-                _mm_storeu_si128(
-                    (__m128i *)(void *)(segs[t] + (size_t)g * 16u), r[t]);
+                for (t = 0; t < 16u; t++) {
+                    tin[t] = in + (size_t)g * 256u + (size_t)t * 16u;
+                    tout[t] = segs[t] + (size_t)g * 16u;
+                }
+                zpse_t16x16_avx2(tin, tout);
+            } else
+#endif /* ZPSE_T_HAVE_AVX2 */
+            {
+                __m128i r[16];
+                unsigned t;
+
+                for (t = 0; t < 16u; t++) {
+                    r[t] = _mm_loadu_si128((const __m128i *)(const void *)
+                                           (in + (size_t)g * 256u +
+                                            (size_t)t * 16u));
+                }
+                zpse_t16x16(r);
+                for (t = 0; t < 16u; t++) {
+                    _mm_storeu_si128(
+                        (__m128i *)(void *)(segs[t] + (size_t)g * 16u),
+                        r[t]);
+                }
             }
         }
         /* Ragged tail (segment lengths differ by at most one row). */
@@ -772,19 +912,35 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
              * columns of 16 bytes and transposing them yields the 16
              * contiguous output rows out[16*j + s]. */
             for (g = 0; (g + 1u) * 16u <= rows; g++) {
-                __m128i r[16];
-                unsigned t;
+#if ZPSE_T_HAVE_AVX2
+                if (zpse_t_avx2()) {
+                    const uint8_t *tin[16];
+                    uint8_t *tout[16];
+                    unsigned t;
 
-                for (t = 0; t < 16u; t++) {
-                    r[t] = _mm_loadu_si128((const __m128i *)(const void *)
-                                           (segs[t] + (size_t)g * 16u));
-                }
-                zpse_t16x16(r);
-                for (t = 0; t < 16u; t++) {
-                    _mm_storeu_si128(
-                        (__m128i *)(void *)(out + (size_t)g * 256u +
-                                            (size_t)t * 16u),
-                        r[t]);
+                    for (t = 0; t < 16u; t++) {
+                        tin[t] = segs[t] + (size_t)g * 16u;
+                        tout[t] = out + (size_t)g * 256u + (size_t)t * 16u;
+                    }
+                    zpse_t16x16_avx2(tin, tout);
+                } else
+#endif /* ZPSE_T_HAVE_AVX2 */
+                {
+                    __m128i r[16];
+                    unsigned t;
+
+                    for (t = 0; t < 16u; t++) {
+                        r[t] = _mm_loadu_si128(
+                            (const __m128i *)(const void *)
+                            (segs[t] + (size_t)g * 16u));
+                    }
+                    zpse_t16x16(r);
+                    for (t = 0; t < 16u; t++) {
+                        _mm_storeu_si128(
+                            (__m128i *)(void *)(out + (size_t)g * 256u +
+                                                (size_t)t * 16u),
+                            r[t]);
+                    }
                 }
             }
             for (s = 0; s < w; s++) {

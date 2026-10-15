@@ -1,9 +1,42 @@
 #include "zpse/residual.h"
 #include "zpse/bits.h"
 #include "zpse/status.h"
+#include "zpse/vector.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+/* The mode-2 palette unpack is the densest residual path the decoder has:
+ * a 256-position tile of low-entropy noise carries ~235 exceptions, all of
+ * them palette indices, and unpacking them one shift-and-mask at a time
+ * measured ~0.75 ns per value - the largest single pool left in the decode
+ * benchmark. Sixteen values at a time come out of the bit-packed payload
+ * with byte shuffles instead, which needs pshufb.
+ *
+ * Same per-function-target structure as the SIMD paths in tile.c: gcc and
+ * clang enable SSSE3 for these routines alone, MSVC only when the whole
+ * translation unit is built with an /arch level that defines __SSSE3__,
+ * otherwise the SIMD form is compiled out and the scalar loop is used.
+ * Execution is additionally gated on zpse_cpu_caps(), so the scalar path
+ * stays reachable and tests/test_parity.c can require the two to agree. */
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_RES_SSSE3 __attribute__((target("ssse3")))
+#define ZPSE_RES_HAVE_SSSE3 1
+#elif defined(__SSSE3__)
+#define ZPSE_RES_SSSE3
+#define ZPSE_RES_HAVE_SSSE3 1
+#else
+#define ZPSE_RES_SSSE3
+#define ZPSE_RES_HAVE_SSSE3 0
+#endif
+#else
+#define ZPSE_RES_HAVE_SSSE3 0
+#endif
+
+#if ZPSE_RES_HAVE_SSSE3
+#include <immintrin.h>
+#endif
 
 uint8_t zpse_base_m_group(uint8_t m)
 {
@@ -150,6 +183,172 @@ static void residual_copy_bytes(uint8_t *dst, const uint8_t *src, uint32_t n)
     }
 }
 
+#if ZPSE_RES_HAVE_SSSE3
+
+/* Sixteen palette indices, one per byte lane, from the low 64 bits of the
+ * bit-packed stream `w` (already shifted down to the first value's bit 0).
+ * Every field is b <= 4 bits wide and never crosses a 64-bit lane, so the
+ * three wide cases are byte shuffles:
+ *
+ *   b == 4   each payload byte holds values 2k and 2k+1; the low and high
+ *            nibbles interleave straight into value order.
+ *   b == 2   each payload byte holds values 4k..4k+3 in bit pairs; the four
+ *            masked copies interleave back into value order.
+ *   b == 1   each payload byte holds eight values, one per bit, so the byte
+ *            is broadcast against the per-lane bit values and compared.
+ *
+ * Only the low eight lanes of the two b == 1 compares are consumed by the
+ * unpacklo_epi64 that joins them, so the all-ones the zeroed upper lanes of
+ * bitv would produce past lane 7 never reaches an output byte. */
+static ZPSE_RES_SSSE3 __m128i residual_pal_index(uint64_t w, unsigned b)
+{
+    const __m128i one = _mm_set1_epi8((char)1);
+    __m128i v = _mm_cvtsi64_si128((long long)w);
+
+    if (b == 4u) {
+        __m128i nib = _mm_set1_epi8((char)0x0F);
+        __m128i lo = _mm_and_si128(v, nib);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), nib);
+
+        return _mm_unpacklo_epi8(lo, hi);
+    }
+    if (b == 2u) {
+        __m128i two = _mm_set1_epi8((char)0x03);
+        __m128i a = _mm_and_si128(v, two);
+        __m128i c = _mm_and_si128(_mm_srli_epi16(v, 2), two);
+        __m128i d = _mm_and_si128(_mm_srli_epi16(v, 4), two);
+        __m128i e = _mm_and_si128(_mm_srli_epi16(v, 6), two);
+
+        return _mm_unpacklo_epi16(_mm_unpacklo_epi8(a, c),
+                                  _mm_unpacklo_epi8(d, e));
+    }
+    {
+        const __m128i bitv = _mm_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, (char)0x80,
+            0, 0, 0, 0, 0, 0, 0, 0);
+        __m128i lo = _mm_cmpeq_epi8(
+            _mm_and_si128(_mm_set1_epi8((char)(uint8_t)w), bitv), bitv);
+        __m128i hi = _mm_cmpeq_epi8(
+            _mm_and_si128(_mm_set1_epi8((char)(uint8_t)(w >> 8)), bitv),
+            bitv);
+
+        return _mm_unpacklo_epi64(_mm_and_si128(lo, one),
+                                  _mm_and_si128(hi, one));
+    }
+}
+
+/* Unpack whole blocks of sixteen mode-2 palette indices with SSSE3,
+ * returning how many values were written. It stops at the first block it
+ * cannot handle - a width other than 1, 2 or 4, or an index that is not
+ * below m - and the scalar loop in the caller then re-decides from there,
+ * so a rejected payload still produces the scalar PSE_BAD_RESIDUAL at the
+ * scalar position and every accepted value is byte-identical to what that
+ * loop would have written. Reads stop at the block's last needed byte, so
+ * a partial final block never touches the byte after the packed region.
+ * The palette is copied into a zero-padded 16-byte register rather than
+ * loaded straight from the payload, because a payload with m < 16 has no
+ * readable bytes past the palette. */
+static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
+    const uint8_t *palette, const uint8_t *src, uint16_t k, unsigned b,
+    unsigned m, uint8_t *exc_out)
+{
+    uint16_t i = 0u;
+    uint8_t pal[16];
+    __m128i palv;
+    __m128i limv;
+
+    /* m is in [2,16], so b is in [1,4] and every width has a path below. */
+    if (b < 1u || b > 4u) {
+        return 0u;
+    }
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+        return 0u;
+    }
+    memcpy(pal, palette, (size_t)m);
+    memset(pal + m, 0, sizeof pal - (size_t)m);
+    palv = _mm_loadu_si128((const __m128i *)(const void *)pal);
+    limv = _mm_set1_epi8((char)(uint8_t)(m - 1u));
+
+    /* A 3-bit field does not tile a byte, so this width takes eight values
+     * (24 bits) per block, extracted with plain shifts into eight index
+     * bytes and then looked up with the same shuffle. The 24 bits plus the
+     * phase always fit in the first 8-byte read, so there is no second
+     * load here. */
+    if (b == 3u) {
+        while ((uint32_t)i + 8u <= (uint32_t)k) {
+            uint32_t bit = (uint32_t)i * 3u;
+            uint32_t off = bit >> 3u;
+            unsigned ph = (unsigned)(bit & 7u);
+            uint32_t take = ((bit + 24u + 7u) >> 3u) - off;
+            uint64_t w = 0u;
+            uint8_t t8[8];
+            __m128i idx;
+
+            if (take > 8u) {
+                take = 8u;
+            }
+            memcpy(&w, src + off, (size_t)take);
+            w = (w >> ph) & UINT64_C(0xFFFFFF);
+            t8[0] = (uint8_t)(w & 7u);
+            t8[1] = (uint8_t)((w >> 3) & 7u);
+            t8[2] = (uint8_t)((w >> 6) & 7u);
+            t8[3] = (uint8_t)((w >> 9) & 7u);
+            t8[4] = (uint8_t)((w >> 12) & 7u);
+            t8[5] = (uint8_t)((w >> 15) & 7u);
+            t8[6] = (uint8_t)((w >> 18) & 7u);
+            t8[7] = (uint8_t)((w >> 21) & 7u);
+            idx = _mm_loadl_epi64((const __m128i *)(const void *)t8);
+            if (_mm_movemask_epi8(_mm_cmpgt_epi8(idx, limv)) != 0) {
+                break;
+            }
+            _mm_storel_epi64((__m128i *)(void *)(exc_out + i),
+                             _mm_shuffle_epi8(palv, idx));
+            i = (uint16_t)(i + 8u);
+        }
+        return i;
+    }
+
+    while ((uint32_t)i + 16u <= (uint32_t)k) {
+        uint32_t bit = (uint32_t)i * b;
+        uint32_t off = bit >> 3u;
+        unsigned ph = (unsigned)(bit & 7u);
+        /* One past the last payload byte this block reads: bit (i+16)*b is
+         * still inside the packed region because i + 16 <= k, so every read
+         * below is bounded by the payload and the bytes past the block are
+         * never touched. A block spans 16*b + ph <= 71 bits, i.e. two reads
+         * of at most 8 and 1 bytes. */
+        uint32_t end = (bit + 16u * b + 7u) >> 3u;
+        uint32_t take = end - off;
+        uint64_t w = 0u;
+        __m128i idx;
+
+        if (take > 8u) {
+            take = 8u;
+        }
+        memcpy(&w, src + off, (size_t)take);
+        if (ph != 0u) {
+            uint32_t rem = (end > off + 8u) ? end - (off + 8u) : 0u;
+            uint64_t hi = 0u;
+
+            if (rem > 0u) {
+                memcpy(&hi, src + off + 8u,
+                       (size_t)((rem > 8u) ? 8u : rem));
+            }
+            w = (w >> ph) | (hi << (64u - ph));
+        }
+        idx = residual_pal_index(w, b);
+        if (_mm_movemask_epi8(_mm_cmpgt_epi8(idx, limv)) != 0) {
+            break;
+        }
+        _mm_storeu_si128((__m128i *)(void *)(exc_out + i),
+                         _mm_shuffle_epi8(palv, idx));
+        i = (uint16_t)(i + 16u);
+    }
+    return i;
+}
+
+#endif /* ZPSE_RES_HAVE_SSSE3 */
+
 static int residual_decode_mode2(const uint8_t *payload,
                                  uint16_t payload_len, uint16_t k,
                                  uint8_t *exc_out)
@@ -188,7 +387,19 @@ static int residual_decode_mode2(const uint8_t *payload,
             }
         }
     }
-    for (i = 0; i < k; i++) {
+#if ZPSE_RES_HAVE_SSSE3
+    /* Below a block there is nothing to unpack, and the setup (a caps query
+     * plus the zero-padded palette) would cost more than the scalar walk. */
+    i = (k >= 8u) ? residual_decode_mode2_simd(payload + 1u, payload + 1u + m,
+                                               k, b, m, exc_out)
+                  : 0u;
+    /* A half-written tile after a rejection is unobservable: every caller
+     * returns immediately on a non-OK status and exc_out is the tile's
+     * resid[] scratch, which is never read afterwards. */
+#else
+    i = 0;
+#endif
+    for (; i < k; i++) {
         unsigned idx = residual_get_bits(payload + 1u + m,
                                          (uint32_t)i * b, b);
         if (idx >= m) {

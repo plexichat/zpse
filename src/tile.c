@@ -1566,16 +1566,33 @@ int zpse_tile_encode(ZpseLaneState *lanes, const uint8_t *actual, uint16_t nt,
         }                                                                    \
     } while (0)
 
-/* Branchless STRIDE-family reconstruction for strides 1, 2 and 4.
+/* Branchless STRIDE-family reconstruction for strides 1, 2, 4 and 8.
  *
  * Stride s predicts x[p] = x[p - s]; the serial dependence is through the
  * previous output, so the loop is latency-bound rather than throughput-
  * bound, and the old per-byte ternary/branch form paid a mispredict on
  * every irregular mask bit (15+ cycles per byte on text). Here the
- * exception select is a conditional move and the residual index advances
- * by the mask bit, so there is no data-dependent branch at all. For s == 1
- * the chain lives in a register. Returns the number of residual units
- * consumed (compared against k by the caller). */
+ * exception select is an XOR/AND mask and the residual index advances by
+ * the mask bit, so there is no data-dependent branch at all.
+ *
+ * For s > 1 the residue classes mod s are s INDEPENDENT chains: position
+ * p's prediction reads out[p - s], which belongs to the same chain and to
+ * no other position in between, so nothing couples the chains. On a DENSE
+ * mask - the case that matters, text and noise at 200+ exceptions in 256
+ * positions - reading out[p - s] back from memory puts the store-to-load
+ * latency of s positions ago straight onto the critical path, and the loop
+ * runs one chain at a time. The loop therefore unrolls by exactly s, one
+ * chain kept in a register each: the s positions of a step are mutually
+ * independent, so their latency overlaps instead of adding up. The
+ * residual units are still consumed in ascending position order: each
+ * step's expansions run in position order and the steps themselves are
+ * ascending.
+ *
+ * For s == 1 there is one chain and no interleaving to be had; the chain
+ * lives in `prev` and the loop stays as it was. Positions below the stride
+ * read the segment's earlier bytes (or the initial literal at the very
+ * start of the segment) exactly as before. Returns the number of residual
+ * units consumed (compared against k by the caller). */
 static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
                                          const uint8_t *seg_base,
                                          uint32_t seg_pos, uint8_t init,
@@ -1589,10 +1606,20 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
     uint8_t prev = 0u;
     uint32_t head = (s < (uint32_t)nt) ? s : (uint32_t)nt;
 
-#define ZPSE_STRIDE_STEP(XHAT)                                              \
+    /* One position `PP`: take its prediction, invert the residual if the
+     * mask marks the position, store, and leave the result as the front of
+     * the chain (`CHAIN` is `prev` for the single-chain loops and one of
+     * the interleaved registers otherwise). `mk_` is the mask bit expanded
+     * to a byte mask, which is what makes the select branchless:
+     * x_ = xh_ ^ ((xh_ ^ e_) & mk_). The position is a parameter rather
+     * than an implicit `p` so the interleaved loops can expand several
+     * positions of one step in ascending order without touching p, which
+     * is what keeps the unit order the scalar loop had. */
+#define ZPSE_STRIDE_STEP(PP, XHAT, CHAIN)                                   \
     do {                                                                    \
+        uint32_t pp_ = (uint32_t)(PP);                                      \
         uint8_t xh_ = (uint8_t)(XHAT);                                      \
-        uint32_t m_ = (words[p >> 5] >> (p & 31u)) & 1u;                    \
+        uint32_t m_ = (words[pp_ >> 5] >> (pp_ & 31u)) & 1u;                \
         uint8_t mk_ = (uint8_t)(0u - m_);                                   \
         uint8_t x_;                                                         \
         if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {                       \
@@ -1606,23 +1633,79 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
             uint8_t e_ = (uint8_t)(r_ + (uint8_t)(r_ >= xh_));              \
             x_ = (uint8_t)(xh_ ^ ((xh_ ^ e_) & mk_));                       \
         }                                                                   \
-        out[p] = x_;                                                        \
+        out[pp_] = x_;                                                      \
         j += m_;                                                            \
-        prev = x_;                                                          \
+        CHAIN = x_;                                                         \
     } while (0)
 
     /* Positions below the stride read the segment's earlier bytes (or the
-     * initial literal at the very start of the segment). */
-    for (p = 0u; p < head; p++)
-        ZPSE_STRIDE_STEP((seg_pos + p < s) ? init : seg_base[seg_pos + p - s]);
+     * initial literal at the very start of the segment). They also seed
+     * the s chains: after this loop out[0 .. head-1] is final, and the
+     * chain of position p is the one whose previous member is out[p - s]. */
+    for (p = 0u; p < head; p++) {
+        uint8_t xh = (seg_pos + p < s) ? init : seg_base[seg_pos + p - s];
+
+        ZPSE_STRIDE_STEP(p, xh, prev);
+    }
 
     if (s == 1u) {
         /* head == 1 here (nt >= 1); the chain is `prev`. */
         for (; p < (uint32_t)nt; p++)
-            ZPSE_STRIDE_STEP(prev);
+            ZPSE_STRIDE_STEP(p, prev, prev);
+    } else if (s == 2u && (uint32_t)nt >= 2u) {
+        /* Two chains, one per residue class mod 2. out[0] and out[1] are
+         * the current members of chain 0 and chain 1, which is exactly
+         * what position 2 and position 3 predict from. */
+        uint8_t c0 = out[0];
+        uint8_t c1 = out[1];
+
+        for (; p + 2u <= (uint32_t)nt; p += 2u) {
+            ZPSE_STRIDE_STEP(p, c0, c0);
+            ZPSE_STRIDE_STEP(p + 1u, c1, c1);
+        }
+        /* Fewer than s positions left: they read the finished bytes back,
+         * which are the same values the chain registers hold. */
+        for (; p < (uint32_t)nt; p++)
+            ZPSE_STRIDE_STEP(p, out[p - s], prev);
+    } else if (s == 4u && (uint32_t)nt >= 4u) {
+        uint8_t c0 = out[0];
+        uint8_t c1 = out[1];
+        uint8_t c2 = out[2];
+        uint8_t c3 = out[3];
+
+        for (; p + 4u <= (uint32_t)nt; p += 4u) {
+            ZPSE_STRIDE_STEP(p, c0, c0);
+            ZPSE_STRIDE_STEP(p + 1u, c1, c1);
+            ZPSE_STRIDE_STEP(p + 2u, c2, c2);
+            ZPSE_STRIDE_STEP(p + 3u, c3, c3);
+        }
+        for (; p < (uint32_t)nt; p++)
+            ZPSE_STRIDE_STEP(p, out[p - s], prev);
+    } else if (s == 8u && (uint32_t)nt >= 8u) {
+        uint8_t c0 = out[0];
+        uint8_t c1 = out[1];
+        uint8_t c2 = out[2];
+        uint8_t c3 = out[3];
+        uint8_t c4 = out[4];
+        uint8_t c5 = out[5];
+        uint8_t c6 = out[6];
+        uint8_t c7 = out[7];
+
+        for (; p + 8u <= (uint32_t)nt; p += 8u) {
+            ZPSE_STRIDE_STEP(p, c0, c0);
+            ZPSE_STRIDE_STEP(p + 1u, c1, c1);
+            ZPSE_STRIDE_STEP(p + 2u, c2, c2);
+            ZPSE_STRIDE_STEP(p + 3u, c3, c3);
+            ZPSE_STRIDE_STEP(p + 4u, c4, c4);
+            ZPSE_STRIDE_STEP(p + 5u, c5, c5);
+            ZPSE_STRIDE_STEP(p + 6u, c6, c6);
+            ZPSE_STRIDE_STEP(p + 7u, c7, c7);
+        }
+        for (; p < (uint32_t)nt; p++)
+            ZPSE_STRIDE_STEP(p, out[p - s], prev);
     } else {
         for (; p < (uint32_t)nt; p++)
-            ZPSE_STRIDE_STEP(out[p - s]);
+            ZPSE_STRIDE_STEP(p, out[p - s], prev);
     }
 #undef ZPSE_STRIDE_STEP
     return (uint16_t)j;
@@ -1846,6 +1929,31 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
     return consumed;
 }
 
+/* The 32-lane counterpart of tile_unit_index(): the exclusive popcount of
+the chunk's mask bits at each byte lane, i.e. the index, inside the
+chunk's unit window, of the unit that lane consumes. `v1` is the chunk's
+mask bits as 0/1 bytes (the caller already has the byte mask `mb`, so
+this is just `mb & 1`), and the same three-step shift-and-add ladder
+produces the exclusive prefix sum. _mm256_slli_si256 shifts each
+128-bit lane independently, so each half of the chunk gets its own index
+in 0..15 - exactly the range vpshufb needs while the two halves are
+separate 16-byte windows. */
+static ZPSE_TILE_AVX2 __m256i tile_unit_index32(__m256i v1)
+{
+    /* Inclusive prefix first, then one shift to make it exclusive. The
+     * ladder has to span the whole half (16 lanes, so shifts 1/2/4/8); an
+     * 8-wide ladder - which is what the 8-lane kernel needs - silently
+     * undercounts from lane 9 on, and the index then points at an earlier
+     * unit. The counts stay in a byte (at most 16). */
+    __m256i x = v1;
+
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 1));
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 2));
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 4));
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 8));
+    return _mm256_slli_si256(x, 1);
+}
+
 /* Reconstruct a whole CONST tile 32 positions at a time.
  *
  * A CONST tile has no recurrence at all: every prediction is the same
@@ -1899,10 +2007,9 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
 
     while (at < full) {
         uint32_t w = words[at >> 5u];
-        uint8_t tmp[32];
+        __m256i mb;
         __m256i r;
         __m256i x;
-        __m256i mb;
         __m256i res;
 
         /* No exceptions in this chunk: the whole result is the
@@ -1912,12 +2019,51 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
             at += 32u;
             continue;
         }
-        if (w == UINT32_C(0xFFFFFFFF)) {
-            /* Every position is an exception: the units are contiguous
-             * and already in position order. */
-            memcpy(tmp, units + consumed, 32);
-            consumed = (uint16_t)(consumed + 32u);
+
+        /* Expand the chunk's 32 mask bits to a byte mask: byte lane i
+         * holds the word's byte i >> 3, so ANDing with bitv (1 << (i & 7))
+         * keeps exactly bitv's bit when bit i of the word is set. This is
+         * also what the unit placement below indexes with, so it is built
+         * before the units rather than after them. */
+        mb = _mm256_cmpeq_epi8(
+            _mm256_and_si256(
+                _mm256_shuffle_epi8(_mm256_set1_epi32((int)w), dup8),
+                bitv),
+            bitv);
+
+        /* The chunk's units, placed at the lane of the position they
+         * belong to: lane i takes unit popcount(w below i), which is what
+         * the ladder gives. Compacting them into the low lanes instead
+         * would be wrong - lane i must hold the unit of position at + i,
+         * not the i-th unit.
+         *
+         * The units of a chunk are contiguous, and the ladder is per
+         * 128-bit lane, so the low half's units are the 16 bytes at
+         * `consumed` and the high half's are the 16 bytes at `consumed +
+         * popcount(w & 0xFFFF)`; two windows, one shuffle. (The old form
+         * built the same vector in a 32-byte stack staging buffer with a
+         * per-bit walk and loaded it back, a store-to-load round trip per
+         * chunk, which is what sparse tiles spent their reconstruction on.)
+         *
+         * The two windows are only read when the whole chunk still fits in
+         * the unit array. A chunk that does not (a tile with more than 224
+         * exceptions, which is dense even by this kernel's standards) keeps
+         * the per-bit walk, which never reads past the units it consumes
+         * (consumed + popcount(w) <= k <= ZPSE_TILE_UNIT_BYTES). */
+        if ((uint32_t)consumed + 32u <= ZPSE_TILE_UNIT_BYTES) {
+            uint32_t lo = (uint32_t)tile_popcount32(w & UINT32_C(0xFFFF));
+            __m128i win_lo = _mm_loadu_si128(
+                (const __m128i *)(const void *)(units + consumed));
+            __m128i win_hi = _mm_loadu_si128(
+                (const __m128i *)(const void *)(units + consumed + lo));
+            __m256i win = _mm256_castsi128_si256(win_lo);
+
+            win = _mm256_inserti128_si256(win, win_hi, 1);
+            r = _mm256_shuffle_epi8(
+                win, tile_unit_index32(_mm256_and_si256(mb, one)));
+            consumed = (uint16_t)(consumed + (uint16_t)tile_popcount32(w));
         } else {
+            uint8_t tmp[32];
             uint32_t wg = w;
             uint32_t bit = 0u;
             uint16_t cnt = 0u;
@@ -1935,9 +2081,9 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
                 bit++;
             }
             consumed = (uint16_t)(consumed + cnt);
+            r = _mm256_loadu_si256((const __m256i *)(const void *)tmp);
         }
 
-        r = _mm256_loadu_si256((const __m256i *)(const void *)tmp);
         if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
             x = r;
         } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
@@ -1949,14 +2095,6 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
             x = _mm256_add_epi8(r, _mm256_and_si256(ge, one));
         }
 
-        /* Expand the chunk's 32 mask bits to a byte mask: byte lane i
-         * holds the word's byte i >> 3, so ANDing with bitv (1 << (i & 7))
-         * keeps exactly bitv's bit when bit i of the word is set. */
-        mb = _mm256_cmpeq_epi8(
-            _mm256_and_si256(
-                _mm256_shuffle_epi8(_mm256_set1_epi32((int)w), dup8),
-                bitv),
-            bitv);
         res = _mm256_or_si256(_mm256_and_si256(mb, x),
                               _mm256_andnot_si256(mb, xhat));
         _mm256_storeu_si256((__m256i *)(void *)(out + (size_t)at), res);
