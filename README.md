@@ -175,16 +175,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encode GB/s | decode GB/s |
 | --- | --- | --- | --- |
-| zeros | 0.040 | 12.8 | 14.6 |
+| zeros | 0.040 | 12.8 | 14.8 |
 | incr | 0.040 | 1.1 | 6.9 |
-| random | 1.000 | 0.15 | 20.9 |
-| sparse | 0.060 | 0.35 | 3.7 |
-| strided | 0.040 | 1.0 | 6.9 |
+| random | 1.000 | 0.41 | 21.2 |
+| sparse | 0.060 | 0.32 | 3.7 |
+| strided | 0.040 | 1.0 | 6.8 |
 | const5A | 0.040 | 12.8 | 14.9 |
-| alt00FF | 0.040 | 2.5 | 13.0 |
-| sawtooth | 0.163 | 0.16 | 1.1 |
-| lowentropy | 0.688 | 0.06 | 0.29 |
-| sparse2 | 0.048 | 0.52 | 5.0 |
+| alt00FF | 0.040 | 2.5 | 12.4 |
+| sawtooth | 0.163 | 0.23 | 1.1 |
+| lowentropy | 0.688 | 0.08 | 0.5 |
+| sparse2 | 0.048 | 0.49 | 5.1 |
 
 The same run reports this machine's ceilings for the same 64 KiB working
 set: memcpy 51-69 GB/s, memset 87-127 GB/s and CRC32-C 24-31 GB/s. The
@@ -195,11 +195,17 @@ checksum alone is about a third of the decode time.
 What sets each direction: encode is dominated by the per-tile predictor
 search - the AVX2 prescreen computes the exception count of eight
 predictors in one whole-tile pass, and a run of all-hit tiles is written
-as its 8-byte record directly. Decode is dominated by reconstruction
+as its 8-byte record directly. Tiles that are mostly exceptions (text,
+noise: the `random`, `sawtooth` and `lowentropy` rows) no longer pay a
+per-exception scalar loop at all: the exception mask, the exclusion
+residuals and the signed-delta range come out of one AVX2 pass, and the
+predictions and residuals are compacted into position order with a
+256-entry byte-shuffle table. Decode is dominated by reconstruction
 (exception tiles), the segment transforms, and the CRC; all-hit runs of a
 segment coalesce into a single fill, the delta8/xor8 inverses are AVX2
-prefix scans, and a single-segment raw-bytes block decodes straight into
-the caller's buffer.
+prefix scans, strided reconstruction is branchless (which is what lifts
+the exception-heavy `lowentropy` row), and a single-segment raw-bytes
+block decodes straight into the caller's buffer.
 
 ## License
 

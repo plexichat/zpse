@@ -2,6 +2,8 @@
 #include "zpse/combinadic.h"
 #include "zpse/status.h"
 
+#include <string.h>
+
 /* Unity-build safe: only static helpers plus the public API. No
  * allocation, no globals, C11. */
 
@@ -15,17 +17,13 @@ static void zpse_mask_set_at(uint32_t words[8], uint16_t pos)
  * the file buildable elsewhere without changing the result. */
 static int zpse_mask_popcount32(uint32_t w)
 {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_popcount(w);
-#else
-    int n = 0;
-
-    while (w != 0u) {
-        w &= w - 1u;
-        n++;
-    }
-    return n;
-#endif
+    /* Branch-free SWAR popcount. __builtin_popcount lowers to a libgcc
+     * call (__popcountdi2) unless the whole build is compiled with
+     * -mpopcnt, which this portable codebase is not. */
+    w = w - ((w >> 1) & 0x55555555u);
+    w = (w & 0x33333333u) + ((w >> 2) & 0x33333333u);
+    w = (w + (w >> 4)) & 0x0F0F0F0Fu;
+    return (int)((w * 0x01010101u) >> 24);
 }
 
 /* Index of the lowest set bit. Caller guarantees w != 0. */
@@ -356,10 +354,16 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
             return PSE_BAD_ARG;
         /* Little-endian serialisation of the dense words: payload byte b
          * is byte lane (b & 3) of words[b >> 2]. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        memcpy(payload_out, words, (size_t)need);
+        (void)byte_i;
+#else
         for (byte_i = 0; byte_i < (unsigned)need; byte_i++) {
             payload_out[byte_i] =
                 (uint8_t)(words[byte_i >> 2] >> ((byte_i & 3u) * 8u));
         }
+#endif
         /* Pad bits (>= nt) MUST be zero on the wire. The caller's array
          * may hold stray bits above nt, which zpse_mask_count_bits()
          * deliberately ignores, so clear them explicitly rather than

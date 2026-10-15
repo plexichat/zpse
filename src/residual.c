@@ -654,11 +654,12 @@ int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
         if ((uint32_t)payload_cap < (uint32_t)k) {
             return PSE_OUTPUT_OVERFLOW;
         }
-        for (i = 0; i < k; i++) {
-            if (exc_in[i] > 254u) {
+        if (k > 0u) {
+            /* `> 254` on a byte is `== 255`; test eight at a time, then copy. */
+            if (residual_has_ff(exc_in, (uint32_t)k)) {
                 return PSE_BAD_RESIDUAL;
             }
-            payload_out[i] = exc_in[i];
+            memcpy(payload_out, exc_in, (size_t)k);
         }
         return (int)k;
     }
