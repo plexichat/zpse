@@ -312,6 +312,35 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
         k++;                                                            \
     } while (0)
 
+/* Same bookkeeping as TILE_TAKE_EXC for a position that the finished
+ * mask ALREADY marks. Both callers below walk the mask words, so the
+ * set-bit store of TILE_TAKE_EXC would write a bit that is already set:
+ * dropping it leaves cl->words identical. What it also removes is the
+ * only write the walk performs, and `words` is `cl->words`, a caller
+ * pointer the compiler may not assume is disjoint from the tile bytes --
+ * with the store gone it can keep `actual[]`/`stg[]` values in registers
+ * across exceptions instead of reloading them after every store. */
+#define TILE_TAKE_EXC_MASKED(p_, xhat_, x_)                             \
+    do {                                                                \
+        uint16_t _pp = (uint16_t)(p_);                                  \
+        uint8_t _xh = (uint8_t)(xhat_);                                 \
+        uint8_t _x = (uint8_t)(x_);                                     \
+        uint8_t _r = zpse_exclusion_forward(_x, _xh);                   \
+        uint8_t _db = (uint8_t)((((unsigned)_x - (unsigned)_xh + 128u)  \
+                                 & 0xFFu));                             \
+        (void)_pp;                                                      \
+        cl->at_pred[k] = _xh;                                           \
+        cl->res_at_exc[k] = _r;                                         \
+        cl->seen[_r >> 5] |= (uint32_t)1u << (_r & 31u);                \
+        if (_r > _rmax)                                                 \
+            _rmax = _r;                                                 \
+        if (_db < _dmin)                                                \
+            _dmin = _db;                                                \
+        if (_db > _dmax)                                                \
+            _dmax = _db;                                                \
+        k++;                                                            \
+    } while (0)
+
 /* Mark position p as an exception without touching the residual
  * statistics. The vector classifier uses this to build the mask in
  * position order across its prologue/vector/tail, then makes exactly one
@@ -764,6 +793,52 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
             else
                 pv = _mm256_avg_epu8(h8, h16);
         }
+        (void)eq; (void)idx;
+        lt = _mm256_cmpeq_epi8(_mm256_min_epu8(v, pv), v);
+        r = _mm256_add_epi8(v, _mm256_xor_si256(lt, all));
+        db = _mm256_add_epi8(_mm256_sub_epi8(v, pv), b128);
+        if (m == 0xFFFFFFFFu) {
+            /* Fully set word: every lane is an exception, so the blend
+             * mask the expansion below would build is all ones and both
+             * uses of it collapse. The masked maxima take r and db
+             * unmasked (`and` with an all-ones vector), the minimum over
+             * ~db is ~db itself, and tile_cmp_lut[0xFF] is exactly
+             * 00..07 (verified above), i.e. the compaction of a full word
+             * is the sixteen bytes of pv / r in order -- so seventeen
+             * words of vector work per chunk become four stores. A dense
+             * tile has seven such chunks out of eight. Bits at or above
+             * nt are never set by the chunk macro, so a full word implies
+             * a full chunk and k + 32 <= 256 always holds here. */
+            /* Eight lanes at a time, in position order: the low half of
+             * each 128-bit lane holds positions h*8..h*8+7 and its high
+             * half the next eight, so the four 8-byte stores cover the
+             * chunk in order. (Storing a whole 128-bit lane with one
+             * 8-byte store would put positions 16..23 after 0..7 and
+             * drop 8..15 -- the unit-order trap this path has to avoid
+             * just like the general one.) */
+            const __m128i plo = _mm256_castsi256_si128(pv);
+            const __m128i rlo = _mm256_castsi256_si128(r);
+            const __m128i phi = _mm256_extracti128_si256(pv, 1);
+            const __m128i rhi = _mm256_extracti128_si256(r, 1);
+
+            rmaxv = _mm256_max_epu8(rmaxv, r);
+            dmaxv = _mm256_max_epu8(dmaxv, db);
+            ndminv = _mm256_max_epu8(ndminv, _mm256_xor_si256(db, all));
+            _mm_storel_epi64((__m128i *)(void *)(tp + k), plo);
+            _mm_storel_epi64((__m128i *)(void *)(tr + k), rlo);
+            _mm_storel_epi64((__m128i *)(void *)(tp + k + 8u),
+                             _mm_srli_si128(plo, 8));
+            _mm_storel_epi64((__m128i *)(void *)(tr + k + 8u),
+                             _mm_srli_si128(rlo, 8));
+            _mm_storel_epi64((__m128i *)(void *)(tp + k + 16u), phi);
+            _mm_storel_epi64((__m128i *)(void *)(tr + k + 16u), rhi);
+            _mm_storel_epi64((__m128i *)(void *)(tp + k + 24u),
+                             _mm_srli_si128(phi, 8));
+            _mm_storel_epi64((__m128i *)(void *)(tr + k + 24u),
+                             _mm_srli_si128(rhi, 8));
+            k += 32u;
+            continue;
+        }
         /* exception lanes straight from the finished mask word */
         {
             __m256i bits = _mm256_set1_epi32((int)m);
@@ -775,10 +850,6 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
                 1,2,4,8,16,32,64,(char)128,1,2,4,8,16,32,64,(char)128);
             ex = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(bits, sel), bm), bm);
         }
-        (void)eq; (void)idx;
-        lt = _mm256_cmpeq_epi8(_mm256_min_epu8(v, pv), v);
-        r = _mm256_add_epi8(v, _mm256_xor_si256(lt, all));
-        db = _mm256_add_epi8(_mm256_sub_epi8(v, pv), b128);
         rmaxv = _mm256_max_epu8(rmaxv, _mm256_and_si256(r, ex));
         dmaxv = _mm256_max_epu8(dmaxv, _mm256_and_si256(db, ex));
         ndminv = _mm256_max_epu8(
@@ -1034,41 +1105,54 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
             k = tile_dense_bk_avx2(stg, nt, predictor_id, fam, c, s, words, cl,
                                    &_rmax, &_dmin, &_dmax);
         } else if (fam == TILE_FAM_CONST) {
-            for (wi = 0; wi < 8u; wi++) {
+            /* Stop once every set bit of the mask has been consumed:
+             * positions ascend across words and the mask holds exactly
+             * `nexc` of them. */
+            for (wi = 0; wi < 8u && k < (uint16_t)nexc; wi++) {
                 uint32_t w = words[wi];
 
                 while (w != 0u) {
                     uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
 
-                    TILE_TAKE_EXC(pos, c, actual[pos]);
+                    TILE_TAKE_EXC_MASKED(pos, c, stg[16u + (uint32_t)pos]);
                     w &= w - 1u;
                 }
             }
         } else if (fam == TILE_FAM_STRIDE) {
-            for (wi = 0; wi < 8u; wi++) {
+            /* Stop once every set bit of the mask has been consumed:
+             * positions ascend across words and the mask holds exactly
+             * `nexc` of them. */
+            for (wi = 0; wi < 8u && k < (uint16_t)nexc; wi++) {
                 uint32_t w = words[wi];
 
                 while (w != 0u) {
                     uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
 
-                    TILE_TAKE_EXC(pos, stg[16u + (uint32_t)pos - s],
-                                  actual[pos]);
+                    TILE_TAKE_EXC_MASKED(pos, stg[16u + (uint32_t)pos - s],
+                                         stg[16u + (uint32_t)pos]);
                     w &= w - 1u;
                 }
             }
         } else if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
-            for (wi = 0; wi < 8u; wi++) {
+            /* Stop once every set bit of the mask has been consumed:
+             * positions ascend across words and the mask holds exactly
+             * `nexc` of them. */
+            for (wi = 0; wi < 8u && k < (uint16_t)nexc; wi++) {
                 uint32_t w = words[wi];
 
                 while (w != 0u) {
                     uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
 
-                    TILE_TAKE_EXC(pos, stg[8u + (uint32_t)pos], actual[pos]);
+                    TILE_TAKE_EXC_MASKED(pos, stg[8u + (uint32_t)pos],
+                                         stg[16u + (uint32_t)pos]);
                     w &= w - 1u;
                 }
             }
         } else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA) {
-            for (wi = 0; wi < 8u; wi++) {
+            /* Stop once every set bit of the mask has been consumed:
+             * positions ascend across words and the mask holds exactly
+             * `nexc` of them. */
+            for (wi = 0; wi < 8u && k < (uint16_t)nexc; wi++) {
                 uint32_t w = words[wi];
 
                 while (w != 0u) {
@@ -1076,15 +1160,18 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                     uint8_t h8 = stg[8u + (uint32_t)pos];
                     uint8_t h16 = stg[pos];
 
-                    TILE_TAKE_EXC(pos,
-                                  (uint8_t)((2u * (unsigned)h8 -
-                                            (unsigned)h16) & 0xFFu),
-                                  actual[pos]);
+                    TILE_TAKE_EXC_MASKED(pos,
+                                         (uint8_t)((2u * (unsigned)h8 -
+                                                   (unsigned)h16) & 0xFFu),
+                                         stg[16u + (uint32_t)pos]);
                     w &= w - 1u;
                 }
             }
         } else { /* ZPSE_P_LANE_AVERAGE */
-            for (wi = 0; wi < 8u; wi++) {
+            /* Stop once every set bit of the mask has been consumed:
+             * positions ascend across words and the mask holds exactly
+             * `nexc` of them. */
+            for (wi = 0; wi < 8u && k < (uint16_t)nexc; wi++) {
                 uint32_t w = words[wi];
 
                 while (w != 0u) {
@@ -1092,10 +1179,10 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                     uint8_t h8 = stg[8u + (uint32_t)pos];
                     uint8_t h16 = stg[pos];
 
-                    TILE_TAKE_EXC(pos,
-                                  (uint8_t)(((unsigned)h8 + (unsigned)h16 +
-                                             1u) >> 1),
-                                  actual[pos]);
+                    TILE_TAKE_EXC_MASKED(pos,
+                                         (uint8_t)(((unsigned)h8 + (unsigned)h16 +
+                                                    1u) >> 1),
+                                         stg[16u + (uint32_t)pos]);
                     w &= w - 1u;
                 }
             }

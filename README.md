@@ -175,16 +175,21 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encode GB/s | decode GB/s |
 | --- | --- | --- | --- |
-| zeros | 0.040 | 12.5 | 16.0 |
-| incr | 0.040 | 1.0 | 8.6 |
-| random | 1.000 | 0.42 | 20.4 |
-| sparse | 0.060 | 0.32 | 4.7 |
-| strided | 0.040 | 1.0 | 8.6 |
-| const5A | 0.040 | 12.1 | 16.2 |
-| alt00FF | 0.040 | 2.4 | 13.7 |
-| sawtooth | 0.163 | 0.23 | 1.2 |
-| lowentropy | 0.688 | 0.08 | 0.9 |
-| sparse2 | 0.048 | 0.48 | 5.1 |
+| zeros | 0.040 | 12.5 | 14.7 |
+| incr | 0.040 | 1.0 | 7.4 |
+| random | 1.000 | 0.38 | 18.8 |
+| sparse | 0.060 | 0.28 | 3.7 |
+| strided | 0.040 | 1.0 | 7.2 |
+| const5A | 0.040 | 12.2 | 14.6 |
+| alt00FF | 0.040 | 2.2 | 12.2 |
+| sawtooth | 0.163 | 0.22 | 1.0 |
+| lowentropy | 0.688 | 0.10 | 0.7 |
+| sparse2 | 0.048 | 0.44 | 4.3 |
+
+The encode column moved this round by 1.04-1.15x per row (measured as
+best-of-25 pairs of the same binary before and after, so the ratios do not
+depend on the clock state). This table is one run, so its fastest rows sit
+about 7% below the same binaries measured earlier on this machine.
 
 The same run reports this machine's ceilings for the same 64 KiB working
 set: memcpy 69 GB/s, memset 123 GB/s and CRC32-C 30.5 GB/s. The CRC32-C
@@ -205,7 +210,12 @@ noise: the `random`, `sawtooth` and `lowentropy` rows) no longer pay a
 per-exception scalar loop at all: the exception mask, the exclusion
 residuals and the signed-delta range come out of one AVX2 pass, and the
 predictions and residuals are compacted into position order with a
-256-entry byte-shuffle table. Decode is dominated by reconstruction
+256-entry byte-shuffle table, a 32-exception chunk whose mask word is full
+is placed with four stores instead of the expansion and the shuffle, and a
+dense palette residual payload packs sixteen values per step through a
+two-half byte shuffle (the isolated dense pack measured 293 -> 191 ns per
+245 values; the earlier round's 16-wide unpack covers the decode side of
+the same path). Decode is dominated by reconstruction
 (exception tiles), the segment transforms, and the CRC; all-hit runs of a
 segment coalesce into a single fill (and a run's records are now compared
 two at a time), the delta8/xor8 inverses are AVX2 prefix scans whose carry
