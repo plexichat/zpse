@@ -62,12 +62,17 @@ int zpse_tile_encode(ZpseLaneState *lanes, const uint8_t *actual, uint16_t nt,
 typedef struct ZpseTileClass {
     uint32_t words[8];     /* 256-bit exception mask, bit p = exception */
     uint16_t k;            /* number of exceptions (== popcount) */
-    uint16_t nu;           /* distinct exclusion-residual values seen */
+    uint16_t nu;           /* distinct exclusion-residual values seen,
+                            * capped at 17: the palette mode is rejected
+                            * above 16 entries, so a larger exact count
+                            * could not change any packed byte and the
+                            * dense classify stops counting there. */
     uint8_t  constant_C;   /* predictor 9 mode byte (encoder choice) */
     uint8_t  rmax;         /* largest exclusion residual seen */
     uint8_t  dmin;         /* signed-delta range, stored biased by +128 */
     uint8_t  dmax;
-    uint32_t seen[8];      /* 256-bit set of exclusion residuals seen */
+    uint32_t seen[8];      /* 256-bit set of exclusion residuals seen, cut
+                            * to its lowest popcount(seen) == nu bits */
     uint8_t  at_pred[256]; /* predictions at exception positions, ascending */
     uint8_t  res_at_exc[256]; /* exclusion residuals at those positions:
                                * exclusion_forward(actual[p], at_pred[j]).

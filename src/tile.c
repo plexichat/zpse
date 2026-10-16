@@ -368,6 +368,47 @@ static int tile_popcount32(uint32_t w)
     return (int)((w * 0x01010101u) >> 24);
 }
 
+/* The distinct-residual count is capped here, and that is exact where it
+ * matters: the only consumer of cl->nu is the palette length in
+ * tile_res_len(), which rejects the palette outright once nu exceeds 16
+ * (a palette holds at most 16 entries). Reporting 17 for every tile above
+ * the threshold therefore cannot change one packed byte, while making the
+ * count knowable from a prefix of the exceptions -- which is what lets the
+ * dense classify below stop recording residuals as soon as a seventeenth
+ * distinct value is seen instead of walking all ~250 of them. Below the
+ * threshold nu stays exact, and cl->seen is trimmed with it so the two
+ * remain consistent (popcount(seen) == nu, which is what the scalar/SIMD
+ * parity suite checks). */
+#define ZPSE_TILE_NU_CAP 17u
+
+/* Only a tile with more than ZPSE_TILE_NU_CAP distinct residuals reaches
+ * the trim, so it is kept out of line: inlined into the classify epilogue
+ * (which every tile runs) its register pressure measurably slowed the
+ * sparse and nibble rows down. MSVC has no per-function attribute and
+ * simply inlines it. */
+#if defined(__GNUC__) || defined(__clang__)
+#define ZPSE_TILE_RARE __attribute__((noinline, cold))
+#else
+#define ZPSE_TILE_RARE
+#endif
+
+/* Reduce cl->seen to its `keep` lowest set bits, so the set can never
+ * disagree with a capped nu. Caller guarantees keep < popcount. */
+static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep)
+{
+    unsigned w;
+    unsigned total = 0u;
+
+    for (w = 0; w < 8u; w++)
+        total += (unsigned)tile_popcount32(seen[w]);
+    for (w = 0; w < 8u && total > keep; w++) {
+        while (total > keep && seen[w] != 0u) {
+            seen[w] &= seen[w] - 1u; /* drop the lowest set bit */
+            total--;
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ *
  * Vectorised exception discovery for the classification pass.
  *
@@ -746,6 +787,25 @@ static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
     return (uint8_t)_mm_cvtsi128_si32(m);
 }
 
+/* Fold the 256-byte residual-presence array into `seen`, returning how
+ * many distinct values it holds. */
+static ZPSE_TILE_AVX2 unsigned tile_pres_fold(const uint8_t *pres,
+                                              uint32_t seen[8])
+{
+    const __m256i z = _mm256_setzero_si256();
+    unsigned i;
+    unsigned nu = 0u;
+
+    for (i = 0; i < 8u; i++) {
+        const __m256i q = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pres + i * 32u));
+
+        seen[i] = (uint32_t)~_mm256_movemask_epi8(_mm256_cmpeq_epi8(q, z));
+        nu += (unsigned)tile_popcount32(seen[i]);
+    }
+    return nu;
+}
+
 static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
     const uint8_t *stg, uint16_t nt, uint8_t predictor_id, int fam,
     uint8_t c, uint32_t s, const uint32_t words[8], ZpseTileClass *cl,
@@ -897,39 +957,47 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
     memcpy(cl->res_at_exc, tr, k);
     memcpy(cl->act_at_exc, ta, k);
 
-    /* distinct-residual set. cl->seen is the COMPLETE set -- cl->nu is its
-     * popcount and callers test it -- so every unit is stored; stopping
-     * early once 17 values are known would leave the set a strict subset,
-     * which is not what the scalar path returns and is what the scalar/
-     * SIMD parity suite compares.
+    /* distinct-residual set. cl->seen is the complete set up to the point
+     * where it is complete enough: word w bit j of cl->seen is "value
+     * 32*w + j is present", which is the bit the scalar path sets, and
+     * ZPSE_TILE_NU_CAP is where that stops being worth paying for.
      *
      * A 256-byte presence array needs one independent byte store per
      * exception and no read-modify-write, where the four-bitmap form paid
      * a load and a store through a data-dependent address for each unit.
-     * Word w bit j of cl->seen is then "value 32*w + j is present", which
-     * is the bit the scalar path sets: the compare against zero marks the
-     * ABSENT values and the complement of its movemask has a one exactly
-     * where a presence byte is nonzero. */
+     * The compare against zero marks the ABSENT values and the complement
+     * of its movemask has a one exactly where a presence byte is nonzero.
+     *
+     * The pass is therefore done in two parts, and the first is a probe:
+     * this function only runs with k >= 32, and a tile whose first 32
+     * exceptions already hold ZPSE_TILE_NU_CAP distinct residuals has
+     * already rejected the palette mode, so the remaining entries are
+     * recorded, folded and thrown away. That is the common case for a
+     * dense tile (a 256-byte tile of text, code or noise reaches 17
+     * distinct residuals within its first ~20 exceptions), and it is the
+     * single largest cost in this function. A tile that is still under
+     * the cap after the probe -- the palettizable ones -- walks the rest
+     * exactly as before, so its count stays exact. */
     {
         uint8_t pres[256];
-        const __m256i z = _mm256_setzero_si256();
 
         memset(pres, 0, sizeof pres);
-        for (i = 0; i + 4u <= k; i += 4u) {
+        for (i = 0; i + 4u <= 32u; i += 4u) {
             pres[tr[i]] = 1u;
             pres[tr[i + 1u]] = 1u;
             pres[tr[i + 2u]] = 1u;
             pres[tr[i + 3u]] = 1u;
         }
-        for (; i < k; i++)
-            pres[tr[i]] = 1u;
-
-        for (i = 0; i < 8u; i++) {
-            const __m256i q = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(pres + i * 32u));
-
-            cl->seen[i] = (uint32_t)~_mm256_movemask_epi8(
-                _mm256_cmpeq_epi8(q, z));
+        if (tile_pres_fold(pres, cl->seen) < ZPSE_TILE_NU_CAP) {
+            for (; i + 4u <= (uint32_t)k; i += 4u) {
+                pres[tr[i]] = 1u;
+                pres[tr[i + 1u]] = 1u;
+                pres[tr[i + 2u]] = 1u;
+                pres[tr[i + 3u]] = 1u;
+            }
+            for (; i < k; i++)
+                pres[tr[i]] = 1u;
+            (void)tile_pres_fold(pres, cl->seen);
         }
     }
 
@@ -1225,6 +1293,10 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
 
         for (i = 0; i < 8u; i++)
             nu = (uint16_t)(nu + (uint16_t)tile_popcount32(cl->seen[i]));
+        if (nu > (uint16_t)ZPSE_TILE_NU_CAP) {
+            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP);
+            nu = (uint16_t)ZPSE_TILE_NU_CAP;
+        }
         cl->nu = nu;
     }
 }
@@ -1405,17 +1477,23 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     cl->rmax = _rmax;
     cl->dmin = _dmin;
     cl->dmax = _dmax;
-    /* cl->nu is exactly the number of distinct exclusion residuals, so
-     * it is the popcount of the 256-bit set the loop just built. Doing
-     * it once here is much cheaper than a test-and-increment per
-     * exception inside the byte loop, and gives the same value that
-     * choose_modes' palette sizing depends on. */
+    /* cl->nu is exactly the number of distinct exclusion residuals up to
+     * ZPSE_TILE_NU_CAP, so it is the popcount of the 256-bit set the loop
+     * just built. Doing it once here is much cheaper than a
+     * test-and-increment per exception inside the byte loop, and gives the
+     * same value that choose_modes' palette sizing depends on. The scalar
+     * path records every distinct residual (the dense path stops at the
+     * cap), so the set is trimmed here to keep popcount(seen) == nu. */
     {
         unsigned l;
         uint16_t nu = 0;
 
         for (l = 0; l < 8u; l++)
             nu = (uint16_t)(nu + (uint16_t)tile_popcount32(cl->seen[l]));
+        if (nu > (uint16_t)ZPSE_TILE_NU_CAP) {
+            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP);
+            nu = (uint16_t)ZPSE_TILE_NU_CAP;
+        }
         cl->nu = nu;
     }
     return PSE_OK;

@@ -470,6 +470,34 @@ tables, so the memset, not the loop, is what `ORDER2` classification costs.
 Neither scan shipped; `tilechain` exists to keep the state they would have
 had to reproduce honest.
 
+A dense tile that cannot be palettized no longer counts its distinct
+exclusion residuals to the end. The residual-presence pass is the largest
+single cost inside a dense classification (about 105 of its 205 ns for a
+256-position tile with k~250, and it is that size because it is ~250
+independent byte stores into a 256-byte array plus the fold that turns them
+into `cl->seen`), and its whole product is `cl->nu` -- the count the mode
+search compares against 16, the most entries a palette can hold. Once a
+seventeenth distinct residual is known the palette mode is rejected and no
+larger exact count can change one packed byte, so the pass now records the
+first 32 exceptions, folds them, and stops there when that prefix already
+holds 17 distinct values; a tile still under 17 after the probe walks the
+rest exactly as before and stays exact. `cl->seen` is trimmed together with
+`nu` so the two can never disagree (`popcount(seen) == nu`, which the parity
+sweeps fold), and `tile.h` documents the cap: `nu` is exact up to 17 and 17
+above it. Measured paired against the previous build, alternating binaries,
+best of six rounds of `200 6` per pattern: encode `random` 1.21x and
+`lowentropy` 1.03x, every other row 1.00-1.01x, both decode columns
+unchanged, all ten compressed sizes byte-identical, and the parity, fuzz and
+lseed digests identical to the previous build's in all three builds
+(default, `-DZPSE_FORCE_SCALAR`, `-DZPSE_FORCE_TRIAL_SWAP`). An instrumented
+build counts 444 dense classifications on `random` -- every one of them
+retired by the probe -- and 699 on `lowentropy`, 520 of which run the full
+pass because their tiles stay under the cap. The trim itself is kept out of
+line: inlined into the classify epilogue, which every tile runs, its
+register pressure cost the `sparse` row 7-9% without ever being called
+there, the same code-generation failure mode the `ORDER1` note above
+records.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
