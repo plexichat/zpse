@@ -757,7 +757,7 @@ int main(void)
         uint64_t group = 1469598103934665603ull; /* FNV-1a 64 */
         uint32_t pid;
 
-        for (pid = 0; pid <= 10u; pid++) {
+        for (pid = 0; pid <= 11u; pid++) {
             uint64_t acc = 1469598103934665603ull;
             uint32_t cases = 0;
             uint32_t tile_i, lit_i, rst_i, var_i;

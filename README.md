@@ -15,9 +15,9 @@ describe where the prediction is wrong, and *enumerating* those positions
 
 Per block the encoder tries a small set of coordinate transforms (identity,
 delta8, xor8, transpose 2/4/8/16, delta+transpose, stride transpose) and keeps
-the smallest result. Within a segment, each tile independently picks from 11
+the smallest result. Within a segment, each tile independently picks from 12
 predictors (`CONST_ZERO`, `LANE_PREVIOUS`, `LANE_DELTA`, `LANE_AVERAGE`,
-`ORDER1`, `ORDER2`, `STRIDE_1/2/4/8`, `TILE_LOCAL_CONSTANT`), 7 exception-mask
+`ORDER1`, `ORDER2`, `STRIDE_1/2/3/4/8`, `TILE_LOCAL_CONSTANT`), 7 exception-mask
 modes and 5 residual modes, so a single stream can serve both run-like and
 structured data. Blocks that do not compress are stored verbatim behind the
 same envelope (the RAW fallback), and every block carries a CRC32-C of its
@@ -214,25 +214,98 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.040 | 2616 | 14.5 | 23.5 |
-| incr | 0.040 | 2619 | 1.7 | 10.2 |
-| random | 1.000 | 65568 | 0.5 | 21.2 |
-| sparse | 0.060 | 3962 | 0.4 | 5.0 |
-| strided | 0.040 | 2625 | 1.4 | 10.3 |
-| const5A | 0.040 | 2616 | 13.8 | 22.9 |
-| alt00FF | 0.040 | 2618 | 2.6 | 19.0 |
-| sawtooth | 0.163 | 10656 | 0.3 | 1.9 |
-| lowentropy | 0.688 | 45058 | 0.1 | 0.9 |
-| sparse2 | 0.048 | 3126 | 0.6 | 5.6 |
+| zeros | 0.040 | 2616 | 14.0 | 22.9 |
+| incr | 0.040 | 2619 | 5.0 | 10.0 |
+| random | 1.000 | 65568 | 0.4 | 20.4 |
+| sparse | 0.060 | 3962 | 1.0 | 5.3 |
+| strided | 0.040 | 2625 | 3.0 | 10.0 |
+| const5A | 0.040 | 2616 | 13.6 | 23.0 |
+| alt00FF | 0.040 | 2618 | 2.5 | 18.5 |
+| sawtooth | 0.163 | 10656 | 1.1 | 1.8 |
+| lowentropy | 0.687 | 45012 | 0.1 | 0.9 |
+| sparse2 | 0.048 | 3126 | 1.1 | 5.8 |
 
 The table is one session and the deltas below are paired measurements, so the
 absolute columns move between machines and runs while the sizes and the ratios
-do not: all ten `clen` values are the ones this format has always produced,
-and the compressed bytes of the whole test corpus are the same digest the
-previous round printed.
+do not.
 
-This round's change is to the lane state, and it is a speed-only change that
-touches no encoded byte. `zpse_lane_reset` used to fill the three ORDER
+This round adds a twelfth predictor and lets the block sweep skip candidates,
+and it is the first round in some time to move a compressed size: nine of the
+ten `clen` values are the ones this format has always produced, and
+`lowentropy` is 46 bytes smaller. On 610 KB of this repository's own sources
+(the implementation, the headers and the suites) the new build produces 1,824
+fewer bytes: 576,543 -> 574,719, ratio 0.9441 -> 0.9412.
+
+`STRIDE_3` (predictor id 11) is `x_hat = x[p - 3]`: the STRIDE family at S = 3,
+which the format had at S = 1, 2, 4 and 8 but not at the one width an
+interleaved 3-byte record (an RGB pixel, an xyz vector) wants. It is appended
+LAST in the encoder's prescreen order, deliberately: the winner is the first
+predictor with the strictly smallest exception count, so a new entrant can only
+take a tile where it beats every candidate that precedes it. That is a change
+in the *choice*, not automatically in the bytes -- the tile is packed from
+its two best candidates and the smaller record wins -- and the measured effect
+is the one above: every bench `clen` is unchanged except `lowentropy`, and the
+real corpus is 0.32% smaller. `tests/test_stride3.c` is the suite for it: pure
+period-3 data collapses from 65536 to 2883 bytes, 8-pixel RGB runs to 18826,
+and pseudorandom data stays at exactly RAW size, which is the check that a
+candidate which cannot win costs no ratio.
+
+The sweep change is a prescreen proxy. `zpse_block_proxy` prices a candidate by
+staging its transform over the first 16 KiB and summing the prescreen's own
+per-tile estimate, and `zpse_block_encode` then fully encodes only the
+candidates whose estimate is within ~6% of the best (always at least one). A
+full trial is a classify plus mode search plus pack of every tile, so on a ramp
+or a stride -- where one candidate is four or more times more predictable than
+the other -- this replaces three trials with one. Measured against the previous
+commit, same source, alternating binaries, min per pattern over nine rounds of
+`60 3`: encode `incr` 3.65x, `sawtooth` 3.38x, `strided` 2.36x, `sparse` 2.31x,
+`sparse2` 1.76x, `lowentropy` 1.17x, and the rows whose first trial already wins
+(`zeros`, `const5A`, `random`, `alt00FF`) at 1.00-1.03x. Decode is untouched by
+this round and measures 0.92-1.06x across the ten rows, i.e. noise. Two costs
+are worth stating rather than hiding: the proxy is pure overhead when nothing
+is droppable -- `random` is incompressible and its sweep is ended by the
+RAW-envelope budget instead -- and the ninth prescreen count is work on every
+tile of every encode. With the proxy removed entirely the same build still
+measures `random` 0.93x and `strided` 0.90x, so that part is the added
+candidate's price, not the proxy's.
+
+The proxy is gated as cheaply as it can be: it runs only for blocks of at least
+8 KiB with more than one candidate, and it is skipped entirely when the
+order sample already reports that the identity's plane predicts every sampled
+tile, because such a block reaches the global floor on its first trial and
+pricing the others would then be most of its encode. That gate is not
+cosmetic: without it `zeros` measured 0.50x and `const5A` 0.47x against the
+previous build, because the old sweep ends those blocks after one trial.
+
+Pruning compacts the candidate list, which is why the attempt order stopped
+being an index permutation over it: candidates are moved -- transform id,
+segment count, metadata and the original list index the winner's tie-break
+compares -- and the sweep walks the surviving slots in order. The permutation
+form could point the loop at a slot the pruning had already dropped, and on
+`sawtooth` that ran a stale DELTA8 (12345 bytes) against the transpose that
+should win (10656, +16% ratio) -- invisible to the parity step, because the
+staleness is deterministic in every build. Swapping before pruning means the
+sweep is exactly the surviving list, and `-DZPSE_FORCE_TRIAL_SWAP` still
+permutes it on every block, so both the proxy's gate and its ordering are
+covered by the parity suite rather than by inspection.
+
+Two smaller encoder changes ride along. The classifier now records the actual
+bytes at the exception positions while it walks the tile (`cl->act_at_exc`),
+including in the AVX2 dense path, so the packer reads them instead of gathering
+them a second time for the `RAW_ACTUAL` and `SIGNED_DELTA` payloads. And
+`zpse_tile_choose_modes` now prefers `RAW_ACTUAL` over `EXCLUSION_U8` when the
+two cost exactly the same (one byte per exception) and the tile has a real mix
+of hits and exceptions: the decoder then copies the byte instead of rebuilding
+it from the exclusion-domain residual and the prediction, which removes a
+serial dependency from reconstruction. Same length, different bytes -- both
+legal and the two extremes keep `EXCLUSION_U8`, because k == 0 has no payload
+at all and k == Nt is the verbatim path. `SPEC_V1.md` documents id 11 and
+`ids 12..255` as invalid, and `zpse_tile_header_parse` now accepts 0..11 like
+the tile validator does: the change left that parser at 0..10, which would have
+rejected a legal id-11 stream at the very boundary it exists to check.
+
+The previous round's change was to the lane state, and it is a speed-only
+change that touches no encoded byte. `zpse_lane_reset` used to fill the three ORDER
 tables -- 66 KiB of memset, `order1` with the literal and `o2val`/`o2conf`
 with the literal and zero -- at the start of every segment, and the block
 decoder did it once per segment in front of a segment decoder that did it
@@ -264,8 +337,8 @@ policy switched (paired, alternating binaries, min per pattern): decode
 of incompressible or code-heavy tiles unchanged. Every `clen` and both corpus
 digests are identical to the previous round, so no stream moved.
 
-Three size levers were measured this round and none of them shipped, which is
-worth recording because each looks attractive from the code:
+Three size levers were measured in an earlier round and none of them shipped,
+which is worth recording because each looks attractive from the code:
 
 * The tile predictor search tries the best prescreened predictor and a second
 one only when its exception count is within 4 of the best. Widening that
@@ -286,7 +359,7 @@ and 368 us at k=128, and the unrank 34 us at k=8 and 1.0 ms at k=240, against
 choosing the only mode whose codec is affordable, not leaving a cheap 3% on
 the table.
 
-This round's encode change is a candidate-attempt order picked from the
+An earlier round's encode change is a candidate-attempt order picked from the
 tile encoder's own prescreen. The sweep's result does not depend on the order
 it tries its candidates in - the winner is the smallest total, ties going to
 the earlier candidate in the list, and that is applied explicitly - so the
@@ -315,7 +388,7 @@ more. `-DZPSE_FORCE_TRIAL_SWAP` is the test hook that takes the other
 decision on every block, so the difference between the two orders is covered
 by the parity step above rather than by inspection.
 
-This round's earlier encode change is in the block-level trial sweep, and it
+An earlier round's encode change is in the block-level trial sweep, and it
 moved three rows: measured by alternating the two binaries in the same clock
 state (best of three rounds of 900 compressions, min per pattern), the
 `sparse` row is 1.12x, `lowentropy` 1.12x and `sparse2` 1.06x, with every
@@ -324,11 +397,10 @@ deliberately untouched) and all ten compressed sizes byte-identical. The
 decode column is unchanged code this round and measures within 2%.
 
 The same run reports this machine's ceilings for the same 64 KiB working
-set: memcpy 69 GB/s, memset 127 GB/s and CRC32-C 30.6 GB/s. The CRC32-C
-rate matters because every block carries a checksum of its decoded bytes,
-so on the fastest paths - 23.5 GB/s against a 30.6 GB/s checksum - the
-checksum is now about three quarters of the decode time, and it is the
-floor under this table: `crc32 r64,r64` retires one instruction per cycle
+set: memcpy 50 GB/s, memset 77 GB/s and CRC32-C 24 GB/s. The CRC32-C rate
+matters because every block carries a checksum of its decoded bytes, so on
+the fastest paths - 22.9 GB/s of decode against a 24 GB/s checksum - almost
+all of that decode time is the checksum, and it is the floor under this table: `crc32 r64,r64` retires one instruction per cycle
 here, which is 8 B/cycle = ~31 GB/s, and a PCLMULQDQ fold cannot beat that
 on a core
 that retires one carry-less multiply per cycle (a fold-by-4 needs eight of

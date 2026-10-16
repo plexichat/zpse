@@ -1,6 +1,7 @@
 #include "zpse/types.h"
 #include "zpse/bits.h"
 #include "zpse/crc32c.h"
+#include "zpse/predictor.h"
 #include "zpse/status.h"
 
 static int zpse_is_valid_segment_count(uint8_t c)
@@ -295,7 +296,7 @@ int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len
     if (res_mode > 4u) {
         return PSE_BAD_RESIDUAL; /* modes 5..7 reserved */
     }
-    if (pid > 10u) {
+    if (pid > (uint8_t)ZPSE_P_STRIDE_3) {
         return PSE_BAD_PREDICTOR;
     }
     out->tile_flags = flags;

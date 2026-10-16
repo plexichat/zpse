@@ -104,7 +104,7 @@ int main(void) {
         for (i = 0; i < 256; i++) data[i] = (uint8_t)((i * 7 + (i >> 4)) & 0xFF);
         memset(cdata, 0x41, sizeof cdata);
         memcpy(seg + 64, data, 256);
-        for (pid = 0; pid <= 10; pid++) {
+        for (pid = 0; pid <= 11; pid++) {
             for (rm = 0; rm <= 4; rm++) {
                 int ok = 0, tried = 0;
                 const uint8_t mmodes[] = {1, 2, 5, 0, 6};

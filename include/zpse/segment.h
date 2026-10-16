@@ -26,13 +26,16 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * output. It exists so a caller that already knows a larger total cannot
  * win -- block.c's transform sweep against the raw envelope does -- can
  * abandon a hopeless trial without paying for the rest of the tiles. */
+/* Prescreen-only size estimate of one transformed plane (see segment.c). */
+uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
                         uint8_t *payload_out, uint32_t payload_cap,
                         uint32_t byte_budget);
 
-/* The cheap eight-predictor screen zpse_segment_encode runs per tile,
+/* The cheap nine-predictor screen zpse_segment_encode runs per tile,
  * exposed so a caller can ask how predictable a candidate plane is
  * without encoding it: ks[] receives the exact exception count of each
  * screened predictor (ids 3, 4 and 9 are unreachable sentinels). `a` is
@@ -41,6 +44,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
  * table's first tile, whose preceding plane bytes do not exist). */
 void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             const uint8_t *seg_base, uint32_t seg_pos,
-                            uint8_t initial_literal, uint16_t ks[11]);
+                            uint8_t initial_literal, uint16_t ks[12]);
 
 #endif /* ZPSE_SEGMENT_H */

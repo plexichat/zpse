@@ -632,7 +632,7 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
     for (i = 0; i < ns; i++) {
         uint32_t t = ((uint32_t)(i + 1u) * tc) / (uint32_t)(ns + 1u);
         uint32_t p = t * (uint32_t)ZPSE_TILE_SIZE;
-        uint16_t ks[11];
+        uint16_t ks[12];
         uint32_t kmin;
 
         /* Interior tiles only: the head has to be real plane bytes, and
@@ -657,9 +657,12 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
          * reach the global floor and end the sweep -- and it is the
          * cheap kind of block (constant, all-hit), where the estimate's
          * own cost would be the largest part of the encode. Stop before
-         * paying for the other plane. */
+         * paying for the other plane, and report the third answer: this
+         * is not just "the identity goes first", it is "the identity is
+         * about to END the sweep", so the caller can also skip the proxy
+         * that would otherwise price every candidate first. */
         if (est_id == 0u) {
-            return 0;
+            return 2;
         }
 
         /* DELTA8 plane over the same window, one byte behind itself. */
@@ -686,6 +689,83 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
     return (est_d1 * 4u <= est_id) ? 1 : 0;
 }
 
+
+/* Estimated size of one transform trial: stage the transform, then price
+ * each plane with the prescreen alone (no classify, no packing).
+ * UINT32_MAX means "could not be estimated" and the caller keeps the
+ * candidate. */
+static uint32_t zpse_block_proxy(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                                 uint8_t tid, uint8_t sc,
+                                 const uint8_t *meta_bytes, uint16_t meta_len)
+{
+    ZpseTransformMeta tm;
+    uint8_t w = 0;
+    uint32_t lens[16];
+    uint8_t *planes[16];
+    uint32_t off = 0;
+    uint32_t total;
+    uint32_t s;
+
+    if (zpse_transform_width(tid, sc, &w) != PSE_OK)
+        return UINT32_MAX;
+    if (zpse_segment_lengths(n, w, lens) != PSE_OK)
+        return UINT32_MAX;
+    if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != PSE_OK)
+        return UINT32_MAX;
+    for (s = 0; s < sc; s++) {
+        if (lens[s] == 0u || (uint64_t)off + lens[s] > ZPSE_E_SZ_TSTAGE)
+            return UINT32_MAX;
+        planes[s] = e->tstage + off;
+        off += lens[s];
+    }
+    if (off != n)
+        return UINT32_MAX;
+    if (zpse_transform_forward(&tm, sc, in, n, planes, lens) != PSE_OK)
+        return UINT32_MAX;
+    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + meta_len +
+            (uint32_t)sc * (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE;
+    for (s = 0; s < sc; s++) {
+        uint32_t c = zpse_segment_proxy_cost(planes[s], lens[s]);
+        if (c == UINT32_MAX)
+            return UINT32_MAX;
+        total += c;
+    }
+    return total;
+}
+/* Exchange two candidate slots, moving the candidate itself in every array
+ * that describes it -- including idx[], which carries its original list
+ * index and is what the winner's tie-break compares. The attempt order is
+ * realized this way and never as an index permutation over the list, so
+ * the proxy pruning below (which compacts the list) cannot leave the
+ * attempt loop pointing at a slot it has since dropped: after the swap the
+ * loop simply walks the surviving slots in order. */
+static void zpse_block_swap_cand(uint8_t tids[4], uint8_t scounts[4],
+                                 uint8_t meta_bufs[4][2],
+                                 uint16_t meta_lens[4], uint8_t idx[4],
+                                 int a, int b)
+{
+    uint8_t t8 = tids[a];
+    uint8_t s8 = scounts[a];
+    uint8_t i8 = idx[a];
+    uint8_t m0 = meta_bufs[a][0];
+    uint8_t m1 = meta_bufs[a][1];
+    uint16_t l16 = meta_lens[a];
+
+    tids[a] = tids[b];
+    scounts[a] = scounts[b];
+    idx[a] = idx[b];
+    meta_bufs[a][0] = meta_bufs[b][0];
+    meta_bufs[a][1] = meta_bufs[b][1];
+    meta_lens[a] = meta_lens[b];
+
+    tids[b] = t8;
+    scounts[b] = s8;
+    idx[b] = i8;
+    meta_bufs[b][0] = m0;
+    meta_bufs[b][1] = m1;
+    meta_lens[b] = l16;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -694,13 +774,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint8_t scounts[4];
     uint8_t meta_bufs[4][2];
     uint16_t meta_lens[4];
-    uint8_t order[4];
+    uint8_t idx[4];
     uint32_t in_crc;
     int ncand = 0;
     uint32_t best_total = 0;
     uint32_t best_idx = 0;
     int have_best = 0;
     int fails = 0;
+    int sample;
     int oi;
     int rc;
 
@@ -713,6 +794,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
         return PSE_BAD_BLOCK_SIZE;
     }
+
+    /* The candidate list is built in slot order below and then reordered
+     * and compacted in place, so every slot a candidate does not fill must
+     * start at a defined value rather than whatever the stack held. */
+    memset(tids, 0, sizeof tids);
+    memset(scounts, 0, sizeof scounts);
+    memset(meta_bufs, 0, sizeof meta_bufs);
+    memset(meta_lens, 0, sizeof meta_lens);
+    memset(idx, 0, sizeof idx);
 
     /* Trial 1: RAW_BYTES (the identity, as a single segment).
      *
@@ -763,13 +853,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
     /* Attempt order: identity first unless the sample says DELTA8's plane
      * is much more predictable, and never anything but a swap of those
-     * two (see the argument above the sample). */
-    order[0] = 0;
-    order[1] = 1;
-    order[2] = 2;
-    order[3] = 3;
+     * two (see the argument above the sample). The sample settles one
+     * more thing: whether the proxy below is worth running at all. */
+    {
+        int i;
+
+        for (i = 0; i < ncand; i++) {
+            idx[i] = (uint8_t)i;
+        }
+    }
+    sample = (ncand >= 2) ? zpse_block_delta_trial_first(in, n) : 0;
     if (ncand >= 2) {
-        int swap = zpse_block_delta_trial_first(in, n);
+        int swap = (sample == 1);
 
 #if defined(ZPSE_FORCE_TRIAL_SWAP)
         /* Test hook: take the other decision wherever a decision exists,
@@ -781,13 +876,64 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         swap = swap ? 0 : 1;
 #endif
         if (swap) {
-            order[0] = 1;
-            order[1] = 0;
+            zpse_block_swap_cand(tids, scounts, meta_bufs, meta_lens, idx, 0,
+                                 1);
+        }
+    }
+
+    /* Prune with the prescreen proxy: price every candidate cheaply and
+     * fully encode only those within ~6% of the best estimate (always at
+     * least one). A full trial is a classify + mode search + pack of every
+     * tile, so where one transform is clearly better this skips the rest.
+     * The decision is a pure function of the input, so it is identical in
+     * the scalar, SIMD and swapped-order builds.
+     *
+     * sample == 2 means the identity's plane predicts every sampled tile,
+     * so its trial is about to reach the global floor and end the sweep on
+     * the first attempt: pricing the other candidates would then be pure
+     * cost, and on a constant block it is most of the encode. The sample
+     * says nothing about "is one candidate clearly better than another"
+     * unless it looked at more than one plane, so the gate is exact about
+     * what it knows. */
+    if (sample != 2 && ncand > 1 && n >= 8192u) {
+        uint32_t px[4];
+        uint32_t pmin = UINT32_MAX;
+        int kept = 0;
+        int ci;
+
+        /* Rank on the first 16 KiB only: staging a transform costs about
+         * as much as the estimate itself, and a block's structure (record
+         * width, delta-friendliness) is the same throughout, so a quarter
+         * of it orders the candidates just as well. */
+        uint32_t pn = n < 16384u ? n : 16384u;
+
+        for (ci = 0; ci < ncand; ci++) {
+            const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
+            px[ci] = zpse_block_proxy(e, in, pn, tids[ci], scounts[ci], mb,
+                                      meta_lens[ci]);
+            if (px[ci] < pmin)
+                pmin = px[ci];
+        }
+        if (pmin != UINT32_MAX) {
+            uint32_t limit = pmin + (pmin >> 4);
+
+            for (ci = 0; ci < ncand; ci++) {
+                if (px[ci] == UINT32_MAX || px[ci] <= limit) {
+                    tids[kept] = tids[ci];
+                    scounts[kept] = scounts[ci];
+                    meta_lens[kept] = meta_lens[ci];
+                    meta_bufs[kept][0] = meta_bufs[ci][0];
+                    meta_bufs[kept][1] = meta_bufs[ci][1];
+                    idx[kept] = idx[ci];
+                    kept++;
+                }
+            }
+            ncand = kept;
         }
     }
 
     for (oi = 0; oi < ncand; oi++) {
-        int i = order[oi];
+        int i = oi;
         uint32_t t = 0;
         int budget_hit = 0;
         const uint8_t *mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
@@ -811,13 +957,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         /* Smallest total wins; a tie goes to the candidate EARLIER in
          * the list, so the attempt order cannot change the winner. */
         if (!have_best || t < best_total ||
-            (t == best_total && (uint32_t)i < best_idx)) {
+            (t == best_total && (uint32_t)idx[i] < best_idx)) {
             if (t > (uint32_t)ZPSE_E_SZ_BEST) {
                 continue;
             }
             memcpy(e->best, e->cand, t);
             best_total = t;
-            best_idx = (uint32_t)i;
+            best_idx = (uint32_t)idx[i];
             have_best = 1;
         }
         /* Early exit over the candidates that are LEFT, not over all of
@@ -834,7 +980,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             int oj;
 
             for (oj = oi + 1; oj < ncand; oj++) {
-                int j = order[oj];
+                int j = oj;
                 uint32_t f = zpse_block_floor(n, tids[j], scounts[j],
                                               meta_lens[j]);
                 if (f < min_floor) {

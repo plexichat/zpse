@@ -373,7 +373,7 @@ TileRecord (excluding the 2-byte prefix itself).
 | Off | Size | Field                 | Type | Description                          |
 |-----|------|-----------------------|------|--------------------------------------|
 | 0   | 1    | tile_flags            | u8   | bits 0–2 mask_mode, 3–5 residual_mode, bit 6 reserved-0, bit 7 reset |
-| 1   | 1    | predictor_id          | u8   | 0..10 (11..255 => PSE_BAD_PREDICTOR) |
+| 1   | 1    | predictor_id          | u8   | 0..11 (12..255 => PSE_BAD_PREDICTOR) |
 | 2   | 1    | tile_length_minus_1   | u8   | 0..255 => length 1..256              |
 | 3   | 1    | exception_count       | u8   | See K-derivation below               |
 | 4   | 2    | mask_payload_size     | u16  | Mask section bytes                   |
@@ -445,10 +445,11 @@ tile reset bit = 1): both histories `<= initial_literal` for all lanes.
 state (ORDER1 entries = `initial_literal`; ORDER2 pred entries =
 `initial_literal`, conf = 0) at the same points.
 
-STRIDE_PHYSICAL predictors (IDs 5–8) use already-decoded bytes at `p - S`
-(`S in {1,2,4,8}`) within the current segment's transformed stream; for
-`p < S`, prediction = `initial_literal`. (This is a forward-referenced
-causal read, not an LZ back-reference: offset set is fixed {1,2,4,8}.)
+STRIDE_PHYSICAL predictors (IDs 5–8 and 11) use already-decoded bytes at
+`p - S` (`S in {1,2,3,4,8}`) within the current segment's transformed
+stream; for `p < S`, prediction = `initial_literal`. (This is a
+forward-referenced causal read, not an LZ back-reference: offset set is
+fixed {1,2,3,4,8}.)
 
 ### 7.1 Predictor IDs & Formulas
 
@@ -470,7 +471,12 @@ causal read, not an LZ back-reference: offset set is fixed {1,2,4,8}.)
 - **10 RESERVED_ZERO?** v0.1.1 allowed 0..10 but defined only 0–9.
   v1 defines **10 CONST_LITERAL_0x00? No — v1 defines 10 as
   LANE_AVERAGE:** `x_hat = (lane_last[lane] + lane_second_last[lane] + 1) >> 1`
-  (integer average, byte domain). IDs 11..255 => `PSE_BAD_PREDICTOR`.
+  (integer average, byte domain).
+- **11 STRIDE_PHYSICAL S=3 (STRIDE_3):** `x_hat = (p>=3) ?
+  transformed[p-3] : initial_literal`. Added after v1's first draft for
+  interleaved 3-byte records (RGB pixels, xyz vectors); it behaves exactly
+  like IDs 5–8 with S=3, including the tile-start and history rules above.
+  IDs 12..255 => `PSE_BAD_PREDICTOR`.
 
 History update (all predictors): after decoding actual `x` at lane L:
 `lane_second_last[L] <- lane_last[L]; lane_last[L] <- x`. ORDER1/ORDER2
@@ -666,7 +672,7 @@ PHASE 5 CHECKSUM: CRC32-C over decoded bytes; compare iff tagged; return status
   formula violation => `PSE_BAD_SEGMENT_DIRECTORY`.
 - Tile length derivation violation or `SUM(Nt) != segment_decoded_size`
   or `tile_record_size` equation/overrun => `PSE_BAD_TILE_SIZE`.
-- `predictor_id >= 11` => `PSE_BAD_PREDICTOR`.
+- `predictor_id >= 12` => `PSE_BAD_PREDICTOR`.
 - `mask_mode == 7`, K-derivation failure, bitmap popcount mismatch,
   non-ascending/OO-range sparse positions, bad gaps/runs, non-zero pad
   bits => `PSE_BAD_MASK`.

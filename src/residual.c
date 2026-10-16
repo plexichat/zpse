@@ -1039,8 +1039,6 @@ int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
                          const uint8_t *pred_at_exc, uint16_t k,
                          uint8_t *payload_out, uint16_t payload_cap)
 {
-    uint16_t i;
-
     if (mode > 4u) {
         return PSE_BAD_RESIDUAL;
     }
@@ -1051,9 +1049,8 @@ int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
         if ((uint32_t)payload_cap < (uint32_t)k) {
             return PSE_OUTPUT_OVERFLOW;
         }
-        for (i = 0; i < k; i++) {
-            payload_out[i] = actual_in[i];
-        }
+        if (k > 0u)
+            memcpy(payload_out, actual_in, (size_t)k);
         return (int)k;
     }
     if (mode == ZPSE_R_EXCLUSION_U8) {

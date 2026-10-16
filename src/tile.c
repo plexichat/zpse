@@ -62,7 +62,7 @@ static int tile_family(uint8_t predictor_id)
     case ZPSE_P_TILE_CONSTANT:
         return TILE_FAM_CONST; /* handled with constant_C */
     default:
-        return TILE_FAM_STRIDE; /* 5..8 */
+        return TILE_FAM_STRIDE; /* 5..8, 11 */
     }
 }
 
@@ -118,6 +118,8 @@ static uint32_t tile_stride_of(uint8_t predictor_id)
         return 1u;
     case ZPSE_P_STRIDE_2:
         return 2u;
+    case ZPSE_P_STRIDE_3:
+        return 3u;
     case ZPSE_P_STRIDE_4:
         return 4u;
     default:
@@ -258,7 +260,7 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
         return PSE_BAD_MASK;
     if (res_mode > (uint8_t)ZPSE_R_SIGNED_DELTA)
         return PSE_BAD_RESIDUAL; /* modes 5..7 reserved */
-    if (th->predictor_id > (uint8_t)ZPSE_P_LANE_AVERAGE)
+    if (th->predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return PSE_BAD_PREDICTOR;
     nt = (uint32_t)th->tile_length_minus_1 + (uint32_t)1;
     if (nt != (uint32_t)nt_expected)
@@ -302,6 +304,7 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
         words[_pp >> 5] |= (uint32_t)1u << (_pp & 31u);                 \
         cl->at_pred[k] = _xh;                                           \
         cl->res_at_exc[k] = _r;                                         \
+        cl->act_at_exc[k] = _x;                                         \
         cl->seen[_r >> 5] |= (uint32_t)1u << (_r & 31u);                \
         if (_r > _rmax)                                                 \
             _rmax = _r;                                                 \
@@ -331,6 +334,7 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
         (void)_pp;                                                      \
         cl->at_pred[k] = _xh;                                           \
         cl->res_at_exc[k] = _r;                                         \
+        cl->act_at_exc[k] = _x;                                         \
         cl->seen[_r >> 5] |= (uint32_t)1u << (_r & 31u);                \
         if (_r > _rmax)                                                 \
             _rmax = _r;                                                 \
@@ -749,6 +753,7 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
 {
     uint8_t tp[272];
     uint8_t tr[272];
+    uint8_t ta[272];
     uint32_t k = 0u;
     unsigned ch;
     unsigned i;
@@ -836,6 +841,18 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
                              _mm_srli_si128(phi, 8));
             _mm_storel_epi64((__m128i *)(void *)(tr + k + 24u),
                              _mm_srli_si128(rhi, 8));
+            {
+                /* the actual bytes of a full word are the chunk itself */
+                const __m128i vlo = _mm256_castsi256_si128(v);
+                const __m128i vhi = _mm256_extracti128_si256(v, 1);
+
+                _mm_storel_epi64((__m128i *)(void *)(ta + k), vlo);
+                _mm_storel_epi64((__m128i *)(void *)(ta + k + 8u),
+                                 _mm_srli_si128(vlo, 8));
+                _mm_storel_epi64((__m128i *)(void *)(ta + k + 16u), vhi);
+                _mm_storel_epi64((__m128i *)(void *)(ta + k + 24u),
+                                 _mm_srli_si128(vhi, 8));
+            }
             k += 32u;
             continue;
         }
@@ -860,21 +877,25 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
         for (h = 0; h < 2u; h++) {
             __m128i pd = h ? _mm256_extracti128_si256(pv, 1) : _mm256_castsi256_si128(pv);
             __m128i rd = h ? _mm256_extracti128_si256(r, 1) : _mm256_castsi256_si128(r);
+            __m128i ad = h ? _mm256_extracti128_si256(v, 1) : _mm256_castsi256_si128(v);
             unsigned m0 = (m >> (16u * h)) & 0xFFu;
             unsigned m1 = (m >> (16u * h + 8u)) & 0xFFu;
             __m128i c0 = _mm_loadl_epi64((const __m128i *)(const void *)tile_cmp_lut[m0]);
             __m128i c1 = _mm_loadl_epi64((const __m128i *)(const void *)tile_cmp_lut[m1]);
             _mm_storel_epi64((__m128i *)(void *)(tp + k), _mm_shuffle_epi8(pd, c0));
             _mm_storel_epi64((__m128i *)(void *)(tr + k), _mm_shuffle_epi8(rd, c0));
+            _mm_storel_epi64((__m128i *)(void *)(ta + k), _mm_shuffle_epi8(ad, c0));
             k += (uint32_t)_mm_popcnt_u32(m0);
             _mm_storel_epi64((__m128i *)(void *)(tp + k), _mm_shuffle_epi8(_mm_srli_si128(pd, 8), c1));
             _mm_storel_epi64((__m128i *)(void *)(tr + k), _mm_shuffle_epi8(_mm_srli_si128(rd, 8), c1));
+            _mm_storel_epi64((__m128i *)(void *)(ta + k), _mm_shuffle_epi8(_mm_srli_si128(ad, 8), c1));
             k += (uint32_t)_mm_popcnt_u32(m1);
         }
     }
 
     memcpy(cl->at_pred, tp, k);
     memcpy(cl->res_at_exc, tr, k);
+    memcpy(cl->act_at_exc, ta, k);
 
     /* distinct-residual set. cl->seen is the COMPLETE set -- cl->nu is its
      * popcount and callers test it -- so every unit is stored; stopping
@@ -1194,6 +1215,7 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
     tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
 
     cl->k = k;
+    cl->act_valid = 1u;
     cl->rmax = _rmax;
     cl->dmin = _dmin;
     cl->dmax = _dmax;
@@ -1235,6 +1257,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     memset(words, 0, sizeof cl->words);
     memset(cl->seen, 0, sizeof cl->seen);
     cl->k = 0;
+    cl->act_valid = 0u;
     cl->nu = 0;
     cl->rmax = 0;
     cl->dmin = 255u;
@@ -1378,6 +1401,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     }
 
     cl->k = k;
+    cl->act_valid = 1u;
     cl->rmax = _rmax;
     cl->dmin = _dmin;
     cl->dmax = _dmax;
@@ -1407,7 +1431,7 @@ int zpse_tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         return PSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
         return PSE_BAD_TILE_SIZE;
-    if (predictor_id > (uint8_t)ZPSE_P_LANE_AVERAGE)
+    if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return PSE_BAD_PREDICTOR;
     if (tile_family(predictor_id) == TILE_FAM_STRIDE && seg_base == 0)
         return PSE_BAD_ARG;
@@ -1515,7 +1539,16 @@ void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
     best_rlen = tile_res_len(0u, cl, nt, k);
     for (rm = 1u; rm <= (uint8_t)ZPSE_R_SIGNED_DELTA; rm++) {
         uint16_t l = tile_res_len(rm, cl, nt, k);
-        if (l < best_rlen) {
+        /* RAW_ACTUAL costs exactly what EXCLUSION_U8 does (one byte per
+         * exception), so on a tie it wins whenever a real mix of hits and
+         * exceptions is present: the decoder then copies the byte instead
+         * of undoing the exclusion against the previous output, which
+         * removes a serial dependency from the reconstruction. The two
+         * extremes keep EXCLUSION_U8 -- k == 0 has no residual at all and
+         * k == nt is the verbatim fast path. */
+        if (l < best_rlen ||
+            (l == best_rlen && rm == (uint8_t)ZPSE_R_RAW_ACTUAL &&
+             best_r == 0u && k != 0u && k != nt)) {
             best_rlen = l;
             best_r = rm;
         }
@@ -1525,6 +1558,53 @@ void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
     *res_mode_out = best_r;
 }
 
+
+/* Gather actual[p] at every exception position, ascending (the RAW_ACTUAL
+ * residual payload). Scalar reference first; the AVX2 form compacts 16
+ * positions per step with the same byte-shuffle table the dense
+ * classification uses and writes up to 7 bytes past the last real entry,
+ * so `out` must have 8 spare bytes. */
+static void tile_gather_act_scalar(const uint8_t *actual, uint16_t nt,
+                                   const uint32_t words[8], uint8_t *out)
+{
+    uint16_t j = 0;
+    uint16_t p;
+
+    for (p = 0; p < nt; p++) {
+        if ((words[p >> 5] >> (p & 31u)) & 1u)
+            out[j++] = actual[p];
+    }
+}
+
+#if ZPSE_TILE_HAVE_AVX2
+static ZPSE_TILE_AVX2P void tile_gather_act_avx2(const uint8_t *actual,
+                                                  uint16_t nt,
+                                                  const uint32_t words[8],
+                                                  uint8_t *out)
+{
+    uint8_t buf[272];
+    unsigned k = 0u;
+    unsigned p;
+
+    memcpy(buf, actual, nt);
+    memset(buf + nt, 0, sizeof buf - nt);
+    for (p = 0; p < (unsigned)nt; p += 16u) {
+        unsigned m = (words[p >> 5] >> (p & 31u)) & 0xFFFFu;
+        unsigned m0 = m & 0xFFu;
+        unsigned m1 = m >> 8;
+        __m128i d = _mm_loadu_si128((const __m128i *)(const void *)(buf + p));
+        __m128i c0 = _mm_loadl_epi64((const __m128i *)(const void *)tile_cmp_lut[m0]);
+        __m128i c1 = _mm_loadl_epi64((const __m128i *)(const void *)tile_cmp_lut[m1]);
+
+        _mm_storel_epi64((__m128i *)(void *)(out + k), _mm_shuffle_epi8(d, c0));
+        k += (unsigned)_mm_popcnt_u32(m0);
+        _mm_storel_epi64((__m128i *)(void *)(out + k),
+                         _mm_shuffle_epi8(_mm_srli_si128(d, 8), c1));
+        k += (unsigned)_mm_popcnt_u32(m1);
+    }
+}
+#endif
+
 int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
                    uint16_t nt, const uint8_t *actual,
                    uint8_t mask_mode, uint8_t res_mode,
@@ -1533,7 +1613,8 @@ int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
 {
     const uint32_t *words;
     uint16_t k;
-    uint8_t avals[256];
+    uint8_t avals[272];
+    const uint8_t *act_src = 0;
     uint8_t ec;
     uint32_t off;
     int need_vals;
@@ -1548,7 +1629,7 @@ int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
         return PSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
         return PSE_BAD_TILE_SIZE;
-    if (predictor_id > (uint8_t)ZPSE_P_LANE_AVERAGE)
+    if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return PSE_BAD_PREDICTOR;
     if (record_cap < (uint32_t)ZPSE_TILE_HEADER_SIZE)
         return PSE_OUTPUT_OVERFLOW;
@@ -1638,12 +1719,17 @@ int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
      * it walked the tile, so only the raw-actual operands (modes 1 and
      * 4) still need a gather pass here. */
     if (use_act) {
-        uint16_t j = 0;
-        uint16_t p;
-        for (p = 0; p < nt; p++) {
-            if ((words[p >> 5] >> (p & 31u)) & 1u) {
-                avals[j++] = actual[p];
-            }
+        if (cl->act_valid) {
+            /* classify already collected them */
+            act_src = cl->act_at_exc;
+        } else {
+#if ZPSE_TILE_HAVE_AVX2
+            if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u)
+                tile_gather_act_avx2(actual, nt, words, avals);
+            else
+#endif
+                tile_gather_act_scalar(actual, nt, words, avals);
+            act_src = avals;
         }
     }
 
@@ -1660,7 +1746,7 @@ int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
     if (off > record_cap)
         return PSE_OUTPUT_OVERFLOW;
     rrc = zpse_residual_encode(res_mode, use_vals ? cl->res_at_exc : 0,
-                               use_act ? avals : 0, cl->at_pred, k,
+                               use_act ? act_src : 0, cl->at_pred, k,
                                record_out + off,
                                tile_cap16(record_cap - off));
     if (rrc < 0)
@@ -1862,6 +1948,18 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
         }
         /* Fewer than s positions left: they read the finished bytes back,
          * which are the same values the chain registers hold. */
+        for (; p < (uint32_t)nt; p++)
+            ZPSE_STRIDE_STEP(p, out[p - s], prev);
+    } else if (s == 3u && (uint32_t)nt >= 3u) {
+        uint8_t c0 = out[0];
+        uint8_t c1 = out[1];
+        uint8_t c2 = out[2];
+
+        for (; p + 3u <= (uint32_t)nt; p += 3u) {
+            ZPSE_STRIDE_STEP(p, c0, c0);
+            ZPSE_STRIDE_STEP(p + 1u, c1, c1);
+            ZPSE_STRIDE_STEP(p + 2u, c2, c2);
+        }
         for (; p < (uint32_t)nt; p++)
             ZPSE_STRIDE_STEP(p, out[p - s], prev);
     } else if (s == 4u && (uint32_t)nt >= 4u) {

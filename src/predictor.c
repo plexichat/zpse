@@ -70,6 +70,8 @@ static uint32_t zpse_stride_of(uint8_t predictor_id)
         return 1u;
     case ZPSE_P_STRIDE_2:
         return 2u;
+    case ZPSE_P_STRIDE_3:
+        return 3u;
     case ZPSE_P_STRIDE_4:
         return 4u;
     default:
@@ -90,7 +92,7 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
     if (nt == 0u || nt > 256u) {
         return PSE_BAD_ARG;
     }
-    if (predictor_id > 10u) {
+    if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3) {
         return PSE_BAD_PREDICTOR;
     }
 
@@ -141,6 +143,7 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
     case ZPSE_P_STRIDE_2: /* 6 */
     case ZPSE_P_STRIDE_4: /* 7 */
     case ZPSE_P_STRIDE_8: /* 8 */
+    case ZPSE_P_STRIDE_3: /* 11 */
         {
             uint32_t stride = zpse_stride_of(predictor_id);
             if (seg_pos + (uint32_t)nt > stride && seg_base == NULL) {

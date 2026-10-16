@@ -20,6 +20,8 @@ static uint32_t seg_all_hit_stride(uint8_t predictor_id)
         return 1u;
     case ZPSE_P_STRIDE_2:
         return 2u;
+    case ZPSE_P_STRIDE_3:
+        return 3u;
     case ZPSE_P_STRIDE_4:
         return 4u;
     default:
@@ -168,6 +170,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
          * path uses to expand a seed to a whole tile. */
         if ((rec[1] <= (uint8_t)ZPSE_P_LANE_DELTA ||
              rec[1] == (uint8_t)ZPSE_P_LANE_AVERAGE ||
+             rec[1] == (uint8_t)ZPSE_P_STRIDE_3 ||
              (rec[1] >= (uint8_t)ZPSE_P_STRIDE_1 &&
               rec[1] <= (uint8_t)ZPSE_P_STRIDE_8)) &&
             rsz == 8u && nt_exp == 256u &&
@@ -414,10 +417,10 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * id; ids outside the set are set to an unreachable sentinel. */
 static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
                                  const uint8_t *seg_base, uint32_t seg_pos,
-                                 uint8_t init, uint16_t ks[11])
+                                 uint8_t init, uint16_t ks[12])
 {
     uint32_t k0 = 0u, k1 = 0u, k2 = 0u, k5 = 0u;
-    uint32_t k6 = 0u, k7 = 0u, k8 = 0u, k10 = 0u;
+    uint32_t k6 = 0u, k7 = 0u, k8 = 0u, k10 = 0u, k11 = 0u;
     uint8_t last[8];
     uint8_t second[8];
     unsigned l;
@@ -436,6 +439,7 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
         uint32_t d = seg_pos + (uint32_t)p;
         uint8_t s1 = (d < 1u) ? init : seg_base[d - 1u];
         uint8_t s2 = (d < 2u) ? init : seg_base[d - 2u];
+        uint8_t s3 = (d < 3u) ? init : seg_base[d - 3u];
         uint8_t s4 = (d < 4u) ? init : seg_base[d - 4u];
         uint8_t s8 = (d < 8u) ? init : seg_base[d - 8u];
 
@@ -447,6 +451,7 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
         k6 += (uint32_t)(x != s2);
         k7 += (uint32_t)(x != s4);
         k8 += (uint32_t)(x != s8);
+        k11 += (uint32_t)(x != s3);
         k10 += (uint32_t)(x != (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
                                          >> 1));
 
@@ -462,15 +467,19 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
     ks[7] = (uint16_t)k7;
     ks[8] = (uint16_t)k8;
     ks[10] = (uint16_t)k10;
+    ks[11] = (uint16_t)k11;
     ks[3] = 0xFFFFu;
     ks[4] = 0xFFFFu;
     ks[9] = 0xFFFFu;
 }
 
-static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
+/* STRIDE_3 is last on purpose: the winner is the first predictor with the
+ * strictly smallest miss count, so appending it can only change a tile
+ * where it is strictly better than every earlier candidate. */
+static const uint8_t seg_screen_pred[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u, 11u };
 
 /* ------------------------------------------------------------------ *
- * Vectorised prescreen. Every one of the eight counts above is a
+ * Vectorised prescreen. Every one of the nine counts above is a
  * byte-wise equality test between the current 32 bytes and a shifted
  * (or arithmetically derived) vector, so AVX2 evaluates all of them for
  * 32 positions at once: compare, movemask, popcount. The three
@@ -521,7 +530,7 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
 /* Partition of the staging buffer below. */
 #define ZPSE_PS_STG_LEN 304u /* 16 head + 256 body + 32 pad */
 
-/* Accumulate one 32-byte chunk's hits into the eight counters.
+/* Accumulate one 32-byte chunk's hits into the nine counters.
  * Each comparison contributes 0xFF (-1) per matching byte, so a byte-lane
  * counter sums the hits directly: no movemask plus popcount round trip per
  * comparison, and no 3-cycle latency chain to serialise on. `MASK` is all
@@ -550,6 +559,9 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
                  _mm256_cmpeq_epi8(v_, h8S_), MASK_));                     \
         a7 = _mm256_sub_epi8(a7, _mm256_and_si256(                         \
                  _mm256_cmpeq_epi8(v_, _av), MASK_));                      \
+        a8 = _mm256_sub_epi8(a8, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
+                 _mm256_loadu_si256((const __m256i *)(const void *)        \
+                     (stg + 13u + (size_t)p))), MASK_));                   \
     } while (0)
 
 /* One pass for the whole tile, so there is no scalar prologue or tail to
@@ -587,10 +599,10 @@ static const uint8_t seg_screen_pred[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
 static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
                                             const uint8_t *seg_base,
                                             uint32_t seg_pos, uint8_t init,
-                                            uint16_t ks[11])
+                                            uint16_t ks[12])
 {
     uint8_t stg[ZPSE_PS_STG_LEN];
-    __m256i a0, a1, a2, a3, a4, a5, a6, a7;
+    __m256i a0, a1, a2, a3, a4, a5, a6, a7, a8;
     const __m256i zero = _mm256_setzero_si256();
     const __m256i all = _mm256_cmpeq_epi8(zero, zero);
     const __m256i initv = _mm256_set1_epi8((char)init);
@@ -605,7 +617,7 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
     uint32_t p = 0;
 
     (void)seg_base;
-    a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = zero;
+    a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = a8 = zero;
 
     if (seg_pos == 0u) {
         /* A segment's first tile. The encoder resets the lane state for
@@ -658,15 +670,15 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
     }
 
     {
-        __m256i acc[8];
-        uint64_t hits[8];
+        __m256i acc[9];
+        uint64_t hits[9];
         uint64_t lane[4];
         int i;
         int j;
 
         acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
-        acc[4] = a4; acc[5] = a5; acc[6] = a6; acc[7] = a7;
-        for (i = 0; i < 8; i++) {
+        acc[4] = a4; acc[5] = a5; acc[6] = a6; acc[7] = a7; acc[8] = a8;
+        for (i = 0; i < 9; i++) {
             hits[i] = 0u;
             /* Sum of absolute differences from zero is the sum of the
              * byte-lane counters, i.e. the total number of hits. */
@@ -684,6 +696,7 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
         ks[7] = (uint16_t)((uint32_t)nt - (uint32_t)hits[5]);
         ks[8] = (uint16_t)((uint32_t)nt - (uint32_t)hits[6]);
         ks[10] = (uint16_t)((uint32_t)nt - (uint32_t)hits[7]);
+        ks[11] = (uint16_t)((uint32_t)nt - (uint32_t)hits[8]);
         ks[3] = 0xFFFFu;
         ks[4] = 0xFFFFu;
         ks[9] = 0xFFFFu;
@@ -695,7 +708,7 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
  * no capability state has to be cached in a global. */
 static void seg_prescreen(const uint8_t *a, uint16_t nt,
                           const uint8_t *seg_base, uint32_t seg_pos,
-                          uint8_t init, int have_avx2, uint16_t ks[11])
+                          uint8_t init, int have_avx2, uint16_t ks[12])
 {
 #if ZPSE_PS_HAVE_AVX2
     /* The vector path folds the tile boundaries into the whole-tile
@@ -727,7 +740,7 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
  * satisfying the run's own predictor cannot change the winner. For the
  * cases below that follows from the tile's own bytes plus the segment
  * literal, so a single broadcast compare can replace the whole
- * eight-predictor pass (~30 ns per tile, the dominant cost of encoding a
+ * nine-predictor pass (~30 ns per tile, the dominant cost of encoding a
  * constant or periodic stream). The winner of the prescreen's scan is the
  * FIRST predictor of seg_screen_pred[] whose miss count is 0, so each
  * case also has to exclude every predictor that precedes it:
@@ -878,11 +891,63 @@ static void seg_write_all_hit(uint8_t *dst, uint8_t predictor_id,
 
 void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             const uint8_t *seg_base, uint32_t seg_pos,
-                            uint8_t initial_literal, uint16_t ks[11])
+                            uint8_t initial_literal, uint16_t ks[12])
 {
     int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
 
     seg_prescreen(a, nt, seg_base, seg_pos, initial_literal, have_avx2, ks);
+}
+
+
+/* Cheap size estimate for a transformed plane, from the prescreen alone.
+ *
+ * zpse_block_encode ranks transform candidates with it before spending a
+ * classify + mode search + pack on each: per tile it takes the best
+ * closed-form predictor's exact exception count k and prices the record at
+ * 10 (length prefix + header) + k residual bytes + min(k, 32) mask bytes
+ * (no mask at the two extremes). It ignores the bit-packed residual modes,
+ * which shave a similar fraction off every candidate, so the ranking is
+ * what matters, not the absolute number. */
+uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
+{
+    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    uint32_t tc = (plane_len + 255u) / 256u;
+    uint32_t cost = 16u;
+    uint32_t sum = 0u;
+    uint32_t t;
+    uint8_t init;
+
+    if (plane == 0 || plane_len == 0u)
+        return UINT32_MAX;
+    init = plane[0];
+    /* Every other tile is enough to rank candidates (the estimate is a
+     * sum over many tiles and only its order is used), and it makes the
+     * proxy a small fraction of one trial instead of a tenth of it. The
+     * skipped tiles are priced at the sampled tiles' average. */
+    for (t = 0; t < tc; t += 2u) {
+        uint32_t seg_pos = t * 256u;
+        uint16_t nt =
+            (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
+        uint16_t ks[12];
+        uint16_t bk;
+        uint32_t i;
+
+        seg_prescreen(plane + seg_pos, nt, plane, seg_pos, init, have_avx2,
+                      ks);
+        bk = ks[seg_screen_pred[0]];
+        for (i = 1; i < 9u; i++) {
+            uint16_t c = ks[seg_screen_pred[i]];
+            if (c < bk)
+                bk = c;
+        }
+        sum += 10u;
+        if (bk != 0u) {
+            sum += bk;
+            if (bk != nt)
+                sum += (bk < 32u) ? bk : 32u;
+        }
+    }
+    return cost + sum * 2u;
 }
 
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
@@ -932,7 +997,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * histories need establishing here: every tile below is classified
      * with tile_reset == 1, so zpse_tile_classify calls
      * zpse_lane_reset_for for it (histories + the table its predictor
-     * reads), and no predictor this encoder ever classifies -- the eight
+     * reads), and no predictor this encoder ever classifies -- the nine
      * in seg_screen_pred[] -- reads a table at all. The 66 KiB table
      * memset zpse_lane_reset would do for ORDER1/ORDER2 here was for a
      * classification this encoder never asks for. */
@@ -944,7 +1009,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         uint16_t nt =
             (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
         const uint8_t *actual = plane + seg_pos;
-        uint16_t ks[11];
+        uint16_t ks[12];
         uint8_t cand[3];
         uint32_t ncand = 0;
         uint32_t ci;
@@ -972,7 +1037,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         {
             uint16_t bk = ks[seg_screen_pred[0]];
             uint32_t i;
-            for (i = 1; i < 8u; i++) {
+            for (i = 1; i < 9u; i++) {
                 uint16_t c = ks[seg_screen_pred[i]];
                 if (c < bk) {
                     bk = c;
@@ -986,7 +1051,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             {
                 uint8_t second_p = 0xFFu;
                 uint16_t sk = 0xFFFFu;
-                for (i = 0; i < 8u; i++) {
+                for (i = 0; i < 9u; i++) {
                     uint16_t c = ks[seg_screen_pred[i]];
                     if (seg_screen_pred[i] == best_p) {
                         continue;
@@ -1062,7 +1127,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 uint16_t nnt = (uint16_t)((t + 2u < tc)
                                               ? 256u
                                               : (plane_len - nsseg_pos));
-                uint16_t nks[11];
+                uint16_t nks[12];
                 uint8_t npred = pred;
 
                 if (byte_budget != 0u && pos > byte_budget) {
@@ -1089,7 +1154,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                     seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
                                   initial_literal, have_avx2, nks);
                     nbk = nks[npred];
-                    for (i = 1; i < 8u; i++) {
+                    for (i = 1; i < 9u; i++) {
                         uint16_t c = nks[seg_screen_pred[i]];
                         if (c < nbk) {
                             nbk = c;

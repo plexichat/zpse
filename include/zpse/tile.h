@@ -74,6 +74,11 @@ typedef struct ZpseTileClass {
                                * Filled by classify (and by tile_encode),
                                * so the packers read them instead of
                                * walking the tile a second time. */
+    uint8_t  act_valid;    /* 1 iff act_at_exc[0..k) was filled by classify */
+    uint8_t  act_at_exc[256]; /* actual[p] at the exception positions,
+                               * ascending: the RAW_ACTUAL residual payload,
+                               * produced while classifying so the packer
+                               * does not have to gather it again. */
 } ZpseTileClass;
 
 /* Pick the cheapest legal (mask_mode, res_mode) pair for a finished

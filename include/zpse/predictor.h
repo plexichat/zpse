@@ -18,7 +18,8 @@ typedef enum ZpsePredictorId {
     ZPSE_P_STRIDE_4       = 7,
     ZPSE_P_STRIDE_8       = 8,
     ZPSE_P_TILE_CONSTANT  = 9,
-    ZPSE_P_LANE_AVERAGE   = 10
+    ZPSE_P_LANE_AVERAGE   = 10,
+    ZPSE_P_STRIDE_3       = 11  /* x_hat = out[p-3]; interleaved RGB etc. */
 } ZpsePredictorId;
 
 /* Live lane histories (kept in registers/stack, <= 16 bytes). Tables
