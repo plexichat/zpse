@@ -504,9 +504,19 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             return PSE_BAD_TRANSFORM;
         }
     }
-    rc = zpse_transform_forward(&tm, sc, in, n, planes, lens);
-    if (rc != PSE_OK) {
-        return rc;
+    /* A width-1 split with neither DELTA8 nor XOR8 is the identity: the
+     * segment encoder only reads its plane, so the input itself can serve
+     * as segment 0 and a 64 KiB staging copy disappears from every block
+     * that tries the identity (which is all of them). The overlap
+     * rejection inside zpse_transform_forward exists because it writes the
+     * plane; not copying at all is what makes it unnecessary here. */
+    if (tid == 0u && sc == 1u) {
+        planes[0] = (uint8_t *)(uintptr_t)in;
+    } else {
+        rc = zpse_transform_forward(&tm, sc, in, n, planes, lens);
+        if (rc != PSE_OK) {
+            return rc;
+        }
     }
 
     base = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)meta_len +
@@ -1021,7 +1031,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         /* Rank on the first 16 KiB only: staging a transform costs about
          * as much as the estimate itself, and a block's structure (record
          * width, delta-friendliness) is the same throughout, so a quarter
-         * of it orders the candidates just as well. */
+         * of it orders the candidates just as well. (8 KiB was measured
+         * too: it is faster, but it mis-ranks a block whose structure only
+         * appears past the first quarter -- a long noise prefix in front
+         * of a compressible body went to RAW -- so the window stays at
+         * 16 KiB.) */
         uint32_t pn = n < 16384u ? n : 16384u;
 
         for (ci = 0; ci < ncand; ci++) {
@@ -1053,7 +1067,22 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         int i = oi;
         uint32_t t = 0;
         int budget_hit = 0;
-        const uint8_t *mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
+        const uint8_t *mb;
+        /* Exact bound before the work: the smallest total this candidate's
+         * (transform, segment count, metadata) shape can produce is a
+         * strictly greater size than the winner, so the trial cannot be
+         * chosen or tie and the transform staging is pure cost. Unlike the
+         * post-trial floor check, this one is per candidate, so a single
+         * hopeless shape left in the list no longer keeps the others
+         * alive. `>` (not `>=`) on purpose: a candidate whose floor equals
+         * the winner could still tie it, and a tie is decided by list
+         * order, so it has to be attempted. */
+        if (have_best &&
+            zpse_block_floor(n, tids[i], scounts[i], meta_lens[i]) >
+                best_total) {
+            continue;
+        }
+        mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq,
                                 e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,

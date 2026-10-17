@@ -214,16 +214,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.040 | 2616 | 14.4 | 23.7 |
-| incr | 0.040 | 2619 | 4.5 | 10.4 |
-| random | 1.000 | 65568 | 2.9 | 21.1 |
-| sparse | 0.060 | 3962 | 1.0 | 5.4 |
-| strided | 0.040 | 2625 | 2.9 | 10.4 |
-| const5A | 0.040 | 2616 | 13.8 | 23.9 |
-| alt00FF | 0.040 | 2618 | 2.4 | 19.0 |
-| sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
-| lowentropy | 0.687 | 45012 | 0.2 | 0.9 |
-| sparse2 | 0.048 | 3126 | 1.1 | 6.0 |
+| zeros | 0.040 | 2616 | 17.7 | 23.0 |
+| incr | 0.040 | 2619 | 5.1 | 10.3 |
+| random | 1.000 | 65568 | 3.1 | 20.6 |
+| sparse | 0.060 | 3962 | 1.0 | 5.2 |
+| strided | 0.040 | 2625 | 3.1 | 10.3 |
+| const5A | 0.040 | 2616 | 16.9 | 23.2 |
+| alt00FF | 0.040 | 2618 | 2.6 | 18.6 |
+| sawtooth | 0.163 | 10656 | 1.0 | 1.8 |
+| lowentropy | 0.687 | 45012 | 0.1 | 0.9 |
+| sparse2 | 0.048 | 3126 | 1.1 | 5.9 |
 
 The table is one session and the deltas below are paired measurements, so the
 absolute columns move between machines and runs while the sizes and the ratios
@@ -539,6 +539,44 @@ previous build's. A stretch thinner than a sixteenth of the block that the
 sampled tiles straddle can still be aborted, and the cost is bounded by that
 stretch; the sweep did not find one. `ZPSE_FLAT_MIN_DIV` (default 16) sets the
 fraction of the block, and 0 disables the probe.
+
+The next round removes two pieces of work from the encoder's critical path
+without touching a single compressed byte. First, the identity trial no longer
+stages anything: a width-1 split with neither DELTA8 nor XOR8 is the input, and
+the segment encoder only reads its plane, so `planes[0]` points straight at the
+caller's buffer and every block that tries the identity (which is all of them)
+saves the 64 KiB copy that `zpse_transform_forward` would have made. The
+overlap rejection inside the transform exists because it writes the plane;
+not copying at all is what makes it unnecessary. Second, a candidate whose
+*floor* -- block header, metadata, segment directory, every segment header,
+plus 10 bytes per tile -- already exceeds the running winner is dropped before
+its transform is staged, instead of after its first segment has been encoded.
+The comparison is strict (`floor > best`), because a candidate that could tie
+still has to be attempted: ties go to the earlier candidate in the list, so
+skipping one on equality could change which of two equal-size encodings wins.
+
+The measured effect, alternating binaries over six rounds of `80 3`, min per
+pattern: encode `zeros` 1.26x, `const5A` 1.24x, `random` 1.04x, `strided`
+1.03x, `sawtooth` 1.03x, `alt00FF` 1.02x, the rest within +-3% (i.e. noise),
+decode untouched, and all ten `clen` values byte-identical. The parity digest
+(`BB15773EC15BF841`), the fuzz digest (`B23313EB9E83B797`) and every compressed
+size in the adversarial sweeps -- 40,000 noise-with-a-stripe and
+compressible-with-a-noise-stripe shapes, 4,000 mixed-offset shapes, the
+threshold sweep and the 8/12/32 KiB small-block sweeps -- are unchanged in the
+default, `-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds.
+
+Two cheaper-looking variants lost on the ratio guard and were not kept. Pricing
+the proxy on the first 8 KiB instead of 16 KiB is ~10% faster on incompressible
+blocks, but a block whose structure only appears past the first quarter -- a
+long noise prefix in front of a compressible body -- is then mis-ranked:
+sawtooth behind 8 KiB of noise went from 13,855 to 65,568 bytes (RAW). Pricing
+a fixed sixteen tiles per candidate instead of one in every two is worse on
+*both* axes: the coarser estimate prunes badly, so more full trials run and the
+whole encode slows down (`random` 0.29 -> 0.43 ns/B). Shrinking
+`ZPSE_FLAT_MIN_DIV` from 16 to 32 or 48 also fails the guard: on 20,000
+compressible-with-a-noise-stripe shapes, 308 of them fall back to RAW
+(46,526 -> 65,568) because two flat-aborted trials in a row end the sweep
+before the transform that would have coded them is attempted.
 
 ## License
 
