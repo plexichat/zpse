@@ -271,6 +271,17 @@ amortise all three over sixteen times the data and is the next step here. The
 decoder needs the same treatment from the other side: 70% of its 1,000
 cycles/tile is the 8-lane reconstruction loop.
 
+Four cheaper things were tried on the per-tile path and measured, and are not
+in the tree: widening the dense classifier's compaction stores from 8 to 16
+bytes (0.99x), writing the per-exception arrays in place instead of copying
+them out of the classifier's staging buffers (neutral), a branchless
+block-at-a-time palette discovery scan (slower -- the branch it removes is
+why the repeats cost nothing, since a repeat writes no store at all), and
+skipping the actual-byte compaction on the grounds that the packer can gather
+those bytes itself (0.98x: modes 1 and 4 then pay the gather, and the two
+stores per chunk it saves are cheaper than that). The per-tile path is tight;
+what is left is the framing.
+
 This round adds a twelfth predictor and lets the block sweep skip candidates,
 and it is the first round in some time to move a compressed size: nine of the
 ten `clen` values are the ones this format has always produced, and
