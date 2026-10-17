@@ -68,7 +68,7 @@ int main(void) {
          zpse_tile_decode(&lanes, rec, (uint32_t)wlen, tile[0], 1, tile, 0, dec, sizeof dec, scratch)));
     TIMEIT("segment_encode 1KB x20", 20,
         (zpse_lane_reset(&lanes, plane[0]),
-         zpse_segment_encode(&e, &lanes, plane, 1024, plane[0], pay, sizeof pay, 0u)));
+         zpse_segment_encode(&e, &lanes, plane, 1024, plane[0], pay, sizeof pay, 0u, 0u)));
     TIMEIT("comb rank K=128 x20", 20,
         zpse_comb_rank_to_bytes(c128, 128, 256, rec, sizeof rec));
     TIMEIT("comb rank K=8 x200", 200,

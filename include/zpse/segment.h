@@ -25,7 +25,18 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * is ever truncated and the bytes written are a prefix of the unbounded
  * output. It exists so a caller that already knows a larger total cannot
  * win -- block.c's transform sweep against the raw envelope does -- can
- * abandon a hopeless trial without paying for the rest of the tiles. */
+ * abandon a hopeless trial without paying for the rest of the tiles.
+ *
+ * flat_abort_min is a second, weaker bound for the same caller: 0 disables
+ * it, otherwise the encoder abandons the trial (same status) as soon as it
+ * has covered that many input bytes with not one tile paying for itself --
+ * every tile it wrote cost at least as many bytes as the bytes it codes.
+ * The two counters live in the encoder (e->flat_covered / e->flat_paid) so
+ * the caller can make the threshold a property of the whole trial while the
+ * test itself happens per tile; the caller resets them before each trial.
+ * Unlike byte_budget this is a heuristic, not a bound: it only fires for a
+ * trial that cannot beat the raw envelope anyway, and a trial it abandons
+ * is reported exactly like one the budget stopped. */
 /* Prescreen-only size estimate of one transformed plane (see segment.c). */
 uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
 
@@ -33,7 +44,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
                         uint8_t *payload_out, uint32_t payload_cap,
-                        uint32_t byte_budget);
+                        uint32_t byte_budget, uint32_t flat_abort_min);
 
 /* The cheap nine-predictor screen zpse_segment_encode runs per tile,
  * exposed so a caller can ask how predictable a candidate plane is

@@ -82,6 +82,13 @@ typedef struct ZpseEncoder {
     uint8_t *comb;        /* 8 KiB */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
+    /* Trial-level progress for zpse_segment_encode's flat abort: the length
+     * of the leading run of tiles whose record cost at least as much as the
+     * bytes it codes, and the flag that ends that run (set by the first tile
+     * that does pay for itself). Accumulated across the segments of one
+     * trial and reset by the caller per trial. */
+    uint32_t flat_covered;
+    uint32_t flat_paid;
 } ZpseEncoder;
 
 int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len);

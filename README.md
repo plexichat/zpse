@@ -214,16 +214,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.040 | 2616 | 14.0 | 22.9 |
-| incr | 0.040 | 2619 | 5.0 | 10.0 |
-| random | 1.000 | 65568 | 0.4 | 20.4 |
-| sparse | 0.060 | 3962 | 1.0 | 5.3 |
-| strided | 0.040 | 2625 | 3.0 | 10.0 |
-| const5A | 0.040 | 2616 | 13.6 | 23.0 |
-| alt00FF | 0.040 | 2618 | 2.5 | 18.5 |
-| sawtooth | 0.163 | 10656 | 1.1 | 1.8 |
-| lowentropy | 0.687 | 45012 | 0.1 | 0.9 |
-| sparse2 | 0.048 | 3126 | 1.1 | 5.8 |
+| zeros | 0.040 | 2616 | 14.4 | 23.7 |
+| incr | 0.040 | 2619 | 4.5 | 10.4 |
+| random | 1.000 | 65568 | 2.9 | 21.1 |
+| sparse | 0.060 | 3962 | 1.0 | 5.4 |
+| strided | 0.040 | 2625 | 2.9 | 10.4 |
+| const5A | 0.040 | 2616 | 13.8 | 23.9 |
+| alt00FF | 0.040 | 2618 | 2.4 | 19.0 |
+| sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
+| lowentropy | 0.687 | 45012 | 0.2 | 0.9 |
+| sparse2 | 0.048 | 3126 | 1.1 | 6.0 |
 
 The table is one session and the deltas below are paired measurements, so the
 absolute columns move between machines and runs while the sizes and the ratios
@@ -497,6 +497,48 @@ line: inlined into the classify epilogue, which every tile runs, its
 register pressure cost the `sparse` row 7-9% without ever being called
 there, the same code-generation failure mode the `ORDER1` note above
 records.
+
+This round abandons a hopeless transform-sweep trial as soon as the front of
+the block says it is hopeless. On a block whose every candidate has to beat
+the RAW envelope -- incompressible data, where the answer is RAW and the only
+question left is how many trials it takes to say so -- `zpse_block_encode`
+now also passes `zpse_segment_encode` a flat-abort threshold, and a trial that
+has covered a sixteenth of the block (floored at four tiles) with not one tile
+paying for itself is dropped with the same status the byte budget returns.
+The probe is one compare per tile (`seg_flat_abort`), and the run it measures
+ends at the first tile that does pay, so a block with any compressible front
+pays nothing for the test.
+
+Abandoning a *hopeless* trial early is only unsound in one direction: the
+front of a block can be noise while the rest of it compresses. A 64 KiB block
+of 16 KiB of noise and then zeros codes at 20883 bytes, and a test that only
+ever looks forward cannot tell it apart from a block that is noise all the
+way through. Ungated, the probe measured `random` 2.4x and turned exactly that
+block into RAW (65568 against 20883, -68%), which is why it ships gated by a
+whole-block sample: sixteen tiles at the odd thirty-seconds of the block are
+prescreened on the trial's own transformed planes, and the abort is armed only
+when every one of them is a tile the segment encoder itself would call
+near-random -- all nine screened predictors miss at least 7/8 of it, the same
+threshold its single-candidate rule uses -- so a compressible stretch wider
+than a sixteenth of the block is seen whatever the segment shape. The sample
+costs sixteen prescreens per trial and is skipped entirely once a winner
+smaller than RAW exists, which is the only condition under which no segment
+could be armed anyway.
+
+Measured paired, alternating binaries, best of four rounds of `200 6` per
+pattern, against the previous build: encode `random` 1.90 -> 0.33 ns/B (5.76x),
+the other nine rows 1.000-1.10x, both decode columns unchanged, all ten
+compressed sizes byte-identical, and the parity, fuzz and lseed digests
+identical in all three builds. The ratio check is the larger one, because this
+is a heuristic and the sample is a sample: on 110,000 adversarial shapes built
+for exactly the case above -- a noise block with a compressible stripe of
+random length at a random offset, 1 byte to 64 KiB, five fill patterns, plus
+the mirror shape of a compressible block with a random noise stripe, at block
+sizes 8, 16, 32 and 64 KiB -- every compressed size is byte-identical to the
+previous build's. A stretch thinner than a sixteenth of the block that the
+sampled tiles straddle can still be aborted, and the cost is bounded by that
+stretch; the sweep did not find one. `ZPSE_FLAT_MIN_DIV` (default 16) sets the
+fraction of the block, and 0 disables the probe.
 
 ## License
 

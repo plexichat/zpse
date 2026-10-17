@@ -362,6 +362,76 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
  * one that sets `*budget_hit`, because it is the only one that means
  * "reached the size where RAW wins" for the caller's incompressible
  * heuristic. */
+/* The nine predictors the segment encoder's prescreen ranks, spelled out
+ * here for the sample below (the same list, and the same reason for
+ * spelling it out, as seg_screen_pred in src/segment.c: appending to the
+ * enum cannot silently reorder it). ids 3, 4 and 9 are the sentinels that
+ * prescreen leaves at 0xFFFF. */
+static const uint8_t zpse_block_screen[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
+                                              10u, 11u };
+
+/* Whole-block noise sample: is EVERY one of sixteen tiles spread evenly
+ * across the block's transformed planes a tile the segment encoder itself
+ * would call near-random -- one where all nine screened predictors miss at
+ * least 7/8 of the positions (the same threshold the segment encoder's own
+ * single-candidate rule uses)?
+ *
+ * This is the second half of the trial-level flat abort's evidence, and it
+ * is what keeps that heuristic off a block whose FRONT is noise and whose
+ * rest compresses: the leading-run test (seg_flat_abort) only ever sees
+ * the front, so it cannot tell such a block from a block that is noise
+ * everywhere, and the whole-block sample sees the rest. Sixteen 256-byte
+ * tiles out of a block is a sample, not a proof -- but the points are the
+ * odd thirty-seconds of the block (1/32, 3/32, ... 31/32), a sixteenth of
+ * the block apart, so a compressible stretch of the block wider than that
+ * contains one of them whatever the segment shape, and each point is judged
+ * by the encoder's own near-random rule on the very plane the trial is
+ * about to write. The abort further requires a leading run of unpredicted
+ * tiles. Returns 1 only when the whole block reads as noise at every sample
+ * point. */
+static int zpse_block_is_noise(const uint8_t *const planes[16], uint8_t sc,
+                               const uint32_t lens[16], uint32_t n)
+{
+    unsigned i;
+
+    for (i = 0; i < 16u; i++) {
+        uint64_t target = ((uint64_t)n * (uint64_t)(2u * i + 1u)) / 32u;
+        uint64_t seen = 0;
+        uint32_t len, off;
+        const uint8_t *pl;
+        uint16_t nt;
+        uint16_t ks[12];
+        uint16_t best;
+        unsigned s, j;
+
+        for (s = 0; s + 1u < sc; s++) {
+            if (target < seen + lens[s])
+                break;
+            seen += lens[s];
+        }
+        pl = planes[s];
+        len = lens[s];
+        if (pl == 0 || len < 64u)
+            continue;
+        off = (uint32_t)(target - seen);
+        off &= ~255u;
+        if (off + 64u > len)
+            off = (len >= 320u) ? (len - 320u) : 0u;
+        nt = (uint16_t)((len - off > 256u) ? 256u : (len - off));
+        if (nt < 64u)
+            continue;
+        zpse_segment_prescreen(pl + off, nt, pl, off, pl[0], ks);
+        best = ks[zpse_block_screen[0]];
+        for (j = 1u; j < 9u; j++) {
+            if (ks[zpse_block_screen[j]] < best)
+                best = ks[zpse_block_screen[j]];
+        }
+        if ((uint32_t)best * 8u < (uint32_t)nt * 7u)
+            return 0; /* a tile the encoder can predict: not a noise block */
+    }
+    return 1;
+}
+
 static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                               uint32_t in_crc,
                               uint8_t tid, uint8_t sc,
@@ -369,7 +439,7 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                               int is_last, uint32_t seq,
                               uint8_t *dst, uint32_t cap, uint32_t *total_out,
                               int *budget_hit, int have_best,
-                              uint32_t best_total)
+                              uint32_t best_total, uint32_t flat_abort_min)
 {
     /* A trial is only ever chosen when its total is below the RAW
      * envelope (32 + N), so it cannot matter once it has reached it:
@@ -390,11 +460,17 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     ZpseBlockHeader h;
     ZpseLaneState lanes;
     uint8_t flags;
+    int is_noise;
     int rc;
 
     if (budget_hit != 0) {
         *budget_hit = 0;
     }
+    /* The flat abort's coverage counter and the flag that ends its run span
+     * this trial's segments, so they are reset here rather than inside
+     * zpse_segment_encode. */
+    e->flat_covered = 0u;
+    e->flat_paid = 0u;
     rc = zpse_transform_width(tid, sc, &w);
     if (rc != PSE_OK) {
         return rc;
@@ -444,6 +520,18 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (lanes.order1 == 0 || lanes.o2val == 0 || lanes.o2conf == 0) {
         return PSE_BAD_ARG;
     }
+    /* Sixteen prescreens against the tiles this trial is about to write,
+     * asked for only while the flat abort could still fire: the abort is
+     * armed per segment only while beating the RAW envelope is the trial's
+     * only way to win, and a winner already smaller than RAW means no
+     * segment can be armed. */
+    is_noise = (flat_abort_min != 0u &&
+                (!have_best ||
+                 (uint64_t)best_total >=
+                     (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n))
+                   ? zpse_block_is_noise((const uint8_t *const *)planes, sc,
+                                         lens, n)
+                   : 0;
     cum = 0;
     for (s = 0; s < sc; s++) {
         uint8_t lit = lens[s] > 0 ? planes[s][0] : 0;
@@ -476,8 +564,19 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 budget_is_raw = 0;
             }
         }
+        /* The flat abort is a *noise* signal: it only means something
+         * while the trial's only way to win is to beat the RAW envelope.
+         * Once a winner exists the budget above is a proof of the same
+         * thing, so the heuristic is switched off and only exact bounds
+         * stop the trial. The whole-block sample is asked first because it
+         * is a property of the trial's transformed planes, not of the
+         * segment being written, so a block that is predictable anywhere
+         * keeps the trial it has always had. */
         wlen = zpse_segment_encode(e, &lanes, planes[s], lens[s], lit,
-                                   dst + at, room, budget);
+                                   dst + at, room, budget,
+                                   (budget_is_raw != 0 && is_noise != 0)
+                                       ? flat_abort_min
+                                       : 0u);
         if (wlen < 0) {
             if (wlen == PSE_OUTPUT_OVERFLOW && budget != 0u &&
                 budget_is_raw != 0 && budget_hit != 0) {
@@ -528,6 +627,12 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     *total_out = total;
     return PSE_OK;
 }
+
+/* Divisor of the trial-level noise probe's threshold: see flat_min in
+ * zpse_block_encode and seg_flat_abort in segment.c. */
+#ifndef ZPSE_FLAT_MIN_DIV
+#define ZPSE_FLAT_MIN_DIV 16u
+#endif
 
 /* Smallest size a trial with this (transform, segment count, metadata)
  * shape can possibly produce: the envelope (block header, metadata, the
@@ -779,6 +884,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int ncand = 0;
     uint32_t best_total = 0;
     uint32_t best_idx = 0;
+    uint32_t flat_min = 0u;
     int have_best = 0;
     int fails = 0;
     int sample;
@@ -794,6 +900,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
         return PSE_BAD_BLOCK_SIZE;
     }
+
+    /* Trial-level noise probe threshold: a trial whose only way to win is
+     * the RAW envelope is abandoned once it has covered this many input
+     * bytes without one tile paying for itself (zpse_segment_encode,
+     * seg_flat_abort). A sixteenth of the block, floored at four tiles, and
+     * only for blocks big enough for either to be worth measuring -- the
+     * same 8 KiB gate the prescreen proxy uses -- so small blocks keep
+     * exactly the trial structure they have always had. */
+    flat_min = (n >= 8192u) ? (n / ZPSE_FLAT_MIN_DIV) : 0u;
+    if (flat_min != 0u && flat_min < 1024u)
+        flat_min = 1024u;
 
     /* The candidate list is built in slot order below and then reordered
      * and compacted in place, so every slot a candidate does not fill must
@@ -940,7 +1057,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq,
                                 e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
-                                &budget_hit, have_best, best_total);
+                                &budget_hit, have_best, best_total,
+                                flat_min);
         if (rc != PSE_OK) {
             /* A trial the budget stopped had already reached the RAW
              * envelope, which is exactly the condition the completed

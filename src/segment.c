@@ -950,11 +950,42 @@ uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
     return cost + sum * 2u;
 }
 
+/* Trial-level noise probe, called once per tile the general path writes.
+ * `flat_covered` accumulates the length of the trial's LEADING run of tiles
+ * that did not pay for themselves -- a tile whose record (the u16 length
+ * prefix included) is not smaller than the bytes it codes. The run ends at
+ * the first tile that does pay (`flat_paid`), and the probe is over for the
+ * rest of the trial then: no later coverage can make a paying tile stop
+ * having paid, so one compare per tile is all the probe costs from that
+ * point on.
+ *
+ * A run of that shape reaching flat_abort_min means the trial has coded that
+ * many input bytes into records at least as large as the bytes they code,
+ * without one tile anywhere in the stretch paying for itself. On a block
+ * whose every transform shape has to beat the RAW envelope, that is the
+ * block being noise. Returns 1 when the caller must abandon the trial.
+ *
+ * The counters live in the encoder so one threshold spans the trial's
+ * segments; the caller resets them per trial. flat_abort_min == 0 disables
+ * the test entirely (that is what the direct tile/segment callers pass). */
+static int seg_flat_abort(ZpseEncoder *e, uint16_t nt, uint32_t coded,
+                          uint32_t flat_abort_min)
+{
+    if (flat_abort_min == 0u || e->flat_paid != 0u)
+        return 0;
+    if (coded < (uint32_t)nt) {
+        e->flat_paid = 1u;
+        return 0;
+    }
+    e->flat_covered += nt;
+    return (e->flat_covered >= flat_abort_min) ? 1 : 0;
+}
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
                         uint8_t *payload_out, uint32_t payload_cap,
-                        uint32_t byte_budget)
+                        uint32_t byte_budget, uint32_t flat_abort_min)
 {
     ZpseSegmentHeader h;
     uint32_t tc;
@@ -1119,6 +1150,17 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             if (payload_cap - pos < 10u) {
                 return PSE_OUTPUT_OVERFLOW;
             }
+            /* The probe is not consulted on this path. A run writes 10 bytes
+             * per tile, which pays for itself unless the tile is 10 bytes or
+             * shorter -- and only a segment's LAST tile can be that short,
+             * against a threshold of a sixteenth of a block of at least
+             * 8 KiB. So every run tile in the stretch the probe measures
+             * pays, the leading non-paying run stays empty here, and the
+             * abort could not fire even if it were consulted. All-hit runs
+             * are the hot path for constant and periodic blocks, so they pay
+             * nothing for a test that cannot fire -- and a block whose front
+             * is a run of predicting tiles is exactly a block this probe is
+             * not looking for. */
             seg_write_all_hit(payload_out + pos, pred, nt);
             pos += 10u;
 
@@ -1247,6 +1289,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         zpse_store_u16le(payload_out + pos, (uint16_t)best_len);
         pos += 2u + (uint32_t)best_len;
+        if (seg_flat_abort(e, nt, 2u + (uint32_t)best_len, flat_abort_min)) {
+            return PSE_OUTPUT_OVERFLOW;
+        }
     }
     return (int)pos;
 }
