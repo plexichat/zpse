@@ -812,6 +812,13 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_TILES 8u
 #endif
 
+/* Tiles the opt-in decision probe prices per candidate (see
+ * ZPSE_SAMPLE_DECIDE below): paid once per candidate against a full
+ * trial's 256 tiles. */
+#ifndef ZPSE_DECIDE_TILES
+#define ZPSE_DECIDE_TILES 16u
+#endif
+
 /* Exact price of a plane: classify, choose modes and pack a spread of its
  * tiles -- the same three calls one tile of a real trial makes, so the
  * estimate sees every mode the encoder can use instead of only the nine
@@ -835,8 +842,8 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
     if (plane == 0 || len == 0u || e->comb == 0) {
         return UINT32_MAX;
     }
-    if (tiles == 0u || tiles > ZPSE_PROBE_TILES) {
-        tiles = ZPSE_PROBE_TILES;
+    if (tiles == 0u || tiles > ZPSE_DECIDE_TILES) {
+        tiles = (tiles == 0u) ? ZPSE_PROBE_TILES : ZPSE_DECIDE_TILES;
     }
     if (tiles > tc) {
         tiles = tc;
@@ -1269,6 +1276,68 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             ncand = kept;
         }
     }
+
+#ifdef ZPSE_SAMPLE_DECIDE
+    /* ---- Decide from a sample, then encode once ---------------- *
+     * OPT-IN (build with -DZPSE_SAMPLE_DECIDE). Every survivor of the
+     * prescreen is encoded in full below and the smallest stream wins. A
+     * trial is a classify, a mode search and a pack of every tile, so the
+     * candidates the prescreen cannot separate -- a 4-bit alphabet, a
+     * nibble-packed record, a text block, where all of them miss about as
+     * often as each other -- cost a whole block encode each for a
+     * difference of a few bytes.
+     *
+     * This prices every survivor exactly instead: the same classify, mode
+     * search and pack on ZPSE_DECIDE_TILES tiles spread over the block,
+     * folded up to the block's tile count. The winner is then encoded
+     * once. Measured 1.65-2.07x on the lowentropy row of the bench (949k ->
+     * 575k-510k cycles per 64 KiB block) and byte-identical on all 768 cases
+     * of tests/clen_corpus.c, INCLUDING their CRC32-Cs.
+     *
+     * It is opt-in because the price is a sample. On a block whose tiles
+     * are not statistically alike -- tests/test_fuzz.c shape 16, regions of
+     * random texture at random boundaries -- a 16-tile sample can pick the
+     * wrong transform outright: 74 of that suite's 2,718 cases moved by one
+     * byte and one (8 KiB of random mixed regions) went from 1,735 to 3,645
+     * bytes. The default sweep therefore stays exact; see the README.
+     *
+     * Ordering keeps the sweep's own tie-break: the smallest price wins and
+     * an exact tie goes to the earlier candidate, so a candidate can only
+     * be picked over one it would have lost to on a strict inequality. A
+     * price that cannot be computed never wins over one that can, and if
+     * nothing can be priced the list is left alone and the sweep runs
+     * exactly as it always did. */
+    if (ncand > 1 && n >= 8192u) {
+        uint32_t ex[4];
+        uint32_t pn = proxy_n != 0u ? proxy_n : n;
+        int pick = -1;
+        int ci;
+
+        for (ci = 0; ci < ncand; ci++) {
+            const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
+
+            ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
+                                            scounts[ci], mb, meta_lens[ci],
+                                            ZPSE_DECIDE_TILES);
+            if (ex[ci] == UINT32_MAX) {
+                continue;
+            }
+            if (pick < 0 || ex[ci] < ex[pick] ||
+                (ex[ci] == ex[pick] && idx[ci] < idx[pick])) {
+                pick = ci;
+            }
+        }
+        if (pick >= 0) {
+            tids[0] = tids[pick];
+            scounts[0] = scounts[pick];
+            meta_lens[0] = meta_lens[pick];
+            meta_bufs[0][0] = meta_bufs[pick][0];
+            meta_bufs[0][1] = meta_bufs[pick][1];
+            idx[0] = idx[pick];
+            ncand = 1;
+        }
+    }
+#endif /* ZPSE_SAMPLE_DECIDE */
 
     for (oi = 0; oi < ncand; oi++) {
         int i = oi;
