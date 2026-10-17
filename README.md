@@ -214,15 +214,15 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.040 | 2616 | 17.7 | 23.0 |
-| incr | 0.040 | 2619 | 5.1 | 10.3 |
-| random | 1.000 | 65568 | 3.1 | 20.6 |
-| sparse | 0.060 | 3962 | 1.0 | 5.2 |
+| zeros | 0.040 | 2616 | 17.9 | 23.5 |
+| incr | 0.040 | 2619 | 5.2 | 10.4 |
+| random | 1.000 | 65568 | 3.1 | 20.9 |
+| sparse | 0.060 | 3962 | 1.0 | 5.4 |
 | strided | 0.040 | 2625 | 3.1 | 10.3 |
-| const5A | 0.040 | 2616 | 16.9 | 23.2 |
-| alt00FF | 0.040 | 2618 | 2.6 | 18.6 |
-| sawtooth | 0.163 | 10656 | 1.0 | 1.8 |
-| lowentropy | 0.687 | 45012 | 0.1 | 0.9 |
+| const5A | 0.040 | 2616 | 17.3 | 23.9 |
+| alt00FF | 0.040 | 2618 | 2.6 | 19.3 |
+| sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
+| lowentropy | 0.687 | 45012 | 0.2 | 0.9 |
 | sparse2 | 0.048 | 3126 | 1.1 | 5.9 |
 
 The table is one session and the deltas below are paired measurements, so the
@@ -577,6 +577,38 @@ whole encode slows down (`random` 0.29 -> 0.43 ns/B). Shrinking
 compressible-with-a-noise-stripe shapes, 308 of them fall back to RAW
 (46,526 -> 65,568) because two flat-aborted trials in a row end the sweep
 before the transform that would have coded them is attempted.
+
+The sweep's prescreen has one blind spot, and this round prices around it.
+`zpse_segment_proxy_cost` sees nine predictors; data on a small alphabet (a
+4-bit sensor, a nibble-packed record, text) is invisible to all nine, so every
+candidate prices the same "no gain", the ~6% prune keeps them all, and every
+one is then encoded in full. `lowentropy` -- uniform 4-bit bytes -- was the
+worst row in the table for exactly that reason: three full trials per block,
+468 us of tile work, where one trial would produce the same 45,012 bytes.
+
+`zpse_block_prune_exact` closes it with a different *estimator* rather than a
+cheaper one: classify, choose modes and pack eight spread tiles per candidate
+(the same three calls a real tile makes, so nibble packing and the mask modes
+are visible), fold the sample back up to the candidate's tile count, and keep
+only what is within the same ~6% of the best. It runs only where the sweep has
+already decided to spend another trial (`best_total > min_floor` over the
+candidates left) and only after the first winner exists, which is what keeps
+it free everywhere else: a constant or all-hit block ends before it, a block
+whose first trial aborted (noise) never reaches it, and a block the floor test
+stops pays nothing. The probe budget is per candidate, not per plane, so a
+16-segment transpose prices sixteen tiles in total rather than sixteen apiece.
+
+Measured against the previous commit, alternating binaries, best of six rounds
+of `80 3`: encode `lowentropy` 0.16 -> 0.22 GB/s (1.38x), `sparse2` 1.05x, the
+other eight rows 0.98-1.02x, both decode columns unchanged -- and all ten
+`clen` values byte-identical, because a candidate the probe drops could not
+have won: 6 of 6 adversarial sweeps (the two noise/stripe families, the mixed
+offset family, the threshold sweep and the 8/12 KiB small-block sweeps, 66,000
+shapes) reproduce every compressed size byte for byte, and the parity
+(`BB15773EC15BF841`), fuzz (`B23313EB9E83B797`) and lseed digests are unchanged
+in the default, `-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds.
+`ZPSE_PROBE_TILES` (default 8) sets the per-candidate budget; 16 and 48 were
+measured too and prune no further, so the smaller budget is the one that ships.
 
 ## License
 
