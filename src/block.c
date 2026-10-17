@@ -812,9 +812,9 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_TILES 8u
 #endif
 
-/* Tiles the opt-in decision probe prices per candidate (see
- * ZPSE_SAMPLE_DECIDE below): paid once per candidate against a full
- * trial's 256 tiles. */
+/* Tiles the decision probe prices per candidate (see the sweep decision in
+ * zpse_block_encode): paid once per candidate against a full trial's 256
+ * tiles. */
 #ifndef ZPSE_DECIDE_TILES
 #define ZPSE_DECIDE_TILES 16u
 #endif
@@ -1277,10 +1277,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
 
-#ifdef ZPSE_SAMPLE_DECIDE
+#ifndef ZPSE_KEEP_EXACT_SWEEP
     /* ---- Decide from a sample, then encode once ---------------- *
-     * OPT-IN (build with -DZPSE_SAMPLE_DECIDE). Every survivor of the
-     * prescreen is encoded in full below and the smallest stream wins. A
+     * DEFAULT; build with -DZPSE_KEEP_EXACT_SWEEP for the old sweep, which
+     * encodes every survivor in full and keeps the smallest stream. A
      * trial is a classify, a mode search and a pack of every tile, so the
      * candidates the prescreen cannot separate -- a 4-bit alphabet, a
      * nibble-packed record, a text block, where all of them miss about as
@@ -1294,12 +1294,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * 575k-510k cycles per 64 KiB block) and byte-identical on all 768 cases
      * of tests/clen_corpus.c, INCLUDING their CRC32-Cs.
      *
-     * It is opt-in because the price is a sample. On a block whose tiles
+     * The price is a sample, and that is the trade. On a block whose tiles
      * are not statistically alike -- tests/test_fuzz.c shape 16, regions of
      * random texture at random boundaries -- a 16-tile sample can pick the
      * wrong transform outright: 74 of that suite's 2,718 cases moved by one
      * byte and one (8 KiB of random mixed regions) went from 1,735 to 3,645
-     * bytes. The default sweep therefore stays exact; see the README.
+     * bytes. Every case of tests/clen_corpus.c is byte-identical. See the
+     * README for what that costs and why it is worth it.
      *
      * Ordering keeps the sweep's own tie-break: the smallest price wins and
      * an exact tie goes to the earlier candidate, so a candidate can only
@@ -1337,7 +1338,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             ncand = 1;
         }
     }
-#endif /* ZPSE_SAMPLE_DECIDE */
+#endif /* !ZPSE_KEEP_EXACT_SWEEP */
 
     for (oi = 0; oi < ncand; oi++) {
         int i = oi;

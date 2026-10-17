@@ -222,56 +222,54 @@ absolute numbers move with the machine and the clock, the shape does not.
 | const5A | 0.040 | 2616 | 17.3 | 23.9 |
 | alt00FF | 0.040 | 2618 | 2.6 | 19.3 |
 | sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
-| lowentropy | 0.687 | 45012 | 0.3 | 0.9 |
+| lowentropy | 0.687 | 45012 | 0.5 | 0.9 |
 | sparse2 | 0.048 | 3126 | 1.1 | 5.9 |
 
 The table is one session and the deltas below are paired measurements, so the
 absolute columns move between machines and runs while the sizes and the ratios
 do not.
 
-### Why `lowentropy` is not 1 GB/s
+### `lowentropy`: what the sweep costs, and why 1 GB/s is still out of reach
 
-It is the sweep's worst case, and the arithmetic says 1 GB/s is out of reach
-for it in this format. Measured on the machine above, in `__rdtsc` reference
-cycles per 64 KiB block (best of many, so clock drift does not enter):
+That row is the sweep's worst case, and it is now the one place where the
+encoder deliberately trades a little ratio for a lot of time. Measured in
+`__rdtsc` reference cycles per 64 KiB block (best of many, so clock drift
+does not enter):
 
 | | cycles/blk | GB/s |
 | --- | --- | --- |
-| encode, as shipped | 949,000 | 0.26 |
-| encode, `-DZPSE_SAMPLE_DECIDE` | 510,000 | 0.49 |
-| decode | 275,000 | 0.94 |
+| encode, full sweep (`-DZPSE_KEEP_EXACT_SWEEP`) | 949,000 | 0.26 |
+| encode, as shipped (sampled decision) | 470,000-510,000 | 0.49 |
+| decode | 260,000-275,000 | 0.94 |
 | budget for 1 GB/s | 242,000 | 1.00 |
 
 On 4-bit noise the prescreen prices the identity, DELTA8 and the transpose
 within 0.02% of each other (45,020 vs 45,012 bytes), so no prune can drop
-either: the sweep encodes a full trial per survivor. One trial, per
-tile: prescreen 190 cycles, classify 850 (of which ~640 is the dense
-compaction and ~350 the distinct-residual count), mode search 50, pack 650
-(palette discovery ~300, palette packing ~250, mask 60, validation 30). That
-is ~1,740 cycles per 256-byte tile, and 256 tiles is 445,000 cycles before the
-two transform stagings, the proxy and the plan probes -- which is the 949,000
-in the table, for two trials.
+either and the full sweep encodes a trial per survivor. A trial, per tile:
+prescreen 190 cycles, classify 850 (of which ~640 is the dense compaction and
+~350 the distinct-residual count), mode search 50, pack 650 (palette discovery
+~300, palette packing ~250, mask 60, validation 30) -- 1,740 cycles per
+256-byte tile, times 256 tiles, plus the transform stagings and probes.
 
-So 1 GB/s needs *one* trial (445,000) at 55% of today's per-tile cost -- and
-the decoder, which does a single pass and no search at all, already needs
-275,000. Anything with a search in it will not beat the decoder it feeds.
-`-DZPSE_SAMPLE_DECIDE` takes the first half of that: it prices every survivor
-on 16 tiles and encodes only the winner, which is the 1.65-2.07x above. It is
-opt-in, not default, because the price is a sample: on all 768 cases of
-`tests/clen_corpus.c` it produces identical bytes and identical CRCs, and on
-`tests/test_fuzz.c` it moves 74 of 2,718 cases by one byte -- but one 8 KiB
-block of random mixed regions goes from 1,735 to 3,645 bytes, because a
-16-tile sample cannot see a block whose regions differ within it. The default
-sweep stays exact.
+The sampled decision is therefore the default now: `zpse_block_encode` prices
+every survivor exactly -- the same classify, mode search and pack, on 16 tiles
+spread over the block -- and encodes only the winner. That is the 1.9-2.0x
+above, and the ratio it costs is measured rather than hoped for: identical
+sizes *and* CRCs on all 768 cases of `tests/clen_corpus.c`, 74 of
+`tests/test_fuzz.c`'s 2,718 cases one byte larger, and one 8 KiB block of
+random mixed regions 1,735 -> 3,645 bytes, because a 16-tile sample cannot see
+a block whose regions differ within it. `-DZPSE_KEEP_EXACT_SWEEP` restores the
+exact sweep for anyone who would rather pay the time.
 
-What would actually buy the factor: a format-level dense record (one mask and
-one residual stream per segment instead of a bitmap and a palette per 256
-bytes), which removes the per-tile mask/mode framing that classify and pack
-spend most of their time on. Two micro-optimisations were tried and measured
-neutral (0.99x) and are not in the tree: widening the dense classifier's
-compaction stores from 8 to 16 bytes, and writing the three per-exception
-arrays in place instead of copying them out of the classifier's staging
-buffers.
+What is left between 510,000 and the 242,000 that 1 GB/s needs is not a
+micro-optimisation: it is the per-tile framing itself. Every tile carries its
+own 8-byte header, its own mask and its own residual mode, so classify, the
+mode search and the pack all run once per 256 bytes. A segment-level dense
+record -- one predictor, one mask over the whole 4 KiB plane and one residual
+stream, with the palette discovered once instead of sixteen times -- would
+amortise all three over sixteen times the data and is the next step here. The
+decoder needs the same treatment from the other side: 70% of its 1,000
+cycles/tile is the 8-lane reconstruction loop.
 
 This round adds a twelfth predictor and lets the block sweep skip candidates,
 and it is the first round in some time to move a compressed size: nine of the
