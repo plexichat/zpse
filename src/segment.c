@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "zpse/bits.h"
+#include "zpse/dense.h"
 #include "zpse/mask.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
@@ -71,11 +72,32 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         return PSE_BAD_SEGMENT_DIRECTORY;
     }
     expect_tc = (h.segment_decoded_size + 255u) / 256u;
-    if (h.tile_count == 0u || (uint32_t)h.tile_count != expect_tc) {
+    if (h.tile_count == 0u) {
         return PSE_BAD_TILE_SIZE;
     }
     if (h.segment_decoded_size > decoded_cap) {
         return PSE_OUTPUT_OVERFLOW;
+    }
+
+    /* ---- Dense record (Sec. 6.3) -------------------------------- *
+     * One predictor, one mask and one residual stream for the whole
+     * plane, either marked by bit 6 of the record's flag byte. That bit
+     * is reserved in a tile record and tile_header_validate rejects it,
+     * so no payload that decodes as tiles can be read as a dense record:
+     * the two interpretations cannot overlap. A payload carrying it and
+     * failing validation below is rejected with the dense record's own
+     * statuses, exactly as a malformed tile is rejected with the tile
+     * ones. The record is the segment's only record, so the whole plane
+     * (and the segment's decoded size) comes from one call. */
+    if (payload_len > 18u && (payload[18] & ZPSE_DENSE_MARKER) != 0u) {
+        if ((uint32_t)h.tile_count != 1u) {
+            return PSE_BAD_TILE_SIZE;
+        }
+        return zpse_dense_decode(&h, payload, payload_len, decoded_out,
+                                 decoded_cap, decoded_len_out, d->comb);
+    }
+    if ((uint32_t)h.tile_count != expect_tc) {
+        return PSE_BAD_TILE_SIZE;
     }
 
     /* First tile of the segment always re-seeds lane state,

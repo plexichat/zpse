@@ -41,7 +41,7 @@ the format is designed for:
 ```
 include/zpse/   public and internal headers (one per stage: crc32c, arena,
                 transform, predictor, combinadic, mask, residual, tile,
-                segment, block, frame, vector, api)
+                dense, segment, block, frame, vector, api)
 src/            the implementation, plus src/zpse_unity.c
 tests/          suites, throughput bench and micro-profilers
 SPEC_V1.md      the normative format specification
@@ -144,6 +144,7 @@ non-zero exit code if any of them fails:
 | `test_parity.c` | the full corpus plus four per-primitive sweeps (uniform, small-`nt`/mask-word boundary, stateful-table ids, and the state a classification leaves) |
 | `test_fuzz.c` | a randomized differential corpus: every size 1 to 64, every tile and segment boundary and its neighbours up to 64 KiB, 60 pseudo-random sizes, 18 shapes each (2718 blocks) plus 6 frames, each block round-tripped and its size, compressed length and compressed bytes folded into one digest |
 | `test_lseed.c` | hand-built foreign segments whose ORDER1/ORDER2 tiles deliberately do NOT reset (non-resetting first tile, chains, mixed ORDER/STRIDE), each decoded by the library and by a reference in the file that hardcodes the documented segment-start state — the shape the lane-state seeding above exists for, and one this encoder cannot produce |
+| `test_dense.c` | dense segment records (SPEC Sec. 6.3): 6042 records built by a reference writer over every predictor family, mask form and residual mode at nine plane sizes, plus hand-computed lane-history predictions, plus 15 malformed shapes (reserved bits/fields/modes, `ORDER1`, wrong spans, pad bits, non-ascending positions, trailing bytes) that must be rejected and never decoded |
 
 The parity step is the important one, and it is two checks over three builds
 of the same three suites: `test_parity.c`, `test_fuzz.c` and `test_lseed.c`
@@ -177,6 +178,7 @@ parity ok (swap): DIGEST <value> identical streams
 fuzz ok (scalar): FUZZ cases=2718 frames=6 digest=<value> identical streams
 fuzz ok (swap): FUZZ cases=2718 frames=6 digest=<value> identical streams
 lseed ok (scalar): LSEED: ALL OK (10 cases) identical streams
+dense records ok   (DENSE: cases=6042 failures=0)
 lseed ok (swap): LSEED: ALL OK (10 cases) identical streams
 ALL SUITES PASS
 ```
@@ -267,9 +269,17 @@ own 8-byte header, its own mask and its own residual mode, so classify, the
 mode search and the pack all run once per 256 bytes. A segment-level dense
 record -- one predictor, one mask over the whole 4 KiB plane and one residual
 stream, with the palette discovered once instead of sixteen times -- would
-amortise all three over sixteen times the data and is the next step here. The
-decoder needs the same treatment from the other side: 70% of its 1,000
-cycles/tile is the 8-lane reconstruction loop.
+amortise all three over sixteen times the data. That record is now defined
+(SPEC Sec. 6.3) and decoded: `src/dense.c` handles one record per plane, with
+its own mask cursor, all three lane-history predictors, the STRIDE family over
+absolute positions and residual modes 0-3, under the same hostile-stream
+validation as tiles, and `tests/test_dense.c` covers it. What is NOT in the
+tree is the emitter: `zpse_segment_encode` still writes tile records, so the
+format exists, round-trips and is tested, but no compressed stream uses it yet
+and the speed above is unchanged. Emitting it requires a plane-level candidate
+search that replaces the tile loop for homogeneous planes rather than running
+after it, which is the next change and the one that has to be measured on
+`lowentropy`.
 
 Four cheaper things were tried on the per-tile path and measured, and are not
 in the tree: widening the dense classifier's compaction stores from 8 to 16

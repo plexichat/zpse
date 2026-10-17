@@ -11,6 +11,7 @@
 #include "combinadic.c"
 #include "mask.c"
 #include "residual.c"
+#include "dense.c"
 #include "tile.c"
 #include "segment.c"
 #include "block.c"

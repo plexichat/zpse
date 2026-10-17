@@ -428,6 +428,73 @@ Additionally: mode 0 with `K>0`, mode 6 with `K != Nt`, modes 1..5 with
 `K==0` or `K==Nt` => `PSE_BAD_MASK`. The legacy `all_exc` flag bit does
 not exist in v1; bit 6 is reserved-0.
 
+### 6.3 Dense Segment Record (defined in v1.1; decoder-side)
+
+Tile framing pays one header, one mask section and one residual section
+per `Nt` bytes. A segment whose plane is homogeneous is cheaper as ONE
+record covering the whole plane: one predictor, one mask over the plane,
+one residual stream. Since `tile_count` is 1 for such a segment, the
+record shape is:
+
+| Off | Size | Field                 | Type | Description                        |
+|-----|------|-----------------------|------|------------------------------------|
+| 0   | 2    | record_size           | u16  | Bytes AFTER this field (header tail + payloads) |
+| 2   | 1    | dense_flags           | u8   | bit 6 marker, bits 0–2 mask_mode, bits 3–5 residual_mode, bit 7 reserved-0 |
+| 3   | 1    | predictor_id          | u8   | 0..11 (12..255 => PSE_BAD_PREDICTOR) |
+| 4   | 1    | constant_C            | u8   | used iff predictor_id == 9        |
+| 5   | 1    | reserved              | u8   | MUST be 0                          |
+| 6   | 2    | exception_count       | u16  | K                                  |
+| 8   | 2    | mask_payload_size     | u16  | Mask section bytes                 |
+|10   | 2    | residual_payload_size | u16  | Residual section bytes             |
+|12   | ...  | mask payload, then residual payload                  |
+
+Identification (normative): a segment payload whose byte at offset 18
+has bit 6 set is a dense record; its `tile_count` MUST be 1 and it MUST
+be the segment's only record. Bit 6 is reserved-zero in a TileRecord
+(Sec. 6.2), so no byte string is both a legal tile record and a legal
+dense record: a decoder that accepts the tile stream keeps accepting
+exactly the same streams, and old decoders reject dense records as
+reserved-bit violations rather than mis-reading them.
+
+Size equation (decoder MUST enforce):
+
+```
+record_size == segment_payload_size - 18
+mask_payload_size + residual_payload_size == record_size - 10
+```
+
+Prediction. Positions are segment-absolute (`d = p`, since the record
+covers the whole plane), the entry state is the segment entry state, and
+the predictor formulas are those of Sec. 7 with `d` in place of
+`seg_pos + p`. In particular `STRIDE_S` uses `initial_literal` for
+`d < S` and `out[d - S]` otherwise, and LANE_DELTA / LANE_AVERAGE read
+the two PREVIOUS values of the lane, both `initial_literal` at segment
+start. Histories are updated with the reconstructed (actual) byte.
+`ORDER1` and `ORDER2` are reserved inside a dense record in v1
+(`PSE_UNSUPPORTED_FEATURE`): they are the only predictors that read the
+segment tables, and no encoder emits them.
+
+Mask: modes 0 (ALL_HIT), 1 (RAW_BITMAP), 2 (SPARSE_U8) and 6
+(ALL_EXCEPTION) only; modes 3, 4, 5, 7 are reserved
+(`PSE_UNSUPPORTED_FEATURE`). K derivation is as in Sec. 6.2 with
+`Nt = segment_decoded_size`, except that SPARSE_U8 (one byte per
+position) exists only when `segment_decoded_size <= 256`
+(`PSE_BAD_MASK` otherwise), and the bitmap is `ceil(Nt/8)` bytes with
+pad bits above `Nt` zero.
+
+Residual: modes 0..3. Mode 4 (SIGNED_DELTA) is reserved
+(`PSE_UNSUPPORTED_FEATURE`) because its decoding needs the prediction at
+each exception before the reconstruction reaches it.
+
+Limits (reserved space, not decoder bugs): `segment_decoded_size <=
+4096`; larger planes use tiles. Violations report
+`PSE_UNSUPPORTED_FEATURE`.
+
+Status mapping for a malformed dense record: size/spans
+`PSE_BAD_TILE_SIZE`; mask shape `PSE_BAD_MASK`; residual payload
+`PSE_BAD_RESIDUAL`; reserved bit, field, mode, predictor or limit
+`PSE_UNSUPPORTED_FEATURE`.
+
 ## 7. Predictor Execution Engine (Profile 0)
 
 8 parallel lanes; transformed position `p in [0,Nt-1]` maps to
@@ -672,7 +739,10 @@ PHASE 5 CHECKSUM: CRC32-C over decoded bytes; compare iff tagged; return status
   formula violation => `PSE_BAD_SEGMENT_DIRECTORY`.
 - Tile length derivation violation or `SUM(Nt) != segment_decoded_size`
   or `tile_record_size` equation/overrun => `PSE_BAD_TILE_SIZE`.
-- `predictor_id >= 12` => `PSE_BAD_PREDICTOR`.
+- `predictor_id >= 12` => `PSE_BAD_PREDICTOR` (dense record: Sec. 6.3).
+- Dense record with `tile_count != 1`, wrong `record_size`, or
+  `mask_payload_size + residual_payload_size` mismatch =>
+  `PSE_BAD_TILE_SIZE`.
 - `mask_mode == 7`, K-derivation failure, bitmap popcount mismatch,
   non-ascending/OO-range sparse positions, bad gaps/runs, non-zero pad
   bits => `PSE_BAD_MASK`.
