@@ -56,6 +56,21 @@ int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
                          uint16_t k, uint8_t *payload_out,
                          uint16_t payload_cap);
 
+/* Same as zpse_residual_encode, with the classification's certificate for
+ * the mode-2 palette: `nu_hint` distinct exclusion residuals and their
+ * `seen_hint` 256-bit set (bit v = value v is present). When the encoder
+ * has already counted the distinct values of exc_in[0..k) -- tile packing
+ * does, because the mode search needs the count anyway -- mode 2 can find
+ * its first-appearance palette by scanning only up to the last NEW value
+ * instead of all k. The certificate is verified before it is used (a
+ * wrong one falls back to the exhaustive scan), so the payload and every
+ * status are identical to zpse_residual_encode. */
+int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
+                              const uint8_t *actual_in,
+                              const uint8_t *pred_at_exc, uint16_t k,
+                              uint8_t *payload_out, uint16_t payload_cap,
+                              uint16_t nu_hint, const uint32_t *seen_hint);
+
 /* Payload-length predictors (encoder sizing). Exact for modes 0-3;
  * mode 4 reports the 8-bit worst case 1+K (exact submode needs
  * actual+pred, unavailable to this signature). */

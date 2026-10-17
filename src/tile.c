@@ -1823,10 +1823,15 @@ int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
     off += (uint32_t)mrc;
     if (off > record_cap)
         return PSE_OUTPUT_OVERFLOW;
-    rrc = zpse_residual_encode(res_mode, use_vals ? cl->res_at_exc : 0,
-                               use_act ? act_src : 0, cl->at_pred, k,
-                               record_out + off,
-                               tile_cap16(record_cap - off));
+    /* The classification counted the distinct exclusion residuals (the
+     * mode search needed `nu` to size the palette), so it can certify the
+     * palette packer's value -> index map and save the packer a full scan
+     * of the tile. Only PALETTE_BITS reads the certificate. */
+    rrc = zpse_residual_encode_hint(res_mode, use_vals ? cl->res_at_exc : 0,
+                                    use_act ? act_src : 0, cl->at_pred, k,
+                                    record_out + off,
+                                    tile_cap16(record_cap - off),
+                                    cl->nu, cl->seen);
     if (rrc < 0)
         return rrc;
     off += (uint32_t)rrc;

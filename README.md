@@ -222,7 +222,7 @@ absolute numbers move with the machine and the clock, the shape does not.
 | const5A | 0.040 | 2616 | 17.3 | 23.9 |
 | alt00FF | 0.040 | 2618 | 2.6 | 19.3 |
 | sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
-| lowentropy | 0.687 | 45012 | 0.2 | 0.9 |
+| lowentropy | 0.687 | 45012 | 0.3 | 0.9 |
 | sparse2 | 0.048 | 3126 | 1.1 | 5.9 |
 
 The table is one session and the deltas below are paired measurements, so the
@@ -609,6 +609,66 @@ shapes) reproduce every compressed size byte for byte, and the parity
 in the default, `-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds.
 `ZPSE_PROBE_TILES` (default 8) sets the per-candidate budget; 16 and 48 were
 measured too and prune no further, so the smaller budget is the one that ships.
+
+### Where the 4-bit noise row spends its time
+
+`lowentropy` (uniform 4-bit bytes) is the slow row, and it is worth knowing
+why. Its tiles are dense: ~235 of 256 positions are exceptions, coded the same
+way every time -- `RAW_BITMAP` (32 bytes) plus a fifteen-entry palette and four
+bits per exception (~174 bytes per 256-byte tile). Two candidates survive the
+sweep and both are encoded in full, because the split candidate ties the
+identity to within 0.02% (45,020 vs 45,012 bytes) and a tie goes to the
+earlier one, so the challenger can only be dropped by *knowing* it loses.
+
+What ships this round is a certificate. The classification already counts the
+distinct exclusion residuals (the mode search needs `nu` to size the palette),
+so the palette packer no longer rediscovers them: it walks the tile only as far
+as the last NEW value -- about fifty values instead of all ~235 -- and the
+first-appearance order, and therefore the payload, is unchanged. The hint is
+verified before use (the prefix must hold `nu` distinct values and each must be
+set in the classification's set), so a stale certificate costs time, never
+bytes. Decode gets the same treatment from the other end: `RAW_BITMAP` has to
+prove its 32 payload bytes hold exactly `k` bits, and eight SWAR popcounts
+(~95 cycles of a tile) became one SSE2 fold-and-SAD pass.
+
+Paired binaries, best of nine, cycles per 64 KiB block: encode 1,152,000 ->
+900,000 (1.28x, 0.22 -> 0.28 GB/s), decode 274,000 -> 259,000 (1.06x). All ten
+bench `clen` values, all 768 `tests/clen_corpus` cases and all 4,000 random
+multi-texture blocks of the sweep below are byte-identical to the previous
+commit, as are the parity (`BB15773EC15BF841`), fuzz (`B23313EB9E83B797`) and
+lseed streams in the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds. `tests/clen_corpus.c` is the tool those
+numbers come from: it prints one line per case with the compressed size and a
+CRC of the compressed bytes, so two builds can be diffed instead of averaged.
+
+Three larger heuristics were measured and rejected, and they are the reason
+this round is a 1.28x and not the 4.5x that "above 1 GB/s" would need:
+
+* **Drop the near-tie candidate.** Pruning every candidate that is not
+  strictly cheaper than the best on the existing 16 KiB prescreen proxy is
+  worth 2.8x on this row (0.22 -> 0.62 GB/s, `clen` unchanged at 45,012). It
+  also changed 55 of the 4,000 random multi-texture blocks, all worse,
+  20,596 bytes in total and up to +3,591 bytes on one block: a prefix proxy
+  mis-ranks exactly the heterogeneous blocks the +6% margin exists for.
+* **"Noise everywhere means no split can help."** Filling the block's count
+  from the sixteen spread noise samples `zpse_block_is_noise` already takes
+  reads well and is false: a 30-character permutation cycle is noise to all
+  nine predictors, yet a 16-way split exposes a period the raw plane does not
+  have (3,070 -> 65,568 bytes, i.e. fallen back to RAW). The abort keeps that
+  evidence because there the trial has already been attempted and is losing.
+* **Price the challenger exactly on spread tiles and drop it if the estimate
+  is not strictly smaller.** Whole-block staging, 8 and 64 sampled tiles: the
+  corpus is clean, but 30-55 of the 4,000 random blocks still get worse
+  (one by 3,591 bytes). Sampling cannot resolve a 0.02% tie without also
+  resolving blocks whose structure sits between two samples.
+
+For the arithmetic of the target: 1 GB/s is ~216,000 cycles per 64 KiB block,
+which -- with the challenge above -- is 422 cycles per 256-byte tile over 511
+tiles, staging and CRC included. A tile costs ~1,760 today, of which ~1,300 is
+classify plus pack at about one cycle per byte per pass. Reaching the target
+therefore needs roughly 4x on both trials at once, which is a format-level
+change (a whole-segment dense record instead of one bitmap and one palette per
+256 bytes) rather than more micro-optimisation of the per-tile path.
 
 ## License
 

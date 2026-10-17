@@ -692,8 +692,20 @@ static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_simd(
 
 #endif /* ZPSE_RES_HAVE_SSSE3 */
 
+/* `nu_hint`/`seen_hint` are the classification's distinct-residual count
+ * and set, when the caller has one: with them the packer can skip the
+ * O(k) discovery scan below and find the first-appearance palette by
+ * scanning only as far as the last NEW value (typically a few dozen
+ * values instead of all k). They are a certificate, not a hint to trust:
+ * the scan only takes the short path when the prefix really does hold
+ * nu_hint distinct values AND every one of them is set in seen_hint, at
+ * which point prefix == set (a subset of a set of the same size) and
+ * every remaining value is known to be a palette entry. Anything else
+ * falls back to the exhaustive scan, so a wrong certificate costs time,
+ * never bytes. */
 static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
-                                 uint8_t *out, uint16_t cap)
+                                 uint8_t *out, uint16_t cap,
+                                 uint16_t nu_hint, const uint32_t *seen_hint)
 {
     /* pal has one byte of slack: the membership test below cannot be a
      * branch (see the loop), so a repeat stores its dead "next slot"
@@ -733,20 +745,68 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
      * pal[nu] holds the dead next slot on a repeat -- which is pal[16] once
      * sixteen values are recorded, above every live entry. */
     memset(idx_of, 0xFF, sizeof idx_of);
-    for (i = 0; i < k; i++) {
-        unsigned v = exc_in[i];
-        unsigned is_new;
+    {
+        int certified = 0;
 
-        if (v > 254u) {
-            return PSE_BAD_RESIDUAL;
+        if (seen_hint != 0 && nu_hint <= 16u) {
+            /* Prefix scan with an early exit: stop as soon as every value
+             * the certificate promises has been seen. Positions are
+             * visited in the same ascending order as the exhaustive scan,
+             * so `pal` comes out in the same first-appearance order and
+             * the payload is identical. The scan alone proves the prefix
+             * holds nu_hint distinct values; the loop after it proves each
+             * of them is one the classification saw, so prefix == set. A
+             * bitmap marker was measured here and lost: the predictable
+             * load-and-compare against 0xFF is cheaper than a read-modify-
+             * write of the bit itself. */
+            for (i = 0; i < k && nu < nu_hint; i++) {
+                unsigned v = exc_in[i];
+
+                if (idx_of[v] == 0xFFu) {
+                    if (v > 254u) {
+                        return PSE_BAD_RESIDUAL;
+                    }
+                    idx_of[v] = (uint8_t)nu;
+                    pal[nu] = (uint8_t)v;
+                    nu++;
+                }
+            }
+            if (nu == nu_hint) {
+                certified = 1;
+                for (s = 0; s < nu; s++) {
+                    uint8_t v = pal[s];
+
+                    if (((seen_hint[v >> 5] >> (v & 31u)) & 1u) == 0u) {
+                        certified = 0;
+                        break;
+                    }
+                }
+            }
+            if (!certified) {
+                /* Not reachable from a valid certificate; rebuild from
+                 * scratch exactly as the exhaustive scan would. */
+                memset(idx_of, 0xFF, sizeof idx_of);
+                nu = 0;
+            }
         }
-        is_new = (idx_of[v] == 0xFFu) ? 1u : 0u;
-        if (is_new != 0u && nu == 16u) {
-            return PSE_BAD_RESIDUAL;
+        if (!certified) {
+            memset(idx_of, 0xFF, sizeof idx_of);
+            for (i = 0; i < k; i++) {
+                unsigned v = exc_in[i];
+                unsigned is_new;
+
+                if (v > 254u) {
+                    return PSE_BAD_RESIDUAL;
+                }
+                is_new = (idx_of[v] == 0xFFu) ? 1u : 0u;
+                if (is_new != 0u && nu == 16u) {
+                    return PSE_BAD_RESIDUAL;
+                }
+                idx_of[v] = (uint8_t)(is_new != 0u ? nu : (unsigned)idx_of[v]);
+                pal[nu] = (uint8_t)(is_new != 0u ? v : 0u);
+                nu += is_new;
+            }
         }
-        idx_of[v] = (uint8_t)(is_new != 0u ? nu : (unsigned)idx_of[v]);
-        pal[nu] = (uint8_t)(is_new != 0u ? v : 0u);
-        nu += is_new;
     }
     m = (nu < 2u) ? 2u : (uint8_t)nu;
     for (s = nu; s < m; s++) {
@@ -1034,10 +1094,11 @@ static int residual_encode_mode4(const uint8_t *actual_in,
     return (int)total;
 }
 
-int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
-                         const uint8_t *actual_in,
-                         const uint8_t *pred_at_exc, uint16_t k,
-                         uint8_t *payload_out, uint16_t payload_cap)
+int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
+                              const uint8_t *actual_in,
+                              const uint8_t *pred_at_exc, uint16_t k,
+                              uint8_t *payload_out, uint16_t payload_cap,
+                              uint16_t nu_hint, const uint32_t *seen_hint)
 {
     if (mode > 4u) {
         return PSE_BAD_RESIDUAL;
@@ -1077,9 +1138,19 @@ int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
         return PSE_BAD_ARG;
     }
     if (mode == ZPSE_R_PALETTE_BITS) {
-        return residual_encode_mode2(exc_in, k, payload_out, payload_cap);
+        return residual_encode_mode2(exc_in, k, payload_out, payload_cap,
+                                     nu_hint, seen_hint);
     }
     return residual_encode_mode3(exc_in, k, payload_out, payload_cap);
+}
+
+int zpse_residual_encode(uint8_t mode, const uint8_t *exc_in,
+                         const uint8_t *actual_in,
+                         const uint8_t *pred_at_exc, uint16_t k,
+                         uint8_t *payload_out, uint16_t payload_cap)
+{
+    return zpse_residual_encode_hint(mode, exc_in, actual_in, pred_at_exc, k,
+                                     payload_out, payload_cap, 0u, 0);
 }
 
 int zpse_residual_payload_len(uint8_t mode, uint16_t k,

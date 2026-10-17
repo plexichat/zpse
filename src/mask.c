@@ -114,6 +114,64 @@ int zpse_mask_test(const uint32_t words[8], uint16_t pos)
     return (int)((words[pos >> 5] >> (pos & 31u)) & 1u);
 }
 
+/* 256-bit population count in one pass, for the modes whose count has to
+ * agree with the header on every tile (RAW_BITMAP decodes 32 payload bytes
+ * and then has to prove they hold exactly k bits; eight SWAR popcounts
+ * measured ~95 cycles of that tile's ~1125, which is why the dense path
+ * gets a vectorised count). The bit-parallel fold needs only AND/ADD/SHIFT,
+ * so SSE2 -- part of the x86-64 baseline -- is enough; SAD then sums the
+ * four 64-bit lanes. Same per-function target structure as the other SIMD
+ * helpers in this tree, and the scalar loop stays the fallback both when
+ * the target is compiled out and when the CPU lacks the level. */
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+#define ZPSE_MASK_SIMD __attribute__((target("sse2")))
+#define ZPSE_MASK_HAVE_SIMD 1
+#elif defined(_M_X64)
+#define ZPSE_MASK_SIMD
+#define ZPSE_MASK_HAVE_SIMD 1
+#else
+#define ZPSE_MASK_HAVE_SIMD 0
+#endif
+#else
+#define ZPSE_MASK_HAVE_SIMD 0
+#endif
+
+#if ZPSE_MASK_HAVE_SIMD
+#include <emmintrin.h>
+
+/* Count of the one bits in one 16-byte half. Straight-line on purpose:
+ * the same fold written as a four-iteration loop was miscompiled by the
+ * MinGW GCC used for the Windows builds -- it summed stale lanes and
+ * returned 20..26 bits for a mask holding one -- while this unrolled form
+ * is exactly what the scalar count says. Two halves per call, no loop. */
+static ZPSE_MASK_SIMD int zpse_mask_popcount16_sse2(__m128i v)
+{
+    const __m128i m1 = _mm_set1_epi8((char)0x55);
+    const __m128i m2 = _mm_set1_epi8((char)0x33);
+    const __m128i m4 = _mm_set1_epi8((char)0x0F);
+    __m128i s;
+
+    v = _mm_sub_epi8(v, _mm_and_si128(_mm_srli_epi16(v, 1), m1));
+    v = _mm_add_epi8(_mm_and_si128(v, m2),
+                     _mm_and_si128(_mm_srli_epi16(v, 2), m2));
+    v = _mm_and_si128(_mm_add_epi8(v, _mm_srli_epi16(v, 4)), m4);
+    s = _mm_sad_epu8(v, _mm_setzero_si128());
+    return (int)_mm_cvtsi128_si32(s) +
+           (int)_mm_cvtsi128_si32(_mm_srli_si128(s, 8));
+}
+
+static ZPSE_MASK_SIMD int zpse_mask_popcount256_sse2(const uint32_t words[8])
+{
+    const unsigned char *b = (const unsigned char *)(const void *)words;
+
+    return zpse_mask_popcount16_sse2(
+               _mm_loadu_si128((const __m128i *)(const void *)(b + 0u))) +
+           zpse_mask_popcount16_sse2(
+               _mm_loadu_si128((const __m128i *)(const void *)(b + 16u)));
+}
+#endif /* ZPSE_MASK_HAVE_SIMD */
+
 int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
 {
     int n = 0;
@@ -123,6 +181,27 @@ int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
         return 0;
     if (nt > 256)
         nt = 256;
+#if ZPSE_MASK_HAVE_SIMD
+    {
+        /* Trim the bits at or above nt in a local copy (the caller's
+         * array is read-only here), then one vector pass counts the lot:
+         * a short final tile costs a 32-byte copy, not eight SWAR
+         * popcounts. SSE2 is part of the x86-64 baseline, so no runtime
+         * capability check is needed -- the compile-time test above is the
+         * only gate. */
+        uint32_t w[8];
+        uint16_t last = (uint16_t)((nt - 1u) >> 5);
+        uint32_t keep = (uint32_t)(((uint64_t)1u << (((nt - 1u) & 31u) + 1u))
+                                   - 1u);
+        int k;
+
+        memcpy(w, words, sizeof w);
+        for (k = (int)last + 1; k < 8; k++)
+            w[k] = 0u;
+        w[last] &= keep;
+        return zpse_mask_popcount256_sse2(w);
+    }
+#endif
     for (i = 0; i < 8; i++) {
         uint32_t w = words[i];
         uint16_t base = (uint16_t)(i * 32);
