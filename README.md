@@ -216,22 +216,26 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.004 | 248 | 12.0 | 21.3 |
-| incr | 0.040 | 2619 | 5.1 | 10.2 |
-| random | 1.000 | 65568 | 2.9 | 20.5 |
-| sparse | 0.060 | 3962 | 1.0 | 5.3 |
-| strided | 0.040 | 2625 | 3.1 | 10.2 |
-| const5A | 0.004 | 248 | 11.8 | 21.4 |
-| alt00FF | 0.040 | 2618 | 4.6 | 18.7 |
+| zeros | 0.004 | 248 | 14.5 | 21.2 |
+| incr | 0.040 | 2619 | 5.2 | 10.2 |
+| random | 1.000 | 65568 | 3.1 | 20.6 |
+| sparse | 0.060 | 3962 | 1.5 | 5.3 |
+| strided | 0.040 | 2625 | 3.1 | 10.3 |
+| const5A | 0.004 | 248 | 14.3 | 21.7 |
+| alt00FF | 0.009 | 608 | 3.5 | 7.6 |
 | sawtooth | 0.163 | 10656 | 1.1 | 2.9 |
-| lowentropy | 0.508 | 33288 | 0.58 | 12.9 |
+| lowentropy | 0.508 | 33288 | 2.1 | 13.0 |
 | sparse2 | 0.019 | 1255 | 2.8 | 6.8 |
 
 The table is one session (both columns re-measured together) and the deltas
 below are paired measurements, so the absolute columns move between machines
 and runs while the sizes and the ratios do not. The encode column reflects the
-tile-path round at the end of this file; before it, `zeros` and `const5A` were
-3.4 GB/s, `alt00FF` 2.3 and `lowentropy` 0.33.
+encoder rounds at the end of this file; before the first of them, `zeros` and
+`const5A` were 3.4 GB/s, `alt00FF` 2.3, `sparse` 0.98, `lowentropy` 0.33 and
+the mean across the ten rows was 2.5 GB/s. `alt00FF` now spends encode time on
+a stream 4.3x smaller than the one it used to write (608 bytes, not 2618), and
+its decode rate is for that stream: 608 bytes in, 64 KiB out, as sixteen dense
+4 KiB records instead of one 2618-byte plane.
 
 ### `lowentropy`: what the sweep costs
 
@@ -933,11 +937,93 @@ randomized planes (alphabets of 1-17 values, values near 240-255, stragglers
 past the head, both `limit` settings) with no divergence.
 
 What is left on the encode side, measured rather than guessed: the per-tile
-`classify` (74-150 ns per 256-byte tile, dense tiles the expensive ones), the
-nine-predictor prescreen (~15 us per 64 KiB, 30% of `sawtooth`'s tile time),
-and the near-tie second candidate that `sparse` encodes and discards. All
-three are per-256-byte framing costs, the same ones the dense-record form was
-added to amortise.
+`classify` (74-150 ns per 256-byte tile, dense tiles the expensive ones) and
+the nine-predictor prescreen (~15 us per 64 KiB, 30% of `sawtooth`'s tile
+time). Both are per-256-byte framing costs, the same ones the dense-record form
+was added to amortise, and they are now what dominates `sparse` (1.5 GB/s) and
+`sawtooth` (1.1).
+
+### Encoder: three decisions that were pricing the wrong thing
+
+The three rounds before this one measured, in order: the palette form
+replacing tile records that had already been written, the block decision
+pricing sixteen tiles per candidate, and the tile path pricing a second
+predictor that was one prescreen miss behind. This one is the decision layer
+itself.
+
+**The palette form was priced last.** A small-alphabet plane was priced by
+writing tile records until they reached the palette's size; on 64 KiB of
+four-bit data that meant classifying, mode-searching and packing 190 tiles
+whose bytes the palette then threw away -- 110 us of the block's 114 us of
+encode. The palette's price is exact and costs one alphabet scan, so once it
+is known and the tiles have not caught up, eight spread tiles go through the
+trial's own pipeline and the result is scaled up; if the palette is an eighth
+smaller than that, it is emitted now and the loop returns. Otherwise the
+tiles run exactly as before. `lowentropy` 0.57 -> 1.47 GB/s with all 768
+`clen_corpus` cases byte-identical.
+
+**A candidate was priced per tile, which cannot see a dense form.** A plane of
+one byte value costs twelve bytes per 4 KiB as a dense record against ten
+bytes per 256-byte tile, and a palette plane about four bits per byte, so a
+transpose whose phases are constant -- alternating bytes, a spike every 256 --
+looked like the worst candidate on the list. Alternating 0x00/0xFF compressed
+to 2618 bytes that way; transposed, all sixteen phases are constant and it is
+608. Two-byte spikes were ranked behind the identity: 3126 bytes instead of
+1255. `zpse_segment_probe_cost` now owns a plane's price -- the sampled tile
+records, or the dense constant form when the plane is constant (tested only
+when the tiles priced at their all-hit floor, so the scan is free on every
+other plane) -- and the block decision prices the identity first, since its
+envelope is the smallest and a hit on its floor settles the winner.
+
+**The sample was priced on more tiles than it needed, and on the wrong
+ones.** Sixteen tiles per candidate decided the same corpus cases as four and
+lost 34 KB on the fuzz suite, because a coarse estimate ties more often and a
+tie goes to the identity, the better prior where the sample is noisiest. A
+transpose's sixteen planes are sixteen phases of the same data, so pricing a
+tile in each measured sixteen tiles to buy four tiles' worth of information
+(12.5 us of a 27 us block); the budget now covers four planes and every
+unpriced plane still gets the constant test, which is the one form that can
+hide in a phase the sample skipped. The tile path likewise stopped pricing a
+second predictor unless it ties the best one's prescreen miss count exactly:
+an exact tie is the only case where the second record can be smaller, and
+`sparse` was paying for two of everything (1.03 -> 1.63 GB/s).
+
+The prescreen proxy stays in front of all of this. It is broad and cheap
+(every other tile of the first 16 KiB, no packing) and the exact sample is
+narrow, so on a block whose structure changes inside that window the proxy is
+what ranks it correctly: removing it made the fuzz suite's mixed-region shapes
+400 KB worse.
+
+Paired measurements, `bench 300 5`, best of five, this machine (memcpy 61 GB/s,
+memset 122, CRC32-C 28.5 during the runs):
+
+| row | encode before these three rounds | now | encode bytes |
+| --- | --- | --- | --- |
+| zeros | 12.2 GB/s | 14.5 | 248 |
+| const5A | 11.8 | 14.3 | 248 |
+| incr | 5.1 | 5.2 | 2619 |
+| alt00FF | 4.5 | 3.5 | 2618 -> 608 |
+| random | 3.0 | 3.1 | 65568 |
+| strided | 3.2 | 3.1 | 2625 |
+| lowentropy | 0.57 | 2.1 | 33288 |
+| sparse2 | 2.8 | 2.8 | 1255 |
+| sparse | 0.98 | 1.5 | 3962 |
+| sawtooth | 1.1 | 1.1 | 10656 |
+| mean | 4.53 | 5.12 | |
+
+`alt00FF` trades encode rate for a stream 4.3x smaller, which is the right way
+round for a compressor, and its decode follows the same stream.
+
+Verified on the final source: `tests/run.sh` ALL SUITES PASS under gcc and
+clang, `DENSE: cases=6140 failures=0`, and the parity, fuzz and lseed digests
+identical across the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds (that build pair is what proves the output is
+independent of the fast paths and of the attempt order). Ratio: the 768-case
+`clen_corpus` loses 18,864 bytes on 27 cases and gains 300 bytes on 6 (three
+of them the alternation shape at 12 KiB, where 538 -> 608 follows from the
+transpose now being priced as what it writes); the 2,718-case fuzz corpus is
+283 KB smaller than before the three rounds. Nothing here changes the wire
+format.
 
 ## License
 
