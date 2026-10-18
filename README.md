@@ -226,7 +226,7 @@ absolute numbers move with the machine and the clock, the shape does not.
 | strided | 0.040 | 2625 | 3.1 | 10.3 |
 | const5A | 0.004 | 248 | 14.3 | 21.7 |
 | alt00FF | 0.009 | 608 | 3.5 | 7.6 |
-| sawtooth | 0.163 | 10656 | 1.1 | 2.9 |
+| sawtooth | 0.116 | 7584 | 1.1 | 5.5 |
 | lowentropy | 0.508 | 33288 | 2.1 | 13.0 |
 | sparse2 | 0.019 | 1255 | 2.8 | 6.8 |
 
@@ -1011,7 +1011,7 @@ memset 122, CRC32-C 28.5 during the runs):
 | lowentropy | 0.57 | 2.1 | 33288 |
 | sparse2 | 2.8 | 2.8 | 1255 |
 | sparse | 0.98 | 1.5 | 3962 |
-| sawtooth | 1.1 | 1.1 | 10656 |
+| sawtooth | 1.1 | 1.1 | 10656 -> 7584 |
 | mean | 4.53 | 5.12 | |
 
 `alt00FF` trades encode rate for a stream 4.3x smaller, which is the right way
@@ -1195,6 +1195,104 @@ Every digest is unchanged (`FC79D5E365BA40E1`, `DFB9C23F6259A686`, `LSEED`)
 and all 768 ratio-corpus sizes are unchanged, in the default,
 `-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds -- the shortcut
 cannot change what the encoder means to write, only how it gets there.
+
+### Decoding a repeated tile without decoding it
+
+The same argument runs the other way. A reset tile's reconstruction is a
+function of its record and, for the STRIDE family, of the eight output bytes
+before it -- a reset tile starts from the segment literal, and CONST's byte,
+the lane histories and those eight bytes are everything the predictors here
+consult. So a record that repeats the previous tile's, at a position whose
+preceding eight output bytes repeat too, decodes to the bytes already written
+one tile back, and a 256-byte copy stands in for the whole tile. A full
+tile's epilogue is the O(8) history update, which for `nt == 256` reads the
+tile's own bytes, so the lane state after the previous tile is the state after
+this one and nothing needs repairing.
+
+The test is one 8-byte key compare -- the record's leading word, the same
+filter the encoder's cache uses -- and only a tile that matches it pays the
+full `memcmp`. ORDER1/ORDER2 are excluded (stateful tables) and so are tiles
+that are not full length. A hostile stream cannot notice: the bytes compared
+are at the same length and already passed validation at that position, so any
+rejection they earn has already happened.
+
+On `sawtooth` (224 of 256 tiles) decode goes **21.5-23.7 -> 12.2 us per
+64 KiB block, 1.8-1.9x**, and part of that is the 29% smaller stream this
+round's mask change produces. Every other row stayed within +-2% across five
+alternating rounds, in both directions, so no claim is made for them.
+
+### A constant tile with few exceptions, filled instead of predicted
+
+A CONST tile's prediction does not depend on any byte the tile writes, so with
+`k` exceptions the tile is the constant everywhere else: `memset` it and write
+the `k` exceptions in mask order (ascending, which is the order the residual
+units were packed in). Under 24 exceptions that is a fill plus a handful of
+stores against the fixed ~150 cycles of the 32-wide CONST kernel, so the
+crossover is where a few cycles per exception overtakes the kernel. The
+window is small: `sparse` is the row with CONST tiles and a small `k`, and its
+decode delta sits in the noise band above.
+
+### Mask mode: RUNS, and what it is worth
+
+`zpse_tile_choose_modes` minimised the mask payload over ALL_HIT,
+SPARSE_U8 and RAW_BITMAP, and the residual payload over all five residual
+modes. RUNS was never chosen -- and it is the mode that wins when a tile's
+exceptions come in a few long runs rather than scattered: one byte per run,
+against one byte per exception (SPARSE_U8) or the fixed `ceil(nt/8)` bitmap.
+The run count is eight word operations, not a 256-bit scan: with `prev` the
+bit below the word, bit `p` of `w ^ (w << 1 | prev)` is set exactly when
+position `p` differs from `p - 1`, so `runs == transitions + 1` and the walk
+stops as soon as it cannot beat the incumbent.
+
+Ratio effect on the 768-case corpus: **249 cases shrink, none grow, -160,862
+bytes (-3.95%)**, by shape:
+
+| shape | before | after | delta |
+| --- | --- | --- | --- |
+| sawtooth (`i*7 + i>>4`) | 156,858 | 118,293 | **-24.6%** |
+| structured 2-byte records | 207,252 | 189,132 | -8.7% |
+| noise then constant | 540,344 | 496,397 | -8.1% |
+| constant then noise | 604,880 | 566,449 | -6.4% |
+| palette, shuffled | 286,371 | 264,620 | -7.6% |
+| the other eleven shapes | -- | -- | 0.0% |
+
+The `sawtooth` number is the one that explains why the mode was missing: its
+winning candidate leaves ~15 exceptions per tile in a few runs, so the mask
+cost 15 bytes where 3-5 will do. Encode and decode pay nothing measurable for
+this: the run encoder is the transition walk above (byte-for-byte the payload
+the old bit scan produced -- 21 corpus cases with a partial last tile caught
+the difference while it was still being written, which is how the `nt` edge
+bit got masked), the choice is eight popcounts on tiles that could win, and a
+RUNS decode is one byte loop, the same per-exception walk SPARSE_U8 always did.
+
+A cheaper variant was measured and rejected: gating RUNS to `k <= 3*nt/4`
+removed the encode cost entirely on the `random` row (whose records are
+discarded anyway, since the block is stored raw) but gave back 100 KB of the
+ratio win, because the shapes above are mostly-exception tiles. Making the run
+encoder a transition walk was the better trade: with it, encode on all ten
+rows is within +-4% of where it was, and `sawtooth` is 3.2% faster on a stream
+29% smaller.
+
+Two guards for the new encoder path: `tests/test_units.c` now round-trips
+`zpse_mask_encode` -> `zpse_mask_decode` for modes 1-4 over 4,000 masks of
+every tile length (dense, sparse, one run, alternating -- so exact multiples of
+32, partial last words and every run length are covered), and the tile
+roundtrip loop now includes mask modes 3 and 4. Checked to have teeth: a
+one-run corruption injected into the RUNS encoder fails that test with 1,017
+bad masks.
+
+Verified: `tests/run.sh` ALL SUITES PASS under gcc and clang and
+`tests/run.ps1` under PowerShell. The parity and fuzz digests move with the
+stream this round shrinks (`FC79D5E365BA40E1` -> `7FC51D6C47053813`,
+`DFB9C23F6259A686` -> `A23B414B92409BD6`), `LSEED` is unchanged, and all
+three are still identical across the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds -- which is what proves the new mode choice
+is a decision the scalar and vector paths and the attempt order agree on. The
+768 pinned
+sizes in `tests/test_sizes.c` are the new ones, so the guard now sits at the
+improved baseline (`grew=0 shrank=0 delta=+0`). The wire format is unchanged:
+RUNS was already a legal mask mode that the decoder has always implemented,
+and the encoder simply never wrote it.
 
 ## License
 
