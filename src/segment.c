@@ -1990,6 +1990,15 @@ static int seg_no_room(ZpseSegmentHeader *h, uint8_t *payload_out,
     return dn != 0 ? dn : PSE_OUTPUT_OVERFLOW;
 }
 
+/* Repeat cache geometry: 128 direct-mapped slots, indexed by the top bits
+ * of the tile key. A plane is 16 tiles, a 64 KiB block 256, so this holds
+ * every distinct tile of any plane that repeats with a period of up to ~128
+ * tiles (32 KiB) -- which is what a block of fixed-size records is. The
+ * arrays are 12 bytes a slot and are zeroed once per segment; on the 16
+ * tiles of a 4 KiB plane that clear is under 3 cycles a tile. */
+#define ZPSE_REP_SLOTS 128u
+#define ZPSE_REP_SHIFT (64u - 7u)
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
@@ -2009,6 +2018,14 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     uint32_t pal_m;
     int pal_try;
     uint32_t pal_bits[8];
+    /* Repeat cache: source tile offset in the plane, where its record
+     * starts in the payload, its length (with the u16 prefix) and its tile
+     * length. A zero offset means the slot is empty and is the only other
+     * thing the entry holds, so the arrays are zeroed together. */
+    uint32_t rep_off[ZPSE_REP_SLOTS];
+    uint32_t rep_pos[ZPSE_REP_SLOTS];
+    uint16_t rep_len[ZPSE_REP_SLOTS];
+    uint16_t rep_nt[ZPSE_REP_SLOTS];
 
     if (e == 0 || lanes == 0 || plane == 0 || payload_out == 0) {
         return PSE_BAD_ARG;
@@ -2082,6 +2099,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                   : 0;
     pal_len = 0u;
     pal_m = 0u;
+    memset(rep_off, 0, sizeof rep_off);
 
     pos = 16u;
     for (t = 0; t < tc; t++) {
@@ -2111,6 +2129,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         int direct;    /* packing the single candidate in place */
         uint8_t *wout; /* where the candidate's record is packed */
         uint32_t wcap; /* and the capacity it is packed with */
+        int rep_slot = -1; /* repeat-cache slot this tile fills, or -1 */
 
         /* Bound check for the byte budget, before any work for this
          * tile: `pos` grows monotonically, so once it is past the budget
@@ -2121,6 +2140,84 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             return seg_no_room(&h, payload_out, plane, plane_len,
                                initial_literal, pos, byte_budget,
                                payload_cap);
+        }
+
+        /* ---- Repeated tile --------------------------------------- *
+         * A tile record is a pure function of the tile's bytes, the eight
+         * plane bytes before it, its length and the segment literal.
+         * Every tile here is classified with tile_reset == 1, so no state
+         * carries across a boundary, and seg_pos reaches nothing else:
+         * the STRIDE predictors read it, through exactly those eight
+         * bytes. So when a tile repeats an earlier one with the same
+         * head, its record IS that record, and copying it writes byte for
+         * byte what the pipeline would have.
+         *
+         * The cache is direct-mapped on four words of the tile (offsets 0,
+         * 64, 128 and 192, XORed into one product), one slot per 4 KiB of a
+         * 64 KiB plane. That key is only a hint: the full 264-byte compare
+         * (the tile and its head) decides, so a collision can only cost the
+         * compare, never a wrong byte -- and the four words are chosen so a
+         * tile of zeroes and a tile of one spike do not collide, which
+         * keying on the leading bytes alone made them do (measured: the
+         * sparse row lost 25% to compares that ran to the spike). A
+         * periodic plane -- a ramp, a repeated 4 KiB block, a transposed
+         * plane whose period is one tile -- repeats most of its tiles, and
+         * each hit replaces a prescreen, a classify, a mode search and a
+         * pack with one compare and one copy.
+         *
+         * Tile 0 is never a target or a source: its STRIDE reads fall back
+         * to the literal instead of reading the plane, and its head is not
+         * before it. The palette form is the one piece of tile-loop state a
+         * copy would skip; it is priced once from a tile's own record
+         * length, so the copy is only taken when that pricing could not
+         * have run at this tile either -- either it has already happened
+         * (pal_try == 0) or the record is too small to trigger it, exactly
+         * as at the tile this record came from -- and never while the form
+         * is still in play (pal_len != 0), which is the one state where the
+         * payload written so far may be rewritten in place. */
+        if (t != 0u && nt == (uint16_t)256u) {
+            uint64_t w0;
+            uint64_t w1;
+            uint64_t w2;
+            uint64_t w3;
+            uint64_t key;
+            unsigned slot;
+
+            memcpy(&w0, actual, sizeof w0);
+            memcpy(&w1, actual + 64, sizeof w1);
+            memcpy(&w2, actual + 128, sizeof w2);
+            memcpy(&w3, actual + 192, sizeof w3);
+            key = (w0 ^ w1 ^ w2 ^ w3) * UINT64_C(0x9E3779B97F4A7C15);
+            slot = (unsigned)(key >> ZPSE_REP_SHIFT);
+            if (rep_off[slot] != 0u && rep_nt[slot] == (uint16_t)256u &&
+                memcmp(plane + rep_off[slot] - 8u, actual - 8u, 264u) == 0 &&
+                pal_len == 0u &&
+                (pal_try == 0 ||
+                 (uint32_t)rep_len[slot] < (uint32_t)(nt >> 3))) {
+                uint32_t rpos = rep_pos[slot];
+                uint32_t rlen = (uint32_t)rep_len[slot];
+
+                if (pos + rlen > payload_cap) {
+                    return seg_no_room(&h, payload_out, plane, plane_len,
+                                       initial_literal, pos, byte_budget,
+                                       payload_cap);
+                }
+                memcpy(payload_out + pos, payload_out + rpos, (size_t)rlen);
+                /* Re-point the slot at this copy, so a run of repeats keeps
+                 * finding the most recent one (and keeps the compare's
+                 * second operand in the payload's hot lines). */
+                rep_off[slot] = seg_pos;
+                rep_pos[slot] = pos;
+                pos += rlen;
+                /* A record with a mask or a residual is not a constant
+                 * tile, which is what the general path records here. */
+                dense_ok = 0;
+                if (seg_flat_abort(e, nt, rlen, flat_abort_min)) {
+                    return PSE_OUTPUT_OVERFLOW;
+                }
+                continue;
+            }
+            rep_slot = (int)slot;
         }
 
         seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
@@ -2376,6 +2473,12 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             memcpy(payload_out + pos + 2u, bst, (size_t)best_len);
         }
         zpse_store_u16le(payload_out + pos, (uint16_t)best_len);
+        if (rep_slot >= 0) {
+            rep_off[rep_slot] = seg_pos;
+            rep_pos[rep_slot] = pos;
+            rep_len[rep_slot] = (uint16_t)(2u + (uint32_t)best_len);
+            rep_nt[rep_slot] = nt;
+        }
         pos += 2u + (uint32_t)best_len;
 
         /* The palette form (SPEC Sec. 6.3) is priced from the first tile
