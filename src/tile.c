@@ -137,6 +137,17 @@ static void tile_history_fixup(ZpseLaneState *lanes, const uint8_t *src,
 {
     unsigned l;
 
+    /* A full tile is the shape of every tile but a segment's last, and
+     * there the rule below collapses: lane l ends on position
+     * l + 31*8 == 248 + l, and no lane's last position is below 8, so no
+     * entry state is involved. That is two 8-byte loads and two stores
+     * instead of eight iterations of a divide and two compares. */
+    if (nt == (uint16_t)ZPSE_MAX_TILE_LEN) {
+        memcpy(lanes->last, src + 248u, sizeof lanes->last);
+        memcpy(lanes->second_last, src + 240u, sizeof lanes->second_last);
+        return;
+    }
+
     for (l = 0; l < 8u; l++) {
         if (l >= (unsigned)nt) {
             lanes->last[l] = ent_last[l];
@@ -808,8 +819,14 @@ static ZPSE_TILE_AVX2 unsigned tile_pres_fold(const uint8_t *pres,
     return nu;
 }
 
+/* `tile` is the tile's own first byte; the sixteen bytes BEFORE it are the
+ * staged head (entry lane state, or the plane bytes preceding a STRIDE
+ * tile), exactly as they sit behind the tile in the staging buffer. Passing
+ * the tile pointer rather than the buffer makes the read offsets family-
+ * independent and lets the caller hand in the input itself when the tile is
+ * read in place (see tile_classify_avx2's `direct`). */
 static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
-    const uint8_t *stg, uint16_t nt, uint8_t predictor_id, int fam,
+    const uint8_t *tile, uint16_t nt, uint8_t predictor_id, int fam,
     uint8_t c, uint32_t s, const uint32_t words[8], ZpseTileClass *cl,
     uint8_t *rmax_o, uint8_t *dmin_o, uint8_t *dmax_o)
 {
@@ -839,7 +856,7 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
 
     for (ch = 0; ch * 32u < (unsigned)nt; ch++) {
         unsigned p = ch * 32u;
-        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(stg + 16u + p));
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(tile + p));
         __m256i pv, eq, ex, lt, r, db;
         uint32_t m = words[ch];
         unsigned h;
@@ -849,10 +866,10 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
         if (fam == TILE_FAM_CONST) {
             pv = cvec;
         } else if (fam == TILE_FAM_STRIDE) {
-            pv = _mm256_loadu_si256((const __m256i *)(const void *)(stg + 16u + p - s));
+            pv = _mm256_loadu_si256((const __m256i *)(const void *)(tile + p - s));
         } else {
-            const __m256i h8 = _mm256_loadu_si256((const __m256i *)(const void *)(stg + 8u + p));
-            const __m256i h16 = _mm256_loadu_si256((const __m256i *)(const void *)(stg + p));
+            const __m256i h8 = _mm256_loadu_si256((const __m256i *)(const void *)(tile + p - 8u));
+            const __m256i h16 = _mm256_loadu_si256((const __m256i *)(const void *)(tile + p - 16u));
             if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS)
                 pv = h8;
             else if (predictor_id == (uint8_t)ZPSE_P_LANE_DELTA)
@@ -1065,6 +1082,20 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
     uint8_t _dmax = 0u;
     const __m256i zero = _mm256_setzero_si256();
     const __m256i all = _mm256_cmpeq_epi8(zero, zero);
+    /* The bytes this tile is compared against and its exceptions read
+     * from. `stg` exists for two reasons: the last chunk of a tile that
+     * is not a whole number of 32-byte chunks is loaded past its end and
+     * masked, and the LANEHIST/STRIDE predictions read bytes BEFORE the
+     * tile. A CONST tile needs neither: its prediction is a single byte,
+     * so the comparison never looks at the head, and a full 256-byte tile
+     * has no partial last chunk -- every load in the loop below stays
+     * inside [0, nt). Such a tile is therefore read straight from the
+     * input and the 304-byte staging copy disappears. `stg` stays for the
+     * other families and for short tiles, whose records are not the hot
+     * case: a segment's tiles are all full except its last. */
+    const int direct = (fam == TILE_FAM_CONST &&
+                        nt == (uint16_t)ZPSE_MAX_TILE_LEN);
+    const uint8_t *tile_bytes;
 
     (void)seg_base;
     (void)seg_pos;
@@ -1077,15 +1108,20 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
         s = tile_stride_of(predictor_id);
     }
 
-    if (fam == TILE_FAM_STRIDE) {
-        /* Real preceding plane bytes; requires seg_pos >= 16. */
-        memcpy(stg, actual - 16, 16);
+    if (direct) {
+        tile_bytes = actual;
     } else {
-        memcpy(stg, ent_second, 8);
-        memcpy(stg + 8, ent_last, 8);
+        if (fam == TILE_FAM_STRIDE) {
+            /* Real preceding plane bytes; requires seg_pos >= 16. */
+            memcpy(stg, actual - 16, 16);
+        } else {
+            memcpy(stg, ent_second, 8);
+            memcpy(stg + 8, ent_last, 8);
+        }
+        memcpy(stg + 16, actual, nt);
+        memset(stg + 16 + nt, 0, 32);
+        tile_bytes = stg + 16;
     }
-    memcpy(stg + 16, actual, nt);
-    memset(stg + 16 + nt, 0, 32);
 
     {
         const __m256i cvec = _mm256_set1_epi8((char)c);
@@ -1095,7 +1131,7 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
 
         while (p + 32u <= (uint32_t)nt) {
             __m256i v = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(stg + 16u + p));
+                (const __m256i *)(const void *)(tile_bytes + p));
             __m256i pv;
 
             if (fam == TILE_FAM_CONST) {
@@ -1126,7 +1162,7 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
             __m256i valid = _mm256_cmpgt_epi8(
                 _mm256_set1_epi8((char)rem), idx);
             __m256i v = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(stg + 16u + p));
+                (const __m256i *)(const void *)(tile_bytes + p));
             __m256i pv;
 
             if (fam == TILE_FAM_CONST) {
@@ -1193,8 +1229,8 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
          * the single mixed loop did, and visits the positions in the same
          * ascending order. */
         if (nexc >= 32u) {
-            k = tile_dense_bk_avx2(stg, nt, predictor_id, fam, c, s, words, cl,
-                                   &_rmax, &_dmin, &_dmax);
+            k = tile_dense_bk_avx2(tile_bytes, nt, predictor_id, fam, c, s,
+                                   words, cl, &_rmax, &_dmin, &_dmax);
         } else if (fam == TILE_FAM_CONST) {
             /* Stop once every set bit of the mask has been consumed:
              * positions ascend across words and the mask holds exactly
@@ -1205,7 +1241,7 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                 while (w != 0u) {
                     uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
 
-                    TILE_TAKE_EXC_MASKED(pos, c, stg[16u + (uint32_t)pos]);
+                    TILE_TAKE_EXC_MASKED(pos, c, tile_bytes[pos]);
                     w &= w - 1u;
                 }
             }
