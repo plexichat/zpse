@@ -428,13 +428,13 @@ Additionally: mode 0 with `K>0`, mode 6 with `K != Nt`, modes 1..5 with
 `K==0` or `K==Nt` => `PSE_BAD_MASK`. The legacy `all_exc` flag bit does
 not exist in v1; bit 6 is reserved-0.
 
-### 6.3 Dense Segment Record (defined in v1.1; decoder-side)
+### 6.3 Dense Segment Record (defined in v1.1)
 
 Tile framing pays one header, one mask section and one residual section
 per `Nt` bytes. A segment whose plane is homogeneous is cheaper as ONE
-record covering the whole plane: one predictor, one mask over the plane,
-one residual stream. Since `tile_count` is 1 for such a segment, the
-record shape is:
+record covering up to 4 KiB of the plane: one predictor, one mask over
+that stretch, one residual stream. Since `tile_count` is 1 for such a
+segment, the record shape is:
 
 | Off | Size | Field                 | Type | Description                        |
 |-----|------|-----------------------|------|------------------------------------|
@@ -449,8 +449,16 @@ record shape is:
 |12   | ...  | mask payload, then residual payload                  |
 
 Identification (normative): a segment payload whose byte at offset 18
-has bit 6 set is a dense record; its `tile_count` MUST be 1 and it MUST
-be the segment's only record. Bit 6 is reserved-zero in a TileRecord
+has bit 6 set carries dense records; its `tile_count` MUST be 1 and the
+record area MUST consist of them and nothing else. The records are laid
+out back to back, and each one's length is fixed by the segment size
+rather than carried separately: record `i` codes exactly
+`min(4096, segment_decoded_size - 4096*i)` bytes, so a 4 KiB plane is one
+record, a 64 KiB segment is sixteen 4 KiB records followed by nothing,
+and a 4796-byte segment is a 4096-byte record and a 700-byte one. A
+decoder MUST derive the length that way and MUST reject a payload whose
+records do not add up to `segment_decoded_size` or leave a byte over
+(`PSE_BAD_TILE_SIZE`). Bit 6 is reserved-zero in a TileRecord
 (Sec. 6.2), so no byte string is both a legal tile record and a legal
 dense record: a decoder that accepts the tile stream keeps accepting
 exactly the same streams, and old decoders reject dense records as
@@ -459,17 +467,20 @@ reserved-bit violations rather than mis-reading them.
 Size equation (decoder MUST enforce):
 
 ```
-record_size == segment_payload_size - 18
-mask_payload_size + residual_payload_size == record_size - 10
+record_size == mask_payload_size + residual_payload_size + 10
+record_size >= 10
+the next record starts at 2 + record_size
 ```
 
-Prediction. Positions are segment-absolute (`d = p`, since the record
-covers the whole plane), the entry state is the segment entry state, and
-the predictor formulas are those of Sec. 7 with `d` in place of
-`seg_pos + p`. In particular `STRIDE_S` uses `initial_literal` for
-`d < S` and `out[d - S]` otherwise, and LANE_DELTA / LANE_AVERAGE read
-the two PREVIOUS values of the lane, both `initial_literal` at segment
-start. Histories are updated with the reconstructed (actual) byte.
+Prediction. Positions are RECORD-relative (`d = p`), and every record is
+self-contained: it restarts from the entry state, so a plane of several
+records is coded 4 KiB at a time and no record reads a byte a previous
+one reconstructed. The predictor formulas are those of Sec. 7 with `d`
+in place of `seg_pos + p`. In particular `STRIDE_S` uses
+`initial_literal` for `d < S` and the record's own `out[d - S]`
+otherwise, and LANE_DELTA / LANE_AVERAGE read the two PREVIOUS values of
+the lane, both `initial_literal` at the record start. Histories are
+updated with the reconstructed (actual) byte.
 `ORDER1` and `ORDER2` are reserved inside a dense record in v1
 (`PSE_UNSUPPORTED_FEATURE`): they are the only predictors that read the
 segment tables, and no encoder emits them.
@@ -477,8 +488,8 @@ segment tables, and no encoder emits them.
 Mask: modes 0 (ALL_HIT), 1 (RAW_BITMAP), 2 (SPARSE_U8) and 6
 (ALL_EXCEPTION) only; modes 3, 4, 5, 7 are reserved
 (`PSE_UNSUPPORTED_FEATURE`). K derivation is as in Sec. 6.2 with
-`Nt = segment_decoded_size`, except that SPARSE_U8 (one byte per
-position) exists only when `segment_decoded_size <= 256`
+`Nt = record length`, except that SPARSE_U8 (one byte per
+position) exists only when `record length <= 256`
 (`PSE_BAD_MASK` otherwise), and the bitmap is `ceil(Nt/8)` bytes with
 pad bits above `Nt` zero.
 
@@ -486,9 +497,20 @@ Residual: modes 0..3. Mode 4 (SIGNED_DELTA) is reserved
 (`PSE_UNSUPPORTED_FEATURE`) because its decoding needs the prediction at
 each exception before the reconstruction reaches it.
 
-Limits (reserved space, not decoder bugs): `segment_decoded_size <=
-4096`; larger planes use tiles. Violations report
-`PSE_UNSUPPORTED_FEATURE`.
+Limits: each record codes between 1 and 4096 bytes, and a plane longer
+than that is a sequence of records (see Identification). A record whose
+length would be 0 or above 4096 is not reachable, because the length is
+derived from `segment_decoded_size`.
+
+What this encoder emits (non-normative, and the only use of the form in
+v1): a plane that is a single byte value `v` end to end, where the dense
+record is strictly smaller than the all-hit tile records it replaces
+(12 bytes per 4 KiB against 10 per 256 bytes, so one-tile planes keep
+their tile). The record is then `K == 0` with mask ALL_HIT, no residual,
+and predictor CONST_ZERO when `v == 0`, STRIDE_1 when
+`v == initial_literal`, TILE_CONSTANT with `C == v` otherwise -- all
+three reconstruct as a fill of `v`. Every other plane is coded as tiles,
+byte for byte as before this form existed.
 
 Status mapping for a malformed dense record: size/spans
 `PSE_BAD_TILE_SIZE`; mask shape `PSE_BAD_MASK`; residual payload

@@ -8,12 +8,26 @@
  * predictor, ONE mask over the plane and ONE residual stream, so the same
  * bytes cost a dozen headers per plane instead of a dozen per tile. The
  * record sits where the tile records would: directly after the 16-byte
- * segment header, and it is the segment's only record.
+ * segment header, and a segment that uses the form uses nothing else.
  *
  * A dense record is marked by bit 6 of its flag byte -- the bit tile
  * records must leave clear (ZPSE_TILE_FLAG_RESERVED_BIT), so no stream
  * that decoded before can be read as a dense record and no dense record
  * is reachable as a tile.
+ *
+ * The record AREA of such a segment is a sequence of these records,
+ * back to back, each coding at most ZPSE_DENSE_MAX_LEN bytes and exactly
+ * one when the plane fits; the segment's decoded size is their sum. A
+ * 64 KiB segment is therefore sixteen 4 KiB records, which is what lets
+ * a block encoded as one segment use the form at all. Each record is
+ * self-contained: its predictions never read a byte another record
+ * reconstructed.
+ *
+ * `zpse_segment_encode` emits the form for exactly one shape in v1 -- a
+ * plane that is a single byte value end to end, where 12 bytes per 4 KiB
+ * beats 10 per 256-byte tile (segment.c). This decoder is not limited to
+ * that shape: it accepts any conforming record, which is what the 6044
+ * reference-built cases in tests/test_dense.c exercise.
  *
  * Layout (little-endian), offset from the start of the record:
  *   0  u16  rec_len        bytes after this field (header tail + payloads)

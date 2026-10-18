@@ -4,6 +4,7 @@
 #include "zpse/bits.h"
 #include "zpse/constants.h"
 #include "zpse/crc32c.h"
+#include "zpse/dense.h"
 #include "zpse/predictor.h"
 #include "zpse/segment.h"
 #include "zpse/status.h"
@@ -610,14 +611,15 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     for (s = 0; s < sc; s++) {
         uint32_t off = 0;
+        uint8_t *ent =
+            dst + ZPSE_BLOCK_HEADER_SIZE + meta_len + (size_t)s * 8;
         uint32_t k;
+
         for (k = 0; k < s; k++) {
             off += seg_sizes[k];
         }
-        zpse_store_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + meta_len + (size_t)s * 8,
-                          off);
-        zpse_store_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + meta_len + (size_t)s * 8 + 4,
-                          seg_sizes[s]);
+        zpse_store_u32le(ent, off);
+        zpse_store_u32le(ent + 4, seg_sizes[s]);
     }
 
     flags = (uint8_t)(ZPSE_B_RESET | ZPSE_B_CRC);
@@ -653,7 +655,7 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
                                  uint16_t meta_len)
 {
     uint32_t lens[16];
-    uint32_t tiles = 0u;
+    uint32_t records_bytes = 0u;
     uint8_t w = 0;
     uint8_t s;
 
@@ -664,12 +666,24 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
         return UINT32_MAX;
     }
     for (s = 0; s < sc; s++) {
-        tiles += (lens[s] + 255u) / 256u;
+        uint32_t ch = (lens[s] + ZPSE_DENSE_MAX_LEN - 1u) /
+                      ZPSE_DENSE_MAX_LEN;
+        uint32_t tile_cost = 10u * ((lens[s] + 255u) / 256u);
+        uint32_t dense_cost = ZPSE_DENSE_HEADER_SIZE * ch;
+
+        /* The two forms have very different floors -- ten bytes per
+         * 256-byte tile, twelve per 4 KiB dense record -- and a constant
+         * plane is coded at the second rate (zpse_segment_encode emits it
+         * that way), so a candidate's bound is the smaller of the two.
+         * Anything larger would prune a candidate whose plane happens to
+         * be constant, which is a real shape (the DELTA8 plane of a
+         * strided block). */
+        records_bytes += (tile_cost < dense_cost ? tile_cost : dense_cost);
     }
     return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + (uint32_t)meta_len +
            (uint32_t)sc * ((uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE +
                            (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) +
-           10u * tiles;
+           records_bytes;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1353,8 +1367,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * hopeless shape left in the list no longer keeps the others
          * alive. `>` (not `>=`) on purpose: a candidate whose floor equals
          * the winner could still tie it, and a tie is decided by list
-         * order, so it has to be attempted. */
-        if (have_best &&
+         * order, so it has to be attempted.
+         *
+         * "Could still tie" is only true for a candidate EARLIER in the
+         * list than the current winner: a tie goes to the lower index, so
+         * a later one cannot win it. The list-order test is what keeps the
+         * bound exact wherever the attempt order is not the list order
+         * (ZPSE_FORCE_TRIAL_SWAP, and any future reordering): skipping an
+         * earlier candidate because it merely ties would change the
+         * stream, and the parity suite proves it does not. */
+        if (have_best && (uint32_t)idx[i] > best_idx &&
             zpse_block_floor(n, tids[i], scounts[i], meta_lens[i]) >
                 best_total) {
             continue;
@@ -1401,17 +1423,27 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * ramp whose winner is DELTA8 still gets its second trial. */
         {
             uint32_t min_floor = UINT32_MAX;
+            int earlier_left = 0;
             int oj;
 
             for (oj = oi + 1; oj < ncand; oj++) {
                 int j = oj;
-                uint32_t f = zpse_block_floor(n, tids[j], scounts[j],
-                                              meta_lens[j]);
+                uint32_t f;
+
+                /* A candidate earlier in the list than the winner cannot
+                 * produce a smaller total, but it can produce the same one
+                 * and win the tie on order, so the bound does not cover it
+                 * and the sweep does not end while one is left. */
+                if ((uint32_t)idx[j] < best_idx) {
+                    earlier_left = 1;
+                    continue;
+                }
+                f = zpse_block_floor(n, tids[j], scounts[j], meta_lens[j]);
                 if (f < min_floor) {
                     min_floor = f;
                 }
             }
-            if (have_best && best_total <= min_floor) {
+            if (have_best && !earlier_left && best_total <= min_floor) {
                 break;
             }
             /* The sweep IS going to spend another trial, so price the rest
@@ -1429,15 +1461,22 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                        meta_bufs, meta_lens, idx, oi + 1,
                                        &ncand);
                 min_floor = UINT32_MAX;
+                earlier_left = 0;
                 for (oj = oi + 1; oj < ncand; oj++) {
                     int j = oj;
-                    uint32_t f = zpse_block_floor(n, tids[j], scounts[j],
-                                                  meta_lens[j]);
+                    uint32_t f;
+
+                    if ((uint32_t)idx[j] < best_idx) {
+                        earlier_left = 1;
+                        continue;
+                    }
+                    f = zpse_block_floor(n, tids[j], scounts[j],
+                                         meta_lens[j]);
                     if (f < min_floor) {
                         min_floor = f;
                     }
                 }
-                if (have_best && best_total <= min_floor) {
+                if (have_best && !earlier_left && best_total <= min_floor) {
                     break;
                 }
             }

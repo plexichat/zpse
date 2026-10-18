@@ -2,7 +2,9 @@
 #define ZPSE_SEGMENT_H
 
 /* Segment encode/decode (SPEC Sec. 6). A segment payload is a 16-B
- * header followed by tile_count prefixed tile records. */
+ * header followed by tile_count prefixed tile records -- or, for a plane
+ * the encoder coded with the dense form (Sec. 6.3), a sequence of dense
+ * records and no tiles. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -36,7 +38,14 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * test itself happens per tile; the caller resets them before each trial.
  * Unlike byte_budget this is a heuristic, not a bound: it only fires for a
  * trial that cannot beat the raw envelope anyway, and a trial it abandons
- * is reported exactly like one the budget stopped. */
+ * is reported exactly like one the budget stopped.
+ *
+ * A plane that is one byte value end to end -- and only such a plane --
+ * is written in the dense form (Sec. 6.3) when that is strictly smaller
+ * than its tile records: 12 bytes per 4 KiB against 10 per 256-byte tile,
+ * so the last tile of a short plane keeps its record. The dense records
+ * reconstruct exactly the tiles they replace (a K == 0 fill), tile_count
+ * is 1, and every other plane's bytes are unchanged. */
 /* Prescreen-only size estimate of one transformed plane (see segment.c). */
 uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
 

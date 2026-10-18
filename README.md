@@ -144,7 +144,7 @@ non-zero exit code if any of them fails:
 | `test_parity.c` | the full corpus plus four per-primitive sweeps (uniform, small-`nt`/mask-word boundary, stateful-table ids, and the state a classification leaves) |
 | `test_fuzz.c` | a randomized differential corpus: every size 1 to 64, every tile and segment boundary and its neighbours up to 64 KiB, 60 pseudo-random sizes, 18 shapes each (2718 blocks) plus 6 frames, each block round-tripped and its size, compressed length and compressed bytes folded into one digest |
 | `test_lseed.c` | hand-built foreign segments whose ORDER1/ORDER2 tiles deliberately do NOT reset (non-resetting first tile, chains, mixed ORDER/STRIDE), each decoded by the library and by a reference in the file that hardcodes the documented segment-start state — the shape the lane-state seeding above exists for, and one this encoder cannot produce |
-| `test_dense.c` | dense segment records (SPEC Sec. 6.3): 6042 records built by a reference writer over every predictor family, mask form and residual mode at nine plane sizes, plus hand-computed lane-history predictions, plus 15 malformed shapes (reserved bits/fields/modes, `ORDER1`, wrong spans, pad bits, non-ascending positions, trailing bytes) that must be rejected and never decoded |
+| `test_dense.c` | dense segment records (SPEC Sec. 6.3): 6044 records built by a reference writer over every predictor family, mask form and residual mode at nine plane sizes, plus hand-computed lane-history predictions, plus 15 malformed shapes (reserved bits/fields/modes, `ORDER1`, wrong spans, pad bits, non-ascending positions, trailing bytes) that must be rejected and never decoded, plus 92 emitter and sequence cases (a constant plane must come out dense exactly when the form is smaller, with the cheapest of the three constant predictors, through `zpse_segment_encode` and through the public block API, and a near-constant plane must stay tiles) |
 
 The parity step is the important one, and it is two checks over three builds
 of the same three suites: `test_parity.c`, `test_fuzz.c` and `test_lseed.c`
@@ -178,7 +178,7 @@ parity ok (swap): DIGEST <value> identical streams
 fuzz ok (scalar): FUZZ cases=2718 frames=6 digest=<value> identical streams
 fuzz ok (swap): FUZZ cases=2718 frames=6 digest=<value> identical streams
 lseed ok (scalar): LSEED: ALL OK (10 cases) identical streams
-dense records ok   (DENSE: cases=6042 failures=0)
+dense records ok   (DENSE: cases=6136 failures=0)
 lseed ok (swap): LSEED: ALL OK (10 cases) identical streams
 ALL SUITES PASS
 ```
@@ -216,16 +216,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.040 | 2616 | 17.9 | 23.5 |
+| zeros | 0.004 | 248 | 18.0 | 22.9 |
 | incr | 0.040 | 2619 | 5.2 | 10.4 |
 | random | 1.000 | 65568 | 3.1 | 20.9 |
 | sparse | 0.060 | 3962 | 1.0 | 5.4 |
 | strided | 0.040 | 2625 | 3.1 | 10.3 |
-| const5A | 0.040 | 2616 | 17.3 | 23.9 |
+| const5A | 0.004 | 248 | 17.2 | 23.4 |
 | alt00FF | 0.040 | 2618 | 2.6 | 19.3 |
 | sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
 | lowentropy | 0.687 | 45012 | 0.5 | 0.9 |
-| sparse2 | 0.048 | 3126 | 1.1 | 5.9 |
+| sparse2 | 0.019 | 1255 | 2.8 | 5.5 |
 
 The table is one session and the deltas below are paired measurements, so the
 absolute columns move between machines and runs while the sizes and the ratios
@@ -270,16 +270,49 @@ mode search and the pack all run once per 256 bytes. A segment-level dense
 record -- one predictor, one mask over the whole 4 KiB plane and one residual
 stream, with the palette discovered once instead of sixteen times -- would
 amortise all three over sixteen times the data. That record is now defined
-(SPEC Sec. 6.3) and decoded: `src/dense.c` handles one record per plane, with
-its own mask cursor, all three lane-history predictors, the STRIDE family over
-absolute positions and residual modes 0-3, under the same hostile-stream
-validation as tiles, and `tests/test_dense.c` covers it. What is NOT in the
-tree is the emitter: `zpse_segment_encode` still writes tile records, so the
-format exists, round-trips and is tested, but no compressed stream uses it yet
-and the speed above is unchanged. Emitting it requires a plane-level candidate
-search that replaces the tile loop for homogeneous planes rather than running
-after it, which is the next change and the one that has to be measured on
-`lowentropy`.
+(SPEC Sec. 6.3), decoded and emitted: `src/dense.c` handles one record per
+plane, with its own mask cursor, all three lane-history predictors, the STRIDE
+family over absolute positions and residual modes 0-3, under the same
+hostile-stream validation as tiles, and `tests/test_dense.c` covers it. A
+record AREA is a sequence of records (4096 + 4096 + ... + remainder), so a
+64 KiB block encoded as one segment uses the form too.
+
+The emitter takes exactly the shape the form wins on in v1, and no other. A
+record with K == 0 is a fill, so the dense form only pays where the plane is a
+single byte value end to end, and there it costs 12 bytes per 4 KiB against
+ten per 256-byte all-hit tile. Everything else keeps the tiles it had, byte for
+byte. The decision costs no scan: the all-hit run path has already proved each
+tile is constant, so one byte per tile settles the whole plane, and the
+records are replaced only when the dense form is smaller (a plane holding one
+tile keeps its 10-byte tile record, which beats 12). Three consequences the
+sweep had to learn. Its per-candidate floor is the smaller of 10 bytes per
+tile and 12 per 4 KiB, or it would prune a candidate whose transformed plane
+happens to be constant. A candidate that can only *tie* the winner may no
+longer be skipped when it comes earlier in the list, because a tie goes to the
+lower index -- and the sweep may not stop while such a candidate is left.
+Without those two rules the swapped attempt order produced a different stream
+for a 4 KiB constant block; `ZPSE_FORCE_TRIAL_SWAP` now proves it does not.
+
+The block sweep prices candidates with `zpse_segment_proxy_cost`, and a
+constant plane has to be priced at the dense rate there too, or the estimate
+is ten times the truth and the candidate is dropped before it can win. That
+was a real miss, not a hypothetical: the 16-way split of `sparse2` (one nonzero
+two-byte header every 256 bytes) has fifteen all-zero planes, so it costs 16
+segment headers, fifteen 28-byte dense payloads and one 675-byte tile segment
+-- 1255 bytes -- and the sweep never tried it, because the estimate said 16 x
+~2560. Pricing the constant planes correctly lets it through: `sparse2`
+3126 -> 1255 bytes, ratio 0.048 -> 0.019, and encode 1.13 -> 2.89 GB/s because
+the winner is the cheap candidate.
+
+Measured, five alternating rounds of `bench 80 3`, best per row: `zeros` and
+`const5A` 2616 -> 248 bytes (ratio 0.040 -> 0.004), encode 3.21 -> 3.23 and
+3.24 -> 3.23 GB/s, decode 22.4 -> 21.8 and 22.5 -> 22.0 GB/s on this machine;
+`sparse2` 3126 -> 1255 bytes with encode 1.13 -> 2.89 and decode 5.81 -> 5.42
+GB/s; every other row unchanged in size and within +-3% in both directions.
+`tests/clen_corpus.c`:
+324 of 768 cases are smaller, none is larger, and every one of the 324 is a
+plane that is constant end to end. The `zeros`/`const5A`/`sparse2` columns in
+the table above are those paired ratios applied to the session's numbers.
 
 Four cheaper things were tried on the per-tile path and measured, and are not
 in the tree: widening the dense classifier's compaction stores from 8 to 16

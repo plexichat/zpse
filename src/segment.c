@@ -498,7 +498,8 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
 /* STRIDE_3 is last on purpose: the winner is the first predictor with the
  * strictly smallest miss count, so appending it can only change a tile
  * where it is strictly better than every earlier candidate. */
-static const uint8_t seg_screen_pred[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u, 11u };
+static const uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
+                                           7u, 8u, 10u, 11u};
 
 /* ------------------------------------------------------------------ *
  * Vectorised prescreen. Every one of the nine counts above is a
@@ -921,6 +922,32 @@ void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
 }
 
 
+/* 1 iff p[0..n) is one byte value, which is the only plane shape the dense
+ * form pays on (see seg_dense_emit). Word-wise with an early exit, so a
+ * plane that is not constant costs one compare. */
+static int seg_plane_is_const(const uint8_t *p, uint32_t n)
+{
+    uint64_t splat = UINT64_C(0x0101010101010101) * (uint64_t)p[0];
+    uint32_t i = 0u;
+
+    while (i + 8u <= n) {
+        uint64_t w;
+
+        memcpy(&w, p + i, 8);
+        if (w != splat) {
+            return 0;
+        }
+        i += 8u;
+    }
+    while (i < n) {
+        if (p[i] != p[0]) {
+            return 0;
+        }
+        i++;
+    }
+    return 1;
+}
+
 /* Cheap size estimate for a transformed plane, from the prescreen alone.
  *
  * zpse_block_encode ranks transform candidates with it before spending a
@@ -942,6 +969,19 @@ uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
     if (plane == 0 || plane_len == 0u)
         return UINT32_MAX;
     init = plane[0];
+    /* A constant plane is emitted in the dense form (seg_dense_emit): twelve
+     * bytes per 4 KiB instead of ten per tile. Pricing it as tiles would
+     * overstate it by an order of magnitude, and this estimate is what
+     * decides which candidates are worth a trial at all -- a candidate ten
+     * times smaller than the estimate says would be pruned before it could
+     * win. Non-constant planes stop at the first differing word. */
+    if (seg_plane_is_const(plane, plane_len)) {
+        uint32_t ch = (plane_len + ZPSE_DENSE_MAX_LEN - 1u) /
+                      ZPSE_DENSE_MAX_LEN;
+
+        return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+               (uint32_t)ZPSE_DENSE_HEADER_SIZE * ch;
+    }
     /* Every other tile is enough to rank candidates (the estimate is a
      * sum over many tiles and only its order is used), and it makes the
      * proxy a small fraction of one trial instead of a tenth of it. The
@@ -1003,6 +1043,90 @@ static int seg_flat_abort(ZpseEncoder *e, uint16_t nt, uint32_t coded,
     return (e->flat_covered >= flat_abort_min) ? 1 : 0;
 }
 
+/* Dense record form for a constant plane (SPEC Sec. 6.3).
+ *
+ * An all-hit tile costs ten bytes (two of length prefix, eight of tile
+ * header) and a dense record costs twelve for 4 KiB, so a plane that is a
+ * single byte value everywhere is the one shape this form beats the tile
+ * path on: 248 bytes instead of 2616 for a 64 KiB block of zeroes. A
+ * dense record's K == 0 reconstruction is a fill -- every predictor's
+ * fixed point under a record's entry state is one value -- which is
+ * precisely the constant plane, so no other plane is worth the form in
+ * v1 and none is offered it.
+ *
+ * Returns the payload length written, or 0 when the plane is not constant,
+ * when the form would not be strictly smaller than `pos` bytes of tile
+ * records, or when it does not fit `byte_budget` / `payload_cap`. The
+ * constant test is word-wise with an early exit, so a plane that is not
+ * constant costs one compare per segment and the tile path is otherwise
+ * untouched; the budget-exhausted paths call it too, because a trial can
+ * reach a size the tile path cannot encode but these records can. */
+static int seg_dense_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
+                          const uint8_t *plane, uint32_t plane_len,
+                          uint8_t initial_literal, uint32_t pos,
+                          uint32_t byte_budget, uint32_t payload_cap,
+                          int known_const)
+{
+    uint32_t chunks = (plane_len + ZPSE_DENSE_MAX_LEN - 1u) /
+                      ZPSE_DENSE_MAX_LEN;
+    uint32_t dtotal = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+                      chunks * (uint32_t)ZPSE_DENSE_HEADER_SIZE;
+    uint8_t v = plane[0];
+    uint8_t pred;
+    uint8_t *q;
+    uint32_t c;
+
+    if (dtotal >= pos || dtotal > payload_cap) {
+        return 0;
+    }
+    if (byte_budget != 0u && dtotal > byte_budget) {
+        return 0;
+    }
+    if (!known_const && !seg_plane_is_const(plane, plane_len)) {
+        return 0;
+    }
+
+    /* STRIDE_1's fixed point is the segment's initial literal, so it needs
+     * no constant byte; CONST_ZERO needs none either; anything else needs
+     * TILE_CONSTANT and its byte. */
+    pred = (v == 0u) ? (uint8_t)ZPSE_P_CONST_ZERO
+           : (v == initial_literal) ? (uint8_t)ZPSE_P_STRIDE_1
+                                    : (uint8_t)ZPSE_P_TILE_CONSTANT;
+    q = payload_out + ZPSE_SEGMENT_HEADER_SIZE;
+    for (c = 0u; c < chunks; c++) {
+        zpse_store_u16le(q, (uint16_t)(ZPSE_DENSE_HEADER_SIZE - 2u));
+        q[2] = (uint8_t)(ZPSE_DENSE_MARKER |
+                         ((uint8_t)ZPSE_R_EXCLUSION_U8 << 3));
+        q[3] = pred;
+        q[4] = (pred == (uint8_t)ZPSE_P_TILE_CONSTANT) ? v : 0u;
+        q[5] = 0u;
+        zpse_store_u16le(q + 6u, 0u);
+        zpse_store_u16le(q + 8u, 0u);
+        zpse_store_u16le(q + 10u, 0u);
+        q += ZPSE_DENSE_HEADER_SIZE;
+    }
+    /* A dense segment always reports tile_count == 1 (Sec. 6.3). */
+    h->tile_count = 1u;
+    zpse_segment_header_serialize(payload_out, h);
+    return (int)dtotal;
+}
+
+/* Exit helper for the paths that run out of room: the dense form may still
+ * fit where the tile records no longer do, so it is offered before the
+ * overflow is reported. Nothing is known about the plane here, so the
+ * constant test runs (it is a word-wise scan with an early exit). Returns a
+ * payload length or PSE_OUTPUT_OVERFLOW. */
+static int seg_no_room(ZpseSegmentHeader *h, uint8_t *payload_out,
+                       const uint8_t *plane, uint32_t plane_len,
+                       uint8_t initial_literal, uint32_t pos,
+                       uint32_t byte_budget, uint32_t payload_cap)
+{
+    int dn = seg_dense_emit(h, payload_out, plane, plane_len, initial_literal,
+                            pos, byte_budget, payload_cap, 0);
+
+    return dn != 0 ? dn : PSE_OUTPUT_OVERFLOW;
+}
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
@@ -1016,6 +1140,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     uint8_t *tmp;
     uint32_t tmp_cap;
     int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    uint8_t dense_v;
+    int dense_ok;
 
     if (e == 0 || lanes == 0 || plane == 0 || payload_out == 0) {
         return PSE_BAD_ARG;
@@ -1056,6 +1182,17 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * classification this encoder never asks for. */
     zpse_lane_reset_hist(lanes, initial_literal);
 
+    /* Constant-plane tracking, which lets the dense form (SPEC Sec. 6.3)
+     * skip its own scan: a tile the all-hit run writes is constant -- k ==
+     * 0 forces prediction == actual at every position, and under a reset
+     * tile every predictor's fixed point is one value -- so one byte per
+     * tile decides whether the whole plane is that same value, and the
+     * general path, which can code anything, clears the flag. The tile
+     * path is otherwise untouched: the records it writes are replaced at
+     * the end when the dense form is smaller. */
+    dense_v = plane[0];
+    dense_ok = 1;
+
     pos = 16u;
     for (t = 0; t < tc; t++) {
         uint32_t seg_pos = t * 256u;
@@ -1081,7 +1218,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * be skipped by this -- the caller only passes a budget when a
          * total that large cannot win -- and no tile is half-written. */
         if (byte_budget != 0u && pos > byte_budget) {
-            return PSE_OUTPUT_OVERFLOW;
+            return seg_no_room(&h, payload_out, plane, plane_len,
+                               initial_literal, pos, byte_budget,
+                               payload_cap);
         }
 
         seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
@@ -1170,7 +1309,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             uint8_t pred = best_p;
 
             if (payload_cap - pos < 10u) {
-                return PSE_OUTPUT_OVERFLOW;
+                return seg_no_room(&h, payload_out, plane, plane_len,
+                                   initial_literal, pos, byte_budget,
+                                   payload_cap);
             }
             /* The probe is not consulted on this path. A run writes 10 bytes
              * per tile, which pays for itself unless the tile is 10 bytes or
@@ -1195,10 +1336,17 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 uint8_t npred = pred;
 
                 if (byte_budget != 0u && pos > byte_budget) {
-                    return PSE_OUTPUT_OVERFLOW;
+                    return seg_no_room(&h, payload_out, plane, plane_len,
+                                       initial_literal, pos, byte_budget,
+                                       payload_cap);
                 }
                 if (payload_cap - pos < 10u) {
-                    return PSE_OUTPUT_OVERFLOW;
+                    return seg_no_room(&h, payload_out, plane, plane_len,
+                                       initial_literal, pos, byte_budget,
+                                       payload_cap);
+                }
+                if (plane[nsseg_pos] != dense_v) {
+                    dense_ok = 0;
                 }
                 /* The tile keeps the run's predictor and its k == 0 only
                  * when the cheap proof holds; otherwise the prescreen is
@@ -1235,6 +1383,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             }
             continue;
         }
+
+        /* A tile that needs a mask or a residual is not constant, so the
+         * plane cannot be, and the dense form cannot apply. */
+        dense_ok = 0;
 
         /* One candidate and room for the worst record: pack it straight
          * into the output instead of into the 4 KiB scratch and copying
@@ -1304,7 +1456,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         if (pos + 2u > payload_cap ||
             (uint32_t)best_len > payload_cap - pos - 2u) {
-            return PSE_OUTPUT_OVERFLOW;
+            return seg_no_room(&h, payload_out, plane, plane_len,
+                               initial_literal, pos, byte_budget,
+                               payload_cap);
         }
         if (!direct) {
             memcpy(payload_out + pos + 2u, bst, (size_t)best_len);
@@ -1313,6 +1467,21 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         pos += 2u + (uint32_t)best_len;
         if (seg_flat_abort(e, nt, 2u + (uint32_t)best_len, flat_abort_min)) {
             return PSE_OUTPUT_OVERFLOW;
+        }
+    }
+
+    /* The plane may be one byte value end to end, which the dense record
+     * form (SPEC Sec. 6.3) codes in 12 bytes per 4 KiB instead of the ten
+     * bytes per 256-byte tile the run path above just wrote. The rewrite
+     * only ever shrinks the record area, so every bound checked above still
+     * holds. */
+    {
+        int dn = seg_dense_emit(&h, payload_out, plane, plane_len,
+                                initial_literal, pos, byte_budget,
+                                payload_cap, dense_ok);
+
+        if (dn != 0) {
+            return dn;
         }
     }
     return (int)pos;
