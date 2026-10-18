@@ -1331,12 +1331,19 @@ static uint32_t seg_dense_palette_cost(uint32_t plane_len, uint32_t m)
  *
  * Returns the payload length written, or 0 when the plane's alphabet is not
  * small enough, when the form is not strictly smaller than the `pos` bytes
- * of tile records already written, or when it does not fit payload_cap /
- * byte_budget. */
+ * of tile records already written (and `replace` is 0), or when it does not
+ * fit payload_cap / byte_budget.
+ *
+ * `replace` is the caller saying it has already decided the form wins and
+ * the tile records written so far are to be abandoned: the `pos` test is
+ * then not a comparison but a formality, because the only reason `pos` can
+ * still be below the form's size is that the caller stopped the tile loop
+ * early to save the work (see the estimate in zpse_segment_encode). */
 static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
                                   const uint8_t *plane, uint32_t plane_len,
                                   uint32_t m, const uint32_t bits[8],
-                                  uint32_t pos, uint32_t byte_budget,
+                                  uint32_t pos, int replace,
+                                  uint32_t byte_budget,
                                   uint32_t payload_cap)
 {
     uint8_t buf[ZPSE_DENSE_MAX_LEN];
@@ -1351,7 +1358,7 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
         return 0;
     }
     cost = seg_dense_palette_cost(plane_len, m);
-    if (cost >= pos || cost > payload_cap) {
+    if ((cost >= pos && replace == 0) || cost > payload_cap) {
         return 0;
     }
     if (byte_budget != 0u && cost > byte_budget) {
@@ -1455,6 +1462,140 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
     h->tile_count = 1u;
     zpse_segment_header_serialize(payload_out, h);
     return (int)at;
+}
+
+/* Tiles a palette decision prices before deciding, and the plane size in
+ * tiles below which it does not price at all. See seg_tile_estimate. */
+#define ZPSE_EST_TILES 8u
+#define ZPSE_EST_MIN_TILES 16u
+
+/* Estimated size of the tile records a plane would take, from a sample of
+ * ZPSE_EST_TILES tiles spread evenly over it.
+ *
+ * This exists because the two forms are priced in very different ways. The
+ * palette form's price is exact and costs one alphabet scan. The tiles'
+ * price is exact only after every tile has been classified, mode-searched
+ * and packed -- which is the whole trial. On 64 KiB of four-bit data the
+ * tiles lose by a quarter, and the exact comparison finds that out by
+ * writing 190 of them and then replacing all 190 with the palette: measured
+ * 110 us of that block's 114 us of encode. The sample is eight tiles
+ * instead. On a plane whose tiles are alike (what a four-bit plane is) the
+ * per-tile average is within a percent, and on a plane where the palette
+ * loses the sample costs under 4 us -- noise against a trial.
+ *
+ * Each sampled tile goes through exactly the pipeline the trial loop runs,
+ * INCLUDING the second candidate when it is competitive, so this is the
+ * trial's own per-tile size rather than a proxy for it. Returns 0 (the
+ * caller then keeps the exact comparison) when a tile cannot be priced. */
+static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
+                             const uint8_t *plane, uint32_t plane_len,
+                             uint32_t tc, uint8_t initial_literal,
+                             int have_avx2, uint32_t *out)
+{
+    uint32_t step = tc / ZPSE_EST_TILES;
+    uint32_t sum = 0u;
+    uint32_t nsum = 0u;
+    uint32_t t;
+
+    if (step == 0u) {
+        step = 1u;
+    }
+    for (t = 0u; t < tc; t += step) {
+        uint32_t seg_pos = t * 256u;
+        uint16_t nt =
+            (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
+        const uint8_t *actual = plane + seg_pos;
+        uint16_t ks[12];
+        uint16_t best_k;
+        uint8_t best_p;
+        uint8_t cand[2];
+        uint32_t ncand = 0u;
+        uint32_t i;
+        uint32_t ci;
+        int tile_len = -1;
+
+        seg_prescreen(actual, nt, plane, seg_pos, initial_literal, have_avx2,
+                      ks);
+        best_p = seg_screen_pred[0];
+        best_k = ks[best_p];
+        for (i = 1u; i < 9u; i++) {
+            uint16_t c = ks[seg_screen_pred[i]];
+
+            if (c < best_k) {
+                best_k = c;
+                best_p = seg_screen_pred[i];
+            }
+        }
+        if (best_k == 0u) {
+            /* The all-hit run above writes these directly: a 2-byte length
+             * prefix and the 8-byte record. */
+            sum += 10u;
+            nsum++;
+            continue;
+        }
+        cand[ncand++] = best_p;
+        {
+            uint8_t second_p = 0xFFu;
+            uint16_t sk = 0xFFFFu;
+
+            for (i = 0u; i < 9u; i++) {
+                uint16_t c = ks[seg_screen_pred[i]];
+
+                if (seg_screen_pred[i] == best_p) {
+                    continue;
+                }
+                if (c < sk) {
+                    sk = c;
+                    second_p = seg_screen_pred[i];
+                }
+            }
+            if (second_p != 0xFFu &&
+                (uint32_t)sk <= (uint32_t)best_k + 4u &&
+                (uint32_t)best_k * 8u < (uint32_t)nt * 7u) {
+                cand[ncand++] = second_p;
+            }
+        }
+        for (ci = 0u; ci < ncand; ci++) {
+            uint8_t pred = cand[ci];
+            ZpseTileClass cl;
+            uint8_t mm;
+            uint8_t rr;
+            int n;
+
+            if (zpse_tile_classify(lanes, actual, nt, pred, initial_literal, 1,
+                                   plane, seg_pos, &cl) != PSE_OK) {
+                continue;
+            }
+            zpse_tile_choose_modes(&cl, nt, &mm, &rr);
+            n = zpse_tile_pack(pred, &cl, nt, actual, mm, rr, 1, e->hist,
+                               4096u, e->comb);
+            if (n < 8) {
+                mm = (cl.k == 0u) ? 0u
+                     : (cl.k == nt) ? 6u
+                     : ((uint32_t)cl.k <= (((uint32_t)nt + 7u) >> 3) ? 2u
+                                                                     : 1u);
+                n = zpse_tile_pack(pred, &cl, nt, actual, mm, 0u, 1, e->hist,
+                                   4096u, e->comb);
+            }
+            if (n < 8) {
+                continue;
+            }
+            if (tile_len < 0 || n < tile_len) {
+                tile_len = n;
+            }
+        }
+        if (tile_len < 0) {
+            return 0;
+        }
+        sum += 2u + (uint32_t)tile_len;
+        nsum++;
+    }
+    if (nsum == 0u) {
+        return 0;
+    }
+    *out = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+           (uint32_t)(((uint64_t)sum * tc + nsum / 2u) / nsum);
+    return 1;
 }
 
 /* Exit helper for the paths that run out of room: the dense form may still
@@ -1573,10 +1714,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
         const uint8_t *actual = plane + seg_pos;
 
-        if (pal_len != 0u && pos >= pal_len) {
-            int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
-                                            pal_m, pal_bits, pos, byte_budget,
-                                            payload_cap);
+        if (pal_len != 0u && pos >= pal_len) {                int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
+                                                pal_m, pal_bits, pos, 0,
+                                                byte_budget, payload_cap);
 
             if (dn != 0) {
                 return dn;
@@ -1836,8 +1976,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             if (best_len <= 8 + (best_p == 9u ? 1 : 0)) {
                 break;
             }
-        }
-        (void)best_p;
+        }        (void)best_p;
 
         if (best_len < 0) {
             return PSE_BAD_RESIDUAL;
@@ -1879,12 +2018,35 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             }
             if (pal_len != 0u && pos >= pal_len) {
                 dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
-                                            pal_m, pal_bits, pos, byte_budget,
-                                            payload_cap);
+                                            pal_m, pal_bits, pos, 0,
+                                            byte_budget, payload_cap);
                 if (dn != 0) {
                     return dn;
                 }
                 pal_len = 0u;
+            }
+            /* The form is priced and the tiles have not caught up with it.
+             * Ask the sample whether they are going to: if the palette is
+             * smaller than the tiles by a margin, the rest of the loop is
+             * work whose bytes the form will throw away, so emit it now
+             * and return. The margin (an eighth) is what keeps a mispriced
+             * plane -- tiles that differ region by region -- from losing
+             * more bytes than the sample saved; below it the exact rule
+             * still runs the tiles and compares, as it always did. */
+            if (pal_len != 0u && pos < pal_len && tc >= ZPSE_EST_MIN_TILES) {
+                uint32_t est;
+
+                if (seg_tile_estimate(e, lanes, plane, plane_len, tc,
+                                      initial_literal, have_avx2, &est) &&
+                    est - (est >> 3) >= pal_len) {
+                    dn = seg_dense_palette_emit(&h, payload_out, plane,
+                                                plane_len, pal_m, pal_bits,
+                                                pos, 1, byte_budget,
+                                                payload_cap);
+                    if (dn != 0) {
+                        return dn;
+                    }
+                }
             }
         }
         if (seg_flat_abort(e, nt, 2u + (uint32_t)best_len, flat_abort_min)) {
@@ -1913,7 +2075,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * -- it is also the smaller of the two for a constant. */
     if (pal_len != 0u) {
         int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
-                                        pal_m, pal_bits, pos, byte_budget,
+                                        pal_m, pal_bits, pos, 0, byte_budget,
                                         payload_cap);
 
         if (dn != 0) {
