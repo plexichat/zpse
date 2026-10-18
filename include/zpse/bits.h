@@ -53,4 +53,19 @@ static inline uint32_t zpse_min_u32(uint32_t a, uint32_t b) {
     return a < b ? a : b;
 }
 
+/* Index of the lowest set bit. `w` MUST be non-zero (the callers walk a
+ * bitmask with `w &= w - 1`, so every iteration has one). */
+static inline uint32_t zpse_ctz32(uint32_t w) {
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint32_t)__builtin_ctz(w);
+#else
+    uint32_t c = 0;
+    while ((w & 1u) == 0u) {
+        w >>= 1;
+        c++;
+    }
+    return c;
+#endif
+}
+
 #endif /* ZPSE_BITS_H */
