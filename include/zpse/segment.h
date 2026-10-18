@@ -48,8 +48,21 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * ALL_EXCEPTION mask, no prediction to reconstruct). The dense records
  * reconstruct exactly the plane they replace, tile_count is 1, and every
  * other plane's bytes are unchanged. */
-/* Prescreen-only size estimate of one transformed plane (see segment.c). */
+/* Prescreen-only size estimate of one transformed plane, used to rank (and
+ * prune) transform candidates before any of them is priced exactly. */
 uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
+
+/* Smallest size one transformed plane can be written in, whole: its tile
+ * records (sampled), or one of the two dense forms when that is smaller.
+ * Includes the 16-byte segment header; UINT32_MAX when it cannot be
+ * priced. (See segment.c.) */
+uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
+                                 const uint8_t *plane, uint32_t plane_len,
+                                 unsigned tiles);
+
+/* Price of the plane's dense constant form, or UINT32_MAX when the plane is
+ * not one byte value end to end. (See segment.c.) */
+uint32_t zpse_segment_const_cost(const uint8_t *plane, uint32_t plane_len);
 
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,

@@ -840,25 +840,53 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_DECIDE_TILES 4u
 #endif
 
-/* Exact price of a plane: classify, choose modes and pack a spread of its
- * tiles -- the same three calls one tile of a real trial makes, so the
- * estimate sees every mode the encoder can use instead of only the nine
- * predictors the prescreen knows. This is what breaks a prescreen tie: a
- * 4-bit alphabet, a nibble-packed record or a text block all price the
- * same to the prescreen, while their real records differ by more than the
- * ~6% the sweep prunes on.
+static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                             uint8_t tid, uint8_t sc,
+                             const uint8_t *meta_bytes, uint16_t meta_len,
+                             uint8_t *planes[16], uint32_t lens[16]);
+
+/* Estimated size of one transform trial: stage the transform, then price
+ * each plane with the prescreen alone (no classify, no packing).
+ * UINT32_MAX means "could not be estimated" and the caller keeps the
+ * candidate. */
+static uint32_t zpse_block_proxy(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                                 uint8_t tid, uint8_t sc,
+                                 const uint8_t *meta_bytes, uint16_t meta_len)
+{
+    uint32_t lens[16];
+    uint8_t *planes[16];
+    uint32_t total;
+    uint32_t s;
+
+    if (zpse_block_planes(e, in, n, tid, sc, meta_bytes, meta_len, planes,
+                          lens) != PSE_OK) {
+        return UINT32_MAX;
+    }
+    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + meta_len +
+            (uint32_t)sc * (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE;
+    for (s = 0; s < sc; s++) {
+        uint32_t c = zpse_segment_proxy_cost(planes[s], lens[s]);
+        if (c == UINT32_MAX)
+            return UINT32_MAX;
+        total += c;
+    }
+    return total;
+}
+
+/* Exact price of a plane: the smaller of its tile records (a spread of its
+ * tiles, classified, mode-searched and packed exactly as a trial does) and
+ * the two dense forms, which are priced exactly because each takes one pass
+ * over the plane. zpse_segment_probe_cost owns all three; this only gives
+ * it the lane state a segment encode would start from.
  *
- * `tiles` is how many tiles to price (0 = ZPSE_PROBE_TILES), always spread
- * evenly over the plane and folded back up to its full tile count. Returns
- * the estimate for the whole plane, or UINT32_MAX when the plane cannot be
+ * `tiles` is how many tiles to price (0 = ZPSE_PROBE_TILES), spread evenly
+ * over the plane and folded back up to its full tile count. Returns the
+ * estimate for the whole plane, or UINT32_MAX when the plane cannot be
  * priced (the caller then keeps the candidate). */
 static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
                                  uint32_t len, unsigned tiles)
 {
-    uint32_t tc = (len + 255u) / 256u;
-    uint32_t sum = 0u;
-    uint32_t priced = 0u;
-    uint32_t t;
+    ZpseLaneState lanes;
 
     if (plane == 0 || len == 0u || e->comb == 0) {
         return UINT32_MAX;
@@ -866,73 +894,26 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
     if (tiles == 0u || tiles > ZPSE_DECIDE_TILES) {
         tiles = (tiles == 0u) ? ZPSE_PROBE_TILES : ZPSE_DECIDE_TILES;
     }
-    if (tiles > tc) {
-        tiles = tc;
-    }
-    for (t = 0; t < tiles; t++) {
-        uint32_t seg_pos =
-            ((t + 1u) * len) / (tiles + 1u) & ~(uint32_t)255;
-        uint16_t nt;
-        uint16_t ks[12];
-        uint8_t pred;
-        uint16_t bk;
-        uint8_t rec[16u + ZPSE_TILE_SIZE];
-        ZpseTileClass cl;
-        ZpseLaneState lanes;
-        uint8_t mm = 0u;
-        uint8_t rr = 0u;
-        unsigned j;
-        int n;
-
-        if ((uint64_t)seg_pos + 64u > (uint64_t)len) {
-            seg_pos = len > 64u ? len - 64u : 0u;
-        }
-        nt = (uint16_t)((len - seg_pos > 256u) ? 256u : (len - seg_pos));
-        if (nt < 64u) {
-            continue;
-        }
-        zpse_segment_prescreen(plane + seg_pos, nt, plane, seg_pos, plane[0],
-                               ks);
-        pred = zpse_block_screen[0];
-        bk = ks[pred];
-        for (j = 1u; j < 9u; j++) {
-            if (ks[zpse_block_screen[j]] < bk) {
-                bk = ks[zpse_block_screen[j]];
-                pred = zpse_block_screen[j];
-            }
-        }
-        lanes.order1 = e->order1;
-        lanes.o2val = e->o2val;
-        lanes.o2conf = e->o2conf;
-        if (zpse_tile_classify(&lanes, plane + seg_pos, nt, pred, plane[0], 1,
-                               plane, seg_pos, &cl) != PSE_OK) {
-            return UINT32_MAX;
-        }
-        zpse_tile_choose_modes(&cl, nt, &mm, &rr);
-        n = zpse_tile_pack(pred, &cl, nt, plane + seg_pos, mm, rr, 1, rec,
-                           (uint32_t)sizeof rec, e->comb);
-        if (n < 8) {
-            return UINT32_MAX;
-        }
-        sum += 2u + (uint32_t)n;
-        priced++;
-    }
-    if (priced == 0u) {
-        return UINT32_MAX;
-    }
-    /* Scale the sampled tiles to the plane's own tile count. */
-    return 16u + (uint32_t)(((uint64_t)sum * (uint64_t)tc) / (uint64_t)priced);
+    lanes.order1 = e->order1;
+    lanes.o2val = e->o2val;
+    lanes.o2conf = e->o2conf;
+    return zpse_segment_probe_cost(e, &lanes, plane, len, tiles);
 }
 
 /* Smallest price zpse_block_exact_plane can return for a plane of `len`
- * bytes: the segment envelope, plus a 2-byte length prefix and the 8-byte
- * header of every tile -- the record of a tile whose prediction is exact
- * (mask ALL_HIT, empty residual). Every tile record is at least those ten
- * bytes, so a plane priced at this floor had no exception anywhere the
- * sample looked. */
+ * bytes: the segment envelope, plus either a 2-byte length prefix and the
+ * 8-byte header of every tile (the record of a tile whose prediction is
+ * exact: mask ALL_HIT, empty residual) or the dense constant form's 12
+ * bytes per 4 KiB, whichever is smaller. No record can be below either
+ * bound, so a plane priced at this floor is one whose every tile was an
+ * exact prediction -- a constant plane, which the dense form then writes. */
 static uint32_t zpse_block_plane_floor(uint32_t len)
 {
-    return 16u + 10u * ((len + 255u) / 256u);
+    uint32_t tiles = 16u + 10u * ((len + 255u) / 256u);
+    uint32_t dense = 16u + 12u * ((len + ZPSE_DENSE_MAX_LEN - 1u) /
+                                  ZPSE_DENSE_MAX_LEN);
+
+    return tiles < dense ? tiles : dense;
 }
 
 /* Smallest price zpse_block_exact_sum can return for a candidate whose
@@ -954,26 +935,64 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
                                       unsigned tiles)
 {
     uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u;
-    unsigned per = tiles;
-    uint8_t s;
+    uint32_t records = 0u;
+    uint32_t avg_rec;
+    uint32_t sum_rec;
+    unsigned priced = 0u;
+    unsigned step = 1u;
+    unsigned s;
 
+    /* 0 means "the probe's own default", exactly as zpse_block_exact_plane
+     * reads it; it is resolved here because it divides the budget. */
+    if (tiles == 0u || tiles > ZPSE_DECIDE_TILES) {
+        tiles = (tiles == 0u) ? ZPSE_PROBE_TILES : ZPSE_DECIDE_TILES;
+    }
     /* The budget is per CANDIDATE, not per plane: a 16-segment transpose has
-     * sixteen planes, and pricing each of them with the full budget would
-     * cost as much as the trial this is meant to avoid. */
+     * sixteen planes, and pricing a tile in every one of them measured
+     * sixteen tiles to buy four tiles' worth of information (12.5 us of a
+     * 27 us block on the lowentropy row). Price `tiles` of the planes
+     * instead, one tile each.
+     *
+     * The planes that are not priced still get the constant test, because
+     * that is the one form a tile price cannot see and it is cheap: the
+     * phases of a transpose are constant whenever the source repeats with
+     * the transpose period, and that is exactly the case a spread of four
+     * planes can miss (a spike every 256 bytes lands in one phase). A plane
+     * that is not constant is priced at the priced planes' average. */
     if (sc > 1u) {
-        per = tiles / (unsigned)sc;
-        if (per == 0u) {
-            per = 1u;
+        step = ((unsigned)sc + tiles - 1u) / tiles;
+        if (step == 0u) {
+            step = 1u;
         }
     }
-    for (s = 0; s < sc; s++) {
-        uint32_t c = zpse_block_exact_plane(e, planes[s], lens[s], per);
+    for (s = 0u; s < sc; s += step) {
+        uint32_t c = zpse_block_exact_plane(e, planes[s], lens[s],
+                                            sc > 1u ? 1u : tiles);
 
         if (c == UINT32_MAX) {
             return UINT32_MAX;
         }
-        total += c;
+        /* c is 16 + the plane's record area folded up to its tile count. */
+        records += c - 16u;
+        priced++;
     }
+    if (priced == 0u) {
+        return UINT32_MAX;
+    }
+    sum_rec = records;
+    avg_rec = records / priced;
+    if (step > 1u) {
+        for (s = 0u; s < sc; s++) {
+            uint32_t d;
+
+            if ((s % step) == 0u) {
+                continue;
+            }
+            d = zpse_segment_const_cost(planes[s], lens[s]);
+            sum_rec += (d != UINT32_MAX) ? (d - 16u) : avg_rec;
+        }
+    }
+    total += (uint32_t)sc * 16u + sum_rec;
     return total;
 }
 
@@ -1011,34 +1030,6 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return zpse_transform_forward(&tm, sc, in, n, planes, lens);
 }
 
-/* Estimated size of one transform trial: stage the transform, then price
- * each plane with the prescreen alone (no classify, no packing).
- * UINT32_MAX means "could not be estimated" and the caller keeps the
- * candidate. */
-static uint32_t zpse_block_proxy(ZpseEncoder *e, const uint8_t *in, uint32_t n,
-                                 uint8_t tid, uint8_t sc,
-                                 const uint8_t *meta_bytes, uint16_t meta_len)
-{
-    uint32_t lens[16];
-    uint8_t *planes[16];
-    uint32_t total;
-    uint32_t s;
-
-    if (zpse_block_planes(e, in, n, tid, sc, meta_bytes, meta_len, planes,
-                          lens) != PSE_OK) {
-        return UINT32_MAX;
-    }
-    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + meta_len +
-            (uint32_t)sc * (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE;
-    for (s = 0; s < sc; s++) {
-        uint32_t c = zpse_segment_proxy_cost(planes[s], lens[s]);
-        if (c == UINT32_MAX)
-            return UINT32_MAX;
-        total += c;
-    }
-    return total;
-}
-
 /* Exact price of one candidate, used to break a prescreen tie: see
  * zpse_block_exact_plane. UINT32_MAX means "could not be priced". */
 static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
@@ -1054,8 +1045,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
         return UINT32_MAX;
     }
     return zpse_block_exact_sum(e, planes, lens, sc, tiles);
-}
-/* Price candidates [from, *ncand_io) exactly -- a few packed tiles each --
+}/* Price candidates [from, *ncand_io) exactly -- a few packed tiles each --
  * and drop the ones more than ~6% worse than the best of that range, the
  * same margin the prescreen prune uses. Anything that cannot be priced is
  * kept, and so is everything when the exact prices tie, so this can only
@@ -1153,7 +1143,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int fails = 0;
     int sample;
     int exact_priced = 0;
-    uint32_t proxy_n = 0u;
     int oi;
     int rc;
 
@@ -1278,49 +1267,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * says nothing about "is one candidate clearly better than another"
      * unless it looked at more than one plane, so the gate is exact about
      * what it knows. */
-    if (sample != 2 && ncand > 1 && n >= 8192u) {
-        uint32_t px[4];
-        uint32_t pmin = UINT32_MAX;
-        int kept = 0;
-        int ci;
-
-        /* Rank on the first 16 KiB only: staging a transform costs about
-         * as much as the estimate itself, and a block's structure (record
-         * width, delta-friendliness) is the same throughout, so a quarter
-         * of it orders the candidates just as well. (8 KiB was measured
-         * too: it is faster, but it mis-ranks a block whose structure only
-         * appears past the first quarter -- a long noise prefix in front
-         * of a compressible body went to RAW -- so the window stays at
-         * 16 KiB.) */
-        uint32_t pn = n < 16384u ? n : 16384u;
-
-        proxy_n = pn;
-
-        for (ci = 0; ci < ncand; ci++) {
-            const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
-            px[ci] = zpse_block_proxy(e, in, pn, tids[ci], scounts[ci], mb,
-                                      meta_lens[ci]);
-            if (px[ci] < pmin)
-                pmin = px[ci];
-        }
-        if (pmin != UINT32_MAX) {
-            uint32_t limit = pmin + (pmin >> 4);
-
-            for (ci = 0; ci < ncand; ci++) {
-                if (px[ci] == UINT32_MAX || px[ci] <= limit) {
-                    tids[kept] = tids[ci];
-                    scounts[kept] = scounts[ci];
-                    meta_lens[kept] = meta_lens[ci];
-                    meta_bufs[kept][0] = meta_bufs[ci][0];
-                    meta_bufs[kept][1] = meta_bufs[ci][1];
-                    idx[kept] = idx[ci];
-                    kept++;
-                }
-            }
-            ncand = kept;
-        }
-    }
-
 #ifndef ZPSE_KEEP_EXACT_SWEEP
     /* ---- Decide from a sample, then encode once ---------------- *
      * DEFAULT; build with -DZPSE_KEEP_EXACT_SWEEP for the old sweep, which
@@ -1352,15 +1298,91 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * price that cannot be computed never wins over one that can, and if
      * nothing can be priced the list is left alone and the sweep runs
      * exactly as it always did. */
-    if (ncand > 1 && n >= 8192u) {
-        uint32_t ex[4];
-        uint32_t pn = proxy_n != 0u ? proxy_n : n;
-        int pick = -1;
+    /* Rank the candidates on the prescreen alone before pricing any of
+     * them, and drop everything more than ~6% worse: a trial is a classify,
+     * a mode search and a pack of every tile, and a candidate the cheap
+     * estimate has already lost by more than that is not worth the exact
+     * probe either. That estimate covers every other tile of the first
+     * 16 KiB -- broad enough that a block whose structure changes inside
+     * the probe window still ranks correctly, where a four-tile exact
+     * sample alone mis-picks by a factor (measured on the fuzz suite's
+     * mixed-region shapes: 400 KB worse without this step). */
+    if (sample != 2 && ncand > 1 && n >= 8192u) {
+        uint32_t px[4];
+        uint32_t pmin = UINT32_MAX;
+        int kept = 0;
         int ci;
+        uint32_t pn = n < 16384u ? n : 16384u;
 
         for (ci = 0; ci < ncand; ci++) {
             const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
 
+            px[ci] = zpse_block_proxy(e, in, pn, tids[ci], scounts[ci], mb,
+                                      meta_lens[ci]);
+            if (px[ci] < pmin) {
+                pmin = px[ci];
+            }
+        }
+        if (pmin != UINT32_MAX) {
+            uint32_t limit = pmin + (pmin >> 4);
+
+            for (ci = 0; ci < ncand; ci++) {
+                if (px[ci] == UINT32_MAX || px[ci] <= limit) {
+                    tids[kept] = tids[ci];
+                    scounts[kept] = scounts[ci];
+                    meta_lens[kept] = meta_lens[ci];
+                    meta_bufs[kept][0] = meta_bufs[ci][0];
+                    meta_bufs[kept][1] = meta_bufs[ci][1];
+                    idx[kept] = idx[ci];
+                    kept++;
+                }
+            }
+            ncand = kept;
+        }
+    }
+
+    if (ncand > 1 && n >= 8192u) {
+        uint32_t ex[4];
+        uint8_t order[4];
+        int nord = 0;
+        /* Price on the first 16 KiB only: staging a transform costs about
+         * as much as the estimate itself, and a block's structure (record
+         * width, delta-friendliness) is the same throughout, so a quarter
+         * of it orders the candidates just as well. (8 KiB was measured
+         * too: it is faster, but it mis-ranks a block whose structure only
+         * appears past the first quarter -- a long noise prefix in front
+         * of a compressible body went to RAW -- so the window stays at
+         * 16 KiB.) */
+        uint32_t pn = n < 16384u ? n : 16384u;
+        int pick = -1;
+        int ci;
+        int k;
+
+        /* The identity is priced first, whatever the attempt order is. Its
+         * shape carries the smallest envelope (one segment, no transform
+         * metadata) so its floor is the block's, and the identity wins every
+         * tie on list index 0: the moment it prices at that floor the winner
+         * is settled and the remaining candidates' staging and probes are
+         * pure cost. That is the constant and all-hit case, where it was
+         * 14.6 us of a 19.2 us encode before. The comparison below keeps the
+         * sweep's own tie-break, so the pricing order cannot change who
+         * wins -- only how much of the list is priced. */
+        for (ci = 0; ci < ncand; ci++) {
+            if (idx[ci] == 0u) {
+                order[nord++] = (uint8_t)ci;
+            }
+        }
+        for (ci = 0; ci < ncand; ci++) {
+            if (idx[ci] != 0u) {
+                order[nord++] = (uint8_t)ci;
+            }
+        }
+
+        for (k = 0; k < nord; k++) {
+            const uint8_t *mb;
+
+            ci = order[k];
+            mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
                                             ZPSE_DECIDE_TILES);
@@ -1371,14 +1393,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 (ex[ci] == ex[pick] && idx[ci] < idx[pick])) {
                 pick = ci;
             }
-            /* The identity priced at its own floor: no candidate can price
-             * below that (see zpse_block_cand_floor), and a tie goes to the
-             * earlier list entry -- the identity's index is 0, so it wins
-             * every tie. The decision is therefore already made, and pricing
-             * the remaining candidates would only pay for their transform
-             * staging: on a constant block, where all-hit tiles are exactly
-             * what this test finds, that staging was most of the encode
-             * (14.6 us of 19.2 for 64 KiB of zeros, measured). */
             if (idx[ci] == 0u && scounts[ci] == 1u &&
                 ex[ci] == zpse_block_cand_floor(pn)) {
                 break;
@@ -1499,7 +1513,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * aborted (noise), pays nothing for it. */
             if (!exact_priced && oi + 1 < ncand && n >= 8192u) {
                 exact_priced = 1;
-                zpse_block_prune_exact(e, in, proxy_n, tids, scounts,
+                zpse_block_prune_exact(e, in,
+                                       n < 16384u ? n : 16384u,
+                                       tids, scounts,
                                        meta_bufs, meta_lens, idx, oi + 1,
                                        &ncand);
                 min_floor = UINT32_MAX;

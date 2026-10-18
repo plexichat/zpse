@@ -948,6 +948,7 @@ static int seg_plane_is_const(const uint8_t *p, uint32_t n)
     return 1;
 }
 
+
 /* Cheap size estimate for a transformed plane, from the prescreen alone.
  *
  * zpse_block_encode ranks transform candidates with it before spending a
@@ -1469,30 +1470,31 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
 #define ZPSE_EST_TILES 8u
 #define ZPSE_EST_MIN_TILES 16u
 
-/* Estimated size of the tile records a plane would take, from a sample of
- * ZPSE_EST_TILES tiles spread evenly over it.
+/* Price of a plane's tile records, from a sample of `tiles` tiles spread
+ * evenly over it.
  *
- * This exists because the two forms are priced in very different ways. The
- * palette form's price is exact and costs one alphabet scan. The tiles'
+ * This exists because the two forms are priced in very different ways. A
+ * dense form's price is exact and costs one pass over the plane. The tiles'
  * price is exact only after every tile has been classified, mode-searched
  * and packed -- which is the whole trial. On 64 KiB of four-bit data the
  * tiles lose by a quarter, and the exact comparison finds that out by
  * writing 190 of them and then replacing all 190 with the palette: measured
- * 110 us of that block's 114 us of encode. The sample is eight tiles
+ * 110 us of that block's 114 us of encode. The sample is a few tiles
  * instead. On a plane whose tiles are alike (what a four-bit plane is) the
- * per-tile average is within a percent, and on a plane where the palette
- * loses the sample costs under 4 us -- noise against a trial.
+ * per-tile average is within a percent, and on a plane where the dense form
+ * loses the sample costs a few microseconds -- noise against a trial.
  *
  * Each sampled tile goes through exactly the pipeline the trial loop runs,
- * INCLUDING the second candidate when it is competitive, so this is the
- * trial's own per-tile size rather than a proxy for it. Returns 0 (the
- * caller then keeps the exact comparison) when a tile cannot be priced. */
-static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
-                             const uint8_t *plane, uint32_t plane_len,
-                             uint32_t tc, uint8_t initial_literal,
-                             int have_avx2, uint32_t *out)
+ * including the second candidate when it is competitive, so this is the
+ * trial's own per-tile size rather than a proxy for it. Returns the price
+ * INCLUDING the 16-byte segment header, or UINT32_MAX when a tile cannot be
+ * priced (the caller then has no estimate). */
+static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
+                               const uint8_t *plane, uint32_t plane_len,
+                               uint32_t tc, unsigned tiles,
+                               uint8_t initial_literal, int have_avx2)
 {
-    uint32_t step = tc / ZPSE_EST_TILES;
+    uint32_t step = tc / tiles;
     uint32_t sum = 0u;
     uint32_t nsum = 0u;
     uint32_t t;
@@ -1527,8 +1529,8 @@ static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
             }
         }
         if (best_k == 0u) {
-            /* The all-hit run above writes these directly: a 2-byte length
-             * prefix and the 8-byte record. */
+            /* The all-hit run writes these directly: a 2-byte length prefix
+             * and the 8-byte record. */
             sum += 10u;
             nsum++;
             continue;
@@ -1584,17 +1586,108 @@ static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
             }
         }
         if (tile_len < 0) {
-            return 0;
+            return UINT32_MAX;
         }
         sum += 2u + (uint32_t)tile_len;
         nsum++;
     }
     if (nsum == 0u) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+           (uint32_t)(((uint64_t)sum * tc + nsum / 2u) / nsum);
+}
+
+/* Estimated size of the tile records a plane would take. See seg_tile_price;
+ * returns 0 when the plane cannot be priced, so the caller keeps the exact
+ * comparison. */
+static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
+                             const uint8_t *plane, uint32_t plane_len,
+                             uint32_t tc, uint8_t initial_literal,
+                             int have_avx2, uint32_t *out)
+{
+    uint32_t p = seg_tile_price(e, lanes, plane, plane_len, tc,
+                                ZPSE_EST_TILES, initial_literal, have_avx2);
+
+    if (p == UINT32_MAX) {
         return 0;
     }
-    *out = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
-           (uint32_t)(((uint64_t)sum * tc + nsum / 2u) / nsum);
+    *out = p;
     return 1;
+}
+
+/* Price of the dense constant form for a plane (SPEC Sec. 6.3): the
+ * segment header plus twelve bytes per 4 KiB chunk, no payload. Returns
+ * UINT32_MAX when the plane is not one byte value end to end, which the
+ * word-wise test settles in one compare for every plane that is not. */
+uint32_t zpse_segment_const_cost(const uint8_t *plane, uint32_t plane_len)
+{
+    uint32_t chunks;
+
+    if (plane == 0 || plane_len == 0u) {
+        return UINT32_MAX;
+    }
+    if (!seg_plane_is_const(plane, plane_len)) {
+        return UINT32_MAX;
+    }
+    chunks = (plane_len + ZPSE_DENSE_MAX_LEN - 1u) / ZPSE_DENSE_MAX_LEN;
+    return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+           chunks * (uint32_t)ZPSE_DENSE_HEADER_SIZE;
+}
+
+/* Smallest size the segment encoder can write this plane in, whole: the
+ * smaller of the tile records (sampled) and the dense constant form, which
+ * is priced exactly because it costs one word-wise pass.
+ *
+ * The constant form is what a per-tile estimate cannot see and what changes
+ * the ranking: a plane of one byte value costs twelve bytes per 4 KiB as a
+ * dense record against ten bytes per 256-byte tile, and the phases of a
+ * transposed plane are constant whenever the source repeats with the
+ * transpose period (alternating bytes, a spike every 256). A 64 KiB block
+ * of two-byte spikes is 1255 bytes transposed and 3126 as tiles, and the
+ * per-tile price had it backwards; alternating 0x00/0xFF is 608 against
+ * 2618.
+ *
+ * The palette form is deliberately NOT priced here. Recognising it costs a
+ * scalar gather of the plane's alphabet (the vector pass can only test
+ * membership), and a plane whose tiles are worse than a palette is one
+ * whose candidate is palettable either way, so the ranking it would change
+ * is a tie the segment encoder resolves exactly on its own.
+ *
+ * The result is what zpse_segment_encode would return for the plane, up to
+ * the tile sample's error, and includes the 16-byte segment header.
+ * UINT32_MAX means the plane could not be priced. */
+uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
+                                 const uint8_t *plane, uint32_t plane_len,
+                                 unsigned tiles)
+{
+    uint32_t tc;
+    uint32_t best;
+    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+
+    if (e == 0 || lanes == 0 || plane == 0 || plane_len == 0u) {
+        return UINT32_MAX;
+    }
+    if (tiles == 0u) {
+        tiles = ZPSE_EST_TILES;
+    }
+    tc = (plane_len + 255u) / 256u;
+    best = seg_tile_price(e, lanes, plane, plane_len, tc, tiles,
+                          plane[0], have_avx2);
+
+    /* A constant plane's sampled tiles are all-hit, so its tile price is
+     * exactly the plane floor (a 2-byte prefix and an 8-byte header per
+     * tile); a plane priced above that cannot be constant and does not need
+     * the scan at all. The test is therefore free on every plane that is
+     * not all-hit, which is most of them. */
+    if (best == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u * tc) {
+        uint32_t d = zpse_segment_const_cost(plane, plane_len);
+
+        if (d != UINT32_MAX && d < best) {
+            best = d;
+        }
+    }
+    return best;
 }
 
 /* Exit helper for the paths that run out of room: the dense form may still
