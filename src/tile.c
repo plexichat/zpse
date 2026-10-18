@@ -454,10 +454,9 @@ static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep)
 #define ZPSE_TILE_HAVE_AVX2 0
 #endif
 
-#if ZPSE_TILE_HAVE_AVX2
-#include <immintrin.h>
-
-/* Index of the lowest set bit. Caller guarantees w != 0. */
+/* Index of the lowest set bit. Caller guarantees w != 0. Plain integer
+ * helper (no intrinsics), so every build has it: the exception walk in
+ * zpse_tile_decode uses it with or without a vector unit. */
 static unsigned tile_ctz32(uint32_t w)
 {
 #if defined(__GNUC__) || defined(__clang__)
@@ -472,6 +471,9 @@ static unsigned tile_ctz32(uint32_t w)
     return n;
 #endif
 }
+
+#if ZPSE_TILE_HAVE_AVX2
+#include <immintrin.h>
 
 /* The families whose prediction is a pure function of the plane bytes.
  * ORDER1/ORDER2 read lane-indexed tables, so they stay scalar. */
@@ -1589,6 +1591,57 @@ static uint16_t tile_res_len(uint8_t res_mode, const ZpseTileClass *cl,
     }
 }
 
+/* SWAR population count, spelled out rather than left to
+ * __builtin_popcount: without -mpopcnt GCC turns the builtin into a call to
+ * __popcountdi2, and this one runs once or twice per tile, in the encoder's
+ * and the pricing path's mode choice. Six instructions inline beat two
+ * calls (measured: the pricing path's extra mode choice cost 12-18% of the
+ * `random` row through those calls alone). */
+static unsigned tile_pop32(uint32_t w)
+{
+    w = w - ((w >> 1) & 0x55555555u);
+    w = (w & 0x33333333u) + ((w >> 2) & 0x33333333u);
+    w = (w + (w >> 4)) & 0x0F0F0F0Fu;
+    return (unsigned)((w * 0x01010101u) >> 24);
+}
+
+/* Payload bytes ZPSE_M_RUNS needs for this mask: one byte per maximal run
+ * of equal bits, where the run sequence starts with a HIT run (an
+ * exception at position 0 is a zero-length hit run, which the sequence
+ * carries as its own byte). A transition count gives that in eight word
+ * operations -- bit p differs from bit p-1 counts as one transition, so
+ * runs == transitions + 1. A run can never span the whole tile here (the
+ * callers settle k == 0 and k == nt before looking at RUNS), so nt <= 256
+ * bounds every run below the 255 split and no extra byte is due. */
+static uint32_t tile_mask_runs_len(const uint32_t words[8], uint16_t nt,
+                                   uint32_t limit)
+{
+    uint32_t runs = 1u;
+    uint32_t prev = 0u;
+    unsigned wi;
+
+    for (wi = 0; wi < 8u; wi++) {
+        uint32_t w = words[wi];
+        uint32_t trans = w ^ ((w << 1) | prev);
+        uint32_t keep = ~0u;
+
+        if ((uint32_t)(wi + 1u) * 32u > (uint32_t)nt) {
+            uint32_t rem = (uint32_t)nt - (uint32_t)wi * 32u;
+
+            keep = (rem >= 32u) ? ~0u : ((1u << rem) - 1u);
+        }
+        runs += (uint32_t)tile_pop32(trans & keep);
+        /* The count only grows: once it reaches the length RUNS has to
+         * beat, this mask cannot win and the rest of the walk is dead
+         * work. A noisy tile bails after a word or two; the clustered
+         * masks the mode is for are the ones that walk all eight. */
+        if (runs >= limit)
+            return limit;
+        prev = w >> 31;
+    }
+    return runs;
+}
+
 /* Pick the cheapest legal (mask_mode, res_mode) pair for a finished
  * classification. Mask and residual payload lengths are independent, so
  * each side is minimised on its own -- no encode-and-measure search.
@@ -1612,6 +1665,22 @@ void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
         best_m = (uint8_t)ZPSE_M_SPARSE_U8;
     } else {
         best_m = (uint8_t)ZPSE_M_RAW_BITMAP;
+    }
+
+    /* RUNS is the one remaining mask mode that can undercut both of those,
+     * and it does so exactly when the exceptions come in few long runs --
+     * a burst of changed bytes rather than scattered noise: one byte per
+     * run against one byte per exception (SPARSE_U8) or the fixed
+     * ceil(nt/8) bitmap. It costs eight popcounts here to rule out and a
+     * byte loop to decode, the same walk SPARSE_U8 already does, so it is
+     * priced unconditionally rather than behind a heuristic. */
+    if (k >= 4u && k != nt) {
+        uint32_t cur = (best_m == (uint8_t)ZPSE_M_SPARSE_U8)
+                           ? (uint32_t)k
+                           : rb;
+
+        if (tile_mask_runs_len(cl->words, nt, cur) < cur)
+            best_m = (uint8_t)ZPSE_M_RUNS;
     }
 
     best_rlen = tile_res_len(0u, cl, nt, k);
@@ -2759,6 +2828,52 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
 
     /* ---- General path: dispatch once, then run the family loop ---- */
     fam = tile_family(th.predictor_id);
+
+    /* ---- CONST with few exceptions ------------------------------ *
+     * A constant prediction does not depend on any byte the tile writes,
+     * so such a tile is that constant everywhere except at its
+     * exceptions: fill it and then write them, instead of walking 256
+     * mask bits. The exceptions are visited in mask order (ascending),
+     * which is the order the residual units were packed in, and each one's
+     * byte is resolved from the constant exactly as the byte loops below
+     * resolve it. Below the crossover this is a memset plus k stores; the
+     * 32-wide kernel it replaces costs a fixed ~150 cycles, so the limit
+     * is where a few cycles per exception overtakes it. */
+    if (fam == TILE_FAM_CONST && (uint32_t)k <= 24u) {
+        uint8_t c = (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
+                        ? constant_C : 0u;
+        uint8_t ent_last[8];
+        uint8_t ent_second[8];
+        uint16_t wi;
+
+        tile_capture_hist(lanes, ent_last, ent_second);
+        memset(out, c, nt);
+        j = 0;
+        for (wi = 0; wi < 8u && j < k; wi++) {
+            uint32_t w = words[wi];
+
+            while (w != 0u) {
+                uint16_t pos =
+                    (uint16_t)((uint32_t)wi * 32u + (uint32_t)tile_ctz32(w));
+                uint8_t e;
+
+                if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+                    e = resid[j];
+                } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+                    e = (uint8_t)(((unsigned)c + (int)deltas[j]) & 0xFFu);
+                } else {
+                    e = zpse_exclusion_inverse(resid[j], c);
+                }
+                out[pos] = e;
+                j++;
+                w &= w - 1u;
+            }
+        }
+        tile_history_fixup(lanes, out, nt, ent_last, ent_second);
+        if (j != k)
+            return PSE_BAD_MASK;
+        return (int)nt;
+    }
 
 #if ZPSE_TILE_HAVE_AVX2
     /* Vectorised reconstruction for the two families whose prediction is

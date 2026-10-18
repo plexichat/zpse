@@ -95,6 +95,87 @@ int main(void) {
         CHECK((f & ZPSE_TILE_FLAG_RESET) != 0, "tile reset bit");
     }
 
+    /* Mask encode -> decode roundtrip, every position-coding mode over
+     * every tile length and four mask shapes (dense, sparse, one run,
+     * alternating). This is the guard for the RUNS encoder's transition
+     * walk: a run sequence that disagrees with the mask at one length is
+     * caught here, and the shapes are chosen so the lengths below the 255
+     * split, exact multiples of 32 and partial last words are all hit. */
+    {
+        static uint32_t w[8], w2[8];
+        static uint8_t pay[600];
+        uint32_t seed = 12345u;
+        int trial;
+        int bad = 0;
+
+        for (trial = 0; trial < 4000; trial++) {
+            uint16_t nt;
+            uint16_t k = 0;
+            unsigned cls;
+            int mode;
+            int i;
+
+            seed = seed * 1664525u + 1013904223u;
+            nt = (uint16_t)(2u + (seed >> 16) % 255u);
+            seed = seed * 1664525u + 1013904223u;
+            cls = (seed >> 8) & 3u;
+            for (i = 0; i < 8; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                w[i] = seed;
+            }
+            if (cls == 1u) {
+                for (i = 0; i < 8; i++)
+                    w[i] &= 0x11111111u;
+            } else if (cls == 2u) {
+                uint32_t a = (seed >> 3) % (uint32_t)nt;
+                uint32_t len = 1u + (seed >> 11) % (uint32_t)nt;
+                uint32_t p;
+
+                for (i = 0; i < 8; i++)
+                    w[i] = 0u;
+                for (p = a; p < (uint32_t)nt && len > 0u; p++, len--)
+                    w[p >> 5] |= 1u << (p & 31u);
+            } else if (cls == 3u) {
+                uint32_t p;
+
+                for (i = 0; i < 8; i++)
+                    w[i] = 0u;
+                for (p = 0; p < (uint32_t)nt; p += 2u)
+                    w[p >> 5] |= 1u << (p & 31u);
+            }
+            {
+                uint32_t rem = (uint32_t)nt & 31u;
+                int wi = (int)(nt >> 5);
+
+                if (rem)
+                    w[wi++] &= (1u << rem) - 1u;
+                else if (wi < 8)
+                    w[wi++] = 0u;
+                for (; wi < 8; wi++)
+                    w[wi] = 0u;
+            }
+            for (i = 0; i < (int)nt; i++)
+                k = (uint16_t)(k + (uint16_t)((w[i >> 5] >> (i & 31)) & 1u));
+            if (k == 0u || k == nt)
+                continue;
+            for (mode = 1; mode <= 4; mode++) {
+                int n = zpse_mask_encode((uint8_t)mode, w, nt, k, pay,
+                                         (uint16_t)sizeof pay, comb);
+
+                if (n < 0)
+                    continue;
+                memset(w2, 0, sizeof w2);
+                if (zpse_mask_decode((uint8_t)mode, pay, (uint16_t)n, nt, k,
+                                     w2, comb) != PSE_OK ||
+                    memcmp(w, w2, sizeof w) != 0) {
+                    bad++;
+                }
+            }
+        }
+        CHECK(bad == 0, "mask encode/decode roundtrip modes 1-4 (%d bad)",
+              bad);
+    }
+
     /* Tile roundtrips: every predictor x residual modes {0,1,2,3,4}. */
     {
         static uint8_t seg[512], rec[1024], dec[256];
@@ -107,8 +188,8 @@ int main(void) {
         for (pid = 0; pid <= 11; pid++) {
             for (rm = 0; rm <= 4; rm++) {
                 int ok = 0, tried = 0;
-                const uint8_t mmodes[] = {1, 2, 5, 0, 6};
-                for (mm = 0; mm < 5; mm++) {
+                const uint8_t mmodes[] = {1, 2, 3, 4, 5, 0, 6};
+                for (mm = 0; mm < 7; mm++) {
                     ZpseLaneState le = {{0},{0},o1,o2v,o2c};
                     ZpseLaneState ld = {{0},{0},o1,o2v,o2c};
                     int wlen, got;

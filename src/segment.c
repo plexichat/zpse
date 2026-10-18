@@ -59,6 +59,13 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     uint16_t t;
     int o1_seed;
     int o2_seed;
+    /* Repeated-record shortcut (see the block in the tile loop). The
+     * previous tile's record, its length and whether it was a reset tile
+     * this path may copy the output of. */
+    const uint8_t *prev_rec = 0;
+    uint16_t prev_rsz = 0u;
+    uint64_t prev_key = 0u;
+    int prev_ok = 0;
 
     if (d == 0 || lanes == 0 || payload == 0 || decoded_out == 0 ||
         decoded_len_out == 0) {
@@ -343,7 +350,63 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
             produced = rprod;
             pos = rpos;
             t = (uint16_t)(rt - 1u);
+            prev_ok = 0;
             continue;
+        }
+
+        /* ---- Repeated record -------------------------------------- *
+         * A reset tile's reconstruction is a function of its record and,
+         * for the STRIDE family, of the eight output bytes before it: a
+         * reset tile starts from the segment literal, and nothing else is
+         * read (CONST's byte, the lane histories and the STRIDE reads are
+         * all the predictors here consult). So a record that repeats the
+         * previous tile's, at a position whose eight preceding output
+         * bytes repeat too, decodes to the same bytes -- and those bytes
+         * are already written, one tile back.
+         *
+         * Copying them is exactly what the tile loop below would have
+         * produced. The previous tile must have been a reset tile as well
+         * (otherwise the bytes one tile back are not what a reset tile
+         * yields), and the lane state is left alone: a full 256-byte
+         * tile's epilogue is the O(8) history update, which for nt == 256
+         * reads only the tile's own output bytes, so the state after the
+         * previous tile IS the state after this one.
+         *
+         * Nothing is skipped that a hostile stream could notice: the bytes
+         * compared are at the same length and already passed validation at
+         * this position, so any rejection they earn has already happened.
+         * ORDER1/ORDER2 are excluded (stateful tables, and predictors this
+         * encoder never writes), as are tiles that are not full length. */
+        if (prev_ok && rsz == prev_rsz &&
+            rsz >= (uint16_t)ZPSE_TILE_HEADER_SIZE) {
+            uint64_t key;
+
+            /* The record's leading word is the filter, exactly as in the
+             * encoder's cache: on a plane that repeats nothing it rejects
+             * the tile in one load and one compare, and the full compare
+             * below only runs for a tile that already matches eight bytes
+             * (on `sawtooth` -- 224 of 256 tiles -- the filter passes and
+             * the compare confirms it). The length test in front of it is
+             * what makes the eight-byte load safe: rsz is a field of the
+             * stream and a record shorter than a header is a legal length
+             * prefix, rejected later by the header parse. */
+            memcpy(&key, rec, sizeof key);
+            if (key == prev_key && nt_exp == (uint16_t)256u &&
+                produced >= 264u &&
+                (rec[0] & ZPSE_TILE_FLAG_RESET) != 0u &&
+                rec[1] != (uint8_t)ZPSE_P_ORDER1 &&
+                rec[1] != (uint8_t)ZPSE_P_ORDER2 &&
+                memcmp(rec, prev_rec, (size_t)rsz) == 0 &&
+                (rec[1] < (uint8_t)ZPSE_P_STRIDE_1 ||
+                 rec[1] > (uint8_t)ZPSE_P_STRIDE_8 ||
+                 memcmp(decoded_out + produced - 8u,
+                        decoded_out + produced - 264u, 8u) == 0)) {
+                memcpy(decoded_out + produced, decoded_out + produced - 256u,
+                       256u);
+                produced += 256u;
+                pos += 2u + (uint32_t)rsz;
+                continue;
+            }
         }
 
         tile_reset = (rec[0] & ZPSE_TILE_FLAG_RESET) != 0 ? 1 : 0;
@@ -385,6 +448,12 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         }
         produced += (uint32_t)got;
         pos += 2u + (uint32_t)rsz;
+        /* The repeated-record test above may look at this tile next, and
+         * only a reset tile's output is the fixed point it assumes. */
+        prev_rec = rec;
+        prev_rsz = rsz;
+        memcpy(&prev_key, rec, sizeof prev_key);
+        prev_ok = (tile_reset != 0) ? 1 : 0;
     }
     if (produced != h.segment_decoded_size) {
         return PSE_BAD_TILE_SIZE;
