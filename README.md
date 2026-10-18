@@ -1392,6 +1392,68 @@ and 1023/1024 each land a whole number of the new blocks plus a tail; a
 differential run of all 16 widths against all 707 lengths from 1 to 8192, built
 both ways, produced the same digest (`7FC8C571E3168DC9`) and the same bytes.
 
+### Classifying a full tile where it lies, and three smaller fixed costs
+
+`tile_classify_avx2` compares a tile against its prediction in a 304-byte
+staging buffer: 16 bytes of head (the entry lane state for LANEHIST, the
+preceding plane bytes for STRIDE), the tile's own 256 bytes, and 32 bytes of
+zero pad so a partial last chunk can be read as one full 32-byte load and
+masked. The copy is there for the two reads a 32-byte vector loop cannot make
+from the input -- the head, and the over-read past a short tile.
+
+A CONST tile needs neither. Its prediction is a single byte, so the comparison
+never reads the head, and a full 256-byte tile is eight whole chunks with no
+tail at all: every load stays inside `[0, nt)`. Such a tile is now compared
+straight from the input, and the exception walk that follows reads its bytes
+there too. Measured on one 256-byte tile with three spikes, 200,000 calls per
+build: **classify 48.1 -> 37.5 ns (-22%)**. The segment's last tile (the only
+short one) and the LANEHIST/STRIDE families keep the staging path, because
+their predictions genuinely read the 16 bytes before the tile; the dense
+classifier takes a tile pointer rather than the buffer, so the same code serves
+both, with the head behind the tile either way.
+
+Two more fixed costs went with it. `tile_history_fixup` derives lane l's last
+position as `l + ((nt-1-l)/8)*8`, which for `nt == 256` is `248 + l` for every
+lane and never reaches below 8 -- so a full tile's epilogue is two 8-byte loads
+and two stores instead of eight divides and compares, on the way in (every
+tile) and on the way out (every decoded tile).
+
+And the transform sweep no longer prices a candidate it can prove the prune
+will drop: the proxy price of each candidate is compared against a 6% margin
+around the running best, and a candidate whose own floor (`zpse_block_floor`,
+arithmetic on its transform and segment shape, no plane touched) already
+exceeds that margin cannot be kept whatever its proxy would have said. The
+identity is priced first, so for a block whose identity plane is already
+near-perfect -- a ramp, a constant, an all-hit plane -- the transpose
+candidate's 16 KiB staging disappears from the encode. The floor is taken over
+the proxy's 16 KiB window, not the block: it is being compared with a proxy
+price, which is what makes it a bound and not an estimate.
+
+Paired binaries, alternating `B N N B` within a round, best of four rounds,
+ten 64 KiB bench rows, every `clen` identical:
+
+| row | encode | decode |
+| --- | --- | --- |
+| sparse | 1.98 -> **2.12 GB/s (+7.1%)** | 4.96 -> **5.52 GB/s (+11.3%)** |
+| sawtooth | 2.47 -> 2.50 | 5.47 -> 5.73 (+4.8%) |
+| strided | 3.74 -> 3.79 | 10.07 -> 10.35 (+2.8%) |
+| incr | 5.42 -> 5.50 | 10.05 -> 10.27 (+2.2%) |
+| alt00FF | 3.61 -> 3.62 | 7.48 -> 7.63 (+2.0%) |
+| sparse2 | 2.87 -> 2.90 | 6.77 -> 6.82 |
+| random, lowentropy, zeros, const5A | within +-3% | within +-3% |
+| total of the ten | 195.4 -> 192.9 us (-1.3%) | 70.8 -> 68.3 us (-3.5%) |
+
+`sparse` is the row the change is aimed at -- its 232 CONST tiles per block are
+the ones that stop copying themselves -- and the decode side lands on every row
+that decodes general tiles at all. No byte moves: the ten `clen` values, all
+768 `tests/clen_corpus` cases (`delta=+0`), and the parity / fuzz / lseed
+digests across the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds are identical to the previous commit, and every
+suite passes under gcc, clang and `tests/run.ps1`. Dropping a candidate before
+its proxy is a bound, not a heuristic: a proxy is never below its floor, so the
+survivor list is the same one the prune would have produced, which is why the
+pinned corpus does not move by a byte.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).

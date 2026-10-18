@@ -1314,9 +1314,41 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         int ci;
         uint32_t pn = n < 16384u ? n : 16384u;
 
+        /* The identity is priced first (see the exact probe below: it is
+         * the first candidate in the list, and a swap of the attempt order
+         * does not move it). Its price is therefore in hand when the others
+         * are reached, and a candidate can then be dropped BEFORE its proxy
+         * runs when its own floor -- the smallest total its transform and
+         * segment shape can possibly produce -- already exceeds the 6%
+         * margin around that price. Such a candidate cannot be kept by the
+         * prune below whatever its proxy would say, because a proxy is never
+         * below its floor, so skipping the computation cannot change the
+         * survivor list, and the pruned price is written as limit + 1 to
+         * record exactly that. The margin only shrinks if a later proxy
+         * undercuts the running minimum, and a candidate dropped under the
+         * wider margin is dropped under the narrower one too, so the order
+         * of the loop stays irrelevant. The floor is arithmetic on the
+         * shape -- no plane is touched -- and this is what removes the
+         * transpose candidate from every block whose identity plane is
+         * already near-perfect (a ramp, a constant, an all-hit plane). */
         for (ci = 0; ci < ncand; ci++) {
             const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
+            uint32_t cfloor;
 
+            if (ci > 0 && pmin != UINT32_MAX) {
+                /* The floor is taken over the PROXY's window, not the block:
+                 * it is compared with a proxy, and a proxy prices `pn`
+                 * bytes. A block-sized floor would be several times the
+                 * window's price and would drop candidates the prune is
+                 * meant to keep. */
+                cfloor = zpse_block_floor(pn, tids[ci], scounts[ci],
+                                          meta_lens[ci]);
+                if (cfloor != UINT32_MAX &&
+                    cfloor > pmin + (pmin >> 4)) {
+                    px[ci] = pmin + (pmin >> 4) + 1u;
+                    continue;
+                }
+            }
             px[ci] = zpse_block_proxy(e, in, pn, tids[ci], scounts[ci], mb,
                                       meta_lens[ci]);
             if (px[ci] < pmin) {
