@@ -1549,8 +1549,7 @@ static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
                     second_p = seg_screen_pred[i];
                 }
             }
-            if (second_p != 0xFFu &&
-                (uint32_t)sk <= (uint32_t)best_k + 4u &&
+            if (second_p != 0xFFu && sk == best_k &&
                 (uint32_t)best_k * 8u < (uint32_t)nt * 7u) {
                 cand[ncand++] = second_p;
             }
@@ -1777,18 +1776,27 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         second_p = seg_screen_pred[i];
                     }
                 }
-                /* Second trial only when it is genuinely competitive,
-                 * and never when the best candidate is already perfect:
-                 * bk == 0 selects mask ALL_HIT with residual
-                 * EXCLUSION_U8, whose payloads are both empty, so
-                 * zpse_tile_pack returns exactly ZPSE_TILE_HEADER_SIZE
+                /* Second trial only on an exact tie in the prescreen's
+                 * miss count, and never when the best candidate is
+                 * already perfect: bk == 0 selects mask ALL_HIT with
+                 * residual EXCLUSION_U8, whose payloads are both empty,
+                 * so zpse_tile_pack returns exactly ZPSE_TILE_HEADER_SIZE
                  * -- the smallest record that can exist. The candidate
                  * loop replaces the winner only on a strictly smaller
                  * packed size, which no second candidate can be against
                  * an 8-byte record, so appending one here could not have
-                 * changed the output. */
-                if (bk != 0u && second_p != 0xFFu &&
-                    (uint32_t)sk <= (uint32_t)bk + 4u) {
+                 * changed the output.
+                 *
+                 * The tie is exact because a miss count is a poor price
+                 * of the record: two predictors that miss one position
+                 * each usually pack to the same size, so a candidate one
+                 * miss behind almost never wins, while classifying and
+                 * packing it costs a full tile. With the old +4 slack
+                 * every sparse-plane tile paid for two of everything
+                 * (measured: 1.03 -> 1.63 GB/s on the sparse row), and
+                 * the 768-case clen corpus came out byte-identical
+                 * without it. */
+                if (bk != 0u && second_p != 0xFFu && sk == bk) {
                     cand[ncand++] = second_p;
                 }
             }

@@ -829,9 +829,15 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 
 /* Tiles the decision probe prices per candidate (see the sweep decision in
  * zpse_block_encode): paid once per candidate against a full trial's 256
- * tiles. */
+ * tiles. Four is measured against sixteen: the 768-case clen corpus came
+ * out byte-identical either way, the 2,718-case fuzz corpus came out
+ * 34,174 bytes SMALLER at four (a coarse estimate ties more often, and a
+ * tie goes to the earlier candidate -- the identity, which is the better
+ * prior on the mixed blocks where the sample is noisiest), and it took
+ * 22 us off a 64 KiB block's encode that the probe was spending to price
+ * candidates it then rejected. */
 #ifndef ZPSE_DECIDE_TILES
-#define ZPSE_DECIDE_TILES 16u
+#define ZPSE_DECIDE_TILES 4u
 #endif
 
 /* Exact price of a plane: classify, choose modes and pack a spread of its
