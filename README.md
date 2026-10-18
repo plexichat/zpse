@@ -1333,6 +1333,65 @@ measuring the candidate second made every change look 3-6% slower than it was
 slower slot. The first version of this change looked like a 4.7% regression
 that way, and like a 21% win with the order alternated.
 
+### Palette widths below four bits: a two-valued plane decodes 1.4 -> 14 GB/s
+
+`residual.c` had a vector path for four-bit palette indices and three-bit
+tiles, and nothing for one or two bits per value, so those widths fell through
+to the generic sixteen-value loop: extract 16*b bits from a shifting window,
+validate, `pshufb`, store. Measured on one 64 KiB plane, that loop costs
+**2.3 cycles per value at one bit and 1.8 at two bits**, against 0.15 at four
+bits -- a 1-bit palette was the slowest shape in the file by 13x, and it is the
+shape a two-valued plane produces (a binary mask, a near-binary sensor, the
+residual of data that is one bit deep).
+
+Both widths now have their own block loop. The order they have to undo is the
+one `residual_get_bits` writes: value `8i + j` lives in bit `j` of payload byte
+`i`, so the eight bit planes of an input byte become eight 16-byte vectors
+(`cmp` against a single-bit constant, then `pal[0] ^ (mask & (pal[0] ^
+pal[1]))`) and the usual 2-, 4- and 8-way unpack ladder interleaves them back
+into byte order: **128 values per 64 operations, 2.3 -> 0.12 cycles per
+value**. Two-bit indices tile a byte four ways instead: three shifts and masks
+give four index vectors, one validation, four lookups, and an 8- then 16-bit
+unpack puts 64 values back in order. Validation stays where it was -- before
+the first store, so a rejected payload writes nothing and the generic loop
+re-decides from the same position and reports at the same byte, which is what
+keeps a hostile record's status identical.
+
+The encode side of the same widths had already fallen behind: the packer's
+vector path covered four-bit palettes only, so one- and two-bit data ran the
+eight-value scalar group loop at 3.7 cycles per value against 2.1. Both widths
+now pack vector-to-vector at the same 2.1.
+
+End to end, `zpse_compress_block` / `zpse_decompress_block` on 64 KiB planes of
+`n` distinct uniformly random byte values (so the dense palette record is the
+form chosen at 2 and at 3-4), paired binaries, best of three rounds, all `clen`
+identical:
+
+| distinct values | width | encode GB/s | decode GB/s |
+| --- | --- | --- | --- |
+| 2 | 1 bit | 1.16 -> 2.6 (2.2x) | 1.45 -> 14.2 (9.8x) |
+| 3 | 2 bits | 0.38 -> 0.55 | 1.85 -> 13.2 (7.1x) |
+| 4 | 2 bits | 1.14 -> 1.97 (1.7x) | 1.80 -> 13.3 (7.4x) |
+| 9, 16 | 4 bits | 1.9, 1.9 (unchanged) | 10-13 (unchanged) |
+| 17 | tiles | 0.48 (unchanged) | 0.9 (unchanged) |
+
+Decode now costs the same at every palette width, which is the point: the
+width is a property of the data, not a tax on it. The ten bench rows are
+unaffected -- `alt00FF` is 608 bytes as tiles, not a palette record, so it
+never enters these loops, and every row stayed within noise in both
+directions.
+
+No byte moves: the ten `clen` values, all 768 `tests/clen_corpus` cases and the
+parity / fuzz / lseed digests across the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds are identical to the previous commit, because
+the packers write the same bits and the decoders only change how fast the same
+bytes are expanded. The scalar build is the reference the vector paths are
+checked against: `tests/test_units.c`'s palette roundtrip now runs m = 2..16 at
+25 lengths from 1 to 1024, chosen so 64/65, 127/128/129, 255/256/259, 511/512
+and 1023/1024 each land a whole number of the new blocks plus a tail; a
+differential run of all 16 widths against all 707 lengths from 1 to 8192, built
+both ways, produced the same digest (`7FC8C571E3168DC9`) and the same bytes.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).

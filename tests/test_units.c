@@ -176,6 +176,93 @@ int main(void) {
               bad);
     }
 
+    /* Palette-bits residual roundtrip at every width. The packer has a
+     * vector path per field width (1 bit: two distinct values, 2 bits:
+     * three or four, 3 bits: five to eight, 4 bits: nine to sixteen), and
+     * each is only taken for whole blocks of 16 or 32 values, so the
+     * lengths below are chosen to land on and past every boundary. The
+     * decoder cross-checks the pad bits, the payload length and every
+     * index against M, so a packer that writes the wrong bit at the wrong
+     * place fails here rather than in a roundtrip of some other shape.
+     * The 64- and 128-value blocks the vector decoders consume at 2 and 1
+     * bits per value make 64/65, 127/128/129 and 255/256/259/511/512/1023/
+     * 1024 the lengths that matter most: each of those is a whole number
+     * of the larger blocks plus a tail, so a ladder that mixes up the
+     * block order or drops the tail fails here. */
+    {
+        static uint8_t exc[1200];
+        static uint8_t back[1200];
+        static uint8_t pay[1200];
+        static const uint16_t lens[] = { 1u, 2u, 3u, 7u, 8u, 15u, 16u, 17u,
+                                         31u, 32u, 33u, 63u, 64u, 65u,
+                                         127u, 128u, 129u, 255u, 256u, 259u,
+                                         300u, 511u, 512u, 1023u, 1024u };
+        int m;
+        int lt;
+        int bad = 0;
+
+        for (m = 2; m <= 16; m++) {
+            for (lt = 0; lt < (int)(sizeof lens / sizeof lens[0]); lt++) {
+                uint16_t k = lens[lt];
+                uint16_t nu;
+                unsigned b;
+                uint32_t want;
+                int n;
+                uint16_t i;
+
+                /* The first positions hold one of each value so the
+                 * palette is the whole alphabet, then a scattered mix. */
+                for (i = 0; i < k; i++) {
+                    exc[i] = (i < (uint16_t)m)
+                                 ? (uint8_t)i
+                                 : (uint8_t)((i * 7u + (i >> 3)) %
+                                            (unsigned)m);
+                }
+                /* The payload's M is the distinct count the packer finds
+                 * (padded to two), not the loop's m: a short k cannot hold
+                 * every value. */
+                {
+                    unsigned present[16];
+                    unsigned nv = 0u;
+                    uint16_t j;
+
+                    for (j = 0; j < k; j++) {
+                        unsigned v = exc[j];
+                        unsigned s;
+
+                        for (s = 0; s < nv; s++) {
+                            if (present[s] == v) {
+                                break;
+                            }
+                        }
+                        if (s == nv) {
+                            present[nv++] = v;
+                        }
+                    }
+                    nu = (uint16_t)((nv < 2u) ? 2u : nv);
+                }
+                b = zpse_ceil_log2_u32((uint32_t)nu);
+                want = 1u + (uint32_t)nu +
+                       (((uint32_t)k * b + 7u) / 8u);
+                n = zpse_residual_encode_hint((uint8_t)ZPSE_R_PALETTE_BITS,
+                                              exc, 0, 0, k, pay,
+                                              (uint16_t)sizeof pay, 0u, 0);
+                if (n != (int)want) {
+                    bad++;
+                    continue;
+                }
+                memset(back, 0xEE, sizeof back);
+                if (zpse_residual_decode((uint8_t)ZPSE_R_PALETTE_BITS, pay,
+                                         (uint16_t)n, k, 0, back,
+                                         back) != PSE_OK ||
+                    memcmp(exc, back, (size_t)k) != 0) {
+                    bad++;
+                }
+            }
+        }
+        CHECK(bad == 0, "palette-bits roundtrip m=2..16 (%d bad)", bad);
+    }
+
     /* Tile roundtrips: every predictor x residual modes {0,1,2,3,4}. */
     {
         static uint8_t seg[512], rec[1024], dec[256];
