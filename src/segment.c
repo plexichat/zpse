@@ -11,6 +11,7 @@
 #include "zpse/types.h"
 #include "zpse/vector.h"
 
+
 /* STRIDE period of an all-hit STRIDE record (predictor ids 5..8). Mirrors
  * tile_stride_of in src/tile.c, spelled out here so a change to the enum
  * ordering cannot silently change what a batched run fills. */
@@ -889,6 +890,289 @@ static int seg_all_hit_cheap_ok(const uint8_t *a, uint16_t nt, uint8_t pred,
     (void)have_avx2;
 #endif
     return seg_all_hit_cheap_scalar(a, nt, pred, literal, seg_pos, plane);
+}
+
+/* ------------------------------------------------------------------ *
+ * Generalised run continuation: "does this tile keep the run's predictor,
+ * with k == 0?" proved for any of the nine screened predictors, not just
+ * the three uniform cases seg_all_hit_cheap_ok covers.
+ *
+ * A run may continue only when the prescreen would name the same predictor
+ * with k == 0, because that is what the general path would otherwise have
+ * chosen. The prescreen's winner is the FIRST predictor of
+ * seg_screen_pred[] with the strictly smallest miss count, so keeping the
+ * run needs two facts:
+ *
+ *   (a) the run's predictor misses nothing in this tile, and
+ *   (b) every predictor BEFORE it in scan order misses somewhere.
+ *
+ * (a) is one prediction pass over the tile (a shifted compare for the
+ * families below), (b) is a witness search: one miss each is enough, and
+ * the search stops as soon as it finds one. `(b)` is bounded to the first
+ * SEG_WITNESS positions per predictor, so this can never cost more than a
+ * fixed few dozen cycles; when a witness is not found that fast the caller
+ * asks the prescreen, which stays authoritative. Being wrong towards "ask"
+ * costs time, never bytes.
+ *
+ * This exists because the periodic rows (`incr`'s delta plane, `strided`,
+ * `sparse2`) are runs of tiles that are NOT one repeated byte, so the
+ * uniform proof above could not settle them and every tile paid a full
+ * nine-predictor prescreen: measured 255 prescreens per 64 KiB block on
+ * `strided`, 36k of that block's 74k cycles.
+ * ------------------------------------------------------------------ */
+
+/* Positions the witness search may look at before giving up on ruling a
+ * predictor out. Eight is one chunk: a predictor that hits a whole chunk of
+ * a tile the run's predictor hits exactly is one whose count is worth the
+ * exact prescreen. */
+#define SEG_WITNESS 8u
+
+static uint32_t seg_stride_of(uint8_t pred)
+{
+    switch (pred) {
+    case ZPSE_P_STRIDE_1:
+        return 1u;
+    case ZPSE_P_STRIDE_2:
+        return 2u;
+    case ZPSE_P_STRIDE_3:
+        return 3u;
+    case ZPSE_P_STRIDE_4:
+        return 4u;
+    default:
+        return 8u;
+    }
+}
+
+/* 1 iff `pred` misses at least one of the first `limit` positions. The lane
+ * histories start at `literal` because every tile the encoder writes is
+ * classified with the reset bit set (SPEC Sec. 7). Returns 0 both for "no
+ * miss in the window" and for a predictor this cannot reason about, which
+ * the caller treats the same way: ask the prescreen. */
+static int seg_pred_miss_within(const uint8_t *a, uint16_t nt, uint8_t pred,
+                                uint8_t literal, uint32_t seg_pos,
+                                const uint8_t *plane, uint16_t limit)
+{
+    uint8_t last[8];
+    uint8_t second[8];
+    uint16_t n = (nt < limit) ? nt : limit;
+    uint16_t p;
+    unsigned l;
+
+    for (l = 0; l < 8u; l++) {
+        last[l] = literal;
+        second[l] = literal;
+    }
+    for (p = 0; p < n; p++) {
+        unsigned lane = (unsigned)p & 7u;
+        uint8_t x = a[p];
+        uint32_t d = seg_pos + (uint32_t)p;
+        uint8_t xhat;
+
+        switch (pred) {
+        case (uint8_t)ZPSE_P_CONST_ZERO:
+            xhat = 0u;
+            break;
+        case (uint8_t)ZPSE_P_LANE_PREVIOUS:
+            xhat = last[lane];
+            break;
+        case (uint8_t)ZPSE_P_LANE_DELTA:
+            xhat = (uint8_t)((2u * (unsigned)last[lane] -
+                              (unsigned)second[lane]) & 0xFFu);
+            break;
+        case (uint8_t)ZPSE_P_LANE_AVERAGE:
+            xhat = (uint8_t)(((unsigned)last[lane] +
+                              (unsigned)second[lane] + 1u) >> 1);
+            break;
+        case (uint8_t)ZPSE_P_STRIDE_1:
+        case (uint8_t)ZPSE_P_STRIDE_2:
+        case (uint8_t)ZPSE_P_STRIDE_3:
+        case (uint8_t)ZPSE_P_STRIDE_4:
+        case (uint8_t)ZPSE_P_STRIDE_8: {
+            uint32_t s = seg_stride_of(pred);
+
+            xhat = (d < s) ? literal : plane[d - s];
+            break;
+        }
+        default:
+            return 0;
+        }
+        if (x != xhat) {
+            return 1;
+        }
+        second[lane] = last[lane];
+        last[lane] = x;
+    }
+    return 0;
+}
+
+#if ZPSE_PS_HAVE_AVX2
+/* One prediction pass over the tile for the shifted families, checking that
+ * every position matches. The staging buffer is the tile.c one (16 head
+ * bytes + tile + 32 pad), so each prediction is a constant-offset load:
+ *
+ *   LANE_DELTA    2*stg[8+p] - stg[p]      (head = the entry lane state)
+ *   LANE_AVERAGE  avg(stg[8+p], stg[p])
+ *   STRIDE_s      stg[16+p-s]              (head = real plane bytes)
+ *
+ * The first chunk blends its first 8 / 16 lanes with `literal`, which is
+ * what the lane state holds at p < 8 / p < 16 after the per-tile reset.
+ * STRIDE needs real bytes before the tile, so the caller only takes this
+ * path when seg_pos >= 16. */
+static ZPSE_PS_AVX2 int seg_shift_all_hit_avx2(const uint8_t *a, uint16_t nt,
+                                               uint8_t pred, uint8_t literal,
+                                               uint32_t seg_pos,
+                                               const uint8_t *plane)
+{
+    uint8_t stg[ZPSE_PS_STG_LEN];
+    const __m256i initv = _mm256_set1_epi8((char)literal);
+    const __m256i idx = _mm256_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                                         16,17,18,19,20,21,22,23,24,25,26,27,
+                                         28,29,30,31);
+    const __m256i m8 = _mm256_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,
+                                        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                                        0,0,0,0,0,0,0,0);
+    const __m256i m16 = _mm256_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,
+                                         -1,-1,-1,-1,-1,-1,-1,-1,
+                                         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+    uint32_t s = (pred == (uint8_t)ZPSE_P_LANE_DELTA ||
+                  pred == (uint8_t)ZPSE_P_LANE_AVERAGE)
+                     ? 0u
+                     : seg_stride_of(pred);
+    uint32_t p = 0u;
+
+    if (s != 0u) {
+        /* Real preceding plane bytes (the caller guarantees seg_pos >= 16). */
+        memcpy(stg, plane + seg_pos - 16u, 16);
+    } else {
+        memset(stg, literal, 16);
+    }
+    memcpy(stg + 16, a, nt);
+    memset(stg + 16 + nt, 0, 32);
+
+    while (p + 32u <= (uint32_t)nt) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + 16u + p));
+        __m256i pv;
+
+        if (s != 0u) {
+            pv = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + 16u + p - s));
+        } else {
+            __m256i h8 = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + 8u + p));
+            __m256i h16 = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + p));
+
+            if (p == 0u) {
+                h8 = _mm256_blendv_epi8(h8, initv, m8);
+                h16 = _mm256_blendv_epi8(h16, initv, m16);
+            }
+            if (pred == (uint8_t)ZPSE_P_LANE_DELTA) {
+                pv = _mm256_sub_epi8(_mm256_add_epi8(h8, h8), h16);
+            } else {
+                pv = _mm256_avg_epu8(h8, h16);
+            }
+        }
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, pv)) != -1) {
+            return 0;
+        }
+        p += 32u;
+    }
+    if (p < (uint32_t)nt) {
+        uint32_t rem = (uint32_t)nt - p;
+        __m256i valid = _mm256_cmpgt_epi8(_mm256_set1_epi8((char)rem), idx);
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(stg + 16u + p));
+        __m256i pv;
+
+        if (s != 0u) {
+            pv = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + 16u + p - s));
+        } else {
+            __m256i h8 = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + 8u + p));
+            __m256i h16 = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(stg + p));
+
+            pv = (pred == (uint8_t)ZPSE_P_LANE_DELTA)
+                     ? _mm256_sub_epi8(_mm256_add_epi8(h8, h8), h16)
+                     : _mm256_avg_epu8(h8, h16);
+        }
+        /* Valid lanes must all match; the padding lanes are masked out. */
+        if ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, pv)) |
+             ~_mm256_movemask_epi8(valid)) != -1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif /* ZPSE_PS_HAVE_AVX2 */
+
+/* 1 iff predictor `pred` predicts every position of this tile (k == 0).
+ * The three uniform cases reuse the specialised routine above; the rest are
+ * a shifted compare, or the scalar walk when AVX2 is unavailable or the
+ * tile starts a segment (where STRIDE's preceding bytes are not all
+ * available). */
+static int seg_pred_all_hit(const uint8_t *a, uint16_t nt, uint8_t pred,
+                            uint8_t literal, uint32_t seg_pos,
+                            const uint8_t *plane, int have_avx2)
+{
+    if (pred == (uint8_t)ZPSE_P_CONST_ZERO ||
+        pred == (uint8_t)ZPSE_P_LANE_PREVIOUS ||
+        pred == (uint8_t)ZPSE_P_STRIDE_1) {
+        return seg_all_hit_cheap_ok(a, nt, pred, literal, seg_pos, plane,
+                                    have_avx2);
+    }
+#if ZPSE_PS_HAVE_AVX2
+    if (have_avx2 && (seg_pos >= 16u ||
+                      (pred != (uint8_t)ZPSE_P_STRIDE_2 &&
+                       pred != (uint8_t)ZPSE_P_STRIDE_3 &&
+                       pred != (uint8_t)ZPSE_P_STRIDE_4 &&
+                       pred != (uint8_t)ZPSE_P_STRIDE_8))) {
+        return seg_shift_all_hit_avx2(a, nt, pred, literal, seg_pos, plane);
+    }
+#else
+    (void)have_avx2;
+#endif
+    return !seg_pred_miss_within(a, nt, pred, literal, seg_pos, plane, nt);
+}
+
+/* 1 iff the run may continue with `pred` on this tile: the prescreen would
+ * still name it, with k == 0. See the block comment above. */
+static int seg_run_stays(const uint8_t *a, uint16_t nt, uint8_t pred,
+                         uint8_t literal, uint32_t seg_pos,
+                         const uint8_t *plane, int have_avx2)
+{
+    int i;
+
+    /* The uniform three carry their own ordering proof. */
+    if (pred == (uint8_t)ZPSE_P_CONST_ZERO ||
+        pred == (uint8_t)ZPSE_P_LANE_PREVIOUS ||
+        pred == (uint8_t)ZPSE_P_STRIDE_1) {
+        return seg_all_hit_cheap_ok(a, nt, pred, literal, seg_pos, plane,
+                                    have_avx2);
+    }
+    for (i = 0; i < 9; i++) {
+        if (seg_screen_pred[i] == pred) {
+            break;
+        }
+    }
+    if (i == 9) {
+        return 0; /* not a screened predictor: let the prescreen decide */
+    }
+    /* Every predictor earlier in the scan must miss somewhere, or it would
+     * win the tile instead (first minimum). One miss each is a proof. */
+    {
+        int j;
+
+        for (j = 0; j < i; j++) {
+            if (!seg_pred_miss_within(a, nt, seg_screen_pred[j], literal,
+                                      seg_pos, plane, SEG_WITNESS)) {
+                return 0;
+            }
+        }
+    }
+    return seg_pred_all_hit(a, nt, pred, literal, seg_pos, plane, have_avx2);
 }
 
 /* Emit the minimal all-hit tile record: mask ALL_HIT and residual
@@ -1981,9 +2265,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                  * have concluded, since no other predictor can have a
                  * lower (negative) count and the scan order cannot
                  * promote one that precedes it. */
-                if (!seg_all_hit_cheap_ok(plane + nsseg_pos, nnt, pred,
-                                          initial_literal, nsseg_pos, plane,
-                                          have_avx2)) {
+                if (!seg_run_stays(plane + nsseg_pos, nnt, pred,
+                                   initial_literal, nsseg_pos, plane,
+                                   have_avx2)) {
                     uint16_t nbk;
                     uint32_t i;
 

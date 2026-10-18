@@ -1081,6 +1081,56 @@ The remaining headroom is the per-exception walk itself (about 25 cycles per
 exception, including a data-dependent branch per mask word) and the transform
 staging, which is a full pass over the block that no pricing change removes.
 
+### Run continuation without the prescreen
+
+The all-hit run path (a stretch of tiles whose prediction is exact, 10 bytes
+per tile) could only prove a tile that is *one repeated byte*. Every periodic
+plane therefore failed that proof on every tile and paid the full
+nine-predictor prescreen per 256 bytes: `strided` (period-4) paid 365 of them
+per 64 KiB block, and `incr`'s DELTA8 plane — constant except for its first
+tile, where the seed lands — paid 111.
+
+A run may continue with the same predictor when two things are proved:
+
+1. that predictor misses nothing in this tile, and
+2. every predictor *before* it in the prescreen's scan order misses somewhere
+   — otherwise one of them would win the tile instead, because the winner is
+   the first predictor with the strictly smallest count.
+
+(1) is one prediction pass over the tile (a shifted compare for LANE_DELTA,
+LANE_AVERAGE and STRIDE_2/3/4/8). (2) needs one witness each, and a witness
+is usually the first few bytes, so the search is bounded to eight positions
+per predictor; when it cannot find one that fast the prescreen is asked,
+exactly as before. Being wrong towards "ask" costs time, never bytes: the
+outcome is the same predictor the prescreen would name, with the same
+k == 0, so the record written is identical.
+
+That claim is verified rather than asserted: every parity, fuzz and lseed
+digest is unchanged (`FC79D5E365BA40E1`, `DFB9C23F6259A686`, `LSEED`), and
+all 768 ratio-corpus sizes are unchanged, in the default, `-DZPSE_FORCE_SCALAR`
+and `-DZPSE_FORCE_TRIAL_SWAP` builds.
+
+Deterministic effect, from counters rather than a clock — prescreen calls per
+64 KiB block:
+
+| row | before | after |
+| --- | --- | --- |
+| strided | 365 | **111** |
+| incr | 111 | **80** |
+| sparse2 | 110 | 108 |
+| zeros, const5A, alt00FF | 7, 7, 30 | unchanged (already all-hit or uniform) |
+| sparse, sawtooth, lowentropy, random | 365, 365, 145, 152 | unchanged (no run tiles) |
+
+Each of those prescreens is a nine-predictor pass over 256 bytes replaced by
+a one-predictor pass plus a couple of witness scans, so the work removed is
+real on the rows that take it. The measured wall-clock effect could not be
+pinned down better than that on this session's machine, which was at 90-100%
+external load throughout: process CPU time (30,000 blocks, min of three runs)
+gave `strided` -10%, `sparse` -3%, and `incr`/`sparse2` within ±7% with the
+sign flipping between runs — inside the noise band of a saturated host. The
+one window measured on an idle machine showed `strided` 3.12 -> 3.57 GB/s and
+`incr` 5.22 -> 5.41 GB/s.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
