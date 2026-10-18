@@ -308,6 +308,143 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
         return i;
     }
 
+    /* One bit per value. The width means m == 2 (ceil_log2(m) == 1 has no
+     * other solution), so every index is 0 or 1 and there is nothing to
+     * validate: the value is pal[0] or pal[1] selected by one bit. Sixteen
+     * payload bytes hold 128 values, bit j of byte i being value 8i + j,
+     * so the eight bit planes have to be interleaved back into byte order
+     * -- the 2-, 4- and 8-way unpack ladder below. That is 64 operations
+     * for 128 values where the generic loop spends ~2.3 cycles per value
+     * (measured: 1-bit palettes were 13x slower to expand than 4-bit ones).
+     * Values are consumed in blocks of 128, always from value 0, so what
+     * this consumes is a prefix and the loop below finishes the rest. */
+    if (b == 1u) {
+        const __m128i p0v = _mm_set1_epi8((char)pal[0]);
+        const __m128i xv = _mm_set1_epi8((char)(pal[0] ^ pal[1]));
+        const __m128i b0 = _mm_set1_epi8(1);
+        const __m128i b1 = _mm_set1_epi8(2);
+        const __m128i b2 = _mm_set1_epi8(4);
+        const __m128i b3 = _mm_set1_epi8(8);
+        const __m128i b4 = _mm_set1_epi8(16);
+        const __m128i b5 = _mm_set1_epi8(32);
+        const __m128i b6 = _mm_set1_epi8(64);
+        const __m128i b7 = _mm_set1_epi8((char)0x80);
+
+        while ((uint32_t)i + 128u <= (uint32_t)k) {
+            __m128i x = _mm_loadu_si128(
+                (const __m128i *)(const void *)(src + ((uint32_t)i >> 3u)));
+            __m128i v0, v1, v2, v3, v4, v5, v6, v7;
+            __m128i u0, u1, u2, u3, u4, u5, u6, u7;
+            __m128i w0, w1, w2, w3, w4, w5, w6, w7;
+            uint8_t *o = exc_out + i;
+
+            /* One bit plane per vector: 0xFF where the bit is set, then
+             * pal[0] ^ (mask & (pal[0] ^ pal[1])). */
+            v0 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b0), b0), xv));
+            v1 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b1), b1), xv));
+            v2 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b2), b2), xv));
+            v3 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b3), b3), xv));
+            v4 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b4), b4), xv));
+            v5 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b5), b5), xv));
+            v6 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b6), b6), xv));
+            v7 = _mm_xor_si128(p0v, _mm_and_si128(_mm_cmpeq_epi8(
+                     _mm_and_si128(x, b7), b7), xv));
+
+            /* Interleave bytes (2-way), then 16-bit units (4-way), then
+             * 32-bit units (8-way): each level's lo/hi halves split the
+             * input bytes in half, so the final eight vectors are input
+             * bytes 0-1, 2-3, 4-5, ... in ascending value order. */
+            u0 = _mm_unpacklo_epi8(v0, v1);
+            u1 = _mm_unpackhi_epi8(v0, v1);
+            u2 = _mm_unpacklo_epi8(v2, v3);
+            u3 = _mm_unpackhi_epi8(v2, v3);
+            u4 = _mm_unpacklo_epi8(v4, v5);
+            u5 = _mm_unpackhi_epi8(v4, v5);
+            u6 = _mm_unpacklo_epi8(v6, v7);
+            u7 = _mm_unpackhi_epi8(v6, v7);
+            w0 = _mm_unpacklo_epi16(u0, u2);
+            w1 = _mm_unpackhi_epi16(u0, u2);
+            w2 = _mm_unpacklo_epi16(u1, u3);
+            w3 = _mm_unpackhi_epi16(u1, u3);
+            w4 = _mm_unpacklo_epi16(u4, u6);
+            w5 = _mm_unpackhi_epi16(u4, u6);
+            w6 = _mm_unpacklo_epi16(u5, u7);
+            w7 = _mm_unpackhi_epi16(u5, u7);
+            _mm_storeu_si128((__m128i *)(void *)(o),
+                             _mm_unpacklo_epi32(w0, w4));
+            _mm_storeu_si128((__m128i *)(void *)(o + 16u),
+                             _mm_unpackhi_epi32(w0, w4));
+            _mm_storeu_si128((__m128i *)(void *)(o + 32u),
+                             _mm_unpacklo_epi32(w1, w5));
+            _mm_storeu_si128((__m128i *)(void *)(o + 48u),
+                             _mm_unpackhi_epi32(w1, w5));
+            _mm_storeu_si128((__m128i *)(void *)(o + 64u),
+                             _mm_unpacklo_epi32(w2, w6));
+            _mm_storeu_si128((__m128i *)(void *)(o + 80u),
+                             _mm_unpackhi_epi32(w2, w6));
+            _mm_storeu_si128((__m128i *)(void *)(o + 96u),
+                             _mm_unpacklo_epi32(w3, w7));
+            _mm_storeu_si128((__m128i *)(void *)(o + 112u),
+                             _mm_unpackhi_epi32(w3, w7));
+            i = (uint16_t)(i + 128u);
+        }
+        return i;
+    }
+
+    /* Two-bit indices tile a byte four ways: three or four distinct values,
+     * which is what a near-binary plane or a two-tone mask residual comes
+     * out as. One 16-byte load carries 64 values, extracted as four index
+     * vectors (values 4i + 0..3) and interleaved back into value order by
+     * an 8- and then a 16-bit unpack. Every index is validated before the
+     * first store, so a rejected payload leaves nothing written here and
+     * the loop below re-decides from value i, exactly as it would have. */
+    if (b == 2u) {
+        const __m128i low2 = _mm_set1_epi8(0x03);
+
+        while ((uint32_t)i + 64u <= (uint32_t)k) {
+            __m128i x = _mm_loadu_si128(
+                (const __m128i *)(const void *)(src + ((uint32_t)i >> 2u)));
+            __m128i i0 = _mm_and_si128(x, low2);
+            __m128i i1 = _mm_and_si128(_mm_srli_epi16(x, 2), low2);
+            __m128i i2 = _mm_and_si128(_mm_srli_epi16(x, 4), low2);
+            __m128i i3 = _mm_and_si128(_mm_srli_epi16(x, 6), low2);
+            __m128i a0, a1, a2, a3, u0, u1, u2, u3;
+
+            if (_mm_movemask_epi8(_mm_or_si128(
+                    _mm_or_si128(_mm_cmpgt_epi8(i0, limv),
+                                 _mm_cmpgt_epi8(i1, limv)),
+                    _mm_or_si128(_mm_cmpgt_epi8(i2, limv),
+                                 _mm_cmpgt_epi8(i3, limv)))) != 0) {
+                break;
+            }
+            a0 = _mm_shuffle_epi8(palv, i0);
+            a1 = _mm_shuffle_epi8(palv, i1);
+            a2 = _mm_shuffle_epi8(palv, i2);
+            a3 = _mm_shuffle_epi8(palv, i3);
+            u0 = _mm_unpacklo_epi8(a0, a1);
+            u1 = _mm_unpackhi_epi8(a0, a1);
+            u2 = _mm_unpacklo_epi8(a2, a3);
+            u3 = _mm_unpackhi_epi8(a2, a3);
+            _mm_storeu_si128((__m128i *)(void *)(exc_out + i),
+                             _mm_unpacklo_epi16(u0, u2));
+            _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 16u),
+                             _mm_unpackhi_epi16(u0, u2));
+            _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 32u),
+                             _mm_unpacklo_epi16(u1, u3));
+            _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 48u),
+                             _mm_unpackhi_epi16(u1, u3));
+            i = (uint16_t)(i + 64u);
+        }
+        return i;
+    }
+
     /* Four-bit indices tile a byte exactly, so one 16-byte load carries 32
      * values: the load, the two index extractions, the two shuffles and the
      * two interleaved stores cover 32 values where the loop below covers
@@ -727,6 +864,99 @@ static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_simd(
     return i;
 }
 
+/* One bit per value (b == 1, i.e. a palette of exactly two entries).
+ *
+ * The bit for value i is "index i is 1", and with m == 2 and two distinct
+ * entries that is exactly "the value is pal[1]": index 0 is the other
+ * entry. So sixteen compares become sixteen bits through movemask -- the
+ * byte-lane sign bits in lane order are the ascending values -- and
+ * thirty-two values become one 32-bit store. The scalar loop this replaces
+ * builds the same byte eight values at a time with a table lookup and
+ * seven shifts each (~1.2 cycles a value); this is ~0.25.
+ *
+ * Only taken when nu == 2. A single-entry palette is padded to m == 2 with
+ * pal[1] == 0, and a value of 0 would then compare equal to the padding
+ * and be packed as index 1 instead of 0. */
+static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_bits(
+    const uint8_t *exc_in, uint16_t k, uint8_t p1, uint8_t *dst)
+{
+    const __m128i onev = _mm_set1_epi8((char)p1);
+    uint16_t i = 0u;
+
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+        return 0u;
+    }
+    while ((uint32_t)i + 32u <= (uint32_t)k) {
+        __m128i a = _mm_loadu_si128(
+            (const __m128i *)(const void *)(exc_in + (uint32_t)i));
+        __m128i b = _mm_loadu_si128(
+            (const __m128i *)(const void *)(exc_in + (uint32_t)i + 16u));
+        uint32_t m =
+            (uint32_t)(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(a, onev)) |
+            ((uint32_t)(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(b, onev))
+             << 16u);
+
+        /* Thirty-two 1-bit fields are four whole bytes, at value >> 3. */
+        zpse_store_u32le(dst + ((uint32_t)i >> 3u), m);
+        i = (uint16_t)((uint32_t)i + 32u);
+    }
+    return i;
+}
+
+/* Two bits per value (b == 2, a palette of three or four entries).
+ *
+ * Sixteen values are four packed bytes, and the merge is the 4-bit one from
+ * residual_encode_mode2_simd followed by one horizontal add: maddubs with
+ * (1, 4, 16, 64) puts values 4j and 4j+1 in the low nibble of a 16-bit lane
+ * and values 4j+2 and 4j+3 in its high nibble, so lane pairs add up to
+ * whole bytes, which is what hadd gives. Indices never exceed 3, so neither
+ * maddubs (signed saturation) nor packus can clamp anything.
+ *
+ * The index lookup is the same two-shuffle select as the 4-bit path, so it
+ * needs the same precondition: every residual below 32, which the caller
+ * checks in `wide`. */
+static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_b2(
+    const uint8_t *idx_of, const uint8_t *exc_in, uint16_t k, uint8_t *dst)
+{
+    uint8_t lo[16];
+    uint8_t hi[16];
+    __m128i tlo;
+    __m128i thi;
+    __m128i nibv;
+    __m128i mult;
+    uint16_t i = 0u;
+
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+        return 0u;
+    }
+    memcpy(lo, idx_of, sizeof lo);
+    memcpy(hi, idx_of + 16, sizeof hi);
+    tlo = _mm_loadu_si128((const __m128i *)(const void *)lo);
+    thi = _mm_loadu_si128((const __m128i *)(const void *)hi);
+    nibv = _mm_set1_epi8((char)0x0F);
+    mult = _mm_setr_epi8(1, 4, 16, 64, 1, 4, 16, 64,
+                         1, 4, 16, 64, 1, 4, 16, 64);
+
+    while ((uint32_t)i + 16u <= (uint32_t)k) {
+        __m128i v = _mm_loadu_si128(
+            (const __m128i *)(const void *)(exc_in + (uint32_t)i));
+        __m128i sel = _mm_cmpgt_epi8(v, nibv);
+        __m128i l = _mm_shuffle_epi8(tlo, v);
+        __m128i h = _mm_shuffle_epi8(thi, v);
+        __m128i idx = _mm_or_si128(_mm_and_si128(sel, h),
+                                   _mm_andnot_si128(sel, l));
+        __m128i pair = _mm_maddubs_epi16(idx, mult);
+        __m128i bytev = _mm_hadd_epi16(pair, pair);
+        __m128i packedv = _mm_packus_epi16(bytev, bytev);
+
+        /* Four bytes per sixteen values, at value >> 2. */
+        zpse_store_u32le(dst + ((uint32_t)i >> 2u),
+                         (uint32_t)_mm_cvtsi128_si32(packedv));
+        i = (uint16_t)((uint32_t)i + 16u);
+    }
+    return i;
+}
+
 #endif /* ZPSE_RES_HAVE_SSSE3 */
 
 /* `nu_hint`/`seen_hint` are the classification's distinct-residual count
@@ -898,6 +1128,12 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
         if (b == 4u && wide == 0) {
             gi = residual_encode_mode2_simd(idx_of, exc_in, k, dst);
             g = (uint32_t)gi >> 1u;
+        } else if (b == 1u && nu == 2u) {
+            gi = residual_encode_mode2_bits(exc_in, k, pal[1], dst);
+            g = (uint32_t)gi >> 3u;
+        } else if (b == 2u && wide == 0) {
+            gi = residual_encode_mode2_b2(idx_of, exc_in, k, dst);
+            g = (uint32_t)gi >> 2u;
         }
 #endif
 
