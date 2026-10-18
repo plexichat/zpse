@@ -222,7 +222,7 @@ absolute numbers move with the machine and the clock, the shape does not.
 | zeros | 0.004 | 248 | 14.5 | 21.2 |
 | incr | 0.040 | 2619 | 5.2 | 10.2 |
 | random | 1.000 | 65568 | 3.1 | 20.6 |
-| sparse | 0.060 | 3962 | 1.5 | 5.3 |
+| sparse | 0.060 | 3962 | 1.9 | 5.3 |
 | strided | 0.040 | 2625 | 3.1 | 10.3 |
 | const5A | 0.004 | 248 | 14.3 | 21.7 |
 | alt00FF | 0.009 | 608 | 3.5 | 7.6 |
@@ -1293,6 +1293,45 @@ sizes in `tests/test_sizes.c` are the new ones, so the guard now sits at the
 improved baseline (`grew=0 shrank=0 delta=+0`). The wire format is unchanged:
 RUNS was already a legal mask mode that the decoder has always implemented,
 and the encoder simply never wrote it.
+
+### Not pricing nine predictors when the first one is nearly exact
+
+`sparse` was the slowest encode row and the reason was the prescreen: nine
+predictors evaluated over every 256-byte tile, ~30 ns of a tile that costs
+~170 ns to encode. Its tiles are 250-odd zeroes plus a spike or two, and for
+that shape there is a shortcut. CONST_ZERO's miss count *is* the number of
+nonzero bytes, so one 256-byte compare pass answers it, and CONST_ZERO is
+the first predictor in `seg_screen_pred[]` -- it wins every tie, so the other
+eight can only beat it by a strictly lower count. At three misses or fewer
+the record they would buy differs by a byte or two (a predictor that also
+predicts one spike), so the tile is classified against CONST_ZERO alone.
+
+Armed by the previous tile, not measured on every tile: `zero_cheap` says the
+last tile's prescreen found CONST_ZERO within the threshold, so a plane whose
+tiles are mostly not near-zero -- random, alternation, a ramp -- never pays
+for the zero count at all. Measured unconditionally it cost 1.5-5.8% on every
+row it does not help; armed, those rows stay inside the host's +-3.5% band
+and `sparse` keeps the whole win.
+
+| row | before | after |
+| --- | --- | --- |
+| sparse | 42.7 us | **33.6 us (-21%)** |
+| the other nine rows | -- | within +-3.5%, both directions |
+| total of the ten | 206.8 us | 196.2 us (-5.1%) |
+
+Ratio is untouched: all 768 pinned corpus sizes come out byte-identical
+(`delta=+0`), as does the parity corpus. The fuzz corpus's digest moves, which
+is the honest statement of what the shortcut is -- a heuristic, not a proof:
+on a tile where CONST_ZERO is within three misses of the best, the encoder
+now takes CONST_ZERO. The fuzz frames are random blocks that no pinned size
+covers; the 768 structured cases are the guard that says nothing grew.
+
+One methodological note, because it cost a wasted round: the two binaries must
+alternate within a round (`B N N B`), not run as `B N` each time. Always
+measuring the candidate second made every change look 3-6% slower than it was
+-- the host drifts over a session, and the second binary always got the later,
+slower slot. The first version of this change looked like a 4.7% regression
+that way, and like a 21% win with the order alternated.
 
 ## License
 

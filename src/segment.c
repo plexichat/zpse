@@ -825,6 +825,110 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
     seg_prescreen_counts(a, nt, seg_base, seg_pos, init, ks);
 }
 
+/* Miss count of CONST_ZERO over the whole tile: the number of nonzero
+ * bytes. Same result from both forms, so the encoder's decision cannot
+ * depend on which one a build has. */
+static uint16_t seg_zero_misses_scalar(const uint8_t *a, uint16_t nt)
+{
+    uint32_t p;
+    uint32_t hits = 0u;
+
+    for (p = 0; p < (uint32_t)nt; p++) {
+        hits += (a[p] == 0u) ? 1u : 0u;
+    }
+    return (uint16_t)((uint32_t)nt - hits);
+}
+
+#if ZPSE_PS_HAVE_AVX2
+static ZPSE_PS_AVX2 uint16_t seg_zero_misses_avx2(const uint8_t *a, uint16_t nt)
+{
+    const __m256i zero = _mm256_setzero_si256();
+    __m256i acc = zero;
+    uint64_t lane[4];
+    uint32_t hits = 0u;
+    uint32_t p = 0u;
+    int j;
+
+    while (p + 32u <= (uint32_t)nt) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(a + p));
+
+        /* A byte-lane counter: -1 for a zero byte, added in. */
+        acc = _mm256_sub_epi8(acc, _mm256_cmpeq_epi8(v, zero));
+        p += 32u;
+    }
+    _mm256_storeu_si256((__m256i *)(void *)lane, _mm256_sad_epu8(acc, zero));
+    for (j = 0; j < 4; j++) {
+        hits += (uint32_t)lane[j];
+    }
+    for (; p < (uint32_t)nt; p++) {
+        hits += (a[p] == 0u) ? 1u : 0u;
+    }
+    return (uint16_t)((uint32_t)nt - hits);
+}
+#endif
+
+/* Prescreen with one shortcut: a tile that CONST_ZERO misses at most
+ * ZPSE_PS_ZERO_ONLY positions is classified against CONST_ZERO alone.
+ *
+ * CONST_ZERO is the first predictor in seg_screen_pred[], so it wins every
+ * tie -- which means the other eight can only beat it by a strictly lower
+ * miss count. At <= 3 misses a lower count is at most 2, and the record it
+ * would buy differs by a couple of bytes, while the nine-predictor pass is
+ * ~30 ns of a tile that costs ~170 ns to encode (`sparse`: nearly every
+ * tile is zeroes plus a spike or two, and that row is the slowest encoder).
+ * This is a heuristic, not a proof, so it is gated by the pinned ratio
+ * corpus: no case may grow (`tests/test_sizes.c` fails if one does).
+ *
+ * The shortcut is armed by the PREVIOUS tile rather than measured on every
+ * tile: `*zero_cheap` says the last tile's prescreen found CONST_ZERO
+ * within the threshold, so a plane whose tiles are mostly not near-zero
+ * (random, alternation, a ramp) never pays for the zero count at all --
+ * measuring unconditionally cost 1.5-5.8% on every row the shortcut does
+ * not help. A plane of near-zero tiles pays one 256-byte compare instead
+ * of nine, which is the 16% `sparse` gains.
+ *
+ * Both forms of the miss count return the same value, and the arming
+ * decision comes from ks[0], so a -DZPSE_FORCE_SCALAR build makes exactly
+ * the same decisions as the vector one (the parity digests depend on it). */
+#define ZPSE_PS_ZERO_ONLY 3u
+
+static void seg_prescreen_tile(const uint8_t *a, uint16_t nt,
+                               const uint8_t *seg_base, uint32_t seg_pos,
+                               uint8_t init, int have_avx2, int *zero_cheap,
+                               uint16_t ks[12])
+{
+    if (*zero_cheap) {
+        uint16_t zk;
+
+#if ZPSE_PS_HAVE_AVX2
+        zk = have_avx2 ? seg_zero_misses_avx2(a, nt)
+                       : seg_zero_misses_scalar(a, nt);
+#else
+        (void)have_avx2;
+        zk = seg_zero_misses_scalar(a, nt);
+#endif
+        if (zk <= (uint16_t)ZPSE_PS_ZERO_ONLY) {
+            int i;
+
+            /* The shape seg_prescreen would have returned for a winner of
+             * CONST_ZERO with no runner-up: every other entry unreachable,
+             * so the candidate loop below takes CONST_ZERO alone. */
+            for (i = 0; i < 12; i++) {
+                ks[i] = 0xFFFFu;
+            }
+            ks[0] = zk;
+            return;
+        }
+        *zero_cheap = 0;
+    }
+    seg_prescreen(a, nt, seg_base, seg_pos, init, have_avx2, ks);
+    /* Free whenever it was paid for anyway: ks[0] is CONST_ZERO's count in
+     * the same units the shortcut compares. */
+    *zero_cheap = (ks[seg_screen_pred[0]] <= (uint16_t)ZPSE_PS_ZERO_ONLY)
+                      ? 1 : 0;
+}
+
 /* ------------------------------------------------------------------ *
  * Cheap run continuation for the all-hit batch in zpse_segment_encode.
  *
@@ -2086,6 +2190,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     uint32_t pal_len;
     uint32_t pal_m;
     int pal_try;
+    /* Whether the previous tile armed the CONST_ZERO shortcut in
+     * seg_prescreen_tile (see there). */
+    int zero_cheap = 0;
     uint32_t pal_bits[8];
     /* Repeat cache: source tile offset in the plane, where its record
      * starts in the payload, its length (with the u16 prefix) and its tile
@@ -2289,8 +2396,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             rep_slot = (int)slot;
         }
 
-        seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
-                      have_avx2, ks);
+        seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
+                           have_avx2, &zero_cheap, ks);
         best_p = 0;
         {
             uint16_t bk = ks[seg_screen_pred[0]];
