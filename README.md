@@ -1131,6 +1131,71 @@ sign flipping between runs — inside the noise band of a saturated host. The
 one window measured on an idle machine showed `strided` 3.12 -> 3.57 GB/s and
 `incr` 5.22 -> 5.41 GB/s.
 
+### Encoding a repeated tile without encoding it
+
+The per-tile pipeline above is what a `sawtooth` block spends almost all of
+its time in, and the numbers said it could not be shrunk much further per
+tile. It can be skipped instead. A tile record is a pure function of four
+things: the tile's bytes, the eight plane bytes before it, its length and the
+segment literal. Every tile the encoder writes is classified with
+`tile_reset == 1` (nothing carries across a boundary), and `seg_pos` reaches
+nothing else -- the STRIDE predictors are its only readers, and they read
+exactly those eight bytes. So when a tile repeats an earlier one with the same
+head, its record *is* that record, and copying it writes byte for byte what
+the pipeline would have produced.
+
+That matters for periodic data. A `sawtooth` block's winning candidate puts
+one period of the block in each 256-byte tile, so 224 of its 256 tiles are
+repeats of an earlier tile; `sparse`'s period is 97 tiles, which a 128-entry
+table catches part of.
+
+The cache is 128 direct-mapped slots (12 bytes each, zeroed once per segment,
+under 3 cycles per tile on a 4 KiB plane), keyed by four words of the tile
+(offsets 0, 64, 128, 192, XORed into one product) and confirmed by a 264-byte
+compare of the tile and its head before anything is copied. The key is only a
+hint, so a collision costs a compare and can never change a byte. Tile 0 is
+neither a source nor a target: its STRIDE reads fall back to the literal, and
+it has no head. The palette form is the one piece of tile-loop state a copy
+would step over, so a copy is only taken when that form could not have been
+priced at this tile either (already priced, or a record too small to trigger
+it) and never while it is still in play.
+
+Deterministic effect, from counters per 64 KiB block:
+
+| row | prescreens | classifies | tiles served from the cache |
+| --- | --- | --- | --- |
+| sawtooth | 365 -> **141** | 256 -> **32** | **224 / 256** |
+| sparse | 365 -> 341 | 256 -> 232 | 24 / 256 |
+| incr, strided, alt00FF, sparse2 | 111, 111, 30, 110 | 1, 1, 2, 16 | 0 (no general-path tiles) |
+| zeros, const5A | 7, 7 | 0, 0 | 0 |
+| random, lowentropy | 152, 145 | 28, 21 | 0 (nothing repeats) |
+
+Thread-cycle time per 64 KiB block (min of 3, alternating build order, on the
+host this was developed on -- see the note at the end of "Run continuation"
+about its load): `sawtooth` 97.7 -> 34.3 us (2.85x, and every post-change
+measurement was below every pre-change one, 24.5-39.9 against 88.6-109.7),
+`sparse` 73.8 -> 63.1 us. The rows the table above says do no new work moved
+by less than the noise band of this host (zeroes, `const5A` and `strided`
+within it in both directions); the hash they pay is about eight cycles a tile,
+and the only other new cost is the per-segment clear.
+
+Two rejected variants, both measured:
+
+- **Keying on the tile's first eight bytes.** `sparse` lost 25%, because its
+tiles are mostly zeroes and every one of them hashed to the same slot, so the
+confirming compare ran all the way to the spike that distinguishes them. The
+four-word key costs two more loads and removes that. The first version of the
+model also predicted 150 `sawtooth` hits keyed on the leading bytes where the
+truth is 0: those were false keys, caught by the compare (a ramp repeats its
+opening bytes every 16 tiles, its whole tile every 256).
+- **16 slots.** `sparse` kept 8 of its 24 hits; 128 slots is one per 2 KiB of
+the 64 KiB block, which is what a block of fixed-size records needs.
+
+Every digest is unchanged (`FC79D5E365BA40E1`, `DFB9C23F6259A686`, `LSEED`)
+and all 768 ratio-corpus sizes are unchanged, in the default,
+`-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds -- the shortcut
+cannot change what the encoder means to write, only how it gets there.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
