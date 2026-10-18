@@ -43,6 +43,139 @@ static uint64_t seg_load_u64(const uint8_t *p)
     return w;
 }
 
+/* ---- Inline constant-tile decode ------------------------------------ *
+ *
+ * The dominant record on a sparse plane -- and the shape of every tile of
+ * a constant one -- is a full 256-byte tile whose prediction is a single
+ * byte: CONST_ZERO or TILE_CONSTANT, any mask mode, any residual mode but
+ * SIGNED_DELTA (whose payload decodes through a private helper in
+ * tile.c), at most 24 exceptions. Such a tile is a memset, one store per
+ * exception in mask order, and the two-load history epilogue. The general
+ * entry point reaches exactly that code, but only after it has parsed the
+ * header a second time, re-derived the sizes, taken the family dispatch,
+ * tested the all-hit case and checked for AVX2, and its frame carries the
+ * delta buffer and every family's loop.
+ *
+ * So the tile loop takes this shape itself, using the same public pieces
+ * in the same order (validate, mask decode, residual decode, fill,
+ * scatter, history epilogue). The constants are the ones tile.c uses:
+ * the exception stream is resolved as RAW_ACTUAL or exclusion exactly as
+ * its CONST loop does, and a full tile's history fixup is the two 8-byte
+ * loads below.
+ *
+ * Everything the general path would do about anything else is left to it:
+ * a record of any other shape, and every record this path cannot prove
+ * well formed, returns 0 and the loop calls zpse_tile_decode, which
+ * re-validates and reports the identical status. A record this path does
+ * accept gets the identical bytes and the identical status. */
+static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
+                                 uint16_t rsz, uint8_t literal,
+                                 int tile_reset, uint8_t *out,
+                                 uint8_t *comb)
+{
+    struct ZpseTileHeader th;
+    uint16_t nt = 0;
+    uint16_t k = 0;
+    uint8_t mask_mode;
+    uint8_t res_mode;
+    uint8_t c = 0;
+    const uint8_t *mp;
+    uint32_t words[8];
+    uint8_t resid[256];
+    uint16_t j = 0;
+    unsigned wi;
+    int rc;
+
+    if (rsz < (uint16_t)ZPSE_TILE_HEADER_SIZE) {
+        return 0;
+    }
+    if (rec[1] != (uint8_t)ZPSE_P_CONST_ZERO &&
+        rec[1] != (uint8_t)ZPSE_P_TILE_CONSTANT) {
+        return 0;
+    }
+    mask_mode = zpse_tile_mask_mode(rec[0]);
+    res_mode = zpse_tile_res_mode(rec[0]);
+    if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+        return 0;
+    }
+    zpse_tile_read_header(rec, &th);
+    rc = zpse_tile_validate(&th, (uint16_t)ZPSE_MAX_TILE_LEN, rsz, &nt, &k);
+    if (rc != PSE_OK) {
+        return 0;
+    }
+    /* record_need == record_len, the identity zpse_tile_decode insists on
+     * after its own validate call -- without it a record whose payload
+     * sizes do not add up would be decoded here instead of rejected. */
+    if ((uint32_t)rsz != (uint32_t)ZPSE_TILE_HEADER_SIZE +
+            (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? 1u : 0u) +
+            (uint32_t)th.mask_payload_size +
+            (uint32_t)th.residual_payload_size) {
+        return 0;
+    }
+    /* Above this the general path's 32-wide kernel is the faster one, and
+     * below it the memset plus k stores is; see the CONST crossover in
+     * src/tile.c. */
+    if (k > 24u) {
+        return 0;
+    }
+
+    mp = rec + ZPSE_TILE_HEADER_SIZE;
+    if (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
+        c = mp[0];
+        mp++;
+    }
+    /* CONST reads no table, so a reset is the histories only (this is what
+     * zpse_lane_reset_for does for predictor 0 and 9). */
+    if (tile_reset != 0) {
+        zpse_lane_reset_hist(lanes, literal);
+    }
+
+    zpse_mask_clear(words);
+    rc = zpse_mask_decode(mask_mode, mp, th.mask_payload_size, nt, k, words,
+                          comb);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    if (k > 0u || th.residual_payload_size > 0u) {
+        rc = zpse_residual_decode(res_mode, mp + th.mask_payload_size,
+                                  th.residual_payload_size, k, 0, resid,
+                                  resid);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+    }
+
+    /* A constant prediction is that constant everywhere but its
+     * exceptions, so fill and then write them, in mask order -- the order
+     * the residual units were packed in. */
+    memset(out, c, nt);
+    for (wi = 0; wi < 8u && j < k; wi++) {
+        uint32_t w = words[wi];
+
+        while (w != 0u) {
+            uint16_t p = (uint16_t)((uint32_t)wi * 32u + zpse_ctz32(w));
+            uint8_t e;
+
+            if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+                e = resid[j];
+            } else {
+                e = zpse_exclusion_inverse(resid[j], c);
+            }
+            out[p] = e;
+            j++;
+            w &= w - 1u;
+        }
+    }
+    /* Full tile: lane l ends on position 248 + l, second history 8 back.
+     * This is tile_history_fixup's nt == 256 branch. */
+    memcpy(lanes->last, out + 248u, sizeof lanes->last);
+    memcpy(lanes->second_last, out + 240u, sizeof lanes->second_last);
+    if (j != k) {
+        return PSE_BAD_MASK;
+    }
+    return 1;
+}
+
 int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                         const uint8_t *payload, uint32_t payload_len,
                         uint8_t *decoded_out, uint32_t decoded_cap,
@@ -410,6 +543,33 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         }
 
         tile_reset = (rec[0] & ZPSE_TILE_FLAG_RESET) != 0 ? 1 : 0;
+        /* ---- Inline constant tile -------------------------------- *
+         * See seg_tile_decode_const. 1 means the tile is written and only
+         * the cursors are left; 0 means the record is some other shape (or
+         * one this path will not vouch for) and the general entry point
+         * below handles it; negative is a status it would have returned
+         * at the same point. The lazy ORDER table seeding further down
+         * only applies to predictors 3 and 4, which this path never
+         * takes, so running it first would be dead work -- it is reached
+         * exactly when the record is not a constant one. */
+        if (nt_exp == (uint16_t)ZPSE_MAX_TILE_LEN) {
+            int fc = seg_tile_decode_const(lanes, rec, rsz, literal,
+                                           tile_reset, decoded_out + produced,
+                                           d->comb);
+
+            if (fc < 0) {
+                return fc;
+            }
+            if (fc > 0) {
+                produced += (uint32_t)ZPSE_MAX_TILE_LEN;
+                pos += 2u + (uint32_t)rsz;
+                prev_rec = rec;
+                prev_rsz = rsz;
+                memcpy(&prev_key, rec, sizeof prev_key);
+                prev_ok = (tile_reset != 0) ? 1 : 0;
+                continue;
+            }
+        }
         /* Lazy table seeding (see the reset above). A tile that reads a
          * table it does not reset reads this segment's initial state for
          * it, so seed exactly that table here, once. rec[1] is the
@@ -1379,6 +1539,36 @@ void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
 }
 
 
+#if ZPSE_PS_HAVE_AVX2
+/* 1 iff p[0..n) is one byte value. 32 bytes per step: the word loop below
+ * is a load, a compare and a branch per eight bytes, which is 8192
+ * iterations (2 us) on a 64 KiB plane -- more than the tile loop the
+ * constant shortcut exists to skip. This is byte-for-byte the same test. */
+static ZPSE_PS_AVX2 int seg_plane_is_const_avx2(const uint8_t *p, uint32_t n)
+{
+    const __m256i v = _mm256_set1_epi8((char)p[0]);
+    const __m256i eq = _mm256_cmpeq_epi8(v, v);
+    uint32_t i = 0u;
+
+    while (i + 32u <= n) {
+        __m256i q = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(p + i));
+
+        if ((uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(q, v)) !=
+            (uint32_t)_mm256_movemask_epi8(eq)) {
+            return 0;
+        }
+        i += 32u;
+    }
+    for (; i < n; i++) {
+        if (p[i] != p[0]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif /* ZPSE_PS_HAVE_AVX2 */
+
 /* 1 iff p[0..n) is one byte value, which is the only plane shape the dense
  * form pays on (see seg_dense_emit). Word-wise with an early exit, so a
  * plane that is not constant costs one compare. */
@@ -1387,6 +1577,11 @@ static int seg_plane_is_const(const uint8_t *p, uint32_t n)
     uint64_t splat = UINT64_C(0x0101010101010101) * (uint64_t)p[0];
     uint32_t i = 0u;
 
+#if ZPSE_PS_HAVE_AVX2
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        return seg_plane_is_const_avx2(p, n);
+    }
+#endif
     while (i + 8u <= n) {
         uint64_t w;
 
@@ -2252,6 +2447,50 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * the end when the dense form is smaller. */
     dense_v = plane[0];
     dense_ok = 1;
+
+    /* ---- A constant plane: the dense form, without writing a tile ----- *
+     * The tile loop below writes ten bytes for every 256-byte tile of a
+     * one-value plane (each is an all-hit record) and then `seg_dense_emit`
+     * rewrites the payload as the dense form, which is twelve bytes per
+     * 4 KiB. Both are cheap per tile, but 256 of them is ~5.5k cycles of
+     * work whose only purpose is to be thrown away -- 20% of what a
+     * constant block's encode costs after its CRC.
+     *
+     * So ask first: if the plane is one byte value and the dense form is
+     * strictly smaller than the all-hit tiles it would replace (the same
+     * comparison `seg_dense_emit` would make at the end of the loop), write
+     * it now and return. The bytes and the statuses are exactly the ones
+     * the loop would have produced: the tile size of a constant plane is
+     * 10 bytes per tile by construction, `seg_dense_emit` is handed that
+     * projected size as its `pos` so it applies its own `dtotal < pos`
+     * rule, and the shortcut is skipped whenever the byte budget or the
+     * payload capacity could have stopped the loop short of 16 + 10*tc
+     * (where the old path could still have reached a different ending).
+     *
+     * `flat_paid` is set the way the loop's first all-hit tile sets it: a
+     * 10-byte record for a 256-byte tile pays for itself, and the probe's
+     * state spans the segments of one trial, so leaving it clear here could
+     * arm the abort for a later segment that is not constant. */
+    {
+        uint32_t chunks = (plane_len + ZPSE_DENSE_MAX_LEN - 1u) /
+                          ZPSE_DENSE_MAX_LEN;
+        uint32_t dtotal = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+                          chunks * (uint32_t)ZPSE_DENSE_HEADER_SIZE;
+        uint32_t tiles = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u * tc;
+
+        if (dtotal < tiles && dtotal <= payload_cap &&
+            (byte_budget == 0u || dtotal <= byte_budget) &&
+            seg_plane_is_const(plane, plane_len)) {
+            int dn = seg_dense_emit(&h, payload_out, plane, plane_len,
+                                    initial_literal, tiles, byte_budget,
+                                    payload_cap, 1);
+
+            if (dn != 0) {
+                e->flat_paid = 1u;
+                return dn;
+            }
+        }
+    }
 
     /* Dense palette form (SPEC Sec. 6.3): a plane whose alphabet is small
      * is cheaper as one palette stream than as one predictor search per

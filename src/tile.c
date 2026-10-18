@@ -66,17 +66,22 @@ static int tile_family(uint8_t predictor_id)
     }
 }
 
-static int tile_parse_header(const uint8_t *record, uint32_t record_len,
-                             struct ZpseTileHeader *th)
+void zpse_tile_read_header(const uint8_t *record, struct ZpseTileHeader *th)
 {
-    if (record_len < (uint32_t)ZPSE_TILE_HEADER_SIZE)
-        return PSE_BAD_TILE_SIZE;
     th->tile_flags = record[0];
     th->predictor_id = record[1];
     th->tile_length_minus_1 = record[2];
     th->exception_count = record[3];
     th->mask_payload_size = zpse_load_u16le(record + 4);
     th->residual_payload_size = zpse_load_u16le(record + 6);
+}
+
+static int tile_parse_header(const uint8_t *record, uint32_t record_len,
+                             struct ZpseTileHeader *th)
+{
+    if (record_len < (uint32_t)ZPSE_TILE_HEADER_SIZE)
+        return PSE_BAD_TILE_SIZE;
+    zpse_tile_read_header(record, th);
     return PSE_OK;
 }
 

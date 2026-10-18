@@ -1,0 +1,73 @@
+# Everything the tree can prove about itself, on every push:
+#
+#  - every suite in tests/run.sh (roundtrip, combinadic, hostile, units,
+#    stride3, dense, decide, sizes) under gcc and clang;
+#  - the parity/fuzz/lseed corpora in three builds each (runtime SIMD
+#    dispatch, -DZPSE_FORCE_SCALAR, -DZPSE_FORCE_TRIAL_SWAP), whose digests
+#    must match -- that is what proves the SIMD kernels are bit-exact
+#    replacements and that the encoder's candidate order cannot change a
+#    compressed byte;
+#  - a -Wpedantic -Werror build of the amalgamation, and a build of every
+#    translation unit on its own (the headers are meant to stand alone);
+#  - the same suites on Windows under MSYS2, since the codec has
+#    MSVC/MinGW-specific paths.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: linux / ${{ matrix.cc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compiler version
+        run: ${{ matrix.cc }} --version | head -1
+      - name: Suites + SIMD/scalar/order parity
+        run: CC=${{ matrix.cc }} bash tests/run.sh
+      - name: Strict amalgamation build
+        run: ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude src/zpse_unity.c -c -o /tmp/zpse.o
+      - name: Every translation unit builds alone
+        run: |
+          set -e
+          for f in src/*.c; do
+            case "$f" in
+            */zpse_unity.c) continue ;;
+            esac
+            ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Iinclude -c "$f" -o "/tmp/$(basename "$f").o"
+          done
+      - name: Frame CLI round-trips a corpus
+        run: |
+          set -e
+          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/zpse_cli.c src/zpse_unity.c -o /tmp/zpse_cli
+          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/corpus_write.c -o /tmp/corpus_write
+          mkdir -p /tmp/corpus
+          /tmp/corpus_write /tmp/corpus 1048576
+          for f in /tmp/corpus/*.bin; do
+            /tmp/zpse_cli c "$f" /tmp/out.zpse
+            /tmp/zpse_cli d /tmp/out.zpse /tmp/out.bin
+            cmp "$f" /tmp/out.bin
+          done
+
+  windows:
+    name: windows / msys2 gcc
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+      - name: Suites + SIMD/scalar/order parity
+        run: CC=gcc bash tests/run.sh

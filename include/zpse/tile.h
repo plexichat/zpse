@@ -29,6 +29,12 @@ static inline uint8_t zpse_tile_flags_make(uint8_t mask_mode,
                      (reset ? ZPSE_TILE_FLAG_RESET : 0u));
 }
 
+/* Read the eight record header bytes into `th`. No validation: this is
+ * the field load a caller does before it can ask zpse_tile_validate any
+ * question, exposed so a caller that already holds the record (the
+ * segment decoder's inline fast path) does not have to repeat it. */
+void zpse_tile_read_header(const uint8_t *record, struct ZpseTileHeader *th);
+
 /* Validate a tile header against (nt_expected, bytes_remaining).
  * Derives K, checks the size equation and reserved bits/modes. */
 int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,

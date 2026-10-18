@@ -438,6 +438,12 @@ ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_xor32, _mm256_xor_si256, ZPSE_XOR8)
  * ------------------------------------------------------------------ */
 #define ZPSE_T16_ROW128(p_) ((const __m128i *)(const void *)(p_))
 
+/* Groups of sixteen rows the forward transpose collects before writing
+ * them out; see zpse_t16x16_forward_blocked. */
+#ifndef ZPSE_T16_GROUPS
+#define ZPSE_T16_GROUPS 32u
+#endif
+
 /* One 16-row group: 16 rows of 16 bytes become 16 columns of 16 bytes.
  * The sixteen bases are passed once for the whole plane and the group's
  * byte offset separately, so a caller that walks many groups builds no
@@ -527,6 +533,90 @@ static ZPSE_T_AVX2 void zpse_t16x16_avx2(const uint8_t *const in[16],
 }
 
 #undef ZPSE_T16_ROW128
+
+/* Forward-transpose a whole plane: 16 rows of 16 bytes per group, `rows`
+ * rows per segment, written out in blocks rather than one group at a time.
+ *
+ * The sixteen planes of a transposed block sit `rows` bytes apart, and for
+ * a 64 KiB block that is exactly 4096 -- 64 cache lines, i.e. the same L1
+ * set for every plane. One group at a time therefore leaves sixteen lines
+ * of ONE set live while each of them receives 16 bytes, so every store
+ * re-allocates a line the previous group just evicted: measured 0.49
+ * cycles/byte, against 0.15 for the same kernel writing planes 1 KiB apart
+ * (which is what a 16 KiB segment does, so the block sweep's proxy never
+ * saw the problem and only a winning trial paid for it -- 8 us of a 64 KiB
+ * transpose, a third of `alt00FF`'s whole encode).
+ *
+ * Transposing ZPSE_T16_GROUPS groups into a buffer first -- one plane per
+ * contiguous run, stride 16 * GROUPS, so the buffer itself has no conflicts
+ * -- and then copying whole runs into the planes turns four partial-line
+ * stores per line into one full-line store: 0.20 cycles/byte, the same
+ * number a padded layout gives. 32 groups (an 8 KiB buffer, 512 bytes per
+ * plane) measured best; 16 leaves 0.22 and 64 overruns L1 at 0.31. Eight
+ * planes per copy pass, so no more than the L1 associativity of them share
+ * a set. The buffer lives here rather than in zpse_transform_forward so
+ * that the identity, delta and xor paths never pay for its frame.
+ *
+ * Same bytes, written in a different order. */
+static ZPSE_T_AVX2 void zpse_t16x16_forward_blocked(const uint8_t *const in[16],
+                                                   uint8_t *const out[16],
+                                                   uint32_t rows)
+{
+    uint8_t col[16u * 16u * ZPSE_T16_GROUPS];
+    uint8_t *cseg[16];
+    uint32_t q;
+    uint32_t g;
+    unsigned t;
+
+    for (t = 0; t < 16u; t++) {
+        cseg[t] = col + (size_t)t * 16u * (size_t)ZPSE_T16_GROUPS;
+    }
+    for (g = 0; (g + ZPSE_T16_GROUPS) * 16u <= rows; g += ZPSE_T16_GROUPS) {
+        for (q = 0; q < ZPSE_T16_GROUPS; q++) {
+            zpse_t16x16_avx2(in, (g + q) * 256u, cseg, q * 16u);
+        }
+        for (t = 0; t < 16u; t += 8u) {
+            unsigned u;
+
+            for (u = 0; u < 8u; u++) {
+                memcpy(out[t + u] + (size_t)g * 16u, cseg[t + u],
+                       (size_t)16u * (size_t)ZPSE_T16_GROUPS);
+            }
+        }
+    }
+    for (; (g + 1u) * 16u <= rows; g++) {
+        zpse_t16x16_avx2(in, g * 256u, out, g * 16u);
+    }
+}
+
+/* Width-1 delta/xor staging, 32 bytes per step. No dependency chain to
+ * satisfy: for j >= 1 the stored byte is an op between the stream and
+ * itself shifted by one, so the two loads are independent of the store.
+ * Only dst[0] touches the seed. 16 bytes per step measured 2 us of a
+ * 12 us `incr` encode, where this pass runs once per DELTA8 trial. */
+static ZPSE_T_AVX2 void zpse_prefix_stream_avx2(uint8_t *dst, const uint8_t *in,
+                                                uint32_t n, uint8_t seed,
+                                                int delta)
+{
+    uint32_t q = 1u;
+
+    dst[0] = delta ? (uint8_t)(in[0] - seed) : (uint8_t)(in[0] ^ seed);
+    for (; (size_t)q + 32u <= (size_t)n; q += 32u) {
+        __m256i cur = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(in + q));
+        __m256i prv = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(in + q - 1u));
+
+        _mm256_storeu_si256((__m256i *)(void *)(dst + q),
+                            delta ? _mm256_sub_epi8(cur, prv)
+                                  : _mm256_xor_si256(cur, prv));
+    }
+    for (; q < n; q++) {
+        dst[q] = delta ? (uint8_t)(in[q] - in[q - 1u])
+                       : (uint8_t)(in[q] ^ in[q - 1u]);
+    }
+}
+
 #endif /* ZPSE_T_HAVE_AVX2 */
 
 static int zpse_valid_count(uint8_t v)
@@ -729,6 +819,12 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
             memcpy(dst, in, (size_t)n);
             return PSE_OK;
         }
+#if ZPSE_T_HAVE_AVX2
+        if (zpse_t_avx2()) {
+            zpse_prefix_stream_avx2(dst, in, n, meta->seeds[0], delta);
+            return PSE_OK;
+        }
+#endif /* ZPSE_T_HAVE_AVX2 */
         /* Only dst[0] touches the seed. For j >= 1 the chain's
          * `prev = raw` makes the stored value in[j] - in[j-1] (or the
          * xor), i.e. a bytewise op between the stream and itself shifted
@@ -778,9 +874,8 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
                 tin[t] = in + (size_t)t * 16u;
                 tout[t] = segs[t];
             }
-            for (g = 0; (g + 1u) * 16u <= rows; g++) {
-                zpse_t16x16_avx2(tin, g * 256u, tout, g * 16u);
-            }
+            zpse_t16x16_forward_blocked(tin, tout, rows);
+            g = rows / 16u;
         } else
 #endif /* ZPSE_T_HAVE_AVX2 */
         for (g = 0; (g + 1u) * 16u <= rows; g++) {

@@ -129,6 +129,13 @@ powershell -NoProfile -File tests/run.ps1   # Windows
 bash tests/run.sh                           # Linux / macOS / Git Bash
 ```
 
+CI runs the same two runners: `.github/workflows/tests.yml` builds and runs
+every suite under gcc and clang on Linux and under MSYS2 gcc on Windows,
+adds a `-Wpedantic -Werror` build of the amalgamation, builds every
+translation unit on its own (the headers are meant to stand alone), and
+round-trips the generated corpus through `tests/zpse_cli.c` -- the same
+file-to-file path the cross-tool benchmark uses.
+
 The two runners are twins: same suites, same flags, same checks, and each
 captures every build's and every program's exit status directly (never
 through a pipe), so a failing suite cannot be filtered into a passing one.
@@ -201,6 +208,27 @@ Naming patterns restricts the run to them, in the order given, which is what
 makes a profiler run or a single-row check concentrate on one path; an unknown
 name is refused with a non-zero exit rather than silently benchmarking nothing.
 
+To compare against other compressors, `tests/bench_vs.sh` generates the same
+ten patterns as files (`tests/corpus_write.c`, one continuous stream per
+pattern so no block repeats) and drives every tool through the same
+interface -- one process per file, compress then decompress -- including
+this library through `tests/zpse_cli.c`:
+
+```sh
+sudo apt-get install zstd lz4 brotli xz-utils
+SIZE=4194304 REPS=3 bash tests/bench_vs.sh            # all ten patterns
+SIZE=1048576 REPS=2 bash tests/bench_vs.sh sparse random
+```
+
+The table reports ratio and MB/s of *uncompressed* bytes in both directions;
+a missing tool is skipped rather than counted. `.github/workflows/bench.yml`
+runs it on demand, on `main` pushes and weekly, and appends both the
+in-process table and this one to the job summary (plus an artifact).
+
+Note what the two surfaces measure: the in-process bench below times the
+codec on a 64 KiB block already in cache, while the cross-tool harness
+includes file I/O and process startup for every tool, including this one.
+
 The harness compresses and decompresses a 64 KiB block of each pattern,
 single-core, and reports the best of `reps` rounds for each direction (decode
 is measured ten times per round) as GB/s plus the ratio and compressed size.
@@ -219,16 +247,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.004 | 248 | 14.5 | 21.2 |
-| incr | 0.040 | 2619 | 5.2 | 10.2 |
-| random | 1.000 | 65568 | 3.1 | 20.6 |
-| sparse | 0.060 | 3962 | 1.9 | 5.3 |
-| strided | 0.040 | 2625 | 3.1 | 10.3 |
-| const5A | 0.004 | 248 | 14.3 | 21.7 |
-| alt00FF | 0.009 | 608 | 3.5 | 7.6 |
-| sawtooth | 0.116 | 7584 | 1.1 | 5.5 |
-| lowentropy | 0.508 | 33288 | 2.1 | 13.0 |
-| sparse2 | 0.019 | 1255 | 2.8 | 6.8 |
+| zeros | 0.004 | 248 | 18.6 | 21.6 |
+| incr | 0.040 | 2619 | 5.8 | 10.4 |
+| random | 1.000 | 65568 | 3.0 | 21.1 |
+| sparse | 0.060 | 3962 | 2.16 | 6.1 |
+| strided | 0.040 | 2624 | 3.9 | 10.5 |
+| const5A | 0.004 | 248 | 18.4 | 21.8 |
+| alt00FF | 0.009 | 608 | 6.9 | 7.7 |
+| sawtooth | 0.116 | 7584 | 3.1 | 5.8 |
+| lowentropy | 0.508 | 33288 | 2.0 | 13.9 |
+| sparse2 | 0.019 | 1255 | 4.5 | 7.0 |
 
 The table is one session (both columns re-measured together) and the deltas
 below are paired measurements, so the absolute columns move between machines
@@ -1453,6 +1481,107 @@ suite passes under gcc, clang and `tests/run.ps1`. Dropping a candidate before
 its proxy is a bound, not a heuristic: a proxy is never below its floor, so the
 survivor list is the same one the prune would have produced, which is why the
 pinned corpus does not move by a byte.
+
+### Five fixed costs, an inline constant tile, and a one-limb unrank
+
+The round above chased the *decision*; this one chased the *trampoline*. The
+work was picked by ablation rather than by guesswork: a diagnostic build of
+`zpse_tile_decode` returns early at successive points (after the header
+check, after the mask decode, after the residual decode, before the history
+epilogue) and the real bench is timed against each build, so every number
+below is a difference in the end-to-end rate and not a micro-benchmark's
+opinion. For a `sparse` tile (~45 ns each) that split came out as ~17 ns of
+fixed cost -- 12.8 of it the block's CRC32-C -- ~9 ns mask decode, ~7 ns
+residual decode, and ~12 ns for the fill, the exception stores and the
+history epilogue.
+
+**An inline constant tile** (`src/segment.c`). A full tile predicted by one
+byte is the shape of every CONST tile on a sparse plane: a `memset`, one
+store per exception and the two-load history epilogue. The general entry
+point reaches that code, but only after parsing the header a second time
+(the segment loop has already read it), re-deriving the sizes, dispatching
+on the predictor family and checking for AVX2 -- and its frame carries the
+delta buffer and every family's loop. `seg_tile_decode_const` takes the
+shape in the loop itself, with the same public pieces in the same order
+(validate, mask decode, residual decode, fill, scatter, history).
+Everything else -- any other predictor, SIGNED_DELTA payloads, more than 24
+exceptions, partial tiles, and every record it cannot prove well formed --
+returns to `zpse_tile_decode`, which re-validates and reports the identical
+status. `sparse` decode 5.73 -> 6.10 GB/s (+6.4%, best of eight runs over
+four alternating pairs).
+
+**A blocked forward transpose** (`src/transform.c`). The sixteen planes of
+a 64 KiB block sit exactly 4096 bytes apart -- the same L1 set for every
+one of them -- so emitting one 16x16 group at a time leaves sixteen lines of
+one set live while each receives 16 bytes, and every store re-allocates a
+line the previous group just evicted: 0.49 cycles/byte, against 0.15 for
+the same kernel writing planes 1 KiB apart. That is a third of `alt00FF`'s
+whole encode, and no proxy ever saw it because the sweep only prices
+segments of 16 KiB. Transposing 32 groups into a buffer first (one plane
+per contiguous run, so the buffer has no conflicts) and then copying whole
+runs into the planes turns four partial-line stores per line into one
+full-line store: 0.20 cycles/byte. 32 groups (an 8 KiB buffer, 512 bytes per
+plane) measured best; 16 leaves 0.22 and 64 overruns L1 at 0.31. Copies go
+out eight planes at a time, so no more than the L1 associativity of them
+share a set, and the buffer lives in a function only the transposed
+`w == 16` path enters, so the identity, delta and xor paths never pay for
+its frame. Only the order the same bytes are written in changes.
+
+**A 32-byte width-1 staging pass** (`src/transform.c`). The DELTA8/XOR8
+staging loop stored 16 bytes per step at 2 us of a 12 us `incr` encode. Its
+step has no dependency chain -- the stored byte is an op between the stream
+and itself shifted by one -- so the loads are independent and a 256-bit
+register halves the number of steps. The AVX2 form lives in its own
+target-attributed function, so a build without `-mavx2` still compiles it
+and the scalar loop stays the fallback.
+
+**A constant plane without a tile loop** (`src/segment.c`). A one-value
+plane used to emit ten bytes per 256-byte tile and then have
+`seg_dense_emit` rewrite the payload as the dense form -- 256 records of
+work whose only purpose is to be thrown away. The segment now asks first:
+if the plane is one byte value (32 bytes per step, not a word loop) and the
+dense form is strictly smaller than the all-hit tiles it replaces, write it
+immediately and return, with `flat_paid` set the way the loop's first
+all-hit tile sets it. Both statuses and bytes are the ones the loop would
+have produced. `zeros` encode 14.8 -> 18.6 GB/s, `const5A` 14.5 -> 18.4.
+
+**A one-limb combinadic unrank** (`src/combinadic.c`). A mode-5 mask with a
+handful of exceptions used to grow the Pascal row `C(x, 0..k)` from
+`C(0,*)` with 255 rounds of k four-limb additions before the descending
+scan could start. When `C(nt,k)` fits in 64 bits -- every k up to 10 on a
+full tile -- the row fits in `uint64_t`, the initial row can be evaluated
+directly in k steps (one exact 128-bit product each), the per-step update
+stops at the current `t` because the entries above it are dead, and the
+`t == 1` tail is closed form (`x = min(x_cur, R)`, which is also the last
+selection). The u256 path is untouched for every rank that does not fit,
+and the u64 path only exists where the compiler provides a 128-bit type, so
+MSVC keeps the old code. The parity and fuzz digests are unchanged, which
+is the point: mode 5 is exercised by both corpora on every run.
+
+| pattern | encode GB/s | decode GB/s |
+| --- | --- | --- |
+| zeros | 14.8 -> 18.6 (+25.6%) | 21.5 -> 21.6 |
+| incr | 5.5 -> 5.8 (+5.5%) | 10.3 -> 10.4 |
+| random | 2.9 -> 3.0 | 21.2 -> 21.1 |
+| sparse | 2.17 -> 2.16 | 5.73 -> 6.10 (+6.4%) |
+| strided | 3.8 -> 3.9 | 10.5 -> 10.5 |
+| const5A | 14.5 -> 18.4 (+26.8%) | 21.7 -> 21.8 |
+| alt00FF | 3.7 -> 6.9 (+86.8%) | 7.7 -> 7.7 |
+| sawtooth | 2.6 -> 3.1 (+20.4%) | 5.8 -> 5.8 |
+| lowentropy | 1.94 -> 1.95 | 13.9 -> 13.9 |
+| sparse2 | 2.9 -> 4.5 (+55.5%) | 6.9 -> 7.0 |
+
+Paired binaries, alternating order, best of five rounds each. No byte moves:
+the ten `clen` values, all 768 `tests/clen_corpus` sizes (`delta=+0`) and the
+parity / fuzz / lseed digests across the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds are identical to the previous commit.
+
+What did *not* move, and why: `random` and `lowentropy` encode are dominated
+by the candidate sweep, and the decoder of `zeros`, `const5A` and `random`
+runs at the CRC32-C rate itself -- a 64 KiB block costs 3.1 us to verify at
+~20 GB/s, which is half of a 21 GB/s decode -- so no change to the tile path
+can move those three rows at all. `sparse` and `sawtooth` are the decoder
+rows with headroom, and `sparse` is the one this round took.
 
 ## License
 

@@ -6,7 +6,15 @@
 
 /* Colexicographic (Macaulay) combinadics, SPEC Sec. 8.1-8.2.
  * Ranks are 4-limb little-endian u256. Portable C11 (no __int128,
- * MSVC-safe). No malloc; no VLAs; stack use is O(1) limbs. */
+ * MSVC-safe). No malloc; no VLAs; stack use is O(1) limbs.
+ *
+ * The one-limb unrank below is the single exception: it needs an exact
+ * 128-bit product to evaluate C(n,j) directly, and is compiled only where
+ * the compiler provides one. `__extension__` keeps -Wpedantic quiet about
+ * a type the standard does not name; without it the u256 path runs. */
+#if defined(__SIZEOF_INT128__)
+__extension__ typedef unsigned __int128 zpse_u128;
+#endif
 
 int zpse_u256_gte(ZpseU256 a, ZpseU256 b)
 {
@@ -350,6 +358,71 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
      * required. */
     for (take = 0; take < 8u; take++)
         words[take] = 0u;
+
+#if defined(__SIZEOF_INT128__)
+    /* ---- One-limb path: ranks that fit in 64 bits -------------------- *
+     * C(nt,k) < 2^64 means every C(x,j) the descent can read is below
+     * 2^64 as well, so the Pascal row fits u64 and the initial row
+     * C(nt-1, 0..k) can be evaluated directly, in k steps, instead of
+     * being grown from C(0,*) with nt-1 rounds of k u256 additions.
+     *
+     * That growth was the entire cost of a mode-2 mask with a handful of
+     * exceptions -- 255 rounds, four limbs each, on every sparse tile --
+     * which is the shape a sparse, sawtooth or stride-3 plane emits on
+     * every tile. Three further savings, none of which changes a
+     * decision:
+     *
+     *  - the row is only read at j <= t, and t only ever decreases, so
+     *    the per-step update stops at the current t instead of running
+     *    to k (the entries above t are dead);
+     *  - t == 1 is closed form. The scan selects the first x (descending)
+     *    with C(x,1) == x <= R, which is x == min(x_cur, R); that is the
+     *    last selection, so the remaining descent is skipped;
+     *  - the row never leaves u64.
+     *
+     * The u256 path below is unchanged and still handles every rank that
+     * does not fit, including every k above 10 on a full tile. */
+    if (k <= 32u && cnk.w[1] == 0u && cnk.w[2] == 0u && cnk.w[3] == 0u) {
+        uint64_t row[33];
+        uint64_t r64 = r.w[0];
+        uint16_t tt = k;
+        int j;
+        int x;
+
+        row[0] = 1u;
+        for (j = 1; j <= (int)k; j++) {
+            zpse_u128 prod = (zpse_u128)row[j - 1] *
+                             (zpse_u128)((uint32_t)nt - (uint32_t)j);
+
+            row[j] = (uint64_t)(prod / (uint32_t)j);
+        }
+        for (x = (int)nt - 1; x >= 0 && tt > 0u; x--) {
+            if (tt == 1u) {
+                unsigned pick = (r64 < (uint64_t)x) ? (unsigned)r64
+                                                    : (unsigned)x;
+
+                words[pick >> 5u] |= (uint32_t)1u << (pick & 31u);
+                r64 -= (uint64_t)pick;
+                tt = 0u;
+                break;
+            }
+            if (r64 >= row[tt]) {
+                r64 -= row[tt];
+                words[(unsigned)x >> 5u] |= (uint32_t)1u << ((unsigned)x & 31u);
+                tt--;
+            }
+            /* Step the row from C(x, *) down to C(x-1, *):
+             * C(x-1,j) = C(x,j) - C(x-1,j-1), so the subtrahend is the
+             * entry this same pass has already stepped -- ascending j,
+             * which is the order the reference row update uses. */
+            for (j = 1; j <= (int)tt; j++)
+                row[j] -= row[j - 1];
+        }
+        if (tt != 0u || r64 != 0u)
+            return PSE_BAD_ENUMERATIVE_RANK;
+        return PSE_OK;
+    }
+#endif /* __SIZEOF_INT128__ */
 
     if (comb_scratch != NULL) {
         /* Division-free hot path (SPEC Sec. 8.2 strategy (b)): one Pascal

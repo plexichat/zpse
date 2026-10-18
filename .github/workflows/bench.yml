@@ -1,0 +1,65 @@
+# Cross-tool benchmark: the in-tree codec against the compressors a runner
+# has (zstd, lz4, brotli, gzip, xz), on one generated corpus, through one
+# interface -- one process per file, compress then decompress.
+#
+# The table is appended to the job summary, so it is readable on the run
+# page without downloading anything, and kept as an artifact for diffing
+# between runs. Note that the harness measures *uncompressed* MB/s and
+# reports the ratio next to it: a codec that "wins" on speed by storing
+# the input is visible as ratio 1.0.
+#
+# This job is informational: a slower number than the last run must not
+# fail the build, and a missing third-party tool is skipped rather than an
+# error. It runs on main pushes and on demand, not on every PR.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      size:
+        description: "corpus bytes per pattern (multiple of 65536)"
+        default: "4194304"
+        required: false
+      reps:
+        description: "timed runs per measurement"
+        default: "3"
+        required: false
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compressors
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            zstd lz4 brotli gzip xz-utils
+      - name: In-process codec throughput
+        run: |
+          cc -std=c11 -O2 -march=native -DNDEBUG -Iinclude tests/bench.c src/zpse_unity.c -o /tmp/zpse_bench
+          /tmp/zpse_bench 96 5 | tee /tmp/bench_inproc.txt
+          {
+            echo '### zpse in-process (64 KiB blocks, best of 5)'
+            echo
+            echo '```'
+            cat /tmp/bench_inproc.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare against other tools
+        env:
+          SIZE: ${{ github.event.inputs.size || '4194304' }}
+          REPS: ${{ github.event.inputs.reps || '3' }}
+        run: bash tests/bench_vs.sh | tee /tmp/bench_vs.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            /tmp/bench_inproc.txt
+            /tmp/bench_vs.txt
+          if-no-files-found: error
+          retention-days: 90
