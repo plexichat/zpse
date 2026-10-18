@@ -147,6 +147,7 @@ non-zero exit code if any of them fails:
 | `test_lseed.c` | hand-built foreign segments whose ORDER1/ORDER2 tiles deliberately do NOT reset (non-resetting first tile, chains, mixed ORDER/STRIDE), each decoded by the library and by a reference in the file that hardcodes the documented segment-start state — the shape the lane-state seeding above exists for, and one this encoder cannot produce |
 | `test_dense.c` | dense segment records (SPEC Sec. 6.3): 6044 records built by a reference writer over every predictor family, mask form and residual mode at nine plane sizes, plus hand-computed lane-history predictions, plus 15 malformed shapes (reserved bits/fields/modes, `ORDER1`, wrong spans, pad bits, non-ascending positions, trailing bytes) that must be rejected and never decoded, plus 96 emitter and sequence cases (a constant plane must come out dense exactly when the form is smaller, with the cheapest of the three constant predictors, through `zpse_segment_encode` and through the public block API, a near-constant plane must stay tiles, the palette form must be emitted only for alphabets of at most sixteen values with the record's prediction byte absent from the plane, and a palette plane that *contains* 255 must be filled with the largest byte it lacks and decoded through the exclusion-mapped residual alphabet) |
 | `test_decide.c` | the block decision itself, pinned in bytes: alternating 0x00/0xFF must stay at 608 (not the 2618 identity cost), two-byte spikes at 1255, 4-bit noise at 33288 (the palette form, emitted as soon as it is priced) and zeros at 248 (the floor) — a regression to any of these still round-trips, so nothing else in the suite would notice |
+| `test_sizes.c` | the ratio corpus (`tests/corpus_gen.h`, shared with `tests/clen_corpus.c`) with all 768 compressed sizes pinned: 3 seeds x 16 shapes x 16 sizes, every case decoded and byte-compared, and the suite fails if any case's size grows. A shrink is reported in the summary and does not fail. This is the gate that catches "the encoder still round-trips, it just stopped choosing the smaller form" — it caught a proxy-sampling change at +34,314 bytes over 21 cases while every other suite stayed green |
 
 The parity step is the important one, and it is two checks over three builds
 of the same three suites: `test_parity.c`, `test_fuzz.c` and `test_lseed.c`
@@ -1026,6 +1027,59 @@ of them the alternation shape at 12 KiB, where 538 -> 608 follows from the
 transpose now being priced as what it writes); the 2,718-case fuzz corpus is
 283 KB smaller than before the three rounds. Nothing here changes the wire
 format.
+
+### Where a `sawtooth` tile spends its cycles, and two changes that measured worse
+
+`sawtooth` (1.1 GB/s) and `sparse` (1.5) are the slow encode rows, and both
+are dominated by per-256-byte-tile work rather than by the block decision.
+Attribution matters here because three plausible "make the classifier faster"
+ideas turned out to be worth nothing or worse once measured. Numbers are
+`__rdtsc` reference cycles per 64 KiB block, `best of 300`, on the development
+machine, with the tile loop instrumented per stage (the rdtsc pair itself
+inflates each stage by ~40 cycles per call, so read the shares, not the
+absolute values):
+
+| stage | calls/block | cycles/call | share of block |
+| --- | --- | --- | --- |
+| `seg_prescreen` (nine predictors) | 365 | ~143 | 18% |
+| `zpse_tile_classify` | 256 | ~342 | 30% |
+| `zpse_tile_pack` | 256 | ~170 | 15% |
+| `zpse_tile_choose_modes` | 256 | ~40 | 3% |
+| block proxy (128 prescreens over 16 KiB) | 1 | — | 8% |
+| rest (transform staging of the winning 16-plane transpose, CRC32-C, copies) | — | — | ~26% |
+
+The 365 prescreen calls are the 256 tiles plus the 109 the pricing phase
+spends; the exact-price pass is skipped on this row because only one
+candidate survives the proxy prune. Two of the three calls per tile
+(`classify`, `pack`) are irreducible short of a different record form: the
+encoder must derive the mask and the payloads for the predictor the prescreen
+picked.
+
+What was tried and measured:
+
+- **Rank fewer than nine predictors per tile.** A one-pass "is this tile one
+  repeated byte" test that settles the winner from `a[0]` was implemented,
+  proved equivalent (same predictor, same k) and measured: no change on any of
+  the sixteen corpus shapes or the ten bench rows, within noise. The reason is
+  that uniform tiles already skip the prescreen — they are all-hit tiles, and
+  the all-hit run path proves those three cases from the tile's own bytes
+  (`seg_all_hit_cheap_ok`) before asking. Reverted rather than kept as dead
+  code. The prescreen's 18% is the *non-uniform* tiles, where all nine counts
+  are still candidates for the minimum.
+- **Coarser proxy sampling** (every 4th tile instead of every 2nd, halving the
+  18% pricing share): `test_sizes.c` failed on 21 of 768 cases at +34,314
+  bytes, because a 16 KiB sample ranked the transpose against the identity
+  wrongly on mixed-region shapes. Reverted; the 2-tile stride and the 16 KiB
+  window are load-bearing.
+- **Lowering the dense-classify threshold** from 32 exceptions to 16, to send
+  `sawtooth`'s ~16-exception tiles through the vectorised path: `sparse` fell
+  from 1.56 to 1.19 GB/s and nothing else moved, because that path's fixed
+  cost (a 256-byte presence array plus its fold) dominates below ~32. The
+  scalar per-exception walk is the right side of that crossover.
+
+The remaining headroom is the per-exception walk itself (about 25 cycles per
+exception, including a data-dependent branch per mask word) and the transform
+staging, which is a full pass over the block that no pricing change removes.
 
 ## License
 

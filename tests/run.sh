@@ -34,7 +34,7 @@ esac
 
 fail=0
 
-for t in test_roundtrip test_combinadic test_hostile test_units test_stride3 test_dense test_decide; do
+for t in test_roundtrip test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_sizes; do
     src="$repo/tests/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
