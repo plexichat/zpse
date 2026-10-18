@@ -1491,9 +1491,9 @@ check, after the mask decode, after the residual decode, before the history
 epilogue) and the real bench is timed against each build, so every number
 below is a difference in the end-to-end rate and not a micro-benchmark's
 opinion. For a `sparse` tile (~45 ns each) that split came out as ~17 ns of
-fixed cost -- 12.8 of it the block's CRC32-C -- ~9 ns mask decode, ~7 ns
-residual decode, and ~12 ns for the fill, the exception stores and the
-history epilogue.
+fixed cost -- 9.4 of it the block's CRC32-C, which the same machine measures
+at 27.2 GB/s -- ~9 ns mask decode, ~7 ns residual decode, and ~12 ns for the
+fill, the exception stores and the history epilogue.
 
 **An inline constant tile** (`src/segment.c`). A full tile predicted by one
 byte is the shape of every CONST tile on a sparse plane: a `memset`, one
@@ -1577,11 +1577,15 @@ parity / fuzz / lseed digests across the default, `-DZPSE_FORCE_SCALAR` and
 `-DZPSE_FORCE_TRIAL_SWAP` builds are identical to the previous commit.
 
 What did *not* move, and why: `random` and `lowentropy` encode are dominated
-by the candidate sweep, and the decoder of `zeros`, `const5A` and `random`
-runs at the CRC32-C rate itself -- a 64 KiB block costs 3.1 us to verify at
-~20 GB/s, which is half of a 21 GB/s decode -- so no change to the tile path
-can move those three rows at all. `sparse` and `sawtooth` are the decoder
-rows with headroom, and `sparse` is the one this round took.
+by the candidate sweep, and the decoders of `zeros`, `const5A` and `random`
+are the CRC32-C verification itself -- 2.4 us of a 3.0 us 64 KiB decode at
+the machine's 27.2 GB/s CRC rate, four fifths of the row -- so no change to
+the tile path can move those three at all. That also names the next lever
+that would move *every* row: the hardware `crc32` instruction is at its
+one-instruction-per-cycle throughput (8 bytes per cycle), and only a
+carry-less-multiply fold can go beyond it. `sparse` and `sawtooth` are the
+decoder rows with headroom inside the tile path, and `sparse` is the one
+this round took.
 
 ## License
 
