@@ -438,25 +438,32 @@ ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_xor32, _mm256_xor_si256, ZPSE_XOR8)
  * ------------------------------------------------------------------ */
 #define ZPSE_T16_ROW128(p_) ((const __m128i *)(const void *)(p_))
 
+/* One 16-row group: 16 rows of 16 bytes become 16 columns of 16 bytes.
+ * The sixteen bases are passed once for the whole plane and the group's
+ * byte offset separately, so a caller that walks many groups builds no
+ * pointer array per group; assembling those two sixteen-entry arrays was
+ * a third of this kernel's cost on a 16-way transposed plane. */
 static ZPSE_T_AVX2 void zpse_t16x16_avx2(const uint8_t *const in[16],
-                                         uint8_t *const out[16])
+                                         uint32_t in_off,
+                                         uint8_t *const out[16],
+                                         uint32_t out_off)
 {
-    const __m256i a0 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[8]),
-                                           ZPSE_T16_ROW128(in[0]));
-    const __m256i a1 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[9]),
-                                           ZPSE_T16_ROW128(in[1]));
-    const __m256i a2 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[10]),
-                                           ZPSE_T16_ROW128(in[2]));
-    const __m256i a3 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[11]),
-                                           ZPSE_T16_ROW128(in[3]));
-    const __m256i a4 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[12]),
-                                           ZPSE_T16_ROW128(in[4]));
-    const __m256i a5 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[13]),
-                                           ZPSE_T16_ROW128(in[5]));
-    const __m256i a6 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[14]),
-                                           ZPSE_T16_ROW128(in[6]));
-    const __m256i a7 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[15]),
-                                           ZPSE_T16_ROW128(in[7]));
+    const __m256i a0 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[8] + in_off),
+                                           ZPSE_T16_ROW128(in[0] + in_off));
+    const __m256i a1 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[9] + in_off),
+                                           ZPSE_T16_ROW128(in[1] + in_off));
+    const __m256i a2 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[10] + in_off),
+                                           ZPSE_T16_ROW128(in[2] + in_off));
+    const __m256i a3 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[11] + in_off),
+                                           ZPSE_T16_ROW128(in[3] + in_off));
+    const __m256i a4 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[12] + in_off),
+                                           ZPSE_T16_ROW128(in[4] + in_off));
+    const __m256i a5 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[13] + in_off),
+                                           ZPSE_T16_ROW128(in[5] + in_off));
+    const __m256i a6 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[14] + in_off),
+                                           ZPSE_T16_ROW128(in[6] + in_off));
+    const __m256i a7 = _mm256_loadu2_m128i(ZPSE_T16_ROW128(in[15] + in_off),
+                                           ZPSE_T16_ROW128(in[7] + in_off));
     __m256i t0, t1, t2, t3, t4, t5, t6, t7;
     __m256i u0, u1, u2, u3, u4, u5, u6, u7;
     __m256i v0, v1, v2, v3, v4, v5, v6, v7;
@@ -502,9 +509,9 @@ static ZPSE_T_AVX2 void zpse_t16x16_avx2(const uint8_t *const in[16],
     do {                                                                      \
         const __m128i lo_ = _mm256_castsi256_si128(WK);                       \
         const __m128i hi_ = _mm256_extracti128_si256(WK, 1);                  \
-        _mm_storeu_si128((__m128i *)(void *)(out[IDX]),                       \
+        _mm_storeu_si128((__m128i *)(void *)(out[IDX] + out_off),             \
                          _mm_unpacklo_epi64(lo_, hi_));                       \
-        _mm_storeu_si128((__m128i *)(void *)(out[(IDX) + 8u]),                \
+        _mm_storeu_si128((__m128i *)(void *)(out[(IDX) + 8u] + out_off),      \
                          _mm_unpackhi_epi64(lo_, hi_));                       \
     } while (0)
 
@@ -758,35 +765,37 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
          * block becomes 16 x 16-byte per-segment stores. The group bound
          * uses the SHORTEST segment, so every segment still has all 16
          * rows and every load stays inside the input. */
-        for (g = 0; (g + 1u) * 16u <= rows; g++) {
 #if ZPSE_T_HAVE_AVX2
-            if (zpse_t_avx2()) {
-                const uint8_t *tin[16];
-                uint8_t *tout[16];
-                unsigned t;
+        if (zpse_t_avx2()) {
+            /* Bases once: row t of a group is 16 bytes into the next
+             * contiguous 256-byte input block, and its destination is 16
+             * rows into segment t. */
+            const uint8_t *tin[16];
+            uint8_t *tout[16];
+            unsigned t;
 
-                for (t = 0; t < 16u; t++) {
-                    tin[t] = in + (size_t)g * 256u + (size_t)t * 16u;
-                    tout[t] = segs[t] + (size_t)g * 16u;
-                }
-                zpse_t16x16_avx2(tin, tout);
-            } else
+            for (t = 0; t < 16u; t++) {
+                tin[t] = in + (size_t)t * 16u;
+                tout[t] = segs[t];
+            }
+            for (g = 0; (g + 1u) * 16u <= rows; g++) {
+                zpse_t16x16_avx2(tin, g * 256u, tout, g * 16u);
+            }
+        } else
 #endif /* ZPSE_T_HAVE_AVX2 */
-            {
-                __m128i r[16];
-                unsigned t;
+        for (g = 0; (g + 1u) * 16u <= rows; g++) {
+            __m128i r[16];
+            unsigned t;
 
-                for (t = 0; t < 16u; t++) {
-                    r[t] = _mm_loadu_si128((const __m128i *)(const void *)
-                                           (in + (size_t)g * 256u +
-                                            (size_t)t * 16u));
-                }
-                zpse_t16x16(r);
-                for (t = 0; t < 16u; t++) {
-                    _mm_storeu_si128(
-                        (__m128i *)(void *)(segs[t] + (size_t)g * 16u),
-                        r[t]);
-                }
+            for (t = 0; t < 16u; t++) {
+                r[t] = _mm_loadu_si128((const __m128i *)(const void *)
+                                       (in + (size_t)g * 256u +
+                                        (size_t)t * 16u));
+            }
+            zpse_t16x16(r);
+            for (t = 0; t < 16u; t++) {
+                _mm_storeu_si128(
+                    (__m128i *)(void *)(segs[t] + (size_t)g * 16u), r[t]);
             }
         }
         /* Ragged tail (segment lengths differ by at most one row). */
@@ -911,36 +920,38 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
             /* The mirror image of the forward gather: load 16 segment
              * columns of 16 bytes and transposing them yields the 16
              * contiguous output rows out[16*j + s]. */
-            for (g = 0; (g + 1u) * 16u <= rows; g++) {
 #if ZPSE_T_HAVE_AVX2
-                if (zpse_t_avx2()) {
-                    const uint8_t *tin[16];
-                    uint8_t *tout[16];
-                    unsigned t;
+            if (zpse_t_avx2()) {
+                /* The inverse gather, with the same hoisted bases: a group
+                 * is 16 bytes into each segment and 256 into the output. */
+                const uint8_t *tin[16];
+                uint8_t *tout[16];
+                unsigned t;
 
-                    for (t = 0; t < 16u; t++) {
-                        tin[t] = segs[t] + (size_t)g * 16u;
-                        tout[t] = out + (size_t)g * 256u + (size_t)t * 16u;
-                    }
-                    zpse_t16x16_avx2(tin, tout);
-                } else
+                for (t = 0; t < 16u; t++) {
+                    tin[t] = segs[t];
+                    tout[t] = out + (size_t)t * 16u;
+                }
+                for (g = 0; (g + 1u) * 16u <= rows; g++) {
+                    zpse_t16x16_avx2(tin, g * 16u, tout, g * 256u);
+                }
+            } else
 #endif /* ZPSE_T_HAVE_AVX2 */
-                {
-                    __m128i r[16];
-                    unsigned t;
+            for (g = 0; (g + 1u) * 16u <= rows; g++) {
+                __m128i r[16];
+                unsigned t;
 
-                    for (t = 0; t < 16u; t++) {
-                        r[t] = _mm_loadu_si128(
-                            (const __m128i *)(const void *)
-                            (segs[t] + (size_t)g * 16u));
-                    }
-                    zpse_t16x16(r);
-                    for (t = 0; t < 16u; t++) {
-                        _mm_storeu_si128(
-                            (__m128i *)(void *)(out + (size_t)g * 256u +
-                                                (size_t)t * 16u),
-                            r[t]);
-                    }
+                for (t = 0; t < 16u; t++) {
+                    r[t] = _mm_loadu_si128(
+                        (const __m128i *)(const void *)
+                        (segs[t] + (size_t)g * 16u));
+                }
+                zpse_t16x16(r);
+                for (t = 0; t < 16u; t++) {
+                    _mm_storeu_si128(
+                        (__m128i *)(void *)(out + (size_t)g * 256u +
+                                            (size_t)t * 16u),
+                        r[t]);
                 }
             }
             for (s = 0; s < w; s++) {

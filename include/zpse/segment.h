@@ -40,12 +40,14 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * trial that cannot beat the raw envelope anyway, and a trial it abandons
  * is reported exactly like one the budget stopped.
  *
- * A plane that is one byte value end to end -- and only such a plane --
- * is written in the dense form (Sec. 6.3) when that is strictly smaller
- * than its tile records: 12 bytes per 4 KiB against 10 per 256-byte tile,
- * so the last tile of a short plane keeps its record. The dense records
- * reconstruct exactly the tiles they replace (a K == 0 fill), tile_count
- * is 1, and every other plane's bytes are unchanged. */
+ * Two shapes are written in the dense form (Sec. 6.3), and only when that
+ * is strictly smaller than the tile records they replace: a plane that is
+ * one byte value end to end (12 bytes per 4 KiB against 10 per 256-byte
+ * tile, so the last tile of a short plane keeps its record), and a plane
+ * of at most sixteen distinct byte values (one palette stream per 4 KiB,
+ * ALL_EXCEPTION mask, no prediction to reconstruct). The dense records
+ * reconstruct exactly the plane they replace, tile_count is 1, and every
+ * other plane's bytes are unchanged. */
 /* Prescreen-only size estimate of one transformed plane (see segment.c). */
 uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
 

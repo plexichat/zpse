@@ -2217,6 +2217,65 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
         __m128i xhat;
         __m128i res;
 
+        /* ---- Runs of exception-free 32-byte blocks ---------------- *
+         * A block of four groups whose mask word is zero has no exception
+         * in it at all, so every position is its own prediction and no
+         * unit is consumed. Two of the three lane predictors then have a
+         * closed form over such a run, and sparse tiles are mostly made of
+         * these blocks (a 256-byte tile with fifteen exceptions has most
+         * of its eight blocks clean):
+         *
+         *   LANE_PREVIOUS  every lane predicts the same byte, so the whole
+         *                  run is the previous group repeated and the lane
+         *                  state does not move;
+         *   LANE_DELTA     the per-lane second difference is constant, so
+         *                  the run is an arithmetic progression at one add
+         *                  of that difference per group.
+         *
+         * Both are the same arithmetic the group-at-a-time chain performs
+         * below, only hoisted out of the per-group mask extract, blend and
+         * 8-byte store: one 32-byte store replaces four of them. The block
+         * must be 32-byte aligned in the group index so the four mask
+         * bytes are one word, and it must be whole, which is why a partial
+         * final block stays on the general path. LANE_AVERAGE has no
+         * closed form and keeps it too. */
+        if (fam == TILE_FAM_LANEHIST && (g & 3u) == 0u &&
+            (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS ||
+             predictor_id == (uint8_t)ZPSE_P_LANE_DELTA)) {
+            uint32_t g0 = g;
+
+            while (g < ngroups && ((uint32_t)nt - g * 8u) >= 32u &&
+                   mw[g >> 2u] == 0u) {
+                uint8_t *dst = out + (size_t)g * 8u;
+
+                if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
+                    __m128i v = _mm_unpacklo_epi64(prev1, prev1);
+
+                    _mm_storeu_si128((__m128i *)(void *)dst, v);
+                    _mm_storeu_si128((__m128i *)(void *)(dst + 16), v);
+                    prev2 = prev1;
+                } else {
+                    __m128i d = _mm_sub_epi8(prev1, prev2);
+                    __m128i x0 = _mm_add_epi8(prev1, d);
+                    __m128i x1 = _mm_add_epi8(x0, d);
+                    __m128i x2 = _mm_add_epi8(x1, d);
+                    __m128i x3 = _mm_add_epi8(x2, d);
+
+                    _mm_storeu_si128((__m128i *)(void *)dst,
+                                     _mm_unpacklo_epi64(x0, x1));
+                    _mm_storeu_si128((__m128i *)(void *)(dst + 16),
+                                     _mm_unpacklo_epi64(x2, x3));
+                    prev2 = x2;
+                    prev1 = x3;
+                }
+                g += 4u;
+            }
+            if (g != g0) {
+                g -= 1u; /* the loop's own g++ */
+                continue;
+            }
+        }
+
         if (fam == TILE_FAM_CONST) {
             xhat = cvec;
         } else if (predictor_id == (uint8_t)ZPSE_P_LANE_PREVIOUS) {

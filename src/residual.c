@@ -308,6 +308,43 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
         return i;
     }
 
+    /* Four-bit indices tile a byte exactly, so one 16-byte load carries 32
+     * values: the load, the two index extractions, the two shuffles and the
+     * two interleaved stores cover 32 values where the loop below covers
+     * 16. Every plane of nine to sixteen distinct values lands on this
+     * width -- a 4-bit image, a nibble-packed sensor, entropy-coded data
+     * after a transform -- so it is the width that decides how fast such a
+     * plane decodes (a dense palette record runs this over the whole
+     * plane). Low nibble first and then high, which is the little-endian
+     * bit order residual_get_bits uses, so the interleave below is the
+     * ascending values 0, 1, 2, ... of the payload. Reads stay inside the
+     * packed region: 32 values need bytes [i/2, i/2 + 16) and i + 32 <= k
+     * implies i/2 + 16 <= ceil(k/2). */
+    if (b == 4u) {
+        const __m128i low4 = _mm_set1_epi8(0x0F);
+
+        while ((uint32_t)i + 32u <= (uint32_t)k) {
+            __m128i x = _mm_loadu_si128(
+                (const __m128i *)(const void *)(src + ((uint32_t)i >> 1u)));
+            __m128i lo = _mm_and_si128(x, low4);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(x, 4), low4);
+            __m128i a;
+            __m128i c;
+
+            if (_mm_movemask_epi8(_mm_cmpgt_epi8(lo, limv)) != 0 ||
+                _mm_movemask_epi8(_mm_cmpgt_epi8(hi, limv)) != 0) {
+                break;
+            }
+            a = _mm_shuffle_epi8(palv, lo);
+            c = _mm_shuffle_epi8(palv, hi);
+            _mm_storeu_si128((__m128i *)(void *)(exc_out + i),
+                             _mm_unpacklo_epi8(a, c));
+            _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 16u),
+                             _mm_unpackhi_epi8(a, c));
+            i = (uint16_t)(i + 32u);
+        }
+    }
+
     while ((uint32_t)i + 16u <= (uint32_t)k) {
         uint32_t bit = (uint32_t)i * b;
         uint32_t off = bit >> 3u;

@@ -23,11 +23,14 @@
  * self-contained: its predictions never read a byte another record
  * reconstructed.
  *
- * `zpse_segment_encode` emits the form for exactly one shape in v1 -- a
- * plane that is a single byte value end to end, where 12 bytes per 4 KiB
- * beats 10 per 256-byte tile (segment.c). This decoder is not limited to
- * that shape: it accepts any conforming record, which is what the 6044
- * reference-built cases in tests/test_dense.c exercise.
+ * `zpse_segment_encode` emits the form for two shapes in v1 (segment.c):
+ * a plane that is a single byte value end to end, where 12 bytes per 4 KiB
+ * beats 10 per 256-byte tile; and a plane of at most sixteen distinct byte
+ * values, coded as ALL_EXCEPTION + PALETTE_BITS, which the decoder below
+ * expands without running a predictor at all (see dense_record). This
+ * decoder is not limited to those shapes: it accepts any conforming
+ * record, which is what the reference-built cases in tests/test_dense.c
+ * exercise.
  *
  * Layout (little-endian), offset from the start of the record:
  *   0  u16  rec_len        bytes after this field (header tail + payloads)

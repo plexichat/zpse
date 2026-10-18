@@ -502,15 +502,32 @@ than that is a sequence of records (see Identification). A record whose
 length would be 0 or above 4096 is not reachable, because the length is
 derived from `segment_decoded_size`.
 
-What this encoder emits (non-normative, and the only use of the form in
-v1): a plane that is a single byte value `v` end to end, where the dense
+What this encoder emits (non-normative, and the only two uses of the form
+in v1).
+
+1. A plane that is a single byte value `v` end to end, where the dense
 record is strictly smaller than the all-hit tile records it replaces
 (12 bytes per 4 KiB against 10 per 256 bytes, so one-tile planes keep
 their tile). The record is then `K == 0` with mask ALL_HIT, no residual,
 and predictor CONST_ZERO when `v == 0`, STRIDE_1 when
 `v == initial_literal`, TILE_CONSTANT with `C == v` otherwise -- all
-three reconstruct as a fill of `v`. Every other plane is coded as tiles,
-byte for byte as before this form existed.
+three reconstruct as a fill of `v`.
+
+2. A plane whose bytes span at most sixteen distinct values, where the
+form is strictly smaller than the tile records it replaces. Each record
+is `K == record_length` with mask ALL_EXCEPTION (so it carries no mask
+bytes and the decoder runs no prediction at all), residual PALETTE_BITS,
+and predictor TILE_CONSTANT with a `C` the plane does not contain --
+otherwise the exclusion mapping would have no residual for the bytes
+equal to it. `C == 255` is preferred when absent because the exclusion
+residual of every value below it is the value itself. The record costs
+`12 + 1 + m + ceil(Nt * ceil(log2 m) / 8)` bytes for a palette of `m`
+values, which is what makes a 4-bit plane half its own size and, at
+decode, one palette expansion per 4 KiB instead of a predictor step per
+tile.
+
+Every other plane is coded as tiles, byte for byte as before this form
+existed.
 
 Status mapping for a malformed dense record: size/spans
 `PSE_BAD_TILE_SIZE`; mask shape `PSE_BAD_MASK`; residual payload

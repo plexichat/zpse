@@ -629,6 +629,185 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
           "constant plane decodes");
 }
 
+/* The emitter's palette form (a plane of at most sixteen distinct values):
+ * one record per 4 KiB, predicted by a constant the plane does not
+ * contain, ALL_EXCEPTION mask, PALETTE_BITS residual -- so the decoder
+ * runs no prediction at all. The size checks are exact because the layout
+ * is fixed: rec_len + 12-byte header + palette + packed indices. */
+static void emitter_palette(void)
+{
+    static uint8_t plane[ZPSE_DENSE_MAX_LEN];
+    static uint8_t want[ZPSE_DENSE_MAX_LEN];
+    ZpseEncoder e;
+    ZpseLaneState lanes;
+    uint32_t len;
+    uint32_t got_len = 0u;
+    uint32_t i;
+    uint32_t st = 0xBEEFu;
+    int rc;
+
+    memset(&e, 0, sizeof e);
+    memset(&lanes, 0, sizeof lanes);
+    CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == PSE_OK,
+          "encoder arena init (palette)");
+    lanes.order1 = e.order1;
+    lanes.o2val = e.o2val;
+    lanes.o2conf = e.o2conf;
+
+    /* Sixteen values, four bits each: the shape lowentropy has. */
+    for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
+        st = st * 1664525u + 1013904223u;
+        plane[i] = (uint8_t)((st >> 24) & 0x0Fu);
+        want[i] = plane[i];
+    }
+    len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, ZPSE_DENSE_MAX_LEN,
+                                        plane[0], seg, (uint32_t)sizeof seg,
+                                        0u, 0u);
+    cases++;
+    CHECK((int)len > 0, "palette plane encodes");
+    if ((int)len > 0) {
+        CHECK((seg[16 + 2] & ZPSE_DENSE_MARKER) != 0,
+              "sixteen-value plane is dense");
+        CHECK(seg[7] == ZPSE_S_LEN_PREFIX, "palette segment keeps flag 0x01");
+        CHECK((((uint32_t)seg[4] | ((uint32_t)seg[5] << 8)) == 1u),
+              "palette segment reports one record");
+        CHECK(seg[16 + 3] == ZPSE_P_TILE_CONSTANT,
+              "palette record is constant-predicted");
+        CHECK((seg[16 + 2] & 7u) == (uint8_t)ZPSE_M_ALL_EXCEPTION,
+              "palette record is all-exception");
+        CHECK(((seg[16 + 2] >> 3) & 7u) == (uint8_t)ZPSE_R_PALETTE_BITS,
+              "palette record is palette-coded");
+        CHECK((((uint32_t)seg[16 + 8] | ((uint32_t)seg[16 + 9] << 8)) == 0u),
+              "palette record carries no mask");
+        CHECK((((uint32_t)seg[16 + 6] | ((uint32_t)seg[16 + 7] << 8)) ==
+               ZPSE_DENSE_MAX_LEN),
+              "palette record codes the whole plane");
+        /* 16 + rec_len(2) + header tail(10) + m(1) + 16 + 4096*4/8. */
+        CHECK(len == 16u + 2u + 10u + 1u + 16u + 2048u,
+              "sixteen-value plane is one palette stream");
+        /* The prediction must be a byte the plane does NOT contain,
+         * otherwise the exclusion mapping has no residual for it. */
+        for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
+            if (plane[i] == seg[16 + 4]) {
+                break;
+            }
+        }
+        CHECK(i == ZPSE_DENSE_MAX_LEN,
+              "palette prediction is a value the plane lacks");
+        rc = decode(len, out, &got_len);
+        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+                  memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
+              "sixteen-value plane decodes");
+
+        /* Tampering inside the emitted record must be a status, never a
+         * decode: K, the mask equation and the residual span are all
+         * checked by the same dense-record validation a hand-built record
+         * goes through. `want` is free once the plane has been compared. */
+        memcpy(want, seg, len);
+        seg[16 + 6] = 0u;
+        seg[16 + 7] = 0u; /* K == 0 under an ALL_EXCEPTION mask */
+        CHECK(decode(len, out, &got_len) != PSE_OK,
+              "palette record with K == 0 is rejected");
+        memcpy(seg, want, len);
+        seg[16 + 2] = (uint8_t)(ZPSE_DENSE_MARKER |
+                                (uint8_t)ZPSE_M_RAW_BITMAP |
+                                ((uint8_t)ZPSE_R_PALETTE_BITS << 3));
+        CHECK(decode(len, out, &got_len) != PSE_OK,
+              "palette record claiming a bitmap with no mask is rejected");
+        memcpy(seg, want, len);
+        seg[16 + 11] = (uint8_t)(seg[16 + 11] + 2u); /* residual overruns */
+        CHECK(decode(len, out, &got_len) != PSE_OK,
+              "palette record with a bad residual span is rejected");
+        memcpy(seg, want, len);
+        CHECK(decode(len - 1u, out, &got_len) != PSE_OK,
+              "truncated palette record is rejected");
+        memcpy(seg, want, len);
+    }
+
+    /* Two values, unpredictably placed: one bit per byte, and a much
+     * smaller record than a predictor-per-tile search on random bits.
+     * (The tile path codes such a tile in about a third of its bytes,
+     * which is why the emitter prices the form from a quarter of a tile
+     * upwards.) */
+    for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
+        st = st * 1664525u + 1013904223u;
+        plane[i] = (uint8_t)((st >> 24) & 1u);
+        want[i] = plane[i];
+    }
+    len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, ZPSE_DENSE_MAX_LEN,
+                                        plane[0], seg, (uint32_t)sizeof seg,
+                                        0u, 0u);
+    cases++;
+    CHECK((int)len > 0, "binary plane encodes");
+    if ((int)len > 0) {
+        CHECK((seg[16 + 2] & ZPSE_DENSE_MARKER) != 0,
+              "binary plane is dense");
+        CHECK(len == 16u + 2u + 10u + 1u + 2u + 512u,
+              "binary plane is one bit per byte");
+        rc = decode(len, out, &got_len);
+        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+                  memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
+              "binary plane decodes");
+    }
+
+    /* The same shape with 255 in the alphabet. The record is predicted by
+     * a value the plane lacks, so the fill cannot be 255 here (the largest
+     * absent value is 254), and the residual alphabet is then the plane's
+     * under the exclusion map rather than the plane itself: 253 stays 253
+     * and 255 becomes 254. The emitter hands the packer that mapped set as
+     * its palette certificate, so this is the case that pins the mapped
+     * certificate down -- the palette is still sixteen entries, the payload
+     * still four bits per value, and the plane must still come back
+     * exactly. */
+    for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
+        st = st * 1664525u + 1013904223u;
+        plane[i] = (uint8_t)((st >> 24) % 16u);
+        if (plane[i] == 15u) {
+            plane[i] = 255u;
+        }
+        want[i] = plane[i];
+    }
+    len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, ZPSE_DENSE_MAX_LEN,
+                                        plane[0], seg, (uint32_t)sizeof seg,
+                                        0u, 0u);
+    cases++;
+    CHECK((int)len > 0, "palette plane with 255 encodes");
+    if ((int)len > 0) {
+        CHECK((seg[16 + 2] & ZPSE_DENSE_MARKER) != 0,
+              "palette plane with 255 is dense");
+        CHECK(seg[16 + 3] == ZPSE_P_TILE_CONSTANT,
+              "palette plane with 255 is constant-predicted");
+        CHECK(seg[16 + 4] == 254u, "fill is the largest byte the plane lacks");
+        CHECK(len == 16u + 2u + 10u + 1u + 16u + 2048u,
+              "palette plane with 255 is one palette stream");
+        rc = decode(len, out, &got_len);
+        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+                  memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
+              "palette plane with 255 decodes");
+    }
+
+    /* Seventeen values is one past the palette width, so the tile path
+     * must be left alone: no dense marker, and the tiles still decode. */
+    for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
+        st = st * 1664525u + 1013904223u;
+        plane[i] = (uint8_t)((st >> 24) % 17u);
+        want[i] = plane[i];
+    }
+    len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, ZPSE_DENSE_MAX_LEN,
+                                        plane[0], seg, (uint32_t)sizeof seg,
+                                        0u, 0u);
+    cases++;
+    CHECK((int)len > 0, "seventeen-value plane encodes");
+    if ((int)len > 0) {
+        CHECK((seg[16 + 2] & ZPSE_DENSE_MARKER) == 0,
+              "seventeen-value plane stays tiles");
+        rc = decode(len, out, &got_len);
+        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+                  memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
+              "seventeen-value plane decodes");
+    }
+}
+
 static void emitter_not_constant(void)
 {
     static uint8_t plane[4096];
@@ -713,6 +892,7 @@ static void emitter(void)
         emitter_segment(sizes[si], 0x77u, 0x11u);
     }
     emitter_not_constant();
+    emitter_palette();
 }
 
 int main(void)

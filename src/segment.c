@@ -1111,6 +1111,352 @@ static int seg_dense_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
     return (int)dtotal;
 }
 
+/* How much of the plane the scalar gather below reads before the vector
+ * test takes over. It only has to be long enough to hold the whole
+ * alphabet of a plane the dense palette form can use (at most sixteen
+ * values); every later occurrence of a value costs a vector compare
+ * instead of a read-modify-write of the set. */
+#define ZPSE_ALPHA_HEAD 1024u
+
+#if ZPSE_PS_HAVE_AVX2
+/* First position in p[0, n) whose byte is NOT in the set `bits`, or n when
+ * every byte is.
+ *
+ * The set is turned into two sixteen-entry tables indexed by the LOW
+ * nibble of a byte: table A holds, for each low nibble, the eight high
+ * nibbles 0..7 that occur with it, and table B the same for 8..15. A byte
+ * is therefore a member exactly when bit (v >> 4) & 7 of A[v & 15] (or of
+ * B, for a high nibble above 7) is set, which is three pshufb lookups and
+ * a masked select for 32 bytes at a time -- no per-value broadcast, so the
+ * cost does not grow with the alphabet. This is what replaces the scalar
+ * bitmap probe: that probe is a load-modify-store of the same eight-word
+ * set per byte, i.e. a dependent chain through L1, and it accounted for
+ * most of the 46 us the palette form's alphabet scan cost on 64 KiB of
+ * four-bit data.
+ *
+ * The answer is the same the scalar probe gives -- membership of a byte in
+ * a set of at most sixteen values -- so the caller can hand the offset
+ * back to the scalar loop and get the identical alphabet and count. */
+static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
+    const uint8_t *p, uint32_t n, const uint32_t bits[8])
+{
+    uint8_t ta[16];
+    uint8_t tb[16];
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    const __m256i hi7 = _mm256_set1_epi8(7);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i onehot = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80);
+    __m256i tav;
+    __m256i tbv;
+    uint32_t i = 0u;
+    unsigned v;
+
+    memset(ta, 0, sizeof ta);
+    memset(tb, 0, sizeof tb);
+    for (v = 0u; v < 256u; v++) {
+        if (((bits[v >> 5] >> (v & 31u)) & 1u) == 0u) {
+            continue;
+        }
+        if ((v >> 4) < 8u) {
+            ta[v & 15u] |= (uint8_t)(1u << (v >> 4));
+        } else {
+            tb[v & 15u] |= (uint8_t)(1u << ((v >> 4) - 8u));
+        }
+    }
+    tav = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)(const void *)ta));
+    tbv = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)(const void *)tb));
+
+    while (i + 32u <= n) {
+        const __m256i cur = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(p + i));
+        const __m256i lo = _mm256_and_si256(cur, nib);
+        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(cur, 4), nib);
+        const __m256i sel = _mm256_cmpgt_epi8(hi, hi7);
+        const __m256i mask = _mm256_or_si256(
+            _mm256_and_si256(sel, _mm256_shuffle_epi8(tbv, lo)),
+            _mm256_andnot_si256(sel, _mm256_shuffle_epi8(tav, lo)));
+        const __m256i bit = _mm256_shuffle_epi8(
+            onehot, _mm256_and_si256(hi, hi7));
+        const unsigned miss = (unsigned)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_and_si256(mask, bit), zero));
+
+        if (miss != 0u) {
+            /* movemask sets bit k for the k-th byte, so the lowest set bit
+             * is the first byte outside the set. */
+            unsigned k = 0u;
+
+            while (((miss >> k) & 1u) == 0u) {
+                k++;
+            }
+            return i + k;
+        }
+        i += 32u;
+    }
+    for (; i < n; i++) {
+        unsigned c = p[i];
+
+        if (((bits[c >> 5] >> (c & 31u)) & 1u) == 0u) {
+            return i;
+        }
+    }
+    return n;
+}
+#endif /* ZPSE_PS_HAVE_AVX2 */
+
+/* Which byte values the plane actually contains, as a 256-bit set.
+ * Stops as soon as the alphabet exceeds `limit`, because every caller only
+ * asks whether it is small: a text, code or noise plane bails out after 17
+ * distinct values instead of scanning 64 KiB.
+ *
+ * The gather is a scalar bitmap probe, which is a dependent read-modify-
+ * write per byte. On a plane that really does have a small alphabet that
+ * probe runs over every byte of the plane, and on 64 KiB of four-bit data
+ * it was measured at 46 us per block -- more than the palette form's own
+ * pack. So the first ZPSE_ALPHA_HEAD bytes are gathered scalar (they hold
+ * a palette plane's whole alphabet many times over) and the rest of the
+ * plane is only TESTED for membership in what the head found, with one
+ * vector pass whose cost does not depend on the alphabet size. A plane
+ * with more than sixteen values still leaves the gather the first time the
+ * test finds one, so the early exit that keeps text and noise cheap is
+ * unchanged. */
+static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane_len,
+                                   uint32_t limit, uint32_t bits[8])
+{
+    uint32_t n = 0u;
+    uint32_t i;
+    uint32_t head = (plane_len < ZPSE_ALPHA_HEAD) ? plane_len
+                                                  : ZPSE_ALPHA_HEAD;
+
+    memset(bits, 0, 8u * sizeof bits[0]);
+    for (i = 0u; i < head; i++) {
+        unsigned v = plane[i];
+        uint32_t bit = 1u << (v & 31u);
+
+        if ((bits[v >> 5] & bit) != 0u) {
+            continue;
+        }
+        bits[v >> 5] |= bit;
+        n++;
+        if (n > limit) {
+            return n;
+        }
+    }
+#if ZPSE_PS_HAVE_AVX2
+    /* The membership tables hold at most sixteen values, so the vector test
+     * is only taken when the head found no more than that -- which is the
+     * case every caller cares about (`limit` is 16 at both call sites) and
+     * the case where the scalar probe would otherwise walk the whole
+     * plane. */
+    if (n <= 16u && head < plane_len &&
+        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        uint32_t q = seg_alphabet_first_outside_avx2(plane + head,
+                                                     plane_len - head, bits);
+
+        if (q == plane_len - head) {
+            return n;
+        }
+        i = head + q;
+    }
+#endif
+    for (; i < plane_len; i++) {
+        unsigned v = plane[i];
+        uint32_t bit = 1u << (v & 31u);
+
+        if ((bits[v >> 5] & bit) != 0u) {
+            continue;
+        }
+        bits[v >> 5] |= bit;
+        n++;
+        if (n > limit) {
+            return n;
+        }
+    }
+    return n;
+}
+
+/* Size of the dense palette form for a plane of `m` distinct values
+ * (SPEC Sec. 6.3): one record per ZPSE_DENSE_MAX_LEN bytes, each a 12-byte
+ * header, a palette of m and ceil(ns * ceil(log2 m) / 8) packed indices.
+ *
+ * The palette is sized by the plane's whole alphabet, not by what each
+ * chunk happens to contain, so this is an upper bound on what the encoder
+ * writes -- the packer re-derives m per record and can only be smaller.
+ * An upper bound is the safe direction: it decides whether the form beats
+ * the tiles it would replace. */
+static uint32_t seg_dense_palette_cost(uint32_t plane_len, uint32_t m)
+{
+    uint32_t b = zpse_ceil_log2_u32(m);
+    uint32_t total = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+    uint32_t off;
+
+    for (off = 0u; off < plane_len; off += ZPSE_DENSE_MAX_LEN) {
+        uint32_t ns = plane_len - off;
+
+        if (ns > ZPSE_DENSE_MAX_LEN) {
+            ns = ZPSE_DENSE_MAX_LEN;
+        }
+        total += (uint32_t)ZPSE_DENSE_HEADER_SIZE + 1u + m +
+                 ((ns * b + 7u) / 8u);
+    }
+    return total;
+}
+
+/* Dense palette record form (SPEC Sec. 6.3) for a plane of at most
+ * sixteen distinct byte values.
+ *
+ * This is the shape a 4-bit image has before any transform and the shape
+ * an entropy-coded plane has after one: every byte is one of a handful of
+ * symbols. The tile path spends ten bytes of framing per 256 bytes on it
+ * and then a prediction step per byte, because each tile must pick a
+ * predictor, which for such a plane is close to noise; the dense form
+ * spends one 12-byte header per 4 KiB and codes the whole plane as a
+ * palette plus indices, so it is both smaller and, at decode, one palette
+ * expansion for 4 KiB instead of a predictor chain per tile (dense.c).
+ *
+ * The record uses predictor TILE_CONSTANT, mask ALL_EXCEPTION and residual
+ * PALETTE_BITS. ALL_EXCEPTION makes every position an exception, so the
+ * record codes every byte and the decoder runs no prediction at all; the
+ * constant predictor only has to supply the value exceptions are measured
+ * against, and that value is chosen to be one the plane does NOT contain
+ * -- otherwise the exclusion mapping would have no residual for the bytes
+ * equal to it. 255 is preferred when absent because the exclusion residual
+ * of every value below it is the value itself, which makes the decoder's
+ * inverse a no-op.
+ *
+ * Returns the payload length written, or 0 when the plane's alphabet is not
+ * small enough, when the form is not strictly smaller than the `pos` bytes
+ * of tile records already written, or when it does not fit payload_cap /
+ * byte_budget. */
+static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
+                                  const uint8_t *plane, uint32_t plane_len,
+                                  uint32_t m, const uint32_t bits[8],
+                                  uint32_t pos, uint32_t byte_budget,
+                                  uint32_t payload_cap)
+{
+    uint8_t buf[ZPSE_DENSE_MAX_LEN];
+    uint32_t seen2[8];
+    uint32_t nu2;
+    uint32_t cost;
+    uint32_t fill;
+    uint32_t off;
+    uint32_t at;
+
+    if (m < 2u || m > 16u) {
+        return 0;
+    }
+    cost = seg_dense_palette_cost(plane_len, m);
+    if (cost >= pos || cost > payload_cap) {
+        return 0;
+    }
+    if (byte_budget != 0u && cost > byte_budget) {
+        return 0;
+    }
+
+    fill = 255u;
+    while (fill > 0u && ((bits[fill >> 5] >> (fill & 31u)) & 1u) != 0u) {
+        fill--;
+    }
+
+    /* The residual alphabet every record can draw from, i.e. the plane's
+     * alphabet under the exclusion map for `fill` (a function of one byte,
+     * so distinct values can only merge, never appear). It is a
+     * certificate for the packer, which would otherwise scan all 4096
+     * bytes of every record to discover a palette it can see in the first
+     * few dozen; on 64 KiB of four-bit data that scan was measured at 30 us
+     * of the block's encode. It cannot change a byte: the packer takes the
+     * short path only when the prefix it scanned already holds every value
+     * of the certificate, at which point the palette order and size are the
+     * ones the exhaustive scan produces. */
+    memset(seen2, 0, sizeof seen2);
+    nu2 = 0u;
+    {
+        uint32_t v;
+
+        for (v = 0u; v < 256u; v++) {
+            uint8_t r;
+            uint32_t bit;
+
+            if (((bits[v >> 5] >> (v & 31u)) & 1u) == 0u) {
+                continue;
+            }
+            r = zpse_exclusion_forward((uint8_t)v, (uint8_t)fill);
+            bit = 1u << ((uint32_t)r & 31u);
+            if ((seen2[(uint32_t)r >> 5] & bit) != 0u) {
+                continue;
+            }
+            seen2[(uint32_t)r >> 5] |= bit;
+            nu2++;
+        }
+    }
+
+    at = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+    for (off = 0u; off < plane_len; off += ZPSE_DENSE_MAX_LEN) {
+        uint32_t ns = plane_len - off;
+        uint32_t i;
+        uint32_t room;
+        const uint8_t *exc;
+        int rl;
+
+        if (ns > ZPSE_DENSE_MAX_LEN) {
+            ns = ZPSE_DENSE_MAX_LEN;
+        }
+        /* With fill == 255 the exclusion residual of every byte the plane
+         * can hold is the byte itself, so the packer reads the plane in
+         * place; any other fill needs the mapped copy. */
+        if (fill == 255u) {
+            exc = plane + off;
+        } else {
+            for (i = 0u; i < ns; i++) {
+                buf[i] = zpse_exclusion_forward(plane[off + i],
+                                                (uint8_t)fill);
+            }
+            exc = buf;
+        }
+        room = payload_cap - (at + (uint32_t)ZPSE_DENSE_HEADER_SIZE);
+        if (room > 65535u) {
+            room = 65535u;
+        }
+        rl = zpse_residual_encode_hint((uint8_t)ZPSE_R_PALETTE_BITS, exc, 0, 0,
+                                       (uint16_t)ns,
+                                       payload_out + at +
+                                           (uint32_t)ZPSE_DENSE_HEADER_SIZE,
+                                       (uint16_t)room, (uint16_t)nu2,
+                                       seen2);
+        if (rl < 0) {
+            /* The size bound above said this fits; the packer rejecting a
+             * residual value would mean the exclusion map produced 255,
+             * which a fill the plane does not contain cannot do. Leave the
+             * tile records in place rather than guessing. */
+            return 0;
+        }
+        zpse_store_u16le(payload_out + at,
+                         (uint16_t)(10u + (uint32_t)rl));
+        payload_out[at + 2u] = (uint8_t)(ZPSE_DENSE_MARKER |
+                                         (uint8_t)ZPSE_M_ALL_EXCEPTION |
+                                         ((uint8_t)ZPSE_R_PALETTE_BITS << 3));
+        payload_out[at + 3u] = (uint8_t)ZPSE_P_TILE_CONSTANT;
+        payload_out[at + 4u] = (uint8_t)fill;
+        payload_out[at + 5u] = 0u;
+        zpse_store_u16le(payload_out + at + 6u, (uint16_t)ns);
+        zpse_store_u16le(payload_out + at + 8u, 0u);
+        zpse_store_u16le(payload_out + at + 10u, (uint16_t)rl);
+        /* 2 bytes of rec_len, then the rest of the header (10) and the
+         * residual payload -- what rec_len counts starts after itself. */
+        at += 2u + 10u + (uint32_t)rl;
+    }
+
+    /* A dense segment always reports tile_count == 1 (Sec. 6.3). */
+    h->tile_count = 1u;
+    zpse_segment_header_serialize(payload_out, h);
+    return (int)at;
+}
+
 /* Exit helper for the paths that run out of room: the dense form may still
  * fit where the tile records no longer do, so it is offered before the
  * overflow is reported. Nothing is known about the plane here, so the
@@ -1142,6 +1488,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
     uint8_t dense_v;
     int dense_ok;
+    uint32_t pal_len;
+    uint32_t pal_m;
+    int pal_try;
+    uint32_t pal_bits[8];
 
     if (e == 0 || lanes == 0 || plane == 0 || payload_out == 0) {
         return PSE_BAD_ARG;
@@ -1193,12 +1543,46 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     dense_v = plane[0];
     dense_ok = 1;
 
+    /* Dense palette form (SPEC Sec. 6.3): a plane whose alphabet is small
+     * is cheaper as one palette stream than as one predictor search per
+     * tile -- both in bytes and, at decode, in work (segment.c's
+     * seg_dense_palette_emit). Pricing it means scanning the plane, so it
+     * is only priced when the tile path is *losing*: the first tile is
+     * probed for its alphabet before the loop (a plane's alphabet contains
+     * that tile's, so 256 bytes with more than sixteen values settles it),
+     * and the whole plane is scanned only when the first tile turns out to
+     * need a predictor and a residual at all. A plane of all-hit tiles --
+     * every periodic and every near-constant plane -- therefore never pays
+     * for the scan, and keeps the tile coding it has always had, which is
+     * far smaller than a palette. pal_len is an upper bound on the bytes
+     * the form will write (the packer re-derives the palette per record),
+     * so stopping the loop when pos reaches it can only leave the smaller
+     * form. */
+    pal_try = (seg_plane_alphabet(plane,
+                                  (plane_len < 256u) ? plane_len : 256u, 16u,
+                                  pal_bits) <= 16u)
+                  ? 1
+                  : 0;
+    pal_len = 0u;
+    pal_m = 0u;
+
     pos = 16u;
     for (t = 0; t < tc; t++) {
         uint32_t seg_pos = t * 256u;
         uint16_t nt =
             (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
         const uint8_t *actual = plane + seg_pos;
+
+        if (pal_len != 0u && pos >= pal_len) {
+            int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
+                                            pal_m, pal_bits, pos, byte_budget,
+                                            payload_cap);
+
+            if (dn != 0) {
+                return dn;
+            }
+            pal_len = 0u; /* not emittable after all: keep tiling */
+        }
         uint16_t ks[12];
         uint8_t cand[3];
         uint32_t ncand = 0;
@@ -1384,8 +1768,12 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             continue;
         }
 
-        /* A tile that needs a mask or a residual is not constant, so the
-         * plane cannot be, and the dense form cannot apply. */
+        /* A tile that needs a mask or a residual is not an all-hit tile, so
+         * the dense *constant* form cannot describe this segment. The dense
+         * palette form still can: this is the first moment the encoder knows
+         * the plane is dense rather than periodic, so this is where the form
+         * is priced (once) -- and, if the tiles already written are bigger
+         * than it, where they are replaced by it. */
         dense_ok = 0;
 
         /* One candidate and room for the worst record: pack it straight
@@ -1465,6 +1853,40 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         zpse_store_u16le(payload_out + pos, (uint16_t)best_len);
         pos += 2u + (uint32_t)best_len;
+
+        /* The palette form (SPEC Sec. 6.3) is priced from the first tile
+         * that needs a mask or a residual -- the moment the plane is known
+         * to be dense rather than periodic -- and only when that tile is
+         * losing: a record that fits in an eighth of its own bytes pays for
+         * itself many times over, and a plane of those (a sparse flag
+         * bitmap, a slow ramp) is not worth the plane-wide scan the pricing
+         * needs. An eighth still admits a random one-bit plane, whose tiles
+         * cost about a quarter of their bytes. Once priced, the loop above
+         * the tiles stops the moment the tiles can no longer win. */
+        if (pal_try != 0 &&
+            2u + (uint32_t)best_len >= (uint32_t)(nt >> 3)) {
+            int dn;
+
+            pal_try = 0;
+            pal_m = seg_plane_alphabet(plane, plane_len, 16u, pal_bits);
+            if (pal_m >= 2u && pal_m <= 16u) {
+                uint32_t pc = seg_dense_palette_cost(plane_len, pal_m);
+
+                if (pc <= payload_cap &&
+                    (byte_budget == 0u || pc <= byte_budget)) {
+                    pal_len = pc;
+                }
+            }
+            if (pal_len != 0u && pos >= pal_len) {
+                dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
+                                            pal_m, pal_bits, pos, byte_budget,
+                                            payload_cap);
+                if (dn != 0) {
+                    return dn;
+                }
+                pal_len = 0u;
+            }
+        }
         if (seg_flat_abort(e, nt, 2u + (uint32_t)best_len, flat_abort_min)) {
             return PSE_OUTPUT_OVERFLOW;
         }
@@ -1474,11 +1896,25 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * form (SPEC Sec. 6.3) codes in 12 bytes per 4 KiB instead of the ten
      * bytes per 256-byte tile the run path above just wrote. The rewrite
      * only ever shrinks the record area, so every bound checked above still
-     * holds. */
+     * holds. Offered first so a constant plane keeps the form it has
+     * always had. */
     {
         int dn = seg_dense_emit(&h, payload_out, plane, plane_len,
                                 initial_literal, pos, byte_budget,
-                                payload_cap, dense_ok);
+                                payload_cap, dense_ok);        if (dn != 0) {
+            return dn;
+        }
+    }
+
+    /* The loop above stops early once the palette form is the smaller of
+     * the two; this is the case where it finished and the form still has
+     * to be compared with every tile record written. Offered after the
+     * constant form so a constant plane keeps the form it has always had
+     * -- it is also the smaller of the two for a constant. */
+    if (pal_len != 0u) {
+        int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
+                                        pal_m, pal_bits, pos, byte_budget,
+                                        payload_cap);
 
         if (dn != 0) {
             return dn;

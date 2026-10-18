@@ -8,6 +8,7 @@
 #include "zpse/predictor.h"
 #include "zpse/segment.h"
 #include "zpse/status.h"
+#include "zpse/tile.h"
 #include "zpse/transform.h"
 #include "zpse/types.h"
 
@@ -917,6 +918,29 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
     return 16u + (uint32_t)(((uint64_t)sum * (uint64_t)tc) / (uint64_t)priced);
 }
 
+/* Smallest price zpse_block_exact_plane can return for a plane of `len`
+ * bytes: the segment envelope, plus a 2-byte length prefix and the 8-byte
+ * header of every tile -- the record of a tile whose prediction is exact
+ * (mask ALL_HIT, empty residual). Every tile record is at least those ten
+ * bytes, so a plane priced at this floor had no exception anywhere the
+ * sample looked. */
+static uint32_t zpse_block_plane_floor(uint32_t len)
+{
+    return 16u + 10u * ((len + 255u) / 256u);
+}
+
+/* Smallest price zpse_block_exact_sum can return for a candidate whose
+ * planes total `len` bytes: the block envelope zpse_block_exact_sum starts
+ * from, plus one plane at its floor. Any candidate with more than one plane
+ * pays the 16-byte segment envelope once per plane and so cannot be below
+ * this; a single-segment one reaches it exactly when its plane is at the
+ * floor. */
+static uint32_t zpse_block_cand_floor(uint32_t len)
+{
+    return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
+           zpse_block_plane_floor(len);
+}
+
 /* Exact price of one candidate: every plane probed, summed the same way the
  * prescreen proxy sums its planes. */
 static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
@@ -1340,6 +1364,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (pick < 0 || ex[ci] < ex[pick] ||
                 (ex[ci] == ex[pick] && idx[ci] < idx[pick])) {
                 pick = ci;
+            }
+            /* The identity priced at its own floor: no candidate can price
+             * below that (see zpse_block_cand_floor), and a tie goes to the
+             * earlier list entry -- the identity's index is 0, so it wins
+             * every tie. The decision is therefore already made, and pricing
+             * the remaining candidates would only pay for their transform
+             * staging: on a constant block, where all-hit tiles are exactly
+             * what this test finds, that staging was most of the encode
+             * (14.6 us of 19.2 for 64 KiB of zeros, measured). */
+            if (idx[ci] == 0u && scounts[ci] == 1u &&
+                ex[ci] == zpse_block_cand_floor(pn)) {
+                break;
             }
         }
         if (pick >= 0) {

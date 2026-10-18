@@ -144,7 +144,7 @@ non-zero exit code if any of them fails:
 | `test_parity.c` | the full corpus plus four per-primitive sweeps (uniform, small-`nt`/mask-word boundary, stateful-table ids, and the state a classification leaves) |
 | `test_fuzz.c` | a randomized differential corpus: every size 1 to 64, every tile and segment boundary and its neighbours up to 64 KiB, 60 pseudo-random sizes, 18 shapes each (2718 blocks) plus 6 frames, each block round-tripped and its size, compressed length and compressed bytes folded into one digest |
 | `test_lseed.c` | hand-built foreign segments whose ORDER1/ORDER2 tiles deliberately do NOT reset (non-resetting first tile, chains, mixed ORDER/STRIDE), each decoded by the library and by a reference in the file that hardcodes the documented segment-start state — the shape the lane-state seeding above exists for, and one this encoder cannot produce |
-| `test_dense.c` | dense segment records (SPEC Sec. 6.3): 6044 records built by a reference writer over every predictor family, mask form and residual mode at nine plane sizes, plus hand-computed lane-history predictions, plus 15 malformed shapes (reserved bits/fields/modes, `ORDER1`, wrong spans, pad bits, non-ascending positions, trailing bytes) that must be rejected and never decoded, plus 92 emitter and sequence cases (a constant plane must come out dense exactly when the form is smaller, with the cheapest of the three constant predictors, through `zpse_segment_encode` and through the public block API, and a near-constant plane must stay tiles) |
+| `test_dense.c` | dense segment records (SPEC Sec. 6.3): 6044 records built by a reference writer over every predictor family, mask form and residual mode at nine plane sizes, plus hand-computed lane-history predictions, plus 15 malformed shapes (reserved bits/fields/modes, `ORDER1`, wrong spans, pad bits, non-ascending positions, trailing bytes) that must be rejected and never decoded, plus 96 emitter and sequence cases (a constant plane must come out dense exactly when the form is smaller, with the cheapest of the three constant predictors, through `zpse_segment_encode` and through the public block API, a near-constant plane must stay tiles, the palette form must be emitted only for alphabets of at most sixteen values with the record's prediction byte absent from the plane, and a palette plane that *contains* 255 must be filled with the largest byte it lacks and decoded through the exclusion-mapped residual alphabet) |
 
 The parity step is the important one, and it is two checks over three builds
 of the same three suites: `test_parity.c`, `test_fuzz.c` and `test_lseed.c`
@@ -216,22 +216,28 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.004 | 248 | 18.0 | 22.9 |
-| incr | 0.040 | 2619 | 5.2 | 10.4 |
-| random | 1.000 | 65568 | 3.1 | 20.9 |
-| sparse | 0.060 | 3962 | 1.0 | 5.4 |
-| strided | 0.040 | 2625 | 3.1 | 10.3 |
-| const5A | 0.004 | 248 | 17.2 | 23.4 |
-| alt00FF | 0.040 | 2618 | 2.6 | 19.3 |
-| sawtooth | 0.163 | 10656 | 1.1 | 1.9 |
-| lowentropy | 0.687 | 45012 | 0.5 | 0.9 |
-| sparse2 | 0.019 | 1255 | 2.8 | 5.5 |
+| zeros | 0.004 | 248 | 12.0 | 21.3 |
+| incr | 0.040 | 2619 | 5.1 | 10.2 |
+| random | 1.000 | 65568 | 2.9 | 20.5 |
+| sparse | 0.060 | 3962 | 1.0 | 5.3 |
+| strided | 0.040 | 2625 | 3.1 | 10.2 |
+| const5A | 0.004 | 248 | 11.8 | 21.4 |
+| alt00FF | 0.040 | 2618 | 4.6 | 18.7 |
+| sawtooth | 0.163 | 10656 | 1.1 | 2.9 |
+| lowentropy | 0.508 | 33288 | 0.58 | 12.9 |
+| sparse2 | 0.019 | 1255 | 2.8 | 6.8 |
 
-The table is one session and the deltas below are paired measurements, so the
-absolute columns move between machines and runs while the sizes and the ratios
-do not.
+The table is one session (both columns re-measured together) and the deltas
+below are paired measurements, so the absolute columns move between machines
+and runs while the sizes and the ratios do not. The encode column reflects the
+tile-path round at the end of this file; before it, `zeros` and `const5A` were
+3.4 GB/s, `alt00FF` 2.3 and `lowentropy` 0.33.
 
-### `lowentropy`: what the sweep costs, and why 1 GB/s is still out of reach
+### `lowentropy`: what the sweep costs
+
+(The decode half of the 1 GB/s target this section reasons about was later
+reached by a format change rather than by the sweep -- see "Dense palette
+records" at the end of this file.)
 
 That row is the sweep's worst case, and it is now the one place where the
 encoder deliberately trades a little ratio for a lot of time. Measured in
@@ -277,11 +283,11 @@ hostile-stream validation as tiles, and `tests/test_dense.c` covers it. A
 record AREA is a sequence of records (4096 + 4096 + ... + remainder), so a
 64 KiB block encoded as one segment uses the form too.
 
-The emitter takes exactly the shape the form wins on in v1, and no other. A
-record with K == 0 is a fill, so the dense form only pays where the plane is a
-single byte value end to end, and there it costs 12 bytes per 4 KiB against
-ten per 256-byte all-hit tile. Everything else keeps the tiles it had, byte for
-byte. The decision costs no scan: the all-hit run path has already proved each
+The emitter takes exactly the shapes the form wins on in v1, and no other: a
+plane that is a single byte value end to end, and (see "Dense palette records"
+below) a plane of at most sixteen distinct values. A record with K == 0 is a
+fill, so the first costs 12 bytes per 4 KiB against ten per 256-byte all-hit
+tile. Everything else keeps the tiles it had, byte for byte. The decision costs no scan: the all-hit run path has already proved each
 tile is constant, so one byte per tile settles the whole plane, and the
 records are replaced only when the dense form is smaller (a plane holding one
 tile keeps its 10-byte tile record, which beats 12). Three consequences the
@@ -765,6 +771,173 @@ classify plus pack at about one cycle per byte per pass. Reaching the target
 therefore needs roughly 4x on both trials at once, which is a format-level
 change (a whole-segment dense record instead of one bitmap and one palette per
 256 bytes) rather than more micro-optimisation of the per-tile path.
+
+### Dense palette records: `lowentropy` decode 0.9 -> 4.9 GB/s
+
+The per-tile path is the wrong shape for a plane on a small alphabet. Every
+256-byte tile pays a header, a mask and a residual mode, and the decoder then
+runs a predictor chain to reconstruct 256 bytes of which ~235 were sent
+literally. SPEC Sec. 6.3's dense record exists to amortise that over 4 KiB, and
+`src/dense.c` already accepted any conforming record; what was missing was an
+emitter for anything but a constant plane.
+
+A plane whose bytes span at most sixteen distinct values is now emitted as one
+ALL_EXCEPTION + PALETTE_BITS record per 4 KiB, predicted by a TILE_CONSTANT the
+plane does not contain (otherwise the exclusion mapping has no residual for the
+bytes equal to it; 255 is preferred when absent, where the residual of every
+value below it is the value itself). ALL_EXCEPTION makes every position an
+exception, so the record carries no mask and the decoder runs no prediction at
+all: it is one palette expansion per 4 KiB, decoded straight into the output
+with the exclusion inverse applied 16 bytes at a time.
+
+`lowentropy` (uniform 4-bit bytes), 64 KiB blocks:
+
+| | before | after |
+| --- | --- | --- |
+| bytes | 45012 (0.687) | 33288 (0.508) |
+| encode GB/s | 0.52 | 0.33 |
+| decode GB/s | 0.94 | 12.8 |
+
+Decode is 13.6x and the stream is 26% smaller; encode pays 36% because the row
+now runs the tile search *and* the palette pass -- the tile loop stops as soon
+as the tiles can no longer win (at ~74% of the plane here), but it still has to
+reach that point. The form is priced only where it can plausibly be used: the
+first tile is probed for its alphabet (256 bytes, and more than sixteen
+distinct values settles it outright), the whole plane is scanned only when that
+tile needed a mask or a residual at all, and the form is priced only when that
+tile cost at least an eighth of its own bytes. All-hit planes -- every periodic
+and near-constant block, nine of the ten bench rows -- never pay for the scan
+and keep their tile coding byte for byte: `incr`, `strided`, `alt00FF`, `zeros`,
+`const5A` and `sparse2` are unchanged in size and within noise in both speeds.
+
+Two decode changes were needed to reach that number, and both are shape-level
+rather than micro-optimisation:
+
+* **`residual.c`, mode-2 palette unpack.** Four-bit indices tile a byte
+  exactly, so one 16-byte load carries 32 values: two nibble extractions, two
+  `pshufb` palette lookups and two interleaved stores cover 32 values where the
+  sixteen-value loop covered 16. Every plane of 9-16 distinct values lands on
+  that width, tiles and dense records alike.
+* **`dense.c`, the exclusion inverse.** The encoder picks `C == 255` whenever
+  the plane does not contain 255, and `zpse_exclusion_inverse(r, 255) == r` for
+  every residual a payload can hold -- so the reconstruction IS the expansion
+  and the pass that used to invert 4 KiB byte by byte disappears. (A `C` the
+  plane does contain is still inverts through the byte test.)
+
+`tile.c` got one more of the same kind, for the lane-history family: a 32-byte
+block of four groups whose mask word is zero consumes no units and, for
+`LANE_PREVIOUS`, repeats the previous group's eight bytes, and for
+`LANE_DELTA` is an arithmetic progression at one add per group. Taking such a
+run as one 32-byte store instead of four blended 8-byte ones lifts `sawtooth`
+(16-way transposed ramp, `LANE_DELTA`, 15 exceptions per tile) 1.83 -> 2.53
+GB/s decode with every `clen` unchanged. `LANE_AVERAGE` has no closed form and
+keeps the per-group path.
+
+And `transform.c` had the same shape of waste on the 16-way transposed
+plane: the 16x16 AVX2 transpose was called with two freshly assembled
+sixteen-entry pointer arrays per 256-byte group, which cost a third of the
+kernel. Both the gather and the inverse now hoist those bases out of the loop
+and pass the group's byte offset instead, which is what lifts `sawtooth` to
+2.76 and `sparse2` 5.14 -> 6.8 GB/s decode.
+
+The decoder needs no new rules: the prefix equation, K == Nt for ALL_EXCEPTION
+and the residual payload are validated by the checks every dense record already
+goes through (`dense_check_mask`, `zpse_residual_decode`), so a hostile record
+is rejected by the same statuses as before, and a byte string that is neither
+emitted shape decodes exactly as it did. `tests/test_dense.c` drives the
+emitter directly now: sixteen values must come out as one 2077-byte record with
+TILE_CONSTANT / ALL_EXCEPTION / PALETTE_BITS and a prediction byte the plane
+lacks, two values as one bit per byte (543 bytes), seventeen values as tiles,
+and four tampered records (wrong K, a bitmap claimed without one, a residual
+span that overruns, a truncated payload) that must be rejected rather than
+decoded. All 768 cases of `tests/clen_corpus.c` come out byte-identical to the
+previous commit -- none of those shapes has an alphabet that small -- and
+parity, fuzz and lseed match across the default, `-DZPSE_FORCE_SCALAR` and
+`-DZPSE_FORCE_TRIAL_SWAP` builds under both gcc and clang. That parity run is
+also what proves the two decode rewrites above: the `-DZPSE_FORCE_SCALAR` build
+runs the original scalar loops over the same corpus, and the two digests are
+still identical (`8694766F1D93FB27` parity, `C1931AD9F42A615B` fuzz).
+
+### Encoder: what the sampled decision still paid for
+
+The encoder was 4-30x slower than the decoder on the compressible rows, and
+none of that gap was in the tile search itself: measured with region timers
+inside `zpse_segment_encode` and the block sweep (a throwaway instrumented
+copy, 64 KiB blocks, per region), the three largest items were work the
+encoder did and then threw away. Each is now removed, with the decision it
+feeds left bit-for-bit as it was.
+
+**The decision still staged every candidate.** `zpse_block_encode` picks the
+surviving candidate from an exact price on 16 spread tiles, and it priced the
+identity, DELTA8 and the 16-way transpose whether or not the answer was
+already known. On a block whose identity plane predicts every sampled tile the
+identity's price lands exactly on its own floor (`zpse_block_plane_floor`: the
+segment envelope plus ten bytes per tile, the record of a tile with no
+exceptions), and then nothing can beat it -- a price is that envelope plus, per
+plane, at least that floor, so a single-segment candidate can only tie, and a
+tie goes to the earlier list entry, which the identity always is. So the
+pricing loop now stops there (`zpse_block_cand_floor`), and the remaining
+candidates' transform staging -- a 64 KiB transpose on a constant block -- is
+not paid at all: 14.6 us of the 19.2 that 64 KiB of zeros used to take.
+
+**The palette form scanned the plane twice, scalar.** Pricing the dense palette
+record needs the plane's alphabet (`seg_plane_alphabet`), and discovering it
+was a load-modify-store of the same bitmap word per byte -- a dependent chain
+through L1 that cost 46 us per 64 KiB on four-bit data, more than the palette
+pack itself. The first 1024 bytes are still gathered scalar (they hold a
+palette plane's whole alphabet several times over), and the rest of the plane
+is only TESTED for membership: the set becomes two sixteen-entry nibble tables
+and a byte is a member iff bit `(v >> 4) & 7` of `A[v & 15]` (or of `B`, above
+high nibble 7), which is three `pshufb` lookups and a masked select per 32
+bytes, independent of the alphabet size. A plane with more values still leaves
+that pass the first time it meets one, so the early exit that keeps text and
+noise cheap is unchanged. 46 -> ~4 us.
+
+**The palette packer rediscovered its palette per record.** `dense.c`'s
+emitter packs one 4 KiB record at a time and each call scanned all 4096 bytes
+to find the first-appearance palette. The plane-wide alphabet is already known
+at that point, so the emitter now derives the residual alphabet for its `fill`
+(the exclusion map is a function of one byte, so distinct values can only
+merge) and hands it to `zpse_residual_encode_hint` as the certificate the tile
+path already uses. The packer walks only as far as the last new value -- a few
+dozen bytes -- and the payload is unchanged, because the hint is verified
+before use (the prefix must hold every value of the certificate, at which point
+its palette order and size are the ones the exhaustive scan produces). 41 ->
+~10 us per block.
+
+Paired binaries, `bench 300 5`, best of five rounds, all ten `clen` values
+unchanged (248 / 2619 / 65568 / 3962 / 2625 / 248 / 2618 / 10656 / 33288 /
+1255):
+
+| row | encode before | after |
+| --- | --- | --- |
+| zeros | 3.4 GB/s | 12.2 |
+| const5A | 3.4 | 11.8 |
+| alt00FF | 2.3 | 4.5 |
+| lowentropy | 0.33 | 0.58 |
+| the other six | -- | 0.98-1.07x (no code of theirs changed) |
+
+Mean encode across the ten rows 2.49 -> 4.49 GB/s. The `lowentropy` number in
+the dense-record table above (0.33 GB/s) is superseded by this one; its two
+additions there still stand, and the row is still the slowest because the tile
+loop has to run until `pos` reaches the palette's price before the palette form
+can be chosen -- 79 us of the 115 it now takes is tile search whose records are
+thrown away, and only a change to that decision (or a cheaper classify+pack)
+can remove it. Verified: `tests/run.sh` ALL SUITES PASS under gcc and clang,
+`DENSE: cases=6140 failures=0`, and the parity (`8694766F1D93FB27`) and fuzz
+(`C1931AD9F42A615B`) digests identical to before the round in the default,
+`-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds -- the
+`FORCE_SCALAR` build is the reference the fast paths are diffed against, and
+the alphabet pass was additionally checked against its scalar form on 4,000
+randomized planes (alphabets of 1-17 values, values near 240-255, stragglers
+past the head, both `limit` settings) with no divergence.
+
+What is left on the encode side, measured rather than guessed: the per-tile
+`classify` (74-150 ns per 256-byte tile, dense tiles the expensive ones), the
+nine-predictor prescreen (~15 us per 64 KiB, 30% of `sawtooth`'s tile time),
+and the near-tie second candidate that `sparse` encodes and discards. All
+three are per-256-byte framing costs, the same ones the dense-record form was
+added to amortise.
 
 ## License
 

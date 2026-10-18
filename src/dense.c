@@ -2,11 +2,44 @@
 
 #include <string.h>
 
+#if defined(__SSE2__) || defined(_M_X64) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define ZPSE_DENSE_HAVE_SSE2 1
+#include <emmintrin.h>
+#endif
+
 #include "zpse/bits.h"
 #include "zpse/mask.h"
 #include "zpse/predictor.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
+
+/* out[0..n) += 1, byte-wise with wrap, which is the exclusion inverse for
+ * a zero prediction (zpse_exclusion_inverse(r, 0) == r + 1 for every r).
+ * Byte addition cannot be carried out with a word add -- a carry out of
+ * one byte would corrupt the next -- so the vector form adds with
+ * PADDB, one byte lane at a time. */
+static void dense_add_one(uint8_t *out, uint32_t n)
+{
+    uint32_t i = 0u;
+
+#if ZPSE_DENSE_HAVE_SSE2
+    {
+        const __m128i one = _mm_set1_epi8(1);
+
+        for (; i + 16u <= n; i += 16u) {
+            __m128i v = _mm_loadu_si128(
+                (const __m128i *)(const void *)(out + i));
+
+            _mm_storeu_si128((__m128i *)(void *)(out + i),
+                             _mm_add_epi8(v, one));
+        }
+    }
+#endif
+    for (; i < n; i++) {
+        out[i] = (uint8_t)(out[i] + 1u);
+    }
+}
 
 /* Period of a STRIDE predictor (mirrors tile_stride_of in tile.c). */
 static uint32_t dense_stride(uint8_t predictor_id)
@@ -243,6 +276,49 @@ static int dense_record(uint32_t nt, const uint8_t *payload,
     if (rc != PSE_OK) {
         return rc;
     }
+
+    /* ---- No prediction at all (Sec. 6.3) ------------------------- *
+     * An ALL_EXCEPTION mask makes every position an exception, and the
+     * constant families predict the same byte everywhere, so no
+     * prediction chain exists to follow: the record IS its residual
+     * stream, expanded and mapped through the (constant) exclusion
+     * inverse. That is the shape the encoder emits for a plane with few
+     * distinct byte values (segment.c), and decoding it straight into the
+     * output -- rather than into the exception scratch and back out
+     * through a per-position loop -- is what makes such a plane cost one
+     * palette expansion instead of one predictor step per byte. The
+     * residual decoder validates the payload exactly as it does on the
+     * general path, so every rejection is unchanged; validation of K and
+     * of the mask already happened above. */
+    if (mask_mode == (uint8_t)ZPSE_M_ALL_EXCEPTION &&
+        (pred == (uint8_t)ZPSE_P_CONST_ZERO ||
+         pred == (uint8_t)ZPSE_P_TILE_CONSTANT)) {
+        uint8_t fill = (pred == (uint8_t)ZPSE_P_CONST_ZERO) ? 0u : constant_c;
+
+        rc = zpse_residual_decode(res_mode, res, (uint16_t)res_len,
+                                  (uint16_t)k, 0, out, out);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+        if (res_mode != (uint8_t)ZPSE_R_RAW_ACTUAL) {
+            if (fill == 0u) {
+                dense_add_one(out, nt);
+            } else if (fill == 255u) {
+                /* zpse_exclusion_inverse(r, 255) is r for every residual a
+                 * payload can hold (255 itself is not a legal residual), and
+                 * the encoder picks 255 exactly when the plane does not
+                 * contain it, so the expansion IS the reconstruction. */
+            } else {
+                /* Any other prediction is not a constant offset, so this
+                 * takes the byte test. */
+                for (p = 0u; p < nt; p++) {
+                    out[p] = zpse_exclusion_inverse(out[p], fill);
+                }
+            }
+        }
+        return PSE_OK;
+    }
+
     rc = zpse_residual_decode(res_mode, res, (uint16_t)res_len, (uint16_t)k,
                               0, scratch, scratch);
     if (rc != PSE_OK) {
