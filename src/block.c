@@ -658,9 +658,19 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 }
 
 /* Divisor of the trial-level noise probe's threshold: see flat_min in
- * zpse_block_encode and seg_flat_abort in segment.c. */
+ * zpse_block_encode and seg_flat_abort in segment.c.
+ *
+ * 64, not 16. The probe exists only to stop a trial that can no longer
+ * beat the RAW envelope, and a noise tile costs about 370 ns to encode
+ * (versus 75 ns for one that predicts), so the old 4 KiB threshold spent
+ * 16 of them -- 6 us of a 26 us encode -- before giving up. A quarter of
+ * that decides on the same evidence; the floor in zpse_block_encode means
+ * 64 and anything larger are the same threshold, so this is the smallest
+ * the divisor can usefully be. The noise row goes 3.01 -> 3.44 GB/s and
+ * nothing else moves: tests/test_fuzz.c prints byte-identical sizes for
+ * all 2,718 cases and tests/test_sizes.c still reports grew=0 over 768. */
 #ifndef ZPSE_FLAT_MIN_DIV
-#define ZPSE_FLAT_MIN_DIV 16u
+#define ZPSE_FLAT_MIN_DIV 64u
 #endif
 
 /* Smallest size a trial with this (transform, segment count, metadata)
