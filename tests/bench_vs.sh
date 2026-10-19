@@ -29,11 +29,18 @@ unity="$repo/src/zpse_unity.c"
 SIZE="${SIZE:-4194304}"
 REPS="${REPS:-3}"
 CC="${CC:-cc}"
-if [ -d /dev/shm ]; then
-    work="$(mktemp -d /dev/shm/zpse-bench.XXXXXX)"
-else
-    work="$(mktemp -d "${TMPDIR:-/tmp}/zpse-bench.XXXXXX")"
+# /dev/shm is not always usable: MSYS reports it as a writable-looking
+# directory and then refuses mktemp, which used to leave `work` empty and
+# turn every path below into a relative one (the build wrote next to the
+# repo). Probe, then fall back, and refuse to run with an empty work dir.
+work=""
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    work="$(mktemp -d /dev/shm/zpse-bench.XXXXXX 2>/dev/null)" || work=""
 fi
+if [ -z "$work" ]; then
+    work="$(mktemp -d "${TMPDIR:-/tmp}/zpse-bench.XXXXXX" 2>/dev/null)" || work=""
+fi
+[ -n "$work" ] || { echo "bench_vs: no writable temp directory" >&2; exit 1; }
 trap 'rm -rf "$work"' EXIT
 exe=""
 case "$(uname -s 2>/dev/null)" in
