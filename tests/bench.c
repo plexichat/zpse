@@ -15,6 +15,13 @@
  * Also prints the measured hardware ceilings for this machine
  * (memcpy / memset / CRC32-C), which bound what any codec built on
  * this wire format can reach. */
+/* clock_gettime and CLOCK_MONOTONIC are POSIX, and -std=c11 (which every
+ * build here uses) puts glibc's headers in strict ISO mode, where they are
+ * not declared. Ask for them before the first include; MinGW and MSVC
+ * define _WIN32 and take the QueryPerformanceCounter branch instead. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
