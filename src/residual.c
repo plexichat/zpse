@@ -408,6 +408,39 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     if (b == 2u) {
         const __m128i low2 = _mm_set1_epi8(0x03);
 
+        /* m == 4 fills the width, so the four range checks below are
+         * provably dead for that plane (see the b == 4 note). */
+        if (m == 4u) {
+            while ((uint32_t)i + 64u <= (uint32_t)k) {
+                __m128i x = _mm_loadu_si128(
+                    (const __m128i *)(const void *)(src +
+                                                    ((uint32_t)i >> 2u)));
+                __m128i i0 = _mm_and_si128(x, low2);
+                __m128i i1 = _mm_and_si128(_mm_srli_epi16(x, 2), low2);
+                __m128i i2 = _mm_and_si128(_mm_srli_epi16(x, 4), low2);
+                __m128i i3 = _mm_and_si128(_mm_srli_epi16(x, 6), low2);
+                __m128i a0 = _mm_shuffle_epi8(palv, i0);
+                __m128i a1 = _mm_shuffle_epi8(palv, i1);
+                __m128i a2 = _mm_shuffle_epi8(palv, i2);
+                __m128i a3 = _mm_shuffle_epi8(palv, i3);
+                __m128i u0 = _mm_unpacklo_epi8(a0, a1);
+                __m128i u1 = _mm_unpackhi_epi8(a0, a1);
+                __m128i u2 = _mm_unpacklo_epi8(a2, a3);
+                __m128i u3 = _mm_unpackhi_epi8(a2, a3);
+
+                _mm_storeu_si128((__m128i *)(void *)(exc_out + i),
+                                 _mm_unpacklo_epi16(u0, u2));
+                _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 16u),
+                                 _mm_unpackhi_epi16(u0, u2));
+                _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 32u),
+                                 _mm_unpacklo_epi16(u1, u3));
+                _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 48u),
+                                 _mm_unpackhi_epi16(u1, u3));
+                i = (uint16_t)(i + 64u);
+            }
+            return i;
+        }
+
         while ((uint32_t)i + 64u <= (uint32_t)k) {
             __m128i x = _mm_loadu_si128(
                 (const __m128i *)(const void *)(src + ((uint32_t)i >> 2u)));
@@ -459,6 +492,31 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
      * implies i/2 + 16 <= ceil(k/2). */
     if (b == 4u) {
         const __m128i low4 = _mm_set1_epi8(0x0F);
+
+        /* With sixteen values the width is exactly full, so no 4-bit index
+         * can name a palette entry that is not there: the range check below
+         * is provably dead. Hoisting it out of the loop drops two compares,
+         * two movemasks and a branch from every 32 values, and this is the
+         * loop a nine-to-sixteen-value plane spends its decode in -- every
+         * palette plane dense records carry. */
+        if (m == 16u) {
+            while ((uint32_t)i + 32u <= (uint32_t)k) {
+                __m128i x = _mm_loadu_si128(
+                    (const __m128i *)(const void *)(src +
+                                                    ((uint32_t)i >> 1u)));
+                __m128i lo = _mm_and_si128(x, low4);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(x, 4), low4);
+                __m128i a = _mm_shuffle_epi8(palv, lo);
+                __m128i c = _mm_shuffle_epi8(palv, hi);
+
+                _mm_storeu_si128((__m128i *)(void *)(exc_out + i),
+                                 _mm_unpacklo_epi8(a, c));
+                _mm_storeu_si128((__m128i *)(void *)(exc_out + i + 16u),
+                                 _mm_unpackhi_epi8(a, c));
+                i = (uint16_t)(i + 32u);
+            }
+            return i;
+        }
 
         while ((uint32_t)i + 32u <= (uint32_t)k) {
             __m128i x = _mm_loadu_si128(
