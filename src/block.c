@@ -22,6 +22,42 @@ static int zpse_block_scount_valid(uint8_t sc)
     return sc == 1 || sc == 2 || sc == 4 || sc == 8 || sc == 16;
 }
 
+/* 1 iff in[0..n) is one byte value, which *b_out receives.
+ *
+ * Exists only to pick the CRC form: a one-value block's CRC is O(log n)
+ * matrix applies (zpse_crc32c_repeat) instead of a 64 KiB pass, and on a
+ * constant block that pass is most of the encode. The scan leaves at the
+ * first differing byte -- thirty-two bytes per step, four word compares
+ * and one branch -- so a block that is not constant pays one compare. */
+static int zpse_block_input_const(const uint8_t *in, uint32_t n,
+                                  uint8_t *b_out)
+{
+    const uint8_t b = in[0];
+    const uint64_t splat = UINT64_C(0x0101010101010101) * (uint64_t)b;
+    uint32_t i = 0u;
+
+    *b_out = b;
+    while (i + 32u <= n) {
+        uint64_t w0, w1, w2, w3;
+
+        memcpy(&w0, in + i, 8);
+        memcpy(&w1, in + i + 8u, 8);
+        memcpy(&w2, in + i + 16u, 8);
+        memcpy(&w3, in + i + 24u, 8);
+        if ((((w0 ^ splat) | (w1 ^ splat)) |
+             ((w2 ^ splat) | (w3 ^ splat))) != 0u) {
+            return 0;
+        }
+        i += 32u;
+    }
+    for (; i < n; i++) {
+        if (in[i] != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Fix up header CRC bytes 28..31 after serializing. */
 static void zpse_block_fix_header_crc(uint8_t hdr[32])
 {
@@ -335,7 +371,23 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 
     /* PHASE5: payload CRC iff the block flag tags it. */
     if ((h.block_flags & ZPSE_B_CRC) != 0) {
-        uint32_t calc = zpse_crc32c(output, n);
+        uint32_t calc;
+
+        /* A one-value plane is the dense constant form (Sec. 6.3), and
+         * only the identity shape reaches here with the decoded plane
+         * already in the caller's buffer, so d->seg_const describes
+         * exactly the bytes output[0..n). Its CRC is O(log n) matrix
+         * applies instead of a 64 KiB pass over the buffer the decoder
+         * just wrote -- and that pass is most of the time a constant
+         * block takes to decode. Nothing is skipped on a claim the
+         * decoder made up: seg_const is only ever set by a record whose
+         * every byte the decoder itself wrote as one value, and the
+         * value compared below is still the full 64 KiB's CRC. */
+        if (identity_shape != 0 && d->seg_const != 0u && n != 0u) {
+            calc = zpse_crc32c_repeat(d->seg_const_byte, (size_t)n);
+        } else {
+            calc = zpse_crc32c(output, n);
+        }
         if (calc != h.decoded_crc32c) {
             return PSE_BAD_PAYLOAD_CRC;
         }
@@ -1221,7 +1273,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     /* Every candidate writes the same decoded CRC into its header (it is
      * the CRC of the uncompressed block), so it is computed once here
      * instead of once per trial over the same 64 KiB. */
-    in_crc = zpse_crc32c(in, n);
+    {
+        uint8_t cb = 0u;
+
+        if (zpse_block_input_const(in, n, &cb)) {
+            in_crc = zpse_crc32c_repeat(cb, (size_t)n);
+        } else {
+            in_crc = zpse_crc32c(in, n);
+        }
+    }
 
     /* Attempt order: identity first unless the sample says DELTA8's plane
      * is much more predictable, and never anything but a swap of those

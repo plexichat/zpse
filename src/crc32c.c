@@ -200,6 +200,7 @@ static int zpse_crc32c_hw_present(void)
     cached = present;
     return present;
 }
+#endif /* ZPSE_CRC32C_HAVE_HW */
 
 /* ---- GF(2) zero-byte operator (zlib's crc32_combine recipe) --------
  *
@@ -312,6 +313,8 @@ static uint32_t zpse_crc32c_shift_bytes(uint32_t c, uint64_t len)
     }
     return c;
 }
+
+#if ZPSE_CRC32C_HAVE_HW
 
 /* One 64-bit chain, 8 bytes per step then a byte tail.  Returns the
  * running (pre-xorout) value, exactly as the hardware path always has. */
@@ -506,6 +509,62 @@ uint32_t zpse_crc32c_init(void)
 uint32_t zpse_crc32c_finish(uint32_t crc)
 {
     return crc ^ 0xFFFFFFFFu;
+}
+
+/* CRC32-C of `n` copies of one byte.
+ *
+ * Doubling, not scanning: writing F(X) for the finished CRC of X, the
+ * concatenation rule F(X||Y) = S(F(X), |Y|) ^ F(Y) with X == Y gives
+ *
+ *   F([b] * 2m) = S(F([b] * m), m) ^ F([b] * m)
+ *
+ * so one matrix apply per doubling builds the CRC of every power-of-two
+ * run, and the binary expansion of n stitches those runs together in
+ * order (each stitch is another single apply, and the apply lengths are
+ * powers of two, i.e. one matrix each). O(log n) work for any n, no
+ * dependence on the byte value, and exact: the same S() the hardware
+ * path's chunk combine uses, so this agrees with zpse_crc32c() bit for
+ * bit. The decoder needs it for the dense constant form, whose whole
+ * 64 KiB output is one byte value: the block CRC there is arithmetic
+ * instead of a 64 KiB pass over bytes the decoder just wrote.
+ *
+ * The shifts are byte-granular, so the same routine covers any n a size_t
+ * can hold (a block is at most 64 KiB; the wider case just costs a few
+ * more applies). */
+uint32_t zpse_crc32c_repeat(uint8_t b, size_t n)
+{
+    uint32_t pw[65]; /* pw[j] = CRC of 2^j copies of b */
+    uint32_t acc;
+    uint64_t rem;
+    int top = -1;
+    int j;
+
+    if (n == 0u) {
+        return 0u; /* zpse_crc32c(NULL, 0) == 0 */
+    }
+    {
+        uint64_t v = (uint64_t)n;
+
+        while (v != 0u) {
+            top++;
+            v >>= 1;
+        }
+    }
+    pw[0] = zpse_crc32c(&b, 1u);
+    for (j = 1; j <= top; j++) {
+        uint32_t prev = pw[j - 1];
+
+        pw[j] = zpse_crc32c_shift_bytes(prev, UINT64_C(1) << (j - 1)) ^
+                prev;
+    }
+    acc = pw[top];
+    rem = (uint64_t)n - (UINT64_C(1) << top);
+    for (j = top - 1; j >= 0; j--) {
+        if (((rem >> j) & 1u) != 0u) {
+            acc = zpse_crc32c_shift_bytes(acc, UINT64_C(1) << j) ^ pw[j];
+        }
+    }
+    return acc;
 }
 
 uint32_t zpse_crc32c_update(uint32_t crc, const uint8_t *data, size_t len)
