@@ -28,7 +28,7 @@ jobs:
       - name: Build the harness
         run: |
           cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude \
-            tests/bench_columnar.c src/zpse_unity.c -ldl -o /tmp/benchcol
+            tests/benchmarks/bench_columnar.c src/zpse_unity.c -ldl -o /tmp/benchcol
       - name: Run the matrix (10 cases x 5 codecs, single core)
         run: |
           taskset -c 0 /tmp/benchcol 12 3 all all | tee /tmp/benchcol.txt

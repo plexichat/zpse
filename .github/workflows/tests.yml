@@ -1,6 +1,6 @@
 # Everything the tree can prove about itself, on every push:
 #
-#  - every suite in tests/run.sh (roundtrip, combinadic, hostile, units,
+#  - every suite in tests/runners/run.sh (roundtrip, combinadic, hostile, units,
 #    stride3, dense, decide, sizes) under gcc and clang;
 #  - the parity/fuzz/lseed corpora in three builds each (runtime SIMD
 #    dispatch, -DZPSE_FORCE_SCALAR, -DZPSE_FORCE_TRIAL_SWAP), whose digests
@@ -31,7 +31,7 @@ jobs:
       - name: Compiler version
         run: ${{ matrix.cc }} --version | head -1
       - name: Suites + SIMD/scalar/order parity
-        run: CC=${{ matrix.cc }} bash tests/run.sh
+        run: CC=${{ matrix.cc }} bash tests/runners/run.sh
       - name: Strict amalgamation build
         run: ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude src/zpse_unity.c -c -o /tmp/zpse.o
       - name: Every translation unit builds alone
@@ -46,8 +46,8 @@ jobs:
       - name: Frame CLI round-trips a corpus
         run: |
           set -e
-          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/zpse_cli.c src/zpse_unity.c -o /tmp/zpse_cli
-          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/corpus_write.c -o /tmp/corpus_write
+          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/tools/zpse_cli.c src/zpse_unity.c -o /tmp/zpse_cli
+          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/corpus/corpus_write.c -o /tmp/corpus_write
           mkdir -p /tmp/corpus
           /tmp/corpus_write /tmp/corpus 1048576
           for f in /tmp/corpus/*.bin; do
@@ -70,4 +70,4 @@ jobs:
           update: false
           install: mingw-w64-x86_64-gcc
       - name: Suites + SIMD/scalar/order parity
-        run: CC=gcc bash tests/run.sh
+        run: CC=gcc bash tests/runners/run.sh

@@ -43,7 +43,7 @@ same() {
 fail=0
 
 for t in test_roundtrip test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_sizes; do
-    src="$repo/tests/$t.c"
+    src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
     if ! "$CC" -std=c11 -O2 -Wall -Wextra -I "$inc" "$src" "$unity" -o "$bin"; then
@@ -68,7 +68,7 @@ echo "=== scalar/SIMD/order parity ==="
 # cases= / LSEED:) that must match across the three builds, and the rest of
 # their output must match too, so a divergence names the case that caused it.
 for suite in parity fuzz lseed; do
-    src="$repo/tests/test_$suite.c"
+    src="$repo/tests/suites/test_$suite.c"
     built=1
     for mode in def scalar swap; do
         case "$mode" in
