@@ -16,6 +16,12 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                         uint8_t *decoded_out, uint32_t decoded_cap,
                         uint32_t *decoded_len_out);
 
+/* 1 iff p[0..n) is one byte value. The AVX2 test the constant-plane
+ * shortcut uses, exposed so a caller that needs the answer for its own
+ * reason (block encode picks its CRC form with it) can compute it once.
+ * Returns 0 for a NULL or empty range. */
+int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n);
+
 /* Encoder-side: transform-plane bytes -> segment payload. Returns
  * payload bytes written or negative status. Choice of per-tile
  * (predictor, mask, residual) modes is made internally (PSE SELECT).

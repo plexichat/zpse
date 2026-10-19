@@ -77,5 +77,8 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     e->comb = base + ZPSE_E_OFF_COMB;
     e->hist = base + ZPSE_E_OFF_HIST;
     e->shuf = base + ZPSE_E_OFF_SHUF;
+    e->flat_covered = 0u;
+    e->flat_paid = 0u;
+    e->const_plane = 0;
     return PSE_OK;
 }

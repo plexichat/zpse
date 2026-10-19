@@ -247,16 +247,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.004 | 248 | 22.8 | 55.8 |
-| incr | 0.040 | 2619 | 5.85 | 10.1 |
-| random | 1.000 | 65568 | 3.16 | 20.4 |
-| sparse | 0.060 | 3962 | 2.10 | 6.26 |
-| strided | 0.040 | 2624 | 3.88 | 10.2 |
-| const5A | 0.004 | 248 | 22.4 | 54.7 |
-| alt00FF | 0.009 | 608 | 7.13 | 7.56 |
-| sawtooth | 0.116 | 7584 | 3.04 | 5.52 |
-| lowentropy | 0.508 | 33288 | 2.06 | 12.7 |
-| sparse2 | 0.019 | 1255 | 4.53 | 6.77 |
+| zeros | 0.004 | 248 | 36.2 | 55.7 |
+| incr | 0.040 | 2619 | 5.96 | 10.2 |
+| random | 1.000 | 65568 | 3.17 | 20.4 |
+| sparse | 0.060 | 3962 | 2.03 | 6.34 |
+| strided | 0.040 | 2624 | 3.94 | 10.1 |
+| const5A | 0.004 | 248 | 36.1 | 53.9 |
+| alt00FF | 0.009 | 608 | 7.16 | 10.1 |
+| sawtooth | 0.116 | 7584 | 2.97 | 6.75 |
+| lowentropy | 0.508 | 33288 | 2.07 | 12.8 |
+| sparse2 | 0.019 | 1255 | 4.55 | 8.81 |
 
 The table is one session (both columns re-measured together) and the deltas
 below are paired measurements, so the absolute columns move between machines
@@ -1652,6 +1652,65 @@ the previous commit, under gcc and clang. `zeros` decode is now bounded by
 `memset` plus the ~0.1 us arithmetic, not by the CRC unit; `random` decode
 (20.4 GB/s against a 27-30 GB/s CRC rate) is now the row that is actually
 CRC-bound.
+
+### One scan instead of two, and a transpose that reads the right sets
+
+Two of the three items in the previous section's "remaining limits" were
+taken; the third is measured and deferred.
+
+**Encode: the constant-block scan ran twice.** Block encode has to know
+whether the whole input is one byte value, to pick its CRC form; the
+segment encoder then scanned the same 64 KiB again for the dense form. The
+block now calls the segment encoder's own AVX2 test
+(`zpse_segment_plane_is_const`) and records the pointer it tested in
+`ZpseEncoder.const_plane`; `zpse_segment_encode` skips its scan when it is
+handed that very pointer -- which is only ever the block's input, i.e. the
+identity trial's plane, because that trial does not copy. One scan, and
+the faster kernel: `zeros` encode 22.6 -> 36.2 GB/s, `const5A` 22.6 ->
+36.1.
+
+**Decode: the profile said transpose-16, not the tile path.** Decomposing
+block decode into its stages (segment decode, inverse transform, payload
+CRC; GB/s of 64 KiB, higher is faster):
+
+| pattern | total | segment decode | inverse | CRC |
+|---|---:|---:|---:|---:|
+| incr | 8.10 | 38.3 | 21.8 | 30.3 |
+| sparse | 6.18 | 8.17 | 67.9 | 30.1 |
+| strided | 9.93 | 45.7 | 22.1 | 30.7 |
+| alt00FF | 7.70 | 64.7 | 12.0 | 30.9 |
+| sawtooth | 5.64 | 16.2 | 12.3 | 30.4 |
+| lowentropy | 12.77 | 23.1 | 66.8 | 30.3 |
+| sparse2 | 6.89 | 33.7 | 12.3 | 30.1 |
+
+`alt00FF`, `sawtooth` and `sparse2` are all-transposed blocks (id 6), and
+their inverse ran at 11-12 GB/s -- a fifth of `memcpy`, and the same
+kernel measured 30 GB/s when its sources were L1-resident. Cause: a group
+of the inverse reads 16 bytes from each of sixteen planes that are exactly
+4096 bytes apart, so all sixteen lines of a group land in the same L1 set
+and evict each other. That is the load-side mirror of the store-side
+conflict `zpse_t16x16_forward_blocked` already pays a staging buffer to
+avoid. The inverse now stages one 64-byte line from each plane into a
+1 KiB buffer (plane t at t*64, so its chunks map to set t) and transposes
+four groups from there: 11 -> 16 GB/s in isolation, and the rows move
+`alt00FF` 7.5 -> 10.1, `sparse2` 6.8 -> 8.8, `sawtooth` 5.6 -> 6.75 GB/s.
+The other rows are unchanged (measured inside noise).
+
+Paired binaries, alternating order, best of two rounds: `zeros`/`const5A`
+encode +57 %, `alt00FF` decode +31 %, `sparse2` +29 %, `sawtooth` +21 %.
+No byte moves: the ten `clen` values, all 768 `tests/clen_corpus` sizes and
+the parity / fuzz / lseed digests across the default, scalar and
+trial-swap builds are identical, under gcc and clang.
+
+**Palette CRC fusion: measured, not done.** For `lowentropy` the CRC is
+2.2 us of the block's 5.1 us, and the dense palette decode that produces
+the bytes is 2.8 us of it. Fusing the two would put the `crc32` chain
+inside `residual_decode_mode2`'s unpack loop, which means a crc-carrying
+variant of that decoder threaded through `zpse_dense_decode`,
+`zpse_segment_decode` and `ZpseDecoder` for the block layer to trust. The
+ceiling is the same 8 bytes per cycle the separate pass already runs at,
+so the win is the overlap (up to ~1.2 us, ~25 % of the row), not the
+hashing. It is the next thing to try here, and it needs that plumbing.
 
 ## License
 

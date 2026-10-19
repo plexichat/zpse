@@ -589,6 +589,55 @@ static ZPSE_T_AVX2 void zpse_t16x16_forward_blocked(const uint8_t *const in[16],
     }
 }
 
+/* Inverse of the above, blocked the other way round: one 64-byte line from
+ * each of the sixteen planes into a 1 KiB buffer, then four groups out of
+ * the buffer.
+ *
+ * A group of the inverse reads sixteen bytes from each source plane, and
+ * the planes of a 64 KiB block sit exactly 4096 bytes apart -- so all
+ * sixteen lines of a group have the SAME L1 set index (the same problem
+ * the forward's 4 KiB-strided stores had, now on the load side). Measured
+ * 11 GB/s for the direct form against 30 GB/s for the same kernel with
+ * L1-resident sources: conflict misses, not arithmetic. Staging writes
+ * plane t at t*64, so its sixteen-byte chunks map to set t and the
+ * transpose itself reads from sixteen different sets: 16 GB/s, and the
+ * copy is one full line per plane instead of four partial ones. */
+static ZPSE_T_AVX2 void zpse_t16x16_inverse_blocked(const uint8_t *const in[16],
+                                                    uint8_t *const out[16],
+                                                    uint32_t rows)
+{
+    /* Aligned: the staging stores are aligned _mm256 stores, and every
+     * plane's run inside it starts on a 64-byte boundary. */
+    uint8_t buf[16u * 64u] __attribute__((aligned(64)));
+    const uint8_t *bin[16];
+    uint32_t g = 0u;
+    uint32_t q;
+    unsigned t;
+
+    for (t = 0; t < 16u; t++) {
+        bin[t] = buf + (size_t)t * 64u;
+    }
+    for (; (g + 4u) * 16u <= rows; g += 4u) {
+        for (t = 0; t < 16u; t++) {
+            const __m256i a = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(in[t] + (size_t)g * 16u));
+            const __m256i b = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(in[t] + (size_t)g * 16u + 32u));
+
+            _mm256_store_si256((__m256i *)(void *)(buf + (size_t)t * 64u),
+                               a);
+            _mm256_store_si256((__m256i *)(void *)(buf + (size_t)t * 64u + 32u),
+                               b);
+        }
+        for (q = 0; q < 4u; q++) {
+            zpse_t16x16_avx2(bin, q * 16u, out, (g + q) * 256u);
+        }
+    }
+    for (; (g + 1u) * 16u <= rows; g++) {
+        zpse_t16x16_avx2(in, g * 16u, out, g * 256u);
+    }
+}
+
 /* Width-1 delta/xor staging, 32 bytes per step. No dependency chain to
  * satisfy: for j >= 1 the stored byte is an op between the stream and
  * itself shifted by one, so the two loads are independent of the store.
@@ -1027,9 +1076,8 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
                     tin[t] = segs[t];
                     tout[t] = out + (size_t)t * 16u;
                 }
-                for (g = 0; (g + 1u) * 16u <= rows; g++) {
-                    zpse_t16x16_avx2(tin, g * 16u, tout, g * 256u);
-                }
+                zpse_t16x16_inverse_blocked(tin, tout, rows);
+                g = rows / 16u; /* the tail loop below is already covered */
             } else
 #endif /* ZPSE_T_HAVE_AVX2 */
             for (g = 0; (g + 1u) * 16u <= rows; g++) {

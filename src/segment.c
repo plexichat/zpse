@@ -1787,6 +1787,14 @@ static int seg_dense_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
  * instead of a read-modify-write of the set. */
 #define ZPSE_ALPHA_HEAD 1024u
 
+int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n)
+{
+    if (p == 0 || n == 0u) {
+        return 0;
+    }
+    return seg_plane_is_const(p, n);
+}
+
 #if ZPSE_PS_HAVE_AVX2
 /* First position in p[0, n) whose byte is NOT in the set `bits`, or n when
  * every byte is.
@@ -2398,6 +2406,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
     uint8_t dense_v;
     int dense_ok;
+    /* 1 iff the block layer already proved this very plane is one byte
+     * value (see the constant-plane shortcut below). */
+    int plane_known_const;
     uint32_t pal_len;
     uint32_t pal_m;
     int pal_try;
@@ -2464,6 +2475,13 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     dense_v = plane[0];
     dense_ok = 1;
 
+    /* The block layer may already have established that this plane is one
+     * byte value -- it has to know, to pick its CRC form -- and when it did
+     * it records the pointer it tested. That pointer is only ever the
+     * block's own input, i.e. the identity trial's plane, so another
+     * candidate's staged plane can never inherit the answer. */
+    plane_known_const = (e->const_plane == plane) ? 1 : 0;
+
     /* ---- A constant plane: the dense form, without writing a tile ----- *
      * The tile loop below writes ten bytes for every 256-byte tile of a
      * one-value plane (each is an all-hit record) and then `seg_dense_emit`
@@ -2496,7 +2514,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
 
         if (dtotal < tiles && dtotal <= payload_cap &&
             (byte_budget == 0u || dtotal <= byte_budget) &&
-            seg_plane_is_const(plane, plane_len)) {
+            (plane_known_const != 0 || seg_plane_is_const(plane, plane_len))) {
             int dn = seg_dense_emit(&h, payload_out, plane, plane_len,
                                     initial_literal, tiles, byte_budget,
                                     payload_cap, 1);
@@ -2982,7 +3000,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     {
         int dn = seg_dense_emit(&h, payload_out, plane, plane_len,
                                 initial_literal, pos, byte_budget,
-                                payload_cap, dense_ok);        if (dn != 0) {
+                                payload_cap,
+                                (dense_ok || plane_known_const) ? 1 : 0);        if (dn != 0) {
             return dn;
         }
     }
