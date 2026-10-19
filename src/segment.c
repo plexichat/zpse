@@ -2168,7 +2168,8 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
 static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                                const uint8_t *plane, uint32_t plane_len,
                                uint32_t tc, unsigned tiles,
-                               uint8_t initial_literal, int have_avx2)
+                               uint8_t initial_literal, int have_avx2,
+                               uint32_t limit)
 {
     uint32_t step = tc / tiles;
     uint32_t sum = 0u;
@@ -2266,6 +2267,24 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         sum += 2u + (uint32_t)tile_len;
         nsum++;
+        /* `limit` is the sweep's running verdict: a price above it can never
+         * win, so there is no point finishing the sample. The folded price
+         * is header + round((S_final*tc)/nsum_final), with S_final only
+         * growing and tc/nsum_final >= 1 (we never price more tiles than
+         * exist), so it can never fall below header + sum. Once that floor
+         * reaches `limit` the sample is convicted; UINT32_MAX means "could
+         * not be priced", so the caller keeps the candidate -- a safe,
+         * perf-only degradation, never a wrongly dropped winner. */
+        if (limit != UINT32_MAX &&
+            (uint64_t)ZPSE_SEGMENT_HEADER_SIZE + (uint64_t)sum >=
+                (uint64_t)limit) {
+            /* Convicted: return the proven floor (header + sum), a finite
+             * value >= limit that is a valid lower bound on the true price.
+             * UINT32_MAX stays reserved for "could not be priced" (keep),
+             * so a convicted value is distinguishable from an unpriceable
+             * one and the caller can drop the candidate instead. */
+            return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + sum;
+        }
     }
     if (nsum == 0u) {
         return UINT32_MAX;
@@ -2276,14 +2295,16 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
 
 /* Estimated size of the tile records a plane would take. See seg_tile_price;
  * returns 0 when the plane cannot be priced, so the caller keeps the exact
- * comparison. */
+ * comparison. `limit` is passed straight to the price (UINT32_MAX prices
+ * everything, as before). */
 static int seg_tile_estimate(ZpseEncoder *e, ZpseLaneState *lanes,
                              const uint8_t *plane, uint32_t plane_len,
                              uint32_t tc, uint8_t initial_literal,
-                             int have_avx2, uint32_t *out)
+                             int have_avx2, uint32_t *out, uint32_t limit)
 {
     uint32_t p = seg_tile_price(e, lanes, plane, plane_len, tc,
-                                ZPSE_EST_TILES, initial_literal, have_avx2);
+                                ZPSE_EST_TILES, initial_literal, have_avx2,
+                                limit);
 
     if (p == UINT32_MAX) {
         return 0;
@@ -2332,10 +2353,14 @@ uint32_t zpse_segment_const_cost(const uint8_t *plane, uint32_t plane_len)
  *
  * The result is what zpse_segment_encode would return for the plane, up to
  * the tile sample's error, and includes the 16-byte segment header.
- * UINT32_MAX means the plane could not be priced. */
+ * UINT32_MAX means the plane could not be priced.
+ *
+ * `limit` threads the sweep's running verdict into the sample: planes that
+ * cannot beat it stop after the tiles that convicted them (see
+ * seg_tile_price), while UINT32_MAX prices the whole sample, as before. */
 uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
                                  const uint8_t *plane, uint32_t plane_len,
-                                 unsigned tiles)
+                                 unsigned tiles, uint32_t limit)
 {
     uint32_t tc;
     uint32_t best;
@@ -2349,7 +2374,7 @@ uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
     }
     tc = (plane_len + 255u) / 256u;
     best = seg_tile_price(e, lanes, plane, plane_len, tc, tiles,
-                          plane[0], have_avx2);
+                          plane[0], have_avx2, limit);
 
     /* A constant plane's sampled tiles are all-hit, so its tile price is
      * exactly the plane floor (a 2-byte prefix and an 8-byte header per
@@ -2974,7 +2999,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 uint32_t est;
 
                 if (seg_tile_estimate(e, lanes, plane, plane_len, tc,
-                                      initial_literal, have_avx2, &est) &&
+                                      initial_literal, have_avx2, &est,
+                                      UINT32_MAX) &&
                     est - (est >> 3) >= pal_len) {
                     dn = seg_dense_palette_emit(&h, payload_out, plane,
                                                 plane_len, pal_m, pal_bits,

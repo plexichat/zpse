@@ -61,10 +61,16 @@ uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
 /* Smallest size one transformed plane can be written in, whole: its tile
  * records (sampled), or one of the two dense forms when that is smaller.
  * Includes the 16-byte segment header; UINT32_MAX when it cannot be
- * priced. (See segment.c.) */
+ * priced. (See segment.c.)
+ *
+ * `limit` bounds what the caller needs to know: when the plane's own
+ * proven floor already exceeds it, the price stops at a convicted value
+ * above it (see seg_tile_price in segment.c) instead of paying to price
+ * the rest of the sample. Every caller below passes the running sweep
+ * verdict it already holds, or UINT32_MAX when it holds none. */
 uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
                                  const uint8_t *plane, uint32_t plane_len,
-                                 unsigned tiles);
+                                 unsigned tiles, uint32_t limit);
 
 /* Price of the plane's dense constant form, or UINT32_MAX when the plane is
  * not one byte value end to end. (See segment.c.) */
