@@ -1,4 +1,4 @@
-# zpse — PSE Block Format v1.0.0
+# zpse
 
 `zpse` is a lossless block codec for binary data. It is single-threaded, does
 no allocation after context creation, and has no external dependencies. The
@@ -318,7 +318,7 @@ hostile-stream validation as tiles, and `tests/test_dense.c` covers it. A
 record AREA is a sequence of records (4096 + 4096 + ... + remainder), so a
 64 KiB block encoded as one segment uses the form too.
 
-The emitter takes exactly the shapes the form wins on in v1, and no other: a
+The emitter takes exactly the shapes the form wins on, and no other: a
 plane that is a single byte value end to end, and (see "Dense palette records"
 below) a plane of at most sixteen distinct values. A record with K == 0 is a
 fill, so the first costs 12 bytes per 4 KiB against ten per 256-byte all-hit

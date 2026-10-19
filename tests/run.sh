@@ -32,6 +32,14 @@ case "$(uname -s 2>/dev/null)" in
 MINGW* | MSYS* | CYGWIN*) exe=".exe" ;;
 esac
 
+# Compare two files without diffutils. A minimal MSYS2 install (what the
+# Windows CI job has) ships bash and grep but no cmp, and `cmp: command not
+# found` used to be reported as a digest mismatch on identical digests.
+# `$(<file)` is a bash builtin, so this needs nothing on PATH.
+same() {
+    [ "$(<"$1")" = "$(<"$2")" ]
+}
+
 fail=0
 
 for t in test_roundtrip test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_sizes; do
@@ -96,10 +104,10 @@ for suite in parity fuzz lseed; do
     for mode in scalar swap; do
         grep "$key" "$tmp/$suite.$mode.log" >"$tmp/$suite.$mode.dig" || :
         grep -v "$key" "$tmp/$suite.$mode.log" >"$tmp/$suite.$mode.body" || :
-        if ! cmp -s "$tmp/$suite.def.dig" "$tmp/$suite.$mode.dig"; then
+        if ! same "$tmp/$suite.def.dig" "$tmp/$suite.$mode.dig"; then
             echo "$suite FAILED: digest $(cat "$tmp/$suite.def.dig") vs $mode $(cat "$tmp/$suite.$mode.dig")"
             fail=1
-        elif ! cmp -s "$tmp/$suite.def.body" "$tmp/$suite.$mode.body"; then
+        elif ! same "$tmp/$suite.def.body" "$tmp/$suite.$mode.body"; then
             echo "$suite FAILED: per-case output differs in $mode"
             fail=1
         else
