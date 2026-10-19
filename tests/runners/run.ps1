@@ -14,7 +14,7 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "opencode/zpse-tests"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $fail = 0
 foreach ($t in @("test_roundtrip", "test_combinadic", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_sizes")) {
-    $src = Join-Path $PSScriptRoot "$t.c"
+    $src = Join-Path $PSScriptRoot "suites/$t.c"
     $exe = Join-Path $tmp "$t.exe"
     Write-Output "=== build $t ==="
     gcc -std=c11 -O2 -Wall -Wextra -I $inc $src $unity -o $exe 2>&1
@@ -31,7 +31,7 @@ Write-Output "=== scalar/SIMD/order parity ==="
 # cases= / LSEED:) that must match across the three builds, and the rest of
 # their output must match too, so a divergence names the case that caused it.
 foreach ($suite in @("parity", "fuzz", "lseed")) {
-    $src = Join-Path $PSScriptRoot "test_$suite.c"
+    $src = Join-Path $PSScriptRoot "suites/test_$suite.c"
     $built = $true
     foreach ($mode in @("def", "scalar", "swap")) {
         $exe = Join-Path $tmp "$suite.$mode.exe"

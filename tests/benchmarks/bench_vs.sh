@@ -55,9 +55,9 @@ fail() {
 command -v "$CC" >/dev/null 2>&1 || fail "no C compiler ($CC)"
 
 # ---- Build the corpus writer and the zpse CLI -------------------------
-"$CC" -std=c11 -O2 -DNDEBUG -I "$inc" "$repo/tests/corpus_write.c" \
+"$CC" -std=c11 -O2 -DNDEBUG -I "$inc" "$repo/tests/corpus/corpus_write.c" \
     -o "$work/corpus_write$exe" || fail "building corpus_write"
-"$CC" -std=c11 -O2 -DNDEBUG -I "$inc" "$repo/tests/zpse_cli.c" "$unity" \
+"$CC" -std=c11 -O2 -DNDEBUG -I "$inc" "$repo/tests/tools/zpse_cli.c" "$unity" \
     -o "$work/zpse_cli$exe" || fail "building zpse_cli"
 
 mkdir -p "$work/corpus"

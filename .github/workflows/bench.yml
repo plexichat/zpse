@@ -41,7 +41,7 @@ jobs:
             zstd lz4 brotli gzip xz-utils
       - name: In-process codec throughput
         run: |
-          cc -std=c11 -O2 -march=native -DNDEBUG -Iinclude tests/bench.c src/zpse_unity.c -o /tmp/zpse_bench
+          cc -std=c11 -O2 -march=native -DNDEBUG -Iinclude tests/benchmarks/bench.c src/zpse_unity.c -o /tmp/zpse_bench
           /tmp/zpse_bench 96 5 | tee /tmp/bench_inproc.txt
           {
             echo '### zpse in-process (64 KiB blocks, best of 5)'
@@ -54,7 +54,7 @@ jobs:
         env:
           SIZE: ${{ github.event.inputs.size || '4194304' }}
           REPS: ${{ github.event.inputs.reps || '3' }}
-        run: bash tests/bench_vs.sh | tee /tmp/bench_vs.txt
+        run: bash tests/benchmarks/bench_vs.sh | tee /tmp/bench_vs.txt
       - uses: actions/upload-artifact@v4
         with:
           name: bench-results
