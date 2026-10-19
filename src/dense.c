@@ -41,6 +41,38 @@ static void dense_add_one(uint8_t *out, uint32_t n)
     }
 }
 
+/* out[0..n) = zpse_exclusion_inverse(out[i], fill), for a fill the two
+ * cases above do not cover (0 is dense_add_one, 255 is the identity).
+ * The map is r + (r >= fill) with an unsigned compare, so 16 bytes at a
+ * time: PADDB of the compare's byte mask. This is the pass that used to
+ * be a per-byte scalar loop over the whole 4 KiB record, and on a plane
+ * of sixteen values that happens to include 255 (so the encoder's
+ * preferred no-op fill is not available) it was the whole cost of
+ * decoding a dense record. */
+static void dense_exclusion_map(uint8_t *out, uint32_t n, uint8_t fill)
+{
+    uint32_t i = 0u;
+
+#if ZPSE_DENSE_HAVE_SSE2
+    {
+        const __m128i f = _mm_set1_epi8((char)fill);
+        const __m128i one = _mm_set1_epi8(1);
+
+        for (; i + 16u <= n; i += 16u) {
+            __m128i v = _mm_loadu_si128(
+                (const __m128i *)(const void *)(out + i));
+            __m128i ge = _mm_cmpeq_epi8(_mm_max_epu8(v, f), v);
+
+            _mm_storeu_si128((__m128i *)(void *)(out + i),
+                             _mm_add_epi8(v, _mm_and_si128(ge, one)));
+        }
+    }
+#endif
+    for (; i < n; i++) {
+        out[i] = zpse_exclusion_inverse(out[i], fill);
+    }
+}
+
 /* Period of a STRIDE predictor (mirrors tile_stride_of in tile.c). */
 static uint32_t dense_stride(uint8_t predictor_id)
 {
@@ -73,13 +105,29 @@ static unsigned dense_ctz(unsigned w)
 #endif
 }
 
-/* Number of set bits in a dense bitmap of `need` bytes. */
+/* Number of set bits in a dense bitmap of `need` bytes.
+ *
+ * SWAR over four bytes at a time rather than a bit-scan per byte: a
+ * 4 KiB record's bitmap is 512 bytes and half of them are typically set,
+ * so the bit loop was ~1500 dependent-friendly iterations of a branch
+ * and a clear-lowest-bit per unit of validation. Same count, no
+ * data-dependent branch. */
 static uint32_t dense_popcount(const uint8_t *bits, uint32_t need)
 {
     uint32_t n = 0u;
-    uint32_t i;
+    uint32_t i = 0u;
 
-    for (i = 0u; i < need; i++) {
+    for (; i + 4u <= need; i += 4u) {
+        uint32_t w;
+
+        memcpy(&w, bits + i, sizeof w);
+        w = w - ((w >> 1) & UINT32_C(0x55555555));
+        w = (w & UINT32_C(0x33333333)) +
+            ((w >> 2) & UINT32_C(0x33333333));
+        n += (((w + (w >> 4)) & UINT32_C(0x0F0F0F0F)) *
+              UINT32_C(0x01010101)) >> 24;
+    }
+    for (; i < need; i++) {
         unsigned b = bits[i];
 
         while (b != 0u) {
@@ -312,10 +360,9 @@ static int dense_record(uint32_t nt, const uint8_t *payload,
                  * contain it, so the expansion IS the reconstruction. */
             } else {
                 /* Any other prediction is not a constant offset, so this
-                 * takes the byte test. */
-                for (p = 0u; p < nt; p++) {
-                    out[p] = zpse_exclusion_inverse(out[p], fill);
-                }
+                 * takes the byte test -- vectorised, over the whole
+                 * record, since it is the only pass the form has left. */
+                dense_exclusion_map(out, nt, fill);
             }
         }
         return PSE_OK;

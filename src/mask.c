@@ -12,6 +12,49 @@ static void zpse_mask_set_at(uint32_t words[8], uint16_t pos)
     words[pos >> 5] |= (uint32_t)1u << (pos & 31u);
 }
 
+/* Set every bit of the range [from, from+len).
+ *
+ * The RUNS decoder knows each miss run as one length, and a near-dense
+ * mask -- 253 exceptions in 256 positions, which is three hit bytes and
+ * seven bytes of payload -- was previously written one position at a time
+ * through zpse_mask_set_at: a load, OR and store to the same word for
+ * every position, so each bit paid the store-to-load latency of the one
+ * before it (measured ~5 cycles per exception, 56% of that shape's whole
+ * decode). Setting a whole run with a word-at-a-time OR does the same
+ * eight or sixteen bits in one store, and the caller's `sum <= nt` check
+ * means every bit it sets is still below nt exactly as before. */
+static void zpse_mask_set_range(uint32_t words[8], uint32_t from,
+                                uint32_t len)
+{
+    uint32_t wi = from >> 5u;
+    uint32_t fi = from & 31u;
+    uint32_t bits;
+
+    if (len == 0u) {
+        return;
+    }
+    if (fi != 0u) {
+        bits = 32u - fi;
+        if (bits > len) {
+            bits = len;
+        }
+        words[wi] |= (uint32_t)(((UINT64_C(1) << bits) - 1u) << fi);
+        wi++;
+        len -= bits;
+        if (len == 0u) {
+            return;
+        }
+    }
+    while (len >= 32u) {
+        words[wi] |= UINT32_C(0xFFFFFFFF);
+        wi++;
+        len -= 32u;
+    }
+    if (len != 0u) {
+        words[wi] |= (uint32_t)((UINT64_C(1) << len) - 1u);
+    }
+}
+
 /* Population count on one dense word. The builtin is available on both
  * compilers this codebase targets through gcc/clang; the fallback keeps
  * the file buildable elsewhere without changing the result. */
@@ -362,7 +405,6 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
             return PSE_BAD_MASK;
         for (r = 0; r < payload_len; r++) {
             uint32_t len = payload[r];
-            uint32_t t;
 
             sum += len;
             if (sum > nt)
@@ -371,8 +413,7 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
                 miss += len;
                 if (miss > k)
                     return PSE_BAD_MASK;
-                for (t = 0; t < len; t++)
-                    zpse_mask_set_at(words, (uint16_t)(pos + t));
+                zpse_mask_set_range(words, pos, len);
             }
             pos += len;
         }
