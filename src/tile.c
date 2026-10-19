@@ -372,6 +372,18 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
         words[_pp >> 5] |= (uint32_t)1u << (_pp & 31u);                 \
     } while (0)
 
+/* Number of one bits in a 64-bit word. Same SWAR idiom as the 32-bit
+ * form below, extended one step, so it stays clear of the libgcc helper
+ * a __builtin would call into. */
+static int tile_popcount64(uint64_t v)
+{
+    v = v - ((v >> 1) & UINT64_C(0x5555555555555555));
+    v = (v & UINT64_C(0x3333333333333333)) +
+        ((v >> 2) & UINT64_C(0x3333333333333333));
+    v = (v + (v >> 4)) & UINT64_C(0x0F0F0F0F0F0F0F0F);
+    return (int)((v * UINT64_C(0x0101010101010101)) >> 56);
+}
+
 /* Number of one bits in a 32-bit word (same idiom as mask.c). */
 static int tile_popcount32(uint32_t w)
 {
@@ -2031,6 +2043,598 @@ int zpse_tile_encode(ZpseLaneState *lanes, const uint8_t *actual, uint16_t nt,
         }                                                                    \
     } while (0)
 
+/* ---- STRIDE_1: chain over the exceptions, then a vector fill ------ *
+ * For stride 1 the prediction at p is out[p-1], so the reconstruction is
+ * one recurrence over the tile's Nt positions and, on a tile with a dense
+ * mask, every one of those positions sits on the critical path: measured
+ * at ~5 cycles per byte through the byte-at-a-time loop below, which made
+ * PALETTE16-style plates (STRIDE_1 + RAW_BITMAP, 118 exceptions in 256)
+ * the slowest row of the whole decode corpus.
+ *
+ * The recurrence only MOVES at an exception. Between two of them
+ * out[p] = out[p-1] holds the last exception's value, so the tile is
+ * completely described by the sequence of values its K exceptions take,
+ * plus the entry value (the segment byte before the tile). That splits
+ * the work in two:
+ *
+ *   1. a chain over K values -- not Nt -- in exception order, each one a
+ *      single step of the same predictor (r + (r >= x_hat) for the
+ *      exclusion modes, x_hat + delta for SIGNED_DELTA, and the raw byte
+ *      for RAW_ACTUAL, which needs no chain at all), and
+ *   2. a fill: out[p] = w[number of exceptions at or before p], where
+ *      w[0] is the entry value and w[i] is the value of exception i-1.
+ *      That is a gather, not a recurrence: eight positions at a time, the
+ *      index inside the group is the inclusive popcount of the group's
+ *      mask byte (a three-step shift-and-add ladder), and one vpshufb
+ *      picks the group's eight bytes out of the window w[E0..E0+15], E0
+ *      being the number of exceptions before the group. Every index is
+ *      0..8, which is why the window is 16 bytes and the group is 8 lanes
+ *      rather than 16: a 16-lane ladder reaches 16, and a shuffle index
+ *      of 16 wraps to 0.
+ *
+ * The bytes produced, the units consumed (ascending position order, one
+ * per set mask bit) and the returned count are identical to the scalar
+ * loop's; only the order in which independent work happens changes. Bits
+ * at or above Nt are cleared from the mask first, exactly as the p < nt
+ * loop bound ignored them, so a mask with stray high bits still consumes
+ * its valid bits only.
+ */
+
+/* Fill `out` from the chain values, 32 positions per step.
+ *
+ * The index of a position is the number of exceptions at or before it,
+ * counted inside the chunk, and the chunk is a 32-bit mask word: byte lane
+ * i of the mask expansion tests bit (i & 7) of the word's byte (i >> 3),
+ * and the same per-128-bit-lane ladder as tile_recon_const_avx2 turns
+ * those bits into per-lane counts. Two vpshufb lookups then pick the
+ * chunk's bytes: the low half from the window at w[E0], the high half from
+ * w[E0 + popcount(low 16 bits)].
+ *
+ * A half whose 16 bits are all set is the one case a shuffle cannot
+ * express -- its last lane's count is 16, and pshufb reads only four index
+ * bits -- but that case needs no lookup at all: sixteen contiguous
+ * exceptions ARE sixteen contiguous values, so the half is a straight
+ * load. Both halves are tested with a compare on the word, which is what
+ * keeps this branchless enough to be worth 32 lanes.
+ *
+ * The tail (fewer than 32 positions) drops to eight lanes, then to one,
+ * with the same inclusive ladder: a 16-lane one is exactly what does not
+ * fit a shuffle index. */
+#if ZPSE_TILE_HAVE_AVX2
+static ZPSE_TILE_AVX2 void tile_stride1_fill_avx2(uint8_t *out, uint32_t nt,
+                                                  const uint32_t mw[8],
+                                                  const uint8_t *w)
+{
+    const __m256i bitv32 = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80);
+    const __m256i dup8 = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i one32 = _mm256_set1_epi8((char)1);
+    const __m128i bitv = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)0x80,
+                                       0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i one = _mm_set1_epi8((char)1);
+    uint32_t at = 0u;
+    uint32_t e0 = 0u;
+
+    while (at + 32u <= nt) {
+        uint32_t wi = mw[at >> 5u];
+        /* 0/1 per lane, then the inclusive count within each 128-bit
+         * half. Lane j of `inc` is the number of set bits at lanes
+         * 0..j of its half. */
+        __m256i v1 = _mm256_and_si256(
+            _mm256_cmpeq_epi8(
+                _mm256_and_si256(
+                    _mm256_shuffle_epi8(_mm256_set1_epi32((int)wi), dup8),
+                    bitv32),
+                bitv32),
+            one32);
+        __m256i inc = _mm256_add_epi8(v1, _mm256_slli_si256(v1, 1));
+        __m256i win;
+        __m256i r;
+        uint32_t lo_cnt = (uint32_t)_mm_popcnt_u32(wi & UINT32_C(0xFFFF));
+        __m128i lo128 = _mm_loadu_si128(
+            (const __m128i *)(const void *)(w + e0));
+        __m128i hi128 = _mm_loadu_si128(
+            (const __m128i *)(const void *)(w + e0 + lo_cnt));
+
+        inc = _mm256_add_epi8(inc, _mm256_slli_si256(inc, 2));
+        inc = _mm256_add_epi8(inc, _mm256_slli_si256(inc, 4));
+        inc = _mm256_add_epi8(inc, _mm256_slli_si256(inc, 8));
+        win = _mm256_inserti128_si256(_mm256_castsi128_si256(lo128), hi128,
+                                      1);
+        r = _mm256_shuffle_epi8(win, inc);
+        if ((wi & UINT32_C(0xFFFF)) == UINT32_C(0xFFFF)) {
+            r = _mm256_inserti128_si256(r, _mm_loadu_si128(
+                (const __m128i *)(const void *)(w + e0 + 1u)), 0);
+        }
+        if ((wi >> 16) == UINT32_C(0xFFFF)) {
+            r = _mm256_inserti128_si256(r, _mm_loadu_si128(
+                (const __m128i *)(const void *)(w + e0 + lo_cnt + 1u)), 1);
+        }
+        _mm256_storeu_si256((__m256i *)(void *)(out + (size_t)at), r);
+        e0 += (uint32_t)_mm_popcnt_u32(wi);
+        at += 32u;
+    }
+
+    while (at + 8u <= nt) {
+        uint32_t m8 = (mw[at >> 5u] >> (at & 31u)) & UINT32_C(0xFF);
+        __m128i b1 = _mm_and_si128(
+            _mm_cmpeq_epi8(
+                _mm_and_si128(_mm_set1_epi8((char)m8), bitv), bitv),
+            one);
+        __m128i idx;
+
+        /* Inclusive prefix count of the group's set bits: after the three
+         * steps lane j holds the number of set bits at lanes 0..j. */
+        idx = _mm_add_epi8(b1, _mm_slli_si128(b1, 1));
+        idx = _mm_add_epi8(idx, _mm_slli_si128(idx, 2));
+        idx = _mm_add_epi8(idx, _mm_slli_si128(idx, 4));
+        _mm_storel_epi64(
+            (__m128i *)(void *)(out + (size_t)at),
+            _mm_shuffle_epi8(
+                _mm_loadu_si128(
+                    (const __m128i *)(const void *)(w + e0)),
+                idx));
+        /* POPCNT: this function is built with the AVX2 target, which
+         * implies it, and the SWAR form would cost more than the ladder. */
+        e0 += (uint32_t)_mm_popcnt_u32(m8);
+        at += 8u;
+    }
+    while (at < nt) {
+        e0 += (uint32_t)((mw[at >> 5u] >> (at & 31u)) & 1u);
+        out[at] = w[e0];
+        at++;
+    }
+}
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
+#if ZPSE_TILE_HAVE_AVX2
+/* Bit-parallel exclusion chain.
+ *
+ * The exclusion step is out[j] = r[j] + (r[j] >= out[j-1]): a byte-valued
+ * recurrence that the scalar loop below walks one unit at a time, and one
+ * cmp+add pair of dependent ALU ops per unit is its floor -- measured at
+ * 1.6 cycles per exception, which on a palette16 tile (~118 exceptions in
+ * 256 positions) is most of the reconstruction time.
+ *
+ * The comparison can be rewritten against r alone, so the chain becomes a
+ * carry chain and the carry chains of adjacent units compose.
+ *
+ * Write b[j] = (r[j] >= out[j-1]) (so out[j] = r[j] + b[j]), g[j] =
+ * (r[j] >= r[j-1]) and q[j] = (r[j] == r[j-1]). Then b[j] is g[j] when
+ * b[j-1] is 0, and the strict comparison r[j] > r[j-1] when b[j-1] is 1:
+ *
+ *   b[j] = g[j] ^ (q[j] & b[j-1])
+ *
+ * (checked against the three cases: r[j] > r[j-1] gives g=1,q=0 -> 1;
+ * r[j] == r[j-1] gives g=1,q=1 -> !b[j-1]; r[j] < r[j-1] gives g=0,q=0
+ * -> 0). That is the carry recurrence of an adder with generate g,
+ * propagate q and xor as the carry combine, so the usual Kogge-Stone
+ * prefix applies: with (G,P) as the composed map x -> P*x ^ G of a span,
+ *   combine(lo, hi) = (G_hi ^ (P_hi & G_lo), P_hi & P_lo).
+ * Six shift-and steps over a 64-bit word give every b[0..63] at once.
+ *
+ * The chain's entry is r[-1] := the previous output value (w[0]), because
+ * b[0] = (r[0] >= w[0]) is exactly the first scalar step. So the units
+ * are copied into a padded local with that byte in front and everything
+ * is uniform -- no special case for j == 0, and the class boundary is just
+ * the word boundary (the carry out of one block is the carry in of the
+ * next). The comparisons themselves are 32 bytes at a time: g from
+ * max_epu8 + cmpeq, q from cmpeq, both to a 32-bit mask with movemask.
+ * r is read from the untouched copy, never from the output, so the input
+ * of the next block is still the residuals.
+ *
+ * out[j] is then r[j] plus a 0/1 byte built from bit j of b; two table
+ * lookups per eight units expand the mask (no AVX2 instruction turns mask
+ * bits into bytes before AVX-512). Both stores of a block are 32 bytes
+ * wide, so the last block may write up to 63 bytes past the last unit;
+ * the caller's `w` has that much slack and the fill never reads past
+ * K + 16.
+ *
+ * The blocks are otherwise independent: b for one 64-unit block needs
+ * only that block's comparisons and the previous block's final carry.
+ * Two blocks are therefore scanned in one pass (see the loop), which
+ * keeps 128 units' worth of chain at the latency of one scan; that is
+ * exactly the two-block tile a palette16 plane produces.
+ *
+ * One shape the rewrite does NOT cover is a unit of 255. The format's
+ * exclusion residuals are in [0,254] (every residual decoder enforces
+ * that), where the recurrence never wraps; with a 255 the scalar loop's
+ * out becomes 0 and the next comparison is against 0, which no comparison
+ * of r[j] with r[j-1] can reproduce. So the block loop also flags any
+ * 0xFF it sees and reports it, and the caller falls back to the scalar
+ * loop -- which recomputes w[1..K] from scratch, so a partially written
+ * w from this attempt is harmless. The check is one compare and one
+ * movemask per 32 units on the vector already in a register.
+ */
+/* 32 mask bits -> 32 bytes, each 0 or 1: byte j = bit j of `m`.
+ *
+ * A byte of the mask broadcast to its eight positions, ANDed with the
+ * per-position bit, compared against zero and subtracted from zero is
+ * 0/1 in one pass: compare gives 0xFF where the bit was clear, and 0 -
+ * 0xFF is 1. Four vector ops replace sixteen table loads (two per byte
+ * of the mask) and the eight 64-bit inserts that merged them, which is
+ * what this step used to cost. */
+static ZPSE_TILE_AVX2 __attribute__((always_inline)) inline __m256i
+tile_bits_to_bytes32(uint32_t m)
+{
+    const __m256i pick = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i bit = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80);
+    const __m256i z = _mm256_setzero_si256();
+    __m256i v = _mm256_shuffle_epi8(_mm256_set1_epi32((int)m), pick);
+
+    v = _mm256_and_si256(v, bit);
+    /* A byte is 0 where its bit was clear, so the compare clears exactly
+     * the bytes whose bit was set: andnot with the 0/1 constant is the
+     * mask itself. */
+    return _mm256_andnot_si256(_mm256_cmpeq_epi8(v, z),
+                               _mm256_set1_epi8(1));
+}
+
+/* Bit j = a[j] >= b[j], unsigned, for 32 byte pairs already loaded. */
+static ZPSE_TILE_AVX2 __attribute__((always_inline)) inline uint32_t
+tile_ge_mask_v(__m256i va, __m256i vb)
+{
+    return (uint32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_max_epu8(va, vb), va));
+}
+
+/* Bit j = a[j] == b[j], for 32 byte pairs already loaded. */
+static ZPSE_TILE_AVX2 __attribute__((always_inline)) inline uint32_t
+tile_eq_mask_v(__m256i va, __m256i vb)
+{
+    return (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb));
+}
+
+/* w[0..64) = r + b for one 64-unit block, `G` holding bit j = b[j] and
+ * va / vah the two 32-byte halves of r. */
+static ZPSE_TILE_AVX2 __attribute__((always_inline)) inline void
+tile_chain_store64(uint8_t *w, __m256i va, __m256i vah, uint64_t G)
+{
+    _mm256_storeu_si256(
+        (__m256i *)(void *)w,
+        _mm256_add_epi8(va, tile_bits_to_bytes32((uint32_t)G)));
+    _mm256_storeu_si256(
+        (__m256i *)(void *)(w + 32u),
+        _mm256_add_epi8(vah, tile_bits_to_bytes32((uint32_t)(G >> 32))));
+}
+
+/* Per-bit prefix AND of `q`: one for every bit below q's first zero.
+ * q is a run of ones from bit 0 up to that zero, so q + 1 carries into
+ * the zero and clears the run; q ^ (q + 1) marks the run and the zero,
+ * and shifting right leaves exactly the run. Three dependent ALU ops,
+ * against the ctz/shift/subtract form's five, and it sits on the
+ * carry-in path. The all-ones word -- no zero to stop at -- is the one
+ * input the identity misses, so it is patched with a compare. */
+static inline uint64_t tile_prefix_and64(uint64_t q)
+{
+    return ((q ^ (q + UINT64_C(1))) >> 1) |
+           ((uint64_t)0 - (uint64_t)(q == ~UINT64_C(0)));
+}
+
+/* w[0..n) = the exception values of the exclusion chain over
+ * units[0..n) entered with `entry`. Returns non-zero (and leaves w
+ * unspecified) if a unit is 255: see the note above. */
+/* rbuf = [entry][units[0..n)][32 zero bytes]. The two libc calls this
+ * replaces cost a fixed ~60 cycles per tile even when n is 8 (the
+ * fortify variants add a check and a call each), which is more than the
+ * scan they feed; the copy is at most 256 bytes and all of it is one
+ * 32-byte store per step. A tail that is not a multiple of 32 is written
+ * by one overlapping 32-byte store ending at n, so every byte of
+ * units[0..n) is copied exactly once per byte and nothing past n is read.
+ * The 64 bytes of zero padding cover the widest load the block loops do
+ * (a second 32-byte vector past the last unit). */
+static ZPSE_TILE_AVX2 void tile_chain_stage(uint8_t *rbuf,
+                                            const uint8_t *units, uint32_t n,
+                                            uint8_t entry)
+{
+    const __m256i z = _mm256_setzero_si256();
+    uint8_t *d = rbuf + 1u;
+    uint32_t i = 0u;
+
+    rbuf[0] = entry;
+    if (n >= 32u) {
+        while (i + 32u <= n) {
+            _mm256_storeu_si256(
+                (__m256i *)(void *)(d + i),
+                _mm256_loadu_si256((const __m256i *)(const void *)(units + i)));
+            i += 32u;
+        }
+        if (i != n) {
+            _mm256_storeu_si256(
+                (__m256i *)(void *)(d + n - 32u),
+                _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(units + n - 32u)));
+        }
+    } else {
+        for (i = 0u; i < n; i++) {
+            d[i] = units[i];
+        }
+    }
+    _mm256_storeu_si256((__m256i *)(void *)(d + n), z);
+    _mm256_storeu_si256((__m256i *)(void *)(d + n + 32u), z);
+}
+
+static ZPSE_TILE_AVX2 int tile_chain_excl_avx2(uint8_t *w,
+                                               const uint8_t *units,
+                                               uint32_t n, uint8_t entry)
+{
+    uint8_t rbuf[1u + ZPSE_MAX_TILE_LEN + 96u];
+    const __m256i all_ff = _mm256_set1_epi8((char)0xFF);
+    uint32_t bad = 0u;
+    uint64_t carry = 0u;
+    uint32_t i = 0u;
+
+    tile_chain_stage(rbuf, units, n, entry);
+
+    /* Two blocks per pass whenever a second block exists at all (more
+     * than 64 units left). The two scans share no state -- only the
+     * carry-in fixups that follow them do -- so both dependency chains
+     * run in one body and cost the latency of one scan instead of two.
+     * 118 exceptions (the palette16 shape) is two blocks, so the common
+     * tile is one pass. The first block is always full here; the second
+     * carries the tail mask when fewer than 64 units remain. The prefix
+     * ANDs p0 / p1 depend on eq alone, so they are computed alongside
+     * the scan and the fixup chain is just xor, shift, negate per block. */
+    while (n - i > 64u) {
+        uint32_t cnt1 = n - i - 64u;
+        const uint8_t *a0 = rbuf + 1u + i;
+
+        if (cnt1 > 64u) {
+            cnt1 = 64u;
+        }
+        const uint8_t *a1 = a0 + 64u;
+        uint64_t keep1;
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)a0);
+        __m256i v0h =
+            _mm256_loadu_si256((const __m256i *)(const void *)(a0 + 32u));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)a1);
+        __m256i v1h =
+            _mm256_loadu_si256((const __m256i *)(const void *)(a1 + 32u));
+        __m256i b0 = _mm256_loadu_si256((const __m256i *)(const void *)(a0 - 1u));
+        __m256i b0h =
+            _mm256_loadu_si256((const __m256i *)(const void *)(a0 + 31u));
+        __m256i b1 = _mm256_loadu_si256((const __m256i *)(const void *)(a1 - 1u));
+        __m256i b1h =
+            _mm256_loadu_si256((const __m256i *)(const void *)(a1 + 31u));
+        uint64_t eq0 = (uint64_t)tile_eq_mask_v(v0, b0) |
+                       ((uint64_t)tile_eq_mask_v(v0h, b0h) << 32);
+        uint64_t eq1 = (uint64_t)tile_eq_mask_v(v1, b1) |
+                       ((uint64_t)tile_eq_mask_v(v1h, b1h) << 32);
+        uint64_t G0 = (uint64_t)tile_ge_mask_v(v0, b0) |
+                      ((uint64_t)tile_ge_mask_v(v0h, b0h) << 32);
+        uint64_t G1 = (uint64_t)tile_ge_mask_v(v1, b1) |
+                      ((uint64_t)tile_ge_mask_v(v1h, b1h) << 32);
+        uint64_t P0;
+        uint64_t P1;
+        uint64_t p0;
+        uint64_t p1;
+        unsigned s;
+
+        if (cnt1 < 64u) {
+            /* Bits past the last unit would otherwise compare the zero
+             * padding and come out as an endless run of generate bits. */
+            keep1 = (UINT64_C(1) << cnt1) - 1u;
+            G1 &= keep1;
+            eq1 &= keep1;
+        }
+        p0 = tile_prefix_and64(eq0);
+        p1 = tile_prefix_and64(eq1);
+        P0 = eq0;
+        P1 = eq1;
+        bad |= (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, all_ff));
+        bad |= (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0h, all_ff));
+        bad |= (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, all_ff));
+        bad |= (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1h, all_ff));
+
+        for (s = 1u; s < 64u; s <<= 1u) {
+            G0 ^= P0 & (G0 << s);
+            P0 &= P0 << s;
+            G1 ^= P1 & (G1 << s);
+            P1 &= P1 << s;
+        }
+        G0 ^= p0 & carry;
+        carry = (uint64_t)0 - (G0 >> 63);
+        G1 ^= p1 & carry;
+        carry = (uint64_t)0 - (G1 >> 63);
+        tile_chain_store64(w + i, v0, v0h, G0);
+        tile_chain_store64(w + i + 64u, v1, v1h, G1);
+        i += 64u + cnt1;
+    }
+    while (i < n) {
+        uint32_t cnt = n - i;
+        const uint8_t *a = rbuf + 1u + i;
+        __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)a);
+        __m256i vah =
+            _mm256_loadu_si256((const __m256i *)(const void *)(a + 32u));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(const void *)(a - 1u));
+        __m256i vbh =
+            _mm256_loadu_si256((const __m256i *)(const void *)(a + 31u));
+        uint64_t ge = (uint64_t)tile_ge_mask_v(va, vb) |
+                      ((uint64_t)tile_ge_mask_v(vah, vbh) << 32);
+        uint64_t eq = (uint64_t)tile_eq_mask_v(va, vb) |
+                      ((uint64_t)tile_eq_mask_v(vah, vbh) << 32);
+        uint64_t G;
+        uint64_t P;
+        unsigned s;
+
+        bad |= (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, all_ff));
+        bad |= (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(vah, all_ff));
+        if (cnt < 64u) {
+            /* Bits past the last unit would otherwise compare the zero
+             * padding and come out as an endless run of generate bits. */
+            uint64_t keep = (UINT64_C(1) << cnt) - 1u;
+            ge &= keep;
+            eq &= keep;
+        }
+        G = ge;
+        P = eq;
+        for (s = 1u; s < 64u; s <<= 1u) {
+            G ^= P & (G << s);
+            P &= P << s;
+        }
+        /* Carry in from the previous block. The scan's own P is not the
+         * prefix AND -- `P &= P << s` zeroes bit j for j < s, and after
+         * six steps it is all zero -- but it is exactly right *inside*
+         * the loop, where G only ever reads P at bits >= s. */
+        G ^= tile_prefix_and64(eq) & carry;
+        carry = (uint64_t)0 - (G >> 63);
+        tile_chain_store64(w + i, va, vah, G);
+        i += (cnt < 64u) ? cnt : 64u;
+    }
+    /* The padding past the last unit is zero, so it can never set a bit
+     * here; every bit counted is a real unit. */
+    return (int)(bad != 0u);
+}
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
+#if ZPSE_TILE_HAVE_AVX2
+/* Prefix sum of int8 offsets, modulo 256: dst[j] = run + sum(d[-1..j]).
+ *
+ * This is the SIGNED_DELTA form of the STRIDE_1 chain, and unlike the
+ * exclusion form it is associative -- so the serial recurrence the scalar
+ * loop below walks two cycles at a time becomes four shift-and-add steps
+ * per 16 units. PADDB is byte-wise with wraparound, which is exactly the
+ * arithmetic the scalar loop does, and the running total is carried into
+ * the next block by broadcasting the last byte of the block just
+ * finished. A tile of 242 exceptions (the two-byte-record shape) is 15
+ * blocks, so the chain stops being the tile's critical path. */
+static ZPSE_TILE_AVX2 void tile_prefix_sum_avx2(uint8_t *dst,
+                                                const uint8_t *deltas,
+                                                uint32_t n, uint8_t run)
+{
+    const __m128i last = _mm_set1_epi8((char)15);
+    __m128i carry = _mm_set1_epi8((char)run);
+    uint32_t i = 0u;
+
+    while (i + 16u <= n) {
+        __m128i d = _mm_loadu_si128(
+            (const __m128i *)(const void *)(deltas + i));
+
+        d = _mm_add_epi8(d, _mm_slli_si128(d, 1));
+        d = _mm_add_epi8(d, _mm_slli_si128(d, 2));
+        d = _mm_add_epi8(d, _mm_slli_si128(d, 4));
+        d = _mm_add_epi8(d, _mm_slli_si128(d, 8));
+        d = _mm_add_epi8(d, carry);
+        _mm_storeu_si128((__m128i *)(void *)(dst + i), d);
+        carry = _mm_shuffle_epi8(d, last);
+        i += 16u;
+    }
+    if (i != 0u) {
+        run = (uint8_t)_mm_cvtsi128_si32(carry);
+    }
+    for (; i < n; i++) {
+        run = (uint8_t)((unsigned)run + (unsigned)(int)(int8_t)deltas[i]);
+        dst[i] = run;
+    }
+}
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
+/* Reconstruct a STRIDE_1 tile. Returns the number of residual units
+ * consumed (the caller compares it against K). `units` is resid[] for the
+ * exclusion modes and deltas[] for SIGNED_DELTA, whose entries are int8
+ * offsets from the previous exception's value. */
+static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
+                                   const uint8_t *seg_base, uint32_t seg_pos,
+                                   uint8_t init, const uint32_t words[8],
+                                   uint32_t total, const uint8_t *units,
+                                   uint8_t res_mode)
+{
+    /* w[0] is the entry value; w[1..total] are the exception values. The
+     * tail is slack for the fill's 16-byte window reads plus (for the
+     * bit-parallel chain) the 32-byte store granularity of its last
+     * block, which writes up to 63 bytes past the final unit; it is
+     * zeroed for the fill's reads.
+     *
+     * `total` is the exception count the mask decode already proved equal
+     * to the bit count of `words`, so this reconstructor does not count
+     * them again: eight SWAR popcounts were pure duplicate work on every
+     * STRIDE_1 tile. */
+    uint8_t w[1u + ZPSE_MAX_TILE_LEN + 96u];
+    uint32_t mw[8];
+    uint32_t nw = ((uint32_t)nt + 31u) >> 5u;
+    uint32_t i;
+    uint8_t run;
+
+    memcpy(mw, words, sizeof mw);
+    if ((nt & 31u) != 0u) {
+        mw[nw - 1u] &= (UINT32_C(1) << (nt & 31u)) - 1u;
+    }
+    for (i = nw; i < 8u; i++) {
+        mw[i] = 0u;
+    }
+
+    run = (seg_pos > 0u) ? seg_base[seg_pos - 1u] : init;
+    w[0] = run;
+    if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
+        /* The residual IS the value, so every exception is independent. */
+        if (total != 0u) {
+            memcpy(w + 1u, units, (size_t)total);
+        }
+    } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+#if ZPSE_TILE_HAVE_AVX2
+        if (total >= 16u &&
+            (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            tile_prefix_sum_avx2(w + 1u, units, total, run);
+        } else
+#endif
+        {
+            for (i = 0; i < total; i++) {
+                run = (uint8_t)((unsigned)run +
+                                (unsigned)(int)(int8_t)units[i]);
+                w[i + 1u] = run;
+            }
+        }
+    } else {
+        /* Exclusion inverse against the previous exception's value. */
+        int done = 0;
+#if ZPSE_TILE_HAVE_AVX2
+        if (total >= 16u &&
+            (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            done = (tile_chain_excl_avx2(w + 1u, units, total, run) == 0);
+        }
+#endif
+        if (!done) {
+            for (i = 0; i < total; i++) {
+                uint8_t r = units[i];
+
+                run = (uint8_t)(r + (uint8_t)(r >= run));
+                w[i + 1u] = run;
+            }
+        }
+    }
+    memset(w + total + 1u, 0, 32u);
+
+#if ZPSE_TILE_HAVE_AVX2
+    if ((uint32_t)nt >= 16u &&
+        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        tile_stride1_fill_avx2(out, (uint32_t)nt, mw, w);
+        return (uint16_t)total;
+    }
+#endif
+    {
+        uint32_t at = 0u;
+        uint32_t e0 = 0u;
+
+        while (at < (uint32_t)nt) {
+            e0 += (uint32_t)((mw[at >> 5u] >> (at & 31u)) & 1u);
+            out[at] = w[e0];
+            at++;
+        }
+    }
+    return (uint16_t)total;
+}
+
 /* Branchless STRIDE-family reconstruction for strides 1, 2, 4 and 8.
  *
  * Stride s predicts x[p] = x[p - s]; the serial dependence is through the
@@ -2738,6 +3342,43 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
 }
 #endif /* ZPSE_TILE_HAVE_AVX2 */
 
+/* RAW_BITMAP mask for a full 256-position tile.
+ *
+ * This is mask.c's ZPSE_M_RAW_BITMAP branch with the three cases that
+ * cannot happen here removed, because it is the mask shape of every dense
+ * tile (a palette or noise plane: ~118 exceptions in 256 positions, which
+ * is why the encoder picks the 32-byte bitmap over RUNS and the
+ * enumerative code). Payload length 32 is exactly eight whole
+ * little-endian words, so there is nothing to zero first and no partial
+ * final word; nt == 256 means no tail bits can be set, so the tail check
+ * is gone; and the k check is the same popcount. The bytes and the
+ * statuses returned are identical to zpse_mask_decode's for this mode,
+ * which is what the scalar/SIMD parity suite and the mask sweep cover. */
+static int tile_mask_raw_bitmap_256(const uint8_t *payload, uint16_t k,
+                                    uint32_t words[8])
+{
+    int i;
+
+    int counted = 0;
+
+    if (k < 1u || k > 255u)
+        return PSE_BAD_MASK;
+    /* Load and count in one pass. zpse_mask_count_bits trims its input
+     * with a 32-byte copy and a zeroing loop that a full tile cannot use
+     * (there is no tail), so it is not the right tool here: eight whole
+     * words is four 64-bit loads and four SWAR popcounts. */
+    for (i = 0; i < 4; i++) {
+        uint64_t v = zpse_load_u64le(payload + 8u * (unsigned)i);
+
+        counted += tile_popcount64(v);
+        words[2 * i] = (uint32_t)v;
+        words[2 * i + 1] = (uint32_t)(v >> 32);
+    }
+    if (counted != (int)k)
+        return PSE_BAD_MASK;
+    return PSE_OK;
+}
+
 /* Resolve one predicted/residual stream in position order, family by
  * family, with the predictor dispatch hoisted out of the byte loop. */
 int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
@@ -2793,9 +3434,14 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
     if (fresh)
         zpse_lane_reset_for(lanes, initial_literal, th.predictor_id);
 
-    zpse_mask_clear(words);
-    rc = zpse_mask_decode(mask_mode, mask_ptr, th.mask_payload_size,
-                          nt, k, words, comb_scratch);
+    if (mask_mode == (uint8_t)ZPSE_M_RAW_BITMAP && nt == 256u &&
+        th.mask_payload_size == 32u) {
+        rc = tile_mask_raw_bitmap_256(mask_ptr, k, words);
+    } else {
+        zpse_mask_clear(words);
+        rc = zpse_mask_decode(mask_mode, mask_ptr, th.mask_payload_size,
+                              nt, k, words, comb_scratch);
+    }
     if (rc != PSE_OK)
         return rc;
 
@@ -2990,12 +3636,25 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
             }
 #endif
             if (!done) {
-                memset(resid + k, 0, (size_t)(256u - k) * sizeof resid[0]);
-                if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
-                    memset(deltas + k, 0, (size_t)(256u - k) * sizeof deltas[0]);
-                j = tile_stride_recon_scalar(out, nt, s, seg_base, seg_pos,
-                                             initial_literal, words, resid,
-                                             deltas, res_mode);
+                if (s == 1u) {
+                    /* One chain over the exceptions, then a vector fill:
+                     * see tile_stride1_recon. */
+                    j = tile_stride1_recon(
+                        out, nt, seg_base, seg_pos, initial_literal, words,
+                        (uint32_t)k,
+                        (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
+                            ? (const uint8_t *)(const void *)deltas
+                            : resid,
+                        res_mode);
+                } else {
+                    memset(resid + k, 0, (size_t)(256u - k) * sizeof resid[0]);
+                    if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
+                        memset(deltas + k, 0,
+                               (size_t)(256u - k) * sizeof deltas[0]);
+                    j = tile_stride_recon_scalar(out, nt, s, seg_base, seg_pos,
+                                                 initial_literal, words, resid,
+                                                 deltas, res_mode);
+                }
             }
         }
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
