@@ -22,42 +22,6 @@ static int zpse_block_scount_valid(uint8_t sc)
     return sc == 1 || sc == 2 || sc == 4 || sc == 8 || sc == 16;
 }
 
-/* 1 iff in[0..n) is one byte value, which *b_out receives.
- *
- * Exists only to pick the CRC form: a one-value block's CRC is O(log n)
- * matrix applies (zpse_crc32c_repeat) instead of a 64 KiB pass, and on a
- * constant block that pass is most of the encode. The scan leaves at the
- * first differing byte -- thirty-two bytes per step, four word compares
- * and one branch -- so a block that is not constant pays one compare. */
-static int zpse_block_input_const(const uint8_t *in, uint32_t n,
-                                  uint8_t *b_out)
-{
-    const uint8_t b = in[0];
-    const uint64_t splat = UINT64_C(0x0101010101010101) * (uint64_t)b;
-    uint32_t i = 0u;
-
-    *b_out = b;
-    while (i + 32u <= n) {
-        uint64_t w0, w1, w2, w3;
-
-        memcpy(&w0, in + i, 8);
-        memcpy(&w1, in + i + 8u, 8);
-        memcpy(&w2, in + i + 16u, 8);
-        memcpy(&w3, in + i + 24u, 8);
-        if ((((w0 ^ splat) | (w1 ^ splat)) |
-             ((w2 ^ splat) | (w3 ^ splat))) != 0u) {
-            return 0;
-        }
-        i += 32u;
-    }
-    for (; i < n; i++) {
-        if (in[i] != b) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
 /* Fix up header CRC bytes 28..31 after serializing. */
 static void zpse_block_fix_header_crc(uint8_t hdr[32])
 {
@@ -1273,14 +1237,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     /* Every candidate writes the same decoded CRC into its header (it is
      * the CRC of the uncompressed block), so it is computed once here
      * instead of once per trial over the same 64 KiB. */
-    {
-        uint8_t cb = 0u;
-
-        if (zpse_block_input_const(in, n, &cb)) {
-            in_crc = zpse_crc32c_repeat(cb, (size_t)n);
-        } else {
-            in_crc = zpse_crc32c(in, n);
-        }
+    /* A one-value block can take its CRC arithmetically. The scan is the
+     * segment encoder's own AVX2 one, and its answer is handed back to that
+     * encoder by pointer (e->const_plane) so the identity trial skips its
+     * own scan: a constant block is scanned once, not twice. The scan exits
+     * at the first differing byte, so a block that is not constant pays one
+     * compare and writes no pointer. */
+    e->const_plane = 0;
+    if (zpse_segment_plane_is_const(in, n)) {
+        in_crc = zpse_crc32c_repeat(in[0], (size_t)n);
+        e->const_plane = in;
+    } else {
+        in_crc = zpse_crc32c(in, n);
     }
 
     /* Attempt order: identity first unless the sample says DELTA8's plane
