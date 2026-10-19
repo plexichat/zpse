@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* The mode-2 palette unpack is the densest residual path the decoder has:
  * a 256-position tile of low-entropy noise carries ~235 exceptions, all of
@@ -34,7 +35,22 @@
 #define ZPSE_RES_HAVE_SSSE3 0
 #endif
 
-#if ZPSE_RES_HAVE_SSSE3
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_RES_AVX2 __attribute__((target("avx2")))
+#define ZPSE_RES_HAVE_AVX2 1
+#elif defined(__AVX2__)
+#define ZPSE_RES_AVX2
+#define ZPSE_RES_HAVE_AVX2 1
+#else
+#define ZPSE_RES_AVX2
+#define ZPSE_RES_HAVE_AVX2 0
+#endif
+#else
+#define ZPSE_RES_HAVE_AVX2 0
+#endif
+
+#if ZPSE_RES_HAVE_SSSE3 || ZPSE_RES_HAVE_AVX2
 #include <immintrin.h>
 #endif
 
@@ -248,6 +264,11 @@ static ZPSE_RES_SSSE3 __m128i residual_pal_index(uint64_t w, unsigned b)
  * The palette is copied into a zero-padded 16-byte register rather than
  * loaded straight from the payload, because a payload with m < 16 has no
  * readable bytes past the palette. */
+#if ZPSE_RES_HAVE_AVX2
+static ZPSE_RES_AVX2 uint16_t residual_decode_mode2_avx2_m16(
+    const uint8_t *pal, const uint8_t *src, uint16_t k, uint8_t *out);
+#endif
+
 static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     const uint8_t *palette, const uint8_t *src, uint16_t k, unsigned b,
     unsigned m, uint8_t *exc_out)
@@ -264,6 +285,17 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
         return 0u;
     }
+#if ZPSE_RES_HAVE_AVX2
+    /* The dense palette width first, on a wider unit when one is there:
+     * 64 values per step instead of 32. It cannot change a byte -- only
+     * the order in which independent values are produced -- and the
+     * scalar tail below finishes whatever it leaves, exactly as it does
+     * for the 128-bit loop. */
+    if (b == 4u && m == 16u && k >= 64u &&
+        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        i = residual_decode_mode2_avx2_m16(palette, src, k, exc_out);
+    }
+#endif
     memcpy(pal, palette, (size_t)m);
     memset(pal + m, 0, sizeof pal - (size_t)m);
     palv = _mm_loadu_si128((const __m128i *)(const void *)pal);
@@ -581,6 +613,53 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
 
 #endif /* ZPSE_RES_HAVE_SSSE3 */
 
+#if ZPSE_RES_HAVE_AVX2
+
+/* m == 16 (b == 4) -- the dense palette form's common width: a plane of
+ * nine to sixteen distinct values, packed two per payload byte.
+ *
+ * The 128-bit loop below unpacks 32 values per step; a 256-bit load
+ * carries 64, and the only thing that keeps this from being a plain
+ * doubling is the ORDER. vpshufb and the two unpacks are lane-local, so
+ * lane 0 would produce values 0..31 and lane 1 values 32..63 in the same
+ * register, i.e. out[0..31] then out[32..63] would have to come from four
+ * different halves. Both unpacks are therefore permuted once: the two
+ * 128-bit halves of the low-byte unpack and of the high-byte unpack are
+ * combined pairwise, which is exactly ascending order in two 32-byte
+ * stores (0x20 takes the low half of each, 0x31 the high half).
+ *
+ * With sixteen values the width is full, so no 4-bit index can name a
+ * palette entry that is not there and the range check the general form
+ * needs is provably dead -- hence the `m == 16` guard at every caller. */
+static ZPSE_RES_AVX2 uint16_t residual_decode_mode2_avx2_m16(
+    const uint8_t *pal, const uint8_t *src, uint16_t k, uint8_t *out)
+{
+    const __m256i low4 = _mm256_set1_epi8(0x0F);
+    const __m256i palv = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)(const void *)pal));
+    uint16_t i = 0u;
+
+    while ((uint32_t)i + 64u <= (uint32_t)k) {
+        __m256i x = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + ((uint32_t)i >> 1u)));
+        __m256i lo = _mm256_and_si256(x, low4);
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), low4);
+        __m256i a = _mm256_shuffle_epi8(palv, lo);
+        __m256i c = _mm256_shuffle_epi8(palv, hi);
+        __m256i u = _mm256_unpacklo_epi8(a, c);
+        __m256i v = _mm256_unpackhi_epi8(a, c);
+
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            _mm256_permute2x128_si256(u, v, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 32u),
+                            _mm256_permute2x128_si256(u, v, 0x31));
+        i = (uint16_t)(i + 64u);
+    }
+    return i;
+}
+
+#endif /* ZPSE_RES_HAVE_AVX2 */
+
 static int residual_decode_mode2(const uint8_t *payload,
                                  uint16_t payload_len, uint16_t k,
                                  uint8_t *exc_out)
@@ -642,6 +721,174 @@ static int residual_decode_mode2(const uint8_t *payload,
     return PSE_OK;
 }
 
+/* Base-M digit pairs, one per byte pair: m3_pair_lut[off + r] holds
+ * (r % M) | ((r / M) << 8) for every r below M*M, and m3_pair_off[M] is
+ * where M's row starts. Rows are in the order residual_decode_mode3's
+ * switch names them: 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15. The table is
+ * what makes a two-digit step cost one division: see that function. */
+static const uint16_t m3_pair_lut[1155] = {
+    0x0000, 0x0001, 0x0002, 0x0100, 0x0101, 0x0102, 0x0200, 0x0201,
+    0x0202, 0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0100, 0x0101,
+    0x0102, 0x0103, 0x0104, 0x0200, 0x0201, 0x0202, 0x0203, 0x0204,
+    0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0400, 0x0401, 0x0402,
+    0x0403, 0x0404, 0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005,
+    0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0200, 0x0201,
+    0x0202, 0x0203, 0x0204, 0x0205, 0x0300, 0x0301, 0x0302, 0x0303,
+    0x0304, 0x0305, 0x0400, 0x0401, 0x0402, 0x0403, 0x0404, 0x0405,
+    0x0500, 0x0501, 0x0502, 0x0503, 0x0504, 0x0505, 0x0000, 0x0001,
+    0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0100, 0x0101, 0x0102,
+    0x0103, 0x0104, 0x0105, 0x0106, 0x0200, 0x0201, 0x0202, 0x0203,
+    0x0204, 0x0205, 0x0206, 0x0300, 0x0301, 0x0302, 0x0303, 0x0304,
+    0x0305, 0x0306, 0x0400, 0x0401, 0x0402, 0x0403, 0x0404, 0x0405,
+    0x0406, 0x0500, 0x0501, 0x0502, 0x0503, 0x0504, 0x0505, 0x0506,
+    0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x0606, 0x0000,
+    0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008,
+    0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107,
+    0x0108, 0x0200, 0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206,
+    0x0207, 0x0208, 0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305,
+    0x0306, 0x0307, 0x0308, 0x0400, 0x0401, 0x0402, 0x0403, 0x0404,
+    0x0405, 0x0406, 0x0407, 0x0408, 0x0500, 0x0501, 0x0502, 0x0503,
+    0x0504, 0x0505, 0x0506, 0x0507, 0x0508, 0x0600, 0x0601, 0x0602,
+    0x0603, 0x0604, 0x0605, 0x0606, 0x0607, 0x0608, 0x0700, 0x0701,
+    0x0702, 0x0703, 0x0704, 0x0705, 0x0706, 0x0707, 0x0708, 0x0800,
+    0x0801, 0x0802, 0x0803, 0x0804, 0x0805, 0x0806, 0x0807, 0x0808,
+    0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,
+    0x0008, 0x0009, 0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105,
+    0x0106, 0x0107, 0x0108, 0x0109, 0x0200, 0x0201, 0x0202, 0x0203,
+    0x0204, 0x0205, 0x0206, 0x0207, 0x0208, 0x0209, 0x0300, 0x0301,
+    0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0309,
+    0x0400, 0x0401, 0x0402, 0x0403, 0x0404, 0x0405, 0x0406, 0x0407,
+    0x0408, 0x0409, 0x0500, 0x0501, 0x0502, 0x0503, 0x0504, 0x0505,
+    0x0506, 0x0507, 0x0508, 0x0509, 0x0600, 0x0601, 0x0602, 0x0603,
+    0x0604, 0x0605, 0x0606, 0x0607, 0x0608, 0x0609, 0x0700, 0x0701,
+    0x0702, 0x0703, 0x0704, 0x0705, 0x0706, 0x0707, 0x0708, 0x0709,
+    0x0800, 0x0801, 0x0802, 0x0803, 0x0804, 0x0805, 0x0806, 0x0807,
+    0x0808, 0x0809, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0905,
+    0x0906, 0x0907, 0x0908, 0x0909, 0x0000, 0x0001, 0x0002, 0x0003,
+    0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x000A, 0x0100,
+    0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x0108,
+    0x0109, 0x010A, 0x0200, 0x0201, 0x0202, 0x0203, 0x0204, 0x0205,
+    0x0206, 0x0207, 0x0208, 0x0209, 0x020A, 0x0300, 0x0301, 0x0302,
+    0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0309, 0x030A,
+    0x0400, 0x0401, 0x0402, 0x0403, 0x0404, 0x0405, 0x0406, 0x0407,
+    0x0408, 0x0409, 0x040A, 0x0500, 0x0501, 0x0502, 0x0503, 0x0504,
+    0x0505, 0x0506, 0x0507, 0x0508, 0x0509, 0x050A, 0x0600, 0x0601,
+    0x0602, 0x0603, 0x0604, 0x0605, 0x0606, 0x0607, 0x0608, 0x0609,
+    0x060A, 0x0700, 0x0701, 0x0702, 0x0703, 0x0704, 0x0705, 0x0706,
+    0x0707, 0x0708, 0x0709, 0x070A, 0x0800, 0x0801, 0x0802, 0x0803,
+    0x0804, 0x0805, 0x0806, 0x0807, 0x0808, 0x0809, 0x080A, 0x0900,
+    0x0901, 0x0902, 0x0903, 0x0904, 0x0905, 0x0906, 0x0907, 0x0908,
+    0x0909, 0x090A, 0x0A00, 0x0A01, 0x0A02, 0x0A03, 0x0A04, 0x0A05,
+    0x0A06, 0x0A07, 0x0A08, 0x0A09, 0x0A0A, 0x0000, 0x0001, 0x0002,
+    0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x000A,
+    0x000B, 0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106,
+    0x0107, 0x0108, 0x0109, 0x010A, 0x010B, 0x0200, 0x0201, 0x0202,
+    0x0203, 0x0204, 0x0205, 0x0206, 0x0207, 0x0208, 0x0209, 0x020A,
+    0x020B, 0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306,
+    0x0307, 0x0308, 0x0309, 0x030A, 0x030B, 0x0400, 0x0401, 0x0402,
+    0x0403, 0x0404, 0x0405, 0x0406, 0x0407, 0x0408, 0x0409, 0x040A,
+    0x040B, 0x0500, 0x0501, 0x0502, 0x0503, 0x0504, 0x0505, 0x0506,
+    0x0507, 0x0508, 0x0509, 0x050A, 0x050B, 0x0600, 0x0601, 0x0602,
+    0x0603, 0x0604, 0x0605, 0x0606, 0x0607, 0x0608, 0x0609, 0x060A,
+    0x060B, 0x0700, 0x0701, 0x0702, 0x0703, 0x0704, 0x0705, 0x0706,
+    0x0707, 0x0708, 0x0709, 0x070A, 0x070B, 0x0800, 0x0801, 0x0802,
+    0x0803, 0x0804, 0x0805, 0x0806, 0x0807, 0x0808, 0x0809, 0x080A,
+    0x080B, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0905, 0x0906,
+    0x0907, 0x0908, 0x0909, 0x090A, 0x090B, 0x0A00, 0x0A01, 0x0A02,
+    0x0A03, 0x0A04, 0x0A05, 0x0A06, 0x0A07, 0x0A08, 0x0A09, 0x0A0A,
+    0x0A0B, 0x0B00, 0x0B01, 0x0B02, 0x0B03, 0x0B04, 0x0B05, 0x0B06,
+    0x0B07, 0x0B08, 0x0B09, 0x0B0A, 0x0B0B, 0x0000, 0x0001, 0x0002,
+    0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x000A,
+    0x000B, 0x000C, 0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105,
+    0x0106, 0x0107, 0x0108, 0x0109, 0x010A, 0x010B, 0x010C, 0x0200,
+    0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206, 0x0207, 0x0208,
+    0x0209, 0x020A, 0x020B, 0x020C, 0x0300, 0x0301, 0x0302, 0x0303,
+    0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0309, 0x030A, 0x030B,
+    0x030C, 0x0400, 0x0401, 0x0402, 0x0403, 0x0404, 0x0405, 0x0406,
+    0x0407, 0x0408, 0x0409, 0x040A, 0x040B, 0x040C, 0x0500, 0x0501,
+    0x0502, 0x0503, 0x0504, 0x0505, 0x0506, 0x0507, 0x0508, 0x0509,
+    0x050A, 0x050B, 0x050C, 0x0600, 0x0601, 0x0602, 0x0603, 0x0604,
+    0x0605, 0x0606, 0x0607, 0x0608, 0x0609, 0x060A, 0x060B, 0x060C,
+    0x0700, 0x0701, 0x0702, 0x0703, 0x0704, 0x0705, 0x0706, 0x0707,
+    0x0708, 0x0709, 0x070A, 0x070B, 0x070C, 0x0800, 0x0801, 0x0802,
+    0x0803, 0x0804, 0x0805, 0x0806, 0x0807, 0x0808, 0x0809, 0x080A,
+    0x080B, 0x080C, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0905,
+    0x0906, 0x0907, 0x0908, 0x0909, 0x090A, 0x090B, 0x090C, 0x0A00,
+    0x0A01, 0x0A02, 0x0A03, 0x0A04, 0x0A05, 0x0A06, 0x0A07, 0x0A08,
+    0x0A09, 0x0A0A, 0x0A0B, 0x0A0C, 0x0B00, 0x0B01, 0x0B02, 0x0B03,
+    0x0B04, 0x0B05, 0x0B06, 0x0B07, 0x0B08, 0x0B09, 0x0B0A, 0x0B0B,
+    0x0B0C, 0x0C00, 0x0C01, 0x0C02, 0x0C03, 0x0C04, 0x0C05, 0x0C06,
+    0x0C07, 0x0C08, 0x0C09, 0x0C0A, 0x0C0B, 0x0C0C, 0x0000, 0x0001,
+    0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009,
+    0x000A, 0x000B, 0x000C, 0x000D, 0x0100, 0x0101, 0x0102, 0x0103,
+    0x0104, 0x0105, 0x0106, 0x0107, 0x0108, 0x0109, 0x010A, 0x010B,
+    0x010C, 0x010D, 0x0200, 0x0201, 0x0202, 0x0203, 0x0204, 0x0205,
+    0x0206, 0x0207, 0x0208, 0x0209, 0x020A, 0x020B, 0x020C, 0x020D,
+    0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307,
+    0x0308, 0x0309, 0x030A, 0x030B, 0x030C, 0x030D, 0x0400, 0x0401,
+    0x0402, 0x0403, 0x0404, 0x0405, 0x0406, 0x0407, 0x0408, 0x0409,
+    0x040A, 0x040B, 0x040C, 0x040D, 0x0500, 0x0501, 0x0502, 0x0503,
+    0x0504, 0x0505, 0x0506, 0x0507, 0x0508, 0x0509, 0x050A, 0x050B,
+    0x050C, 0x050D, 0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605,
+    0x0606, 0x0607, 0x0608, 0x0609, 0x060A, 0x060B, 0x060C, 0x060D,
+    0x0700, 0x0701, 0x0702, 0x0703, 0x0704, 0x0705, 0x0706, 0x0707,
+    0x0708, 0x0709, 0x070A, 0x070B, 0x070C, 0x070D, 0x0800, 0x0801,
+    0x0802, 0x0803, 0x0804, 0x0805, 0x0806, 0x0807, 0x0808, 0x0809,
+    0x080A, 0x080B, 0x080C, 0x080D, 0x0900, 0x0901, 0x0902, 0x0903,
+    0x0904, 0x0905, 0x0906, 0x0907, 0x0908, 0x0909, 0x090A, 0x090B,
+    0x090C, 0x090D, 0x0A00, 0x0A01, 0x0A02, 0x0A03, 0x0A04, 0x0A05,
+    0x0A06, 0x0A07, 0x0A08, 0x0A09, 0x0A0A, 0x0A0B, 0x0A0C, 0x0A0D,
+    0x0B00, 0x0B01, 0x0B02, 0x0B03, 0x0B04, 0x0B05, 0x0B06, 0x0B07,
+    0x0B08, 0x0B09, 0x0B0A, 0x0B0B, 0x0B0C, 0x0B0D, 0x0C00, 0x0C01,
+    0x0C02, 0x0C03, 0x0C04, 0x0C05, 0x0C06, 0x0C07, 0x0C08, 0x0C09,
+    0x0C0A, 0x0C0B, 0x0C0C, 0x0C0D, 0x0D00, 0x0D01, 0x0D02, 0x0D03,
+    0x0D04, 0x0D05, 0x0D06, 0x0D07, 0x0D08, 0x0D09, 0x0D0A, 0x0D0B,
+    0x0D0C, 0x0D0D, 0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005,
+    0x0006, 0x0007, 0x0008, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D,
+    0x000E, 0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106,
+    0x0107, 0x0108, 0x0109, 0x010A, 0x010B, 0x010C, 0x010D, 0x010E,
+    0x0200, 0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206, 0x0207,
+    0x0208, 0x0209, 0x020A, 0x020B, 0x020C, 0x020D, 0x020E, 0x0300,
+    0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308,
+    0x0309, 0x030A, 0x030B, 0x030C, 0x030D, 0x030E, 0x0400, 0x0401,
+    0x0402, 0x0403, 0x0404, 0x0405, 0x0406, 0x0407, 0x0408, 0x0409,
+    0x040A, 0x040B, 0x040C, 0x040D, 0x040E, 0x0500, 0x0501, 0x0502,
+    0x0503, 0x0504, 0x0505, 0x0506, 0x0507, 0x0508, 0x0509, 0x050A,
+    0x050B, 0x050C, 0x050D, 0x050E, 0x0600, 0x0601, 0x0602, 0x0603,
+    0x0604, 0x0605, 0x0606, 0x0607, 0x0608, 0x0609, 0x060A, 0x060B,
+    0x060C, 0x060D, 0x060E, 0x0700, 0x0701, 0x0702, 0x0703, 0x0704,
+    0x0705, 0x0706, 0x0707, 0x0708, 0x0709, 0x070A, 0x070B, 0x070C,
+    0x070D, 0x070E, 0x0800, 0x0801, 0x0802, 0x0803, 0x0804, 0x0805,
+    0x0806, 0x0807, 0x0808, 0x0809, 0x080A, 0x080B, 0x080C, 0x080D,
+    0x080E, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0905, 0x0906,
+    0x0907, 0x0908, 0x0909, 0x090A, 0x090B, 0x090C, 0x090D, 0x090E,
+    0x0A00, 0x0A01, 0x0A02, 0x0A03, 0x0A04, 0x0A05, 0x0A06, 0x0A07,
+    0x0A08, 0x0A09, 0x0A0A, 0x0A0B, 0x0A0C, 0x0A0D, 0x0A0E, 0x0B00,
+    0x0B01, 0x0B02, 0x0B03, 0x0B04, 0x0B05, 0x0B06, 0x0B07, 0x0B08,
+    0x0B09, 0x0B0A, 0x0B0B, 0x0B0C, 0x0B0D, 0x0B0E, 0x0C00, 0x0C01,
+    0x0C02, 0x0C03, 0x0C04, 0x0C05, 0x0C06, 0x0C07, 0x0C08, 0x0C09,
+    0x0C0A, 0x0C0B, 0x0C0C, 0x0C0D, 0x0C0E, 0x0D00, 0x0D01, 0x0D02,
+    0x0D03, 0x0D04, 0x0D05, 0x0D06, 0x0D07, 0x0D08, 0x0D09, 0x0D0A,
+    0x0D0B, 0x0D0C, 0x0D0D, 0x0D0E, 0x0E00, 0x0E01, 0x0E02, 0x0E03,
+    0x0E04, 0x0E05, 0x0E06, 0x0E07, 0x0E08, 0x0E09, 0x0E0A, 0x0E0B,
+    0x0E0C, 0x0E0D, 0x0E0E,
+};
+
+static const uint16_t m3_pair_off[11] = {
+    0, 9, 34, 70, 119, 200, 300, 421, 565, 734, 930
+};
+
+/* Two base-M digits of `W` at once: the quotient by M^2, then the pair
+ * itself from the table (the remainder is below M^2 by construction, so
+ * it indexes the row). Writes the two bytes through PTR. */
+#define ZPSE_M3_PAIR(W, PTR, MM, LUT)                                       \
+    do {                                                                    \
+        uint32_t q_ = (W) / ((uint32_t)(MM) * (uint32_t)(MM));              \
+        uint32_t r_ = (W) - q_ * ((uint32_t)(MM) * (uint32_t)(MM));         \
+        memcpy((PTR), (LUT) + r_, sizeof(uint16_t));                        \
+        (W) = q_;                                                           \
+    } while (0)
+
 static int residual_decode_mode3(const uint8_t *payload,
                                  uint16_t payload_len, uint16_t k,
                                  uint8_t *exc_out)
@@ -649,7 +896,9 @@ static int residual_decode_mode3(const uint8_t *payload,
     uint8_t m;
     uint8_t g;
     uint32_t ng;
+    uint32_t nfull;
     uint32_t j;
+    uint32_t bad = 0u;
 
     if (payload_len < 1u) {
         return PSE_BAD_RESIDUAL;
@@ -663,38 +912,188 @@ static int residual_decode_mode3(const uint8_t *payload,
     if ((uint32_t)payload_len != 1u + ng * 4u) {
         return PSE_BAD_RESIDUAL;
     }
-    for (j = 0; j < ng; j++) {
+
+    /* Only whole groups are decoded by the two loops below, so a group
+     * whose digit count is short of G -- the last one, when K is not a
+     * multiple of G -- is always left to the single-group loop at the end.
+     * Writing it in a batched loop would put bytes past k. */
+    nfull = (((uint32_t)k % (uint32_t)g) == 0u) ? ng : ng - 1u;
+
+    /* Two digits per step.
+     *
+     * The single-digit form is bound by instruction count, not latency:
+     * two divides cost one multiply-shift for the quotient, and the digit
+     * itself -- w - M*q -- another multiply or a shift/subtract pair, so
+     * every digit carried a multiply. Dividing by M^2 instead yields two
+     * digits from the same one multiply, and the pair (d0, d1) of a
+     * remainder below M^2 is a byte -> byte function, so the second
+     * division becomes one table load. That is two multiplies per two
+     * digits instead of two per digit, which measures at 0.76 cycles per
+     * digit against 1.9 (6-wide, gcc 15, M = 15, K = 126).
+     *
+     * A group of odd G leaves one digit after the pairs, and it needs no
+     * division at all: every pair step divides by M^2, so the leftover is
+     * the most significant digit itself. It still has to be range-checked
+     * -- a hostile word can leave M or more there -- which the scalar
+     * single-digit loop expressed as "the final quotient is zero".
+     *
+     * Groups are independent, so the batches interleave them: the six
+     * words, each of which is a chain of its own, run as six chains. Six
+     * remains the measured optimum (see the earlier note): four runs 2.3
+     * cycles a digit after GCC packs them into SSE lanes, eight spills.
+     * What this loop leaves over (fewer than six groups) the four-group
+     * loop below runs. */
+    for (j = 0u; j + 6u <= nfull; j += 6u) {
+        const uint8_t *p = payload + 1u + j * 4u;
+        uint32_t w0 = zpse_load_u32le(p);
+        uint32_t w1 = zpse_load_u32le(p + 4u);
+        uint32_t w2 = zpse_load_u32le(p + 8u);
+        uint32_t w3 = zpse_load_u32le(p + 12u);
+        uint32_t w4 = zpse_load_u32le(p + 16u);
+        uint32_t w5 = zpse_load_u32le(p + 20u);
+        uint8_t *o = exc_out + j * (uint32_t)g;
+        uint32_t i;
+
+        /* M is one of eleven fixed constants. Naming it at the point of
+         * use lets the compiler replace the hardware integer divide (one
+         * per unit, ~20+ cycles) with a multiply-shift pair. */
+        switch (m) {
+#define ZPSE_M3_PAIRS6(MM, GI, GG)                                         \
+        case (MM): {                                                       \
+            const uint16_t *lut = m3_pair_lut + m3_pair_off[(GI)];         \
+            for (i = 0u; i + 2u <= (GG); i += 2u) {                        \
+                ZPSE_M3_PAIR(w0, o + i, MM, lut);                          \
+                ZPSE_M3_PAIR(w1, o + (GG) + i, MM, lut);                   \
+                ZPSE_M3_PAIR(w2, o + 2u * (GG) + i, MM, lut);              \
+                ZPSE_M3_PAIR(w3, o + 3u * (GG) + i, MM, lut);              \
+                ZPSE_M3_PAIR(w4, o + 4u * (GG) + i, MM, lut);              \
+                ZPSE_M3_PAIR(w5, o + 5u * (GG) + i, MM, lut);              \
+            }                                                              \
+            if (i < (GG)) {                                                \
+                bad |= (w0 >= (uint32_t)(MM));                             \
+                bad |= (w1 >= (uint32_t)(MM));                             \
+                bad |= (w2 >= (uint32_t)(MM));                             \
+                bad |= (w3 >= (uint32_t)(MM));                             \
+                bad |= (w4 >= (uint32_t)(MM));                             \
+                bad |= (w5 >= (uint32_t)(MM));                             \
+                o[i] = (uint8_t)w0;                                        \
+                o[(GG) + i] = (uint8_t)w1;                                 \
+                o[2u * (GG) + i] = (uint8_t)w2;                            \
+                o[3u * (GG) + i] = (uint8_t)w3;                            \
+                o[4u * (GG) + i] = (uint8_t)w4;                            \
+                o[5u * (GG) + i] = (uint8_t)w5;                            \
+                w0 = w1 = w2 = w3 = w4 = w5 = 0u;                          \
+            }                                                              \
+        } break
+        ZPSE_M3_PAIRS6(3, 0, 20);
+        ZPSE_M3_PAIRS6(5, 1, 13);
+        ZPSE_M3_PAIRS6(6, 2, 11);
+        ZPSE_M3_PAIRS6(7, 3, 10);
+        ZPSE_M3_PAIRS6(9, 4, 9);
+        ZPSE_M3_PAIRS6(10, 5, 9);
+        ZPSE_M3_PAIRS6(11, 6, 8);
+        ZPSE_M3_PAIRS6(12, 7, 8);
+        ZPSE_M3_PAIRS6(13, 8, 8);
+        ZPSE_M3_PAIRS6(14, 9, 7);
+        ZPSE_M3_PAIRS6(15, 10, 7);
+#undef ZPSE_M3_PAIRS6
+        default:
+            return PSE_BAD_RESIDUAL;
+        }
+        /* Full groups: word < M^G. Same check per group. */
+        if ((w0 | w1 | w2 | w3 | w4 | w5) != 0u) {
+            return PSE_BAD_RESIDUAL;
+        }
+    }
+
+    /* The same pairs four wide, for the 0..5 groups a batch of six could
+     * not take. */
+    for (; j + 4u <= nfull; j += 4u) {
+        const uint8_t *p = payload + 1u + j * 4u;
+        uint32_t w0 = zpse_load_u32le(p);
+        uint32_t w1 = zpse_load_u32le(p + 4u);
+        uint32_t w2 = zpse_load_u32le(p + 8u);
+        uint32_t w3 = zpse_load_u32le(p + 12u);
+        uint8_t *o = exc_out + j * (uint32_t)g;
+        uint32_t i;
+
+        switch (m) {
+#define ZPSE_M3_PAIRS4(MM, GI, GG)                                         \
+        case (MM): {                                                       \
+            const uint16_t *lut = m3_pair_lut + m3_pair_off[(GI)];         \
+            for (i = 0u; i + 2u <= (GG); i += 2u) {                        \
+                ZPSE_M3_PAIR(w0, o + i, MM, lut);                          \
+                ZPSE_M3_PAIR(w1, o + (GG) + i, MM, lut);                   \
+                ZPSE_M3_PAIR(w2, o + 2u * (GG) + i, MM, lut);              \
+                ZPSE_M3_PAIR(w3, o + 3u * (GG) + i, MM, lut);              \
+            }                                                              \
+            if (i < (GG)) {                                                \
+                bad |= (w0 >= (uint32_t)(MM));                             \
+                bad |= (w1 >= (uint32_t)(MM));                             \
+                bad |= (w2 >= (uint32_t)(MM));                             \
+                bad |= (w3 >= (uint32_t)(MM));                             \
+                o[i] = (uint8_t)w0;                                        \
+                o[(GG) + i] = (uint8_t)w1;                                 \
+                o[2u * (GG) + i] = (uint8_t)w2;                            \
+                o[3u * (GG) + i] = (uint8_t)w3;                            \
+                w0 = w1 = w2 = w3 = 0u;                                    \
+            }                                                              \
+        } break
+        ZPSE_M3_PAIRS4(3, 0, 20);
+        ZPSE_M3_PAIRS4(5, 1, 13);
+        ZPSE_M3_PAIRS4(6, 2, 11);
+        ZPSE_M3_PAIRS4(7, 3, 10);
+        ZPSE_M3_PAIRS4(9, 4, 9);
+        ZPSE_M3_PAIRS4(10, 5, 9);
+        ZPSE_M3_PAIRS4(11, 6, 8);
+        ZPSE_M3_PAIRS4(12, 7, 8);
+        ZPSE_M3_PAIRS4(13, 8, 8);
+        ZPSE_M3_PAIRS4(14, 9, 7);
+        ZPSE_M3_PAIRS4(15, 10, 7);
+#undef ZPSE_M3_PAIRS4
+        default:
+            return PSE_BAD_RESIDUAL;
+        }
+        /* Full groups: word < M^G. Same check per group. */
+        if ((w0 | w1 | w2 | w3) != 0u) {
+            return PSE_BAD_RESIDUAL;
+        }
+    }
+
+    for (; j < ng; j++) {
         uint32_t word = zpse_load_u32le(payload + 1u + j * 4u);
         uint32_t cnt;
         uint32_t i;
         uint32_t rem = (uint32_t)k - j * (uint32_t)g;
+        uint8_t *o = exc_out + j * (uint32_t)g;
 
         cnt = (rem >= g) ? g : rem;
-        /* M is one of eleven fixed constants. Naming it at the point of
-         * use lets the compiler replace the hardware integer divide
-         * (one per unit, ~20+ cycles) with a multiply-shift pair, which
-         * is the single largest cost in decoding a group of dense
-         * base-M residuals. */
+        /* Same constant-naming argument as the batched loops above. */
         switch (m) {
-#define ZPSE_M3_DIGITS(MM)                                                   \
-        case (MM):                                                           \
-            for (i = 0; i < cnt; i++) {                                      \
-                exc_out[j * (uint32_t)g + i] = (uint8_t)(word % (MM));        \
-                word /= (MM);                                                \
-            }                                                                \
-            break
-        ZPSE_M3_DIGITS(3);
-        ZPSE_M3_DIGITS(5);
-        ZPSE_M3_DIGITS(6);
-        ZPSE_M3_DIGITS(7);
-        ZPSE_M3_DIGITS(9);
-        ZPSE_M3_DIGITS(10);
-        ZPSE_M3_DIGITS(11);
-        ZPSE_M3_DIGITS(12);
-        ZPSE_M3_DIGITS(13);
-        ZPSE_M3_DIGITS(14);
-        ZPSE_M3_DIGITS(15);
-#undef ZPSE_M3_DIGITS
+#define ZPSE_M3_PAIRS(MM, GI)                                              \
+        case (MM): {                                                       \
+            const uint16_t *lut = m3_pair_lut + m3_pair_off[(GI)];         \
+            for (i = 0u; i + 2u <= cnt; i += 2u) {                         \
+                ZPSE_M3_PAIR(word, o + i, MM, lut);                        \
+            }                                                              \
+            if (i < cnt) {                                                 \
+                bad |= (word >= (uint32_t)(MM));                           \
+                o[i] = (uint8_t)word;                                      \
+                word = 0u;                                                 \
+            }                                                              \
+        } break
+        ZPSE_M3_PAIRS(3, 0);
+        ZPSE_M3_PAIRS(5, 1);
+        ZPSE_M3_PAIRS(6, 2);
+        ZPSE_M3_PAIRS(7, 3);
+        ZPSE_M3_PAIRS(9, 4);
+        ZPSE_M3_PAIRS(10, 5);
+        ZPSE_M3_PAIRS(11, 6);
+        ZPSE_M3_PAIRS(12, 7);
+        ZPSE_M3_PAIRS(13, 8);
+        ZPSE_M3_PAIRS(14, 9);
+        ZPSE_M3_PAIRS(15, 10);
+#undef ZPSE_M3_PAIRS
         default:
             return PSE_BAD_RESIDUAL;
         }
@@ -702,6 +1101,9 @@ static int residual_decode_mode3(const uint8_t *payload,
         if (word != 0u) {
             return PSE_BAD_RESIDUAL;
         }
+    }
+    if (bad != 0u) {
+        return PSE_BAD_RESIDUAL;
     }
     return PSE_OK;
 }
