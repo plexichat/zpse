@@ -64,9 +64,15 @@
  * bytes (the caller passes the 8 KiB combinadic region).
  * Returns PSE_OK, or the same class of status a tile record would:
  * PSE_BAD_TILE_SIZE, PSE_BAD_MASK, PSE_BAD_RESIDUAL,
- * PSE_UNSUPPORTED_FEATURE, PSE_OUTPUT_OVERFLOW. */
+ * PSE_UNSUPPORTED_FEATURE, PSE_OUTPUT_OVERFLOW.
+ *
+ * On success *all_const is 1 iff every record reconstructed one byte value
+ * end to end and all of them agreed on it, which is what the dense constant
+ * form written for a one-value plane decodes to; *const_byte is that value
+ * then. The block layer uses it to checksum such a plane arithmetically. */
 int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
                       uint32_t payload_len, uint8_t *out, uint32_t out_cap,
-                      uint32_t *out_len, uint8_t *scratch);
+                      uint32_t *out_len, uint8_t *scratch, int *all_const,
+                      uint8_t *const_byte);
 
 #endif /* ZPSE_DENSE_H */

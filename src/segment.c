@@ -204,6 +204,11 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         decoded_len_out == 0) {
         return PSE_BAD_ARG;
     }
+    /* Cleared here, set only by the dense constant form below: block
+     * decode reads it after the loop to decide whether the payload CRC
+     * can be arithmetic, so it must never describe an earlier segment. */
+    d->seg_const = 0u;
+    d->seg_const_byte = 0u;
     rc = zpse_segment_header_parse(&h, payload, payload_len);
     if (rc != PSE_OK) {
         return rc;
@@ -234,8 +239,19 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         if ((uint32_t)h.tile_count != 1u) {
             return PSE_BAD_TILE_SIZE;
         }
-        return zpse_dense_decode(&h, payload, payload_len, decoded_out,
-                                 decoded_cap, decoded_len_out, d->comb);
+        {
+            int all_const = 0;
+            uint8_t const_byte = 0u;
+
+            rc = zpse_dense_decode(&h, payload, payload_len, decoded_out,
+                                   decoded_cap, decoded_len_out, d->comb,
+                                   &all_const, &const_byte);
+            if (rc == PSE_OK && all_const != 0) {
+                d->seg_const = 1u;
+                d->seg_const_byte = const_byte;
+            }
+            return rc;
+        }
     }
     if ((uint32_t)h.tile_count != expect_tc) {
         return PSE_BAD_TILE_SIZE;

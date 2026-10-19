@@ -247,16 +247,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.004 | 248 | 18.6 | 21.6 |
-| incr | 0.040 | 2619 | 5.8 | 10.4 |
-| random | 1.000 | 65568 | 3.0 | 21.1 |
-| sparse | 0.060 | 3962 | 2.16 | 6.1 |
-| strided | 0.040 | 2624 | 3.9 | 10.5 |
-| const5A | 0.004 | 248 | 18.4 | 21.8 |
-| alt00FF | 0.009 | 608 | 6.9 | 7.7 |
-| sawtooth | 0.116 | 7584 | 3.1 | 5.8 |
-| lowentropy | 0.508 | 33288 | 2.0 | 13.9 |
-| sparse2 | 0.019 | 1255 | 4.5 | 7.0 |
+| zeros | 0.004 | 248 | 22.8 | 55.8 |
+| incr | 0.040 | 2619 | 5.85 | 10.1 |
+| random | 1.000 | 65568 | 3.16 | 20.4 |
+| sparse | 0.060 | 3962 | 2.10 | 6.26 |
+| strided | 0.040 | 2624 | 3.88 | 10.2 |
+| const5A | 0.004 | 248 | 22.4 | 54.7 |
+| alt00FF | 0.009 | 608 | 7.13 | 7.56 |
+| sawtooth | 0.116 | 7584 | 3.04 | 5.52 |
+| lowentropy | 0.508 | 33288 | 2.06 | 12.7 |
+| sparse2 | 0.019 | 1255 | 4.53 | 6.77 |
 
 The table is one session (both columns re-measured together) and the deltas
 below are paired measurements, so the absolute columns move between machines
@@ -1583,9 +1583,75 @@ the machine's 27.2 GB/s CRC rate, four fifths of the row -- so no change to
 the tile path can move those three at all. That also names the next lever
 that would move *every* row: the hardware `crc32` instruction is at its
 one-instruction-per-cycle throughput (8 bytes per cycle), and only a
-carry-less-multiply fold can go beyond it. `sparse` and `sawtooth` are the
+carry-less-multiply fold can go beyond it. (The fold was built in the next
+round and measured *slower* on this core; the rows moved by not hashing
+the block at all. See the last section.) `sparse` and `sawtooth` are the
 decoder rows with headroom inside the tile path, and `sparse` is the one
 this round took.
+
+### A constant block's CRC, and a carry-less multiply that measured slower
+
+A 64 KiB block of one byte value is the cheapest thing this format can code
+(248 bytes) and the most expensive to verify: `zeros` and `const5A` decode
+at ~21 GB/s and the CRC32-C over the 64 KiB the decoder just wrote was 2.4 us
+of that 3.0 us block, i.e. four fifths of the row. The previous section
+called that a hardware limit and named a PCLMULQDQ fold as the only way
+past it. The fold was built and measured before anything else:
+
+* A 4-accumulator reflected fold (two `pclmulqdq` per 16 bytes, runtime
+  constants derived from the polynomial, a 16-KiB reduction table built from
+  the verified crc32 chain) is bit-exact against `zpse_crc32c` at every
+  length tested, and runs at **11.6 GB/s** on this machine against the
+  hardware `crc32` path's **27-30 GB/s**. The arithmetic says why: the fold
+  is two multiplies per 128 bits, and this core retires one `pclmulqdq` per
+  cycle, so it cannot beat eight bytes per `crc32` instruction on a port that
+  takes one per cycle as well. The claim that only a fold moves those rows
+  was wrong, and the fold is not in this tree.
+
+What does move them is not hashing the block faster; it is not hashing it
+at all. A one-value block is already coded as the dense constant form
+(12 bytes per 4 KiB), and that form is self-describing: every record is
+`k == 0`, so every byte the decoder writes for it is one value, and the
+decoder knows which. Two pieces follow from that:
+
+* `zpse_crc32c_repeat(b, n)` computes CRC32-C of `n` copies of `b` with the
+  same GF(2) byte-shift operator the hardware path's chunk combine already
+  used: `F([b] * 2m) = S(F([b] * m), m) ^ F([b] * m)` doubles, and the binary
+  expansion of `n` stitches the powers together. Every shift length is a
+  power of two, i.e. one 32x32 apply, so a 64 KiB block costs ~32 applies --
+  about 0.1 us -- instead of a 2.4 us pass. Verified against the buffer CRC
+  for all 256 byte values and lengths 0..300 plus 4 KiB and 64 KiB
+  boundaries (`tests/test_units.c`).
+* The dense decoder reports whether *every* record it decoded reconstructed
+  one value and whether they agreed (`zpse_dense_decode`'s `all_const`).
+  Block decode uses the arithmetic form only for the identity shape -- where
+  the decoded plane is already the caller's output buffer -- so the claim
+  covers exactly `output[0..n)`. Disagreeing records clear the flag and the
+  ordinary byte CRC runs, which the unit test drives by editing one record's
+  constant byte; a corrupted stored CRC is still rejected on that path and
+  on the arithmetic one.
+
+The encoder gets the same arithmetic for its header CRC, gated on an exact
+test that is free when it fails: a 32-byte-per-step word scan that exits at
+the first differing byte (`zpse_block_input_const`). A constant block pays
+~1 us for the scan and saves 2.4 us of hashing; `random` differs in the
+first word and pays a compare.
+
+Paired binaries, alternating order, best of three rounds, 64 KiB blocks:
+
+| pattern | encode GB/s | decode GB/s |
+| --- | --- | --- |
+| zeros | 18.2 -> 22.8 (+25%) | 21.6 -> 55.8 (+159%) |
+| const5A | 18.1 -> 22.4 (+24%) | 21.3 -> 54.7 (+157%) |
+| the other eight | 3.0-7.2, no change outside +-3% | 5.5-20.8, no change outside +-3% |
+
+No byte moves: the ten `clen` values, all 768 `tests/clen_corpus` sizes
+(`delta=+0`) and the parity / fuzz / lseed digests across the default,
+`-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` builds are identical to
+the previous commit, under gcc and clang. `zeros` decode is now bounded by
+`memset` plus the ~0.1 us arithmetic, not by the CRC unit; `random` decode
+(20.4 GB/s against a 27-30 GB/s CRC rate) is now the row that is actually
+CRC-bound.
 
 ## License
 

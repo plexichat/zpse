@@ -68,6 +68,14 @@ typedef struct ZpseDecoder {
     uint8_t *o2conf;      /* 32 KiB */
     uint8_t *comb;        /* 8 KiB combinadic scratch */
     uint8_t *shuf;        /* 4 KiB shuffle/CRC consts */
+    /* The plane the last zpse_segment_decode produced was one byte value
+     * end to end, and which value. Set only by the dense constant form and
+     * cleared by every segment decode, so a block whose single segment
+     * reports it (the identity shape the encoder emits for a one-value
+     * block) can checksum its output arithmetically instead of scanning
+     * 64 KiB the decoder just wrote. */
+    uint8_t seg_const;
+    uint8_t seg_const_byte;
 } ZpseDecoder;
 
 typedef struct ZpseEncoder {

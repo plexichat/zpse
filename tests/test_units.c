@@ -13,6 +13,7 @@
 #include "zpse/predictor.h"
 #include "zpse/tile.h"
 #include "zpse/status.h"
+#include "zpse/dense.h"
 
 static int fails = 0;
 #define CHECK(cond, ...) do { \
@@ -31,6 +32,80 @@ int main(void) {
         CHECK(zpse_crc32c(v, 9) == 0xE3069283u, "crc check value");
         CHECK(zpse_crc32c(v, 0) == 0u, "crc empty == 0");
         CHECK(zpse_crc32c_init() == 0xFFFFFFFFu, "crc init");
+    }
+
+    /* Repeated-byte CRC: the arithmetic form the block decoder uses for a
+     * one-value plane. Must agree with the buffer CRC at every length,
+     * including the ones whose binary expansion is not a single power of
+     * two (and the 64 KiB block size). */
+    {
+        static uint8_t rep[65536];
+        static const size_t lens[] = { 0u, 1u, 2u, 3u, 7u, 8u, 255u, 256u,
+                                       257u, 4095u, 4096u, 4097u, 65535u,
+                                       65536u };
+        int b, bad = 0;
+        size_t li;
+
+        for (b = 0; b < 256; b++) {
+            memset(rep, b, sizeof rep);
+            for (li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+                if (zpse_crc32c_repeat((uint8_t)b, lens[li]) !=
+                    zpse_crc32c(rep, lens[li])) {
+                    bad++;
+                }
+            }
+        }
+        CHECK(bad == 0, "crc repeat matches buffer crc (%d bad)", bad);
+    }
+
+    /* A one-value block takes the arithmetic payload CRC on decode, and
+     * that path must still reject a corrupt one -- and must not claim the
+     * shortcut when the dense records disagree about their value. */
+    {
+        static unsigned char ea[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
+        static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
+        static uint8_t in[65536], comp[512], out[65536];
+        ZpseBlockHeader h;
+        uint32_t cl = 0, ol = 0;
+        int rc;
+
+        memset(in, 0x5A, sizeof in);
+        rc = zpse_compress_block(in, sizeof in, comp, sizeof comp, &cl, 0, 1,
+                                 ea);
+        CHECK(rc == PSE_OK, "const block encodes (rc=%d)", rc);
+        CHECK(cl < sizeof comp && zpse_block_header_parse(&h, comp, cl) == 0,
+              "const block header parses");
+        CHECK((h.block_flags & ZPSE_B_CRC) != 0 &&
+              (h.block_flags & ZPSE_B_RAW) == 0,
+              "const block is coded with a payload CRC");
+        rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, da);
+        CHECK(rc == PSE_OK && ol == sizeof in &&
+              memcmp(out, in, sizeof in) == 0, "const block roundtrip");
+
+        /* Corrupt the stored payload CRC (the serializer rewrites the
+         * header CRC, so the header still parses). */
+        h.decoded_crc32c ^= 1u;
+        zpse_block_header_serialize(comp, &h);
+        CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &ol, da) ==
+              PSE_BAD_PAYLOAD_CRC, "const block corrupt CRC rejected");
+
+        /* Restore, then make one dense record reconstruct a different
+         * value: the plane is no longer one value, so the arithmetic form
+         * must not be used and the old CRC must now mismatch. */
+        h.decoded_crc32c ^= 1u;
+        zpse_block_header_serialize(comp, &h);
+        {
+            uint32_t rec0 = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
+                            (uint32_t)h.transform_meta_size +
+                            (uint32_t)h.segment_count * 8u + 16u;
+            CHECK((comp[rec0 + 2] & 0x40) != 0,
+                  "const block uses dense records");
+            comp[rec0 + 3] = 9u;    /* TILE_CONSTANT */
+            comp[rec0 + 4] = 0x11u; /* its constant byte */
+        }
+        CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &ol, da) ==
+              PSE_BAD_PAYLOAD_CRC,
+              "disagreeing dense records fall back to the byte CRC");
     }
 
     /* Arenas. */

@@ -202,7 +202,8 @@ static int dense_check_mask(uint8_t mask_mode, const uint8_t *mask,
  * record's entry state and STRIDE fallbacks use. */
 static int dense_record(uint32_t nt, const uint8_t *payload,
                         uint32_t payload_len, uint32_t base, uint8_t *out,
-                        uint8_t *scratch, uint8_t literal)
+                        uint8_t *scratch, uint8_t literal, int *is_const,
+                        uint8_t *fill_out)
 {
     uint32_t k;
     uint32_t mask_len;
@@ -223,6 +224,7 @@ static int dense_record(uint32_t nt, const uint8_t *payload,
     int rc;
     unsigned l;
 
+    *is_const = 0;
     if (nt == 0u || nt > ZPSE_DENSE_MAX_LEN) {
         return PSE_UNSUPPORTED_FEATURE;
     }
@@ -339,6 +341,11 @@ static int dense_record(uint32_t nt, const uint8_t *payload,
                                  : literal;
 
         memset(out, fill, (size_t)nt);
+        /* This record reconstructed one byte value end to end; the
+         * block layer turns a whole plane of these into arithmetic
+         * instead of a CRC pass (crc32c.h: zpse_crc32c_repeat). */
+        *is_const = 1;
+        *fill_out = fill;
         return PSE_OK;
     }
 
@@ -457,16 +464,21 @@ static int dense_record(uint32_t nt, const uint8_t *payload,
 
 int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
                       uint32_t payload_len, uint8_t *out, uint32_t out_cap,
-                      uint32_t *out_len, uint8_t *scratch)
+                      uint32_t *out_len, uint8_t *scratch, int *all_const,
+                      uint8_t *const_byte)
 {
     uint32_t total;
     uint32_t produced;
     uint32_t pos;
+    int one_value = 1;
+    uint8_t fill = 0u;
 
     if (h == 0 || payload == 0 || out == 0 || out_len == 0 || scratch == 0 ||
-        h->tile_count != 1u) {
+        all_const == 0 || const_byte == 0 || h->tile_count != 1u) {
         return PSE_BAD_ARG;
     }
+    *all_const = 0;
+    *const_byte = 0u;
     total = h->segment_decoded_size;
     if (total == 0u || total > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
         return PSE_UNSUPPORTED_FEATURE;
@@ -489,10 +501,22 @@ int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
             return PSE_BAD_TILE_SIZE;
         }
         rec_len = (uint32_t)zpse_load_u16le(payload + pos);
-        rc = dense_record(ns, payload, payload_len, pos, out + produced,
-                          scratch, h->initial_literal);
-        if (rc != PSE_OK) {
-            return rc;
+        {
+            int rec_const = 0;
+            uint8_t rec_fill = 0u;
+
+            rc = dense_record(ns, payload, payload_len, pos, out + produced,
+                              scratch, h->initial_literal, &rec_const,
+                              &rec_fill);
+            if (rc != PSE_OK) {
+                return rc;
+            }
+            if (rec_const == 0 || (one_value != 0 && produced != 0u &&
+                                   rec_fill != fill)) {
+                one_value = 0;
+            } else if (produced == 0u) {
+                fill = rec_fill;
+            }
         }
         pos += 2u + rec_len;
         if (pos > payload_len) {
@@ -504,5 +528,7 @@ int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
         return PSE_BAD_TILE_SIZE;
     }
     *out_len = total;
+    *all_const = one_value;
+    *const_byte = fill;
     return PSE_OK;
 }

@@ -13,6 +13,12 @@ uint32_t zpse_crc32c_finish(uint32_t crc); /* xorout */
 uint32_t zpse_crc32c_update(uint32_t crc, const uint8_t *data, size_t len);
 uint32_t zpse_crc32c(const uint8_t *data, size_t len);
 
+/* CRC32-C of `len` copies of the byte `b`, in O(log len) matrix applies
+ * instead of a pass over the data. Bit-identical to
+ * zpse_crc32c() on a buffer of that shape. The decoder uses it when a
+ * block's whole output is one byte value (the dense constant form). */
+uint32_t zpse_crc32c_repeat(uint8_t b, size_t len);
+
 /* Fused copy + checksum: identical in effect to
  *   memcpy(dst, src, n); return zpse_crc32c(src, n);
  * but the copy and the CRC share one pass over the source, so the
