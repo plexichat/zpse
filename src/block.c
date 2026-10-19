@@ -906,11 +906,14 @@ static uint32_t zpse_block_proxy(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * it the lane state a segment encode would start from.
  *
  * `tiles` is how many tiles to price (0 = ZPSE_PROBE_TILES), spread evenly
- * over the plane and folded back up to its full tile count. Returns the
+ * over the plane and folded back up to its full tile count. `limit` is the
+ * running verdict the caller holds: a plane whose own proven floor already
+ * exceeds it stops there (see seg_tile_price in segment.c). Returns the
  * estimate for the whole plane, or UINT32_MAX when the plane cannot be
  * priced (the caller then keeps the candidate). */
 static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
-                                 uint32_t len, unsigned tiles)
+                                 uint32_t len, unsigned tiles,
+                                 uint32_t limit)
 {
     ZpseLaneState lanes;
 
@@ -923,7 +926,7 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
     lanes.order1 = e->order1;
     lanes.o2val = e->o2val;
     lanes.o2conf = e->o2conf;
-    return zpse_segment_probe_cost(e, &lanes, plane, len, tiles);
+    return zpse_segment_probe_cost(e, &lanes, plane, len, tiles, limit);
 }
 
 /* Smallest price zpse_block_exact_plane can return for a plane of `len`
@@ -958,7 +961,7 @@ static uint32_t zpse_block_cand_floor(uint32_t len)
  * prescreen proxy sums its planes. */
 static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
                                       const uint32_t lens[16], uint8_t sc,
-                                      unsigned tiles)
+                                      unsigned tiles, uint32_t limit)
 {
     uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u;
     uint32_t records = 0u;
@@ -992,15 +995,45 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
         }
     }
     for (s = 0u; s < sc; s += step) {
-        uint32_t c = zpse_block_exact_plane(e, planes[s], lens[s],
-                                            sc > 1u ? 1u : tiles);
-
-        if (c == UINT32_MAX) {
-            return UINT32_MAX;
+        /* The running share: everything still unspent below `limit`
+         * belongs to the planes not yet priced, and this plane may spend
+         * its envelope plus a fair piece of it. UINT32_MAX (no verdict in
+         * hand) prices the whole sample, as before. */
+        uint32_t share = UINT32_MAX;
+        if (limit != UINT32_MAX) {
+            uint64_t envelope = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
+                                (uint64_t)sc * 16u;
+            if ((uint64_t)records + envelope <= (uint64_t)limit) {
+                share = (uint32_t)(16u +
+                          ((uint64_t)limit - (uint64_t)records - envelope));
+            }
         }
-        /* c is 16 + the plane's record area folded up to its tile count. */
-        records += c - 16u;
-        priced++;
+        {
+            uint32_t c = zpse_block_exact_plane(e, planes[s], lens[s],
+                                                sc > 1u ? 1u : tiles, share);
+
+            if (c == UINT32_MAX) {
+                return UINT32_MAX;
+            }
+            /* c is 16 + the plane's record area folded up to its tile count. */
+            records += c - 16u;
+            priced++;
+
+            /* Early exit: if the running lower bound on the candidate total
+             * already exceeds `limit`, this candidate cannot win. Return the
+             * bound (finite, > limit) so the caller drops it instead of
+             * pricing the rest of the planes. UINT32_MAX remains "could not
+             * be priced" (keep), so a convicted value is distinguishable. */
+            if (limit != UINT32_MAX) {
+                uint64_t lb = (uint64_t)(ZPSE_BLOCK_HEADER_SIZE + 16u) +
+                              (uint64_t)sc * 16u + (uint64_t)records;
+                if (lb > (uint64_t)limit) {
+                    return (uint32_t)(lb > (uint64_t)UINT32_MAX
+                                          ? (uint64_t)UINT32_MAX
+                                          : lb);
+                }
+            }
+        }
     }
     if (priced == 0u) {
         return UINT32_MAX;
@@ -1061,7 +1094,8 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                                        uint32_t n, uint8_t tid, uint8_t sc,
                                        const uint8_t *meta_bytes,
-                                       uint16_t meta_len, unsigned tiles)
+                                       uint16_t meta_len, unsigned tiles,
+                                       uint32_t limit)
 {
     uint32_t lens[16];
     uint8_t *planes[16];
@@ -1070,7 +1104,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                           lens) != PSE_OK) {
         return UINT32_MAX;
     }
-    return zpse_block_exact_sum(e, planes, lens, sc, tiles);
+    return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit);
 }/* Price candidates [from, *ncand_io) exactly -- a few packed tiles each --
  * and drop the ones more than ~6% worse than the best of that range, the
  * same margin the prescreen prune uses. Anything that cannot be priced is
@@ -1092,10 +1126,18 @@ static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
 
     for (ci = from; ci < to; ci++) {
         const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
+        /* Feed the running verdict down as `limit`: the first candidate is
+         * priced without one (UINT32_MAX), each later one with the best
+         * price seen so far plus the sweep's ~6% margin. A plane whose
+         * proven floor already exceeds its share stops early, so a
+         * hopeless candidate prices only a tile or two instead of all of
+         * them. Convicted candidates return a finite value > limit, never
+         * UINT32_MAX, so they are dropped, not kept. */
+        uint32_t lim = (pmin == UINT32_MAX) ? UINT32_MAX : pmin + (pmin >> 4);
 
         ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci], scounts[ci], mb,
-                                       meta_lens[ci], 0u);
-        if (ex[ci] < pmin) {
+                                       meta_lens[ci], 0u, lim);
+        if (ex[ci] != UINT32_MAX && ex[ci] < pmin) {
             pmin = ex[ci];
         }
     }
@@ -1455,7 +1497,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
-                                            ZPSE_DECIDE_TILES);
+                                            ZPSE_DECIDE_TILES, UINT32_MAX);
             if (ex[ci] == UINT32_MAX) {
                 continue;
             }
