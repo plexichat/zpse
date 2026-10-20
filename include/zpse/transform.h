@@ -1,7 +1,7 @@
 #ifndef ZPSE_TRANSFORM_H
 #define ZPSE_TRANSFORM_H
 
-/* Coordinate transforms (SPEC Sec. 5). Forward = encode-side split,
+/* Coordinate transforms. Forward = encode-side split,
  * inverse = decode-side interleave. All routines bounds-checked,
  * no allocation, scalar-correct with SIMD fast paths in vector.h. */
 

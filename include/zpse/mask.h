@@ -1,7 +1,7 @@
 #ifndef ZPSE_MASK_H
 #define ZPSE_MASK_H
 
-/* Exception masks (SPEC Sec. 8). Positions are ascending zero-based
+/* Exception masks. Positions are ascending zero-based
  * byte indices within the tile. Dense output is a 256-bit bitmask as
  * 8x u32 words (bit p = word[p>>5] >> (p&31) & 1), matching the
  * combinadic reference decoder. */

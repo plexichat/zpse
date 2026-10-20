@@ -1,4 +1,4 @@
-/* Block + frame roundtrip matrix (SPEC Sec. 13 degenerate/constant cases).
+/* Block + frame roundtrip matrix.
  * Links zpse_unity.c. Exit 0 = all pass. */
 #include <stdio.h>
 #include <string.h>

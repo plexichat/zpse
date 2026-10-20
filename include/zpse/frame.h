@@ -1,7 +1,7 @@
 #ifndef ZPSE_FRAME_H
 #define ZPSE_FRAME_H
 
-/* Frame-level helpers (SPEC Sec. 3). Block framing loops live here;
+/* Frame-level helpers. Block framing loops live here;
  * per-block work delegates to block.h. FrameIndex is opaque in v1. */
 
 #include <stddef.h>

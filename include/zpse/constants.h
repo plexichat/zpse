@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* PSE v1.0.0 wire constants (SPEC_V1.md Sections 3-6). */
+/* PSE v1.0.0 wire constants. */
 
 #define ZPSE_MAGIC              UINT32_C(0x31455350) /* "PSE1" LE */
 #define ZPSE_FRAME_MAJOR        ((uint8_t)1)

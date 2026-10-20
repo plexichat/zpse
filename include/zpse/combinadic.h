@@ -1,7 +1,7 @@
 #ifndef ZPSE_COMBINADIC_H
 #define ZPSE_COMBINADIC_H
 
-/* Macaulay/colex combinadics (SPEC Sec. 8.1-8.2). 256-bit ranks as
+/* Macaulay/colex combinadics. 256-bit ranks as
  * 4x u64 limbs, little-endian limb order. No division in hot paths;
  * ranking/unranking use u256 add/sub/compare only. */
 

@@ -1,7 +1,7 @@
 #ifndef ZPSE_VECTOR_H
 #define ZPSE_VECTOR_H
 
-/* SIMD dispatch + always-inline hot-loop declarations (SPEC Sec. 2, 10).
+/* SIMD dispatch + always-inline hot-loop declarations.
  * Scalar C in the .c files is normative; these kernels MUST be
  * bit-exact replacements selected at runtime by zpse_cpu_caps(). */
 

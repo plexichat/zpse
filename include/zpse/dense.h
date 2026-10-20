@@ -1,7 +1,7 @@
 #ifndef ZPSE_DENSE_H
 #define ZPSE_DENSE_H
 
-/* Dense segment record (SPEC_V1.md Sec. 6.3).
+/* Dense segment record.
  *
  * The tile framing pays one tile header, one mask and one residual header
  * per 256 bytes. A dense record codes a whole segment plane with ONE

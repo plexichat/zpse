@@ -16,7 +16,7 @@ struct ZpseTileHeader;
 #include "zpse/types.h"
 #include "zpse/vector.h"
 
-/* Tile framing + reconstruct path (SPEC Sec. 6.2, 7-10).
+/* Tile framing + reconstruct path.
  * Record layout (record_len == tile_record_size):
  *   [8-B header][1-B C iff predictor==9][mask][residual]
  *
@@ -32,7 +32,7 @@ struct ZpseTileHeader;
  *
  * FAM_CONST, FAM_CONSTC and FAM_STRIDE never read the lane histories or
  * the ORDER tables, so their loops carry no cross-position state: the
- * history update mandated by SPEC Sec. 7 is applied by an O(8) epilogue
+ * history update is applied by an O(8) epilogue
  * (tile_history_fixup) instead of an O(Nt) in-loop update. Every family
  * produces bit-identical predictions to the scalar formulas in Sec. 7.1.
  */
@@ -133,7 +133,7 @@ static uint32_t tile_stride_of(uint8_t predictor_id)
 }
 
 /* Epilogue for the stateless families (CONST, CONSTC, STRIDE): apply the
- * SPEC Sec. 7 history update for every lane in one O(8) pass. `src` holds
+ * history update for every lane in one O(8) pass. `src` holds
  * the Nt actual bytes (encoder input plane or decoder output plane);
  * ent_last/ent_second are the histories captured before the tile ran. */
 static void tile_history_fixup(ZpseLaneState *lanes, const uint8_t *src,
@@ -448,7 +448,7 @@ static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep)
  * actually differ need the per-exception bookkeeping.
  *
  * The identities used below hold for p >= 16 because every tile resets
- * its lane state (SPEC Sec. 7), which makes the history at position p
+ * its lane state, which makes the history at position p
  * exactly the tile's own bytes 8 and 16 back:
  *   last[l] = a[p-8+l],  second[l] = a[p-16+l]
  * Below 16 the entry state is `init`, not the plane, so [0,16) stays on

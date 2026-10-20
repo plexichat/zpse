@@ -1,7 +1,7 @@
 #ifndef ZPSE_BLOCK_H
 #define ZPSE_BLOCK_H
 
-/* Block encode/decode (SPEC Sec. 4). Envelope:
+/* Block encode/decode. Envelope:
  * [32-B header][meta][segdir][payloads]. Includes RAW fallback. */
 
 #include <stddef.h>

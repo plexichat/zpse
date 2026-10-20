@@ -1,7 +1,7 @@
 #ifndef ZPSE_TILE_H
 #define ZPSE_TILE_H
 
-/* Tile encode/decode (SPEC Sec. 6.2, 7-10). A tile is:
+/* Tile encode/decode. A tile is:
  * [u16 size][8-B hdr][C?][mask][residual]. This header covers framing,
  * validation, mode extraction, and the scalar reconstruct path. */
 

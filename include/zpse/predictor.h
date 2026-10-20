@@ -1,7 +1,7 @@
 #ifndef ZPSE_PREDICTOR_H
 #define ZPSE_PREDICTOR_H
 
-/* 8-lane predictors, profile 0 (SPEC Sec. 7). Scalar formulas are
+/* 8-lane predictors, profile 0. Scalar formulas are
  * normative; vector.h provides bit-exact SIMD equivalents. */
 
 #include <stdint.h>
