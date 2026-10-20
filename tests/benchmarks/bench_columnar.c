@@ -627,6 +627,7 @@ extern uint32_t zpse_trial_search_tiles;
 extern uint32_t zpse_stats_palettable;
 extern uint32_t zpse_stats_palette_emits;
 extern uint32_t zpse_stats_literal_emits;
+extern uint32_t zpse_stats_modes[64];
 
 static const char *const pred_names[12] = {
     "CONST_ZERO", "LANE_PREVIOUS", "LANE_DELTA", "ORDER1",
@@ -734,6 +735,27 @@ static int run_trial_stats(const char *only)
         printf("| **searched tiles** | | %u | trials/tile %.2f |\n",
                (unsigned)total_tiles,
                total_tiles ? (double)all / (double)total_tiles : 0.0);
+    }
+    /* Which (mask_mode, res_mode) pairs the mode search picks. A classify
+     * produces three per-exception arrays but a packed record reads one
+     * array per mode, so this is what decides whether producing all three
+     * is worth it. */
+    {
+        uint32_t mtot = 0u;
+
+        for (p = 0; p < 64; p++)
+            mtot += zpse_stats_modes[p];
+        printf("\nmode pairs chosen (mask_mode / res_mode), %u tiles:\n",
+               (unsigned)mtot);
+        printf("| mask | res | tiles | share |\n|---:|---:|---:|---:|\n");
+        for (p = 0; p < 64; p++) {
+            if (zpse_stats_modes[p] == 0u)
+                continue;
+            printf("| %d | %d | %u | %.1f%% |\n", p >> 3, p & 7,
+                   (unsigned)zpse_stats_modes[p],
+                   mtot ? 100.0 * (double)zpse_stats_modes[p] / (double)mtot
+                        : 0.0);
+        }
     }
     return 0;
 }
