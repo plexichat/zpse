@@ -170,6 +170,50 @@ int main(void) {
         CHECK((f & ZPSE_TILE_FLAG_RESET) != 0, "tile reset bit");
     }
 
+    /* Mode-3 base-M packed residuals: every legal M, every K in 1..256,
+     * encoded and decoded. This is the guard for the AVX2 nibble unpack
+     * (M >= 11), whose magic-multiply division is only exact for words
+     * below M^G -- the sweep covers both group widths it vectorises (7 and
+     * 8), whole and partial final groups, and K on both sides of the
+     * eight-group batch boundary, so a wrong constant or a mis-shaped
+     * batch fails here rather than in the fuzz corpus. */
+    {
+        static const uint8_t ms[] = {3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15};
+        uint8_t digits[256];
+        uint8_t payload[1024];
+        uint8_t got[256];
+        unsigned mi;
+        unsigned k;
+        uint32_t rng = UINT32_C(0x5EED1234);
+        int bad = 0;
+
+        for (mi = 0; mi < (unsigned)(sizeof ms / sizeof ms[0]); mi++) {
+            for (k = 1; k <= 256; k++) {
+                unsigned i;
+                int n;
+
+                for (i = 0; i < k; i++) {
+                    rng = rng * UINT32_C(1664525) + UINT32_C(1013904223);
+                    digits[i] = (uint8_t)((rng >> 24) % ms[mi]);
+                }
+                n = zpse_residual_encode(ZPSE_R_PACKED_BASE_M, digits, 0, 0,
+                                         (uint16_t)k, payload,
+                                         (uint16_t)sizeof payload);
+                if (n < 0) {
+                    bad++;
+                    continue;
+                }
+                if (zpse_residual_decode(ZPSE_R_PACKED_BASE_M, payload,
+                                         (uint16_t)n, (uint16_t)k, 0, got,
+                                         0) != 0 ||
+                    memcmp(got, digits, k) != 0) {
+                    bad++;
+                }
+            }
+        }
+        CHECK(bad == 0, "mode-3 M/K sweep: %d cases wrong", bad);
+    }
+
     /* Mask encode -> decode roundtrip, every position-coding mode over
      * every tile length and four mask shapes (dense, sparse, one run,
      * alternating). This is the guard for the RUNS encoder's transition
