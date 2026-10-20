@@ -1928,6 +1928,56 @@ different bytes), because the format never promised to detect it. That is a
 test of the *default*, not of the decoder, and it is there so an
 "always emit the CRC" change cannot slip through unnoticed.
 
+### The inverse 16-plane transpose had the forward's blocking left over
+
+The decoder rows still bounded by arithmetic rather than by hashing are the
+transposed ones: a transform id 6 block is sixteen 4 KiB planes that have to
+be interleaved back into 16-byte rows, and that inverse costs ~3.1 us of a
+4.1 us `alt00FF` decode. Its inner loop stages one 64-byte line from each
+plane before transposing, which is right for the *conflict* problem (all
+sixteen lines of a group sit at the same L1 set index) but had been left at
+**four** sixteen-row groups per stage -- 64 bytes, one line per plane, the
+size that existed before the forward half of the same file started
+collecting thirty-two groups per pass.
+
+Staging what the forward collects instead is a two-line change: 256 bytes
+per plane, 4 KiB of buffer, sixteen groups transposed out of each staged
+block. Isolated cost of the transform per 64 KiB, best of six alternating
+runs at each setting:
+
+| staged groups | bytes per plane | ns per 64 KiB |
+| ---: | ---: | ---: |
+| 4 (before) | 64 | 3100 |
+| 8 | 128 | 2950 |
+| 16 (now) | 256 | **2760** |
+| 32 | 512 | 2700 |
+
+Thirty-two groups is no faster in isolation and slower in place -- the
+transpose's output has to share L1 with 8 KiB of staging -- so sixteen is
+the setting. End to end, paired binaries alternating over eight rounds, best
+of eight, decode GB/s:
+
+| row | before | after | gain |
+| --- | ---: | ---: | ---: |
+| `alt00FF` | 15.40 | **16.19** | +5% |
+| `sawtooth` | 8.44 | **9.70** | +15% |
+| `sparse2` | 12.46 | **13.12** | +5% |
+
+The other seven rows are byte-identical in this change and were used as the
+control: they agree to within the host's jitter between the two binaries.
+The isolated 12% is the honest number for the kernel. The row-level numbers
+weight it by how much of each row is transform and land between them --
+`sawtooth` above its share and the other two below -- which is the size of
+the error bar on this host rather than a second effect.
+
+A pipelined variant -- two staging blocks, the next one's strided loads
+issued before the current one's transposes -- was built and measured
+**2% slower** (0.98x on all three rows): doubling the staging buffer costs
+more L1 than the overlap buys, so it is not in the tree. The same applies to
+splitting the delta/xor prefix scan further: it is already eight independent
+32-byte ladders per vector-register carry link, and what is left there is
+shuffle-port throughput, not scheduling.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
