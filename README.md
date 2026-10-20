@@ -540,9 +540,11 @@ decode column is unchanged code this round and measures within 2%.
 
 The same run reports this machine's ceilings for the same 64 KiB working
 set: memcpy 50 GB/s, memset 77 GB/s and CRC32-C 24 GB/s. The CRC32-C rate
-matters because every block carries a checksum of its decoded bytes, so on
+mattered because every block carried a checksum of its decoded bytes then
+(the encoder now emits one only when asked -- see the last section), so on
 the fastest paths - 22.9 GB/s of decode against a 24 GB/s checksum - almost
-all of that decode time is the checksum, and it is the floor under this table: `crc32 r64,r64` retires one instruction per cycle
+all of that decode time was the checksum, and it was the floor under this
+table: `crc32 r64,r64` retires one instruction per cycle
 here, which is 8 B/cycle = ~31 GB/s, and a PCLMULQDQ fold cannot beat that
 on a core
 that retires one carry-less multiply per cycle (a fold-by-4 needs eight of
