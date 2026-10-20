@@ -37,16 +37,16 @@ WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 
 | pattern | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| `zeros` | 0.004 | 42 500 | **73 000** |
-| `const5A` | 0.004 | 42 700 | **70 100** |
-| `random` | 1.000 | 4 150 | **64 200** |
-| `lowentropy` (4-bit alphabet) | 0.508 | 2 180 | 43 000 |
-| `incr` (0..255 ramp) | 0.040 | 7 500 | 17 000 |
-| `strided` | 0.040 | 3 650 | 15 200 |
-| `alt00FF` | 0.009 | 9 310 | 17 600 |
-| `sparse2` | 0.019 | 5 540 | 14 100 |
-| `sparse` (1 byte per 97) | 0.060 | 2 150 | 13 100 |
-| `sawtooth` | 0.116 | 3 480 | 9 820 |
+| `zeros` | 0.004 | 43 900 | **74 600** |
+| `const5A` | 0.004 | 44 100 | **74 600** |
+| `random` | 1.000 | 4 650 | **66 400** |
+| `lowentropy` (4-bit alphabet) | 0.508 | 2 500 | 47 300 |
+| `incr` (0..255 ramp) | 0.040 | 8 200 | 17 100 |
+| `strided` | 0.040 | 4 360 | 16 400 |
+| `alt00FF` | 0.009 | 9 420 | 19 300 |
+| `sparse2` | 0.019 | 5 820 | 16 000 |
+| `sparse` (1 byte per 97) | 0.060 | 2 350 | 15 100 |
+| `sawtooth` | 0.116 | 3 840 | 11 200 |
 
 What the rows are: `zeros`/`const5A` are one-byte-value blocks (coded in
 248 bytes), `random` is incompressible (coded as a raw block, so decode is
@@ -55,9 +55,9 @@ exactly a `memcpy`), `lowentropy` is a random stream over sixteen byte values,
 16-wide interleave, and `sparse` is zeros with a byte every 97.
 
 The interesting part is the ceilings: on the same machine and the same
-working set, `memcpy` is **57 000 MB/s** and `memset` **115 000 MB/s**. The
+working set, `memcpy` is **65 400 MB/s** and `memset` **132 000 MB/s**. The
 one-value rows decode *above* `memcpy` because the decoder writes them with
-wide stores and never reads them back; `random` decoding at 64 200 MB/s is
+wide stores and never reads them back; `random` decoding at 66 400 MB/s is
 the raw path doing a copy plus a header check, i.e. right at the `memcpy`
 ceiling. Everything else is transform- and tile-bound, not memory-bound.
 
@@ -68,7 +68,7 @@ ceiling. Everything else is transform- and tile-bound, not memory-bound.
   and file I/O, so none of them appear here. The table above is a library call
   over the same buffer, best of six, single thread.
 * The host has two performance states — its `memcpy` ceiling wanders between
-  53 000 and 70 000 MB/s depending on thermal state — so run-to-run spread on
+  57 000 and 66 000 MB/s depending on thermal state — so run-to-run spread on
   a busy row is around ±10%. Any comparison worth trusting here was done as
   two binaries alternating over the same rows, best of eight, never as one
   before-and-after pair.
