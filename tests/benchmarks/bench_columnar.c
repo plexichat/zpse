@@ -25,6 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/utsname.h>
+#endif
 
 #include "zpse/zpse.h"
 
@@ -289,6 +293,60 @@ static void fmt_rate(char *b, size_t n, double mb_s)
     }
 }
 
+/* ---- host: CPU/RAM/OS/compiler, printed above the results so a saved
+ * run is self-describing. Linux-only (/proc, sysconf); elsewhere prints
+ * what uname gives and "n/a" for the rest. Never fails the run. */
+
+static void print_host(void)
+{
+#if defined(__linux__)
+    FILE *f;
+    char line[512], model[256] = "n/a", mhz[64] = "n/a";
+    char flags[256] = "n/a";
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGESIZE);
+    struct utsname u;
+    char os[512] = "n/a";
+
+    if (uname(&u) == 0)
+        snprintf(os, sizeof os, "%s %s %s %s", u.sysname, u.release, u.version, u.machine);
+    f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "model name", 10) && model[0] == 'n') {
+                char *p = strchr(line, ':');
+                if (p) { snprintf(model, sizeof model, "%s", p + 2); model[strcspn(model, "\n")] = 0; }
+            } else if (!strncmp(line, "cpu MHz", 7) && mhz[0] == 'n') {
+                char *p = strchr(line, ':');
+                if (p) { snprintf(mhz, sizeof mhz, "%s MHz", p + 2); mhz[strcspn(mhz, "\n")] = 0; }
+            } else if (!strncmp(line, "flags", 5) && flags[0] == 'n') {
+                char *p = strchr(line, ':');
+                if (p) { snprintf(flags, sizeof flags, "%.200s...", p + 2); flags[strcspn(flags, "\n")] = 0; }
+            }
+            if (model[0] != 'n' && mhz[0] != 'n' && flags[0] != 'n')
+                break;
+        }
+        fclose(f);
+    }
+    printf("host: os=%s\n", os);
+    printf("host: cpu=%s\n", model);
+    printf("host: cpus=%ld\n", ncpu > 0 ? ncpu : -1L);
+    if (pages > 0 && psize > 0)
+        printf("host: ram=%.1f GiB\n", (double)pages * (double)psize / 1073741824.0);
+    else
+        printf("host: ram=n/a\n");
+    printf("host: mhz=%s\n", mhz);
+    printf("host: flags=%s\n", flags);
+#if defined(__VERSION__)
+    printf("host: cc=%s\n", __VERSION__);
+#else
+    printf("host: cc=n/a\n");
+#endif
+#else
+    printf("host: n/a (non-Linux)\n");
+#endif
+}
+
 int main(int argc, char **argv)
 {
     static const struct { const char *name; void (*gen)(void); } cases[] = {
@@ -327,6 +385,7 @@ int main(int argc, char **argv)
         br_cbound, br_comp, br_decomp };
 
     setvbuf(stdout, NULL, _IONBF, 0);
+    print_host();
     printf("columnar in-process: 4 MiB/case as 64x64 KiB blocks, single core, "
            "best-of-reps\n");
     printf("levels: zpse default, zstd -3, lz4 fast, zlib -6, brotli q5; "
