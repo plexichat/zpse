@@ -20,8 +20,11 @@ predictors (`CONST_ZERO`, `LANE_PREVIOUS`, `LANE_DELTA`, `LANE_AVERAGE`,
 `ORDER1`, `ORDER2`, `STRIDE_1/2/3/4/8`, `TILE_LOCAL_CONSTANT`), 7 exception-mask
 modes and 5 residual modes, so a single stream can serve both run-like and
 structured data. Blocks that do not compress are stored verbatim behind the
-same envelope (the RAW fallback), and every block carries a CRC32-C of its
-decoded bytes.
+same envelope (the RAW fallback). A block may carry a CRC32-C of its decoded
+bytes; it is optional in the format and **off by default**, the way LZ4's
+frame checksums are -- `zpse_compress_block_ex(..., ZPSE_ENC_CHECKSUM, ...)`
+turns it on for a stream that wants integrity checked, and every decoder here
+verifies it whenever a stream carries it.
 
 `tests/bench.c` measures ten patterns, which is a fair summary of the shapes
 the format is designed for:
@@ -233,8 +236,10 @@ The harness compresses and decompresses a 64 KiB block of each pattern,
 single-core, and reports the best of `reps` rounds for each direction (decode
 is measured ten times per round) as GB/s plus the ratio and compressed size.
 It then prints the machine's `memcpy`, `memset` and CRC32-C rates for the same
-working set: those bound any codec on this format, because every block is
-verified with a CRC32-C and the RAW fallback is a copy. The bench times
+working set: those bound any codec on this format -- `memcpy` is what the RAW
+fallback costs, and the CRC32-C rate is what a block pays for its optional
+payload checksum, which the bench's streams (like the API's default) do not
+carry. The bench times
 itself with `QueryPerformanceCounter` on Windows and `clock_gettime`
 (`CLOCK_MONOTONIC`) elsewhere, so the same command works on any platform
 the library builds on.
@@ -1874,6 +1879,52 @@ non-identity block at ~14 GB/s, which is where `incr`, `strided` and
 `alt00FF` now sit (10.5-10.8). Getting past it means overlapping the CRC with
 the transform rather than speeding up either, and that is a different kind of
 change from the ones above.
+
+### Checksums off by default: the payload CRC becomes opt-in
+
+The ablations above kept coming back to the same number: the payload CRC32-C
+is 8.2-8.5k cycles of a 64 KiB block, 0.13 cycles a byte, which is ~26% of a
+`sparse` decode and ~45% of a `lowentropy` one -- and on the RAW row it was
+the difference between a memcpy and a third of memcpy speed. It is also
+entirely optional in the format (block flag `ZPSE_B_CRC`, SPEC Sec. 4), and
+the decoder has always verified it only when a stream carries it.
+
+So the encoder now treats it the way LZ4 treats its frame checksum: **off by
+default**. `zpse_compress_block()` / `zpse_compress_frame()` emit no
+checksum and do not pay to compute one; `zpse_compress_block_ex()` /
+`zpse_compress_frame_ex()` take `ZPSE_ENC_CHECKSUM` for a stream that wants
+it, and every decoder here still verifies anything tagged. Compressed sizes
+are unchanged -- the CRC lives in the block header, so the flag bit is the
+only byte that moves -- and both forms roundtrip and are covered by the
+suites.
+
+Paired measurement, one binary, both forms of every row, interleaved
+(decode GB/s):
+
+| row | CRC on | CRC off | gain |
+| --- | ---: | ---: | ---: |
+| `random` | 20.96 | **66.98** | +220% |
+| `lowentropy` | 18.41 | **47.63** | +159% |
+| `incr` | 10.69 | **17.41** | +63% |
+| `strided` | 10.70 | **16.58** | +55% |
+| `alt00FF` | 10.12 | **15.07** | +49% |
+| `sparse` | 9.85 | **14.61** | +48% |
+| `sparse2` | 9.05 | **13.09** | +45% |
+| `sawtooth` | 7.22 | **9.64** | +34% |
+| `zeros`, `const5A` | 56.5, 56.9 | **73.4, 73.7** | +30% |
+
+The RAW row is the extreme case because its verify pass was fused into the
+copy that produces the output; with no checksum it is exactly a memcpy. The
+constant rows gain less because they already took the arithmetic
+`zpse_crc32c_repeat` shortcut on decode -- O(log n) matrix applies instead
+of a 64 KiB pass -- which is still not free.
+
+`tests/suites/test_hostile.c` now asserts both halves of the trade: a
+payload byte flipped in a checksummed stream is rejected with
+`PSE_BAD_PAYLOAD_CRC`, and the same flip in a default stream decodes (with
+different bytes), because the format never promised to detect it. That is a
+test of the *default*, not of the decoder, and it is there so an
+"always emit the CRC" change cannot slip through unnoticed.
 
 ## License
 
