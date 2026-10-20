@@ -16,6 +16,11 @@
 #include "zpse/vector.h"
 
 #if defined(ZPSE_TRIAL_STATS)
+/* Which (mask_mode, res_mode) the mode search actually picks, indexed
+ * mask_mode * 8 + res_mode. This is what says whether a classify product
+ * is worth producing at all: the per-exception arrays it compacts are
+ * read one mode at a time. */
+uint32_t zpse_stats_modes[64];
 /* Opt-in accounting for the encoder's own decisions (see tile.c for the
  * per-predictor half). Defined here rather than next to the code that
  * bumps them because the dense-form counters are read by functions that
@@ -3191,6 +3196,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
+#if defined(ZPSE_TRIAL_STATS)
+            zpse_stats_modes[((uint32_t)mm << 3) | (uint32_t)rr]++;
+#endif
             n = zpse_tile_pack(pred, &cl, nt, actual, mm, rr, 1, wout,
                                wcap, e->comb);
             if (n < 8) {
