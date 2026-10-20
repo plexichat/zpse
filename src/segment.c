@@ -2365,10 +2365,13 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
  * zpse_segment_encode. */
 #define ZPSE_EST_TILES 8u
 #define ZPSE_EST_MIN_TILES 16u
-/* Tiles whose records the projection extrapolates from. Four is enough for
- * a per-tile average to settle on the planes this decides (whose tiles are
- * alike) and keeps a palette that is going to lose its handful. */
-#define ZPSE_PAL_PROJ_TILES 4u
+/* Tiles whose records the projection extrapolates from. Two, not four: the
+ * tiles of a palette plane are alike by construction (that is why the form
+ * wins on it), so half the plane already says what the rest costs, and every
+ * tile coded before the form is taken is a pipeline whose bytes are thrown
+ * away. The 1/8 margin the projection uses is unchanged, so a plane the early
+ * extrapolation misprices keeps its tiles and only loses the comparison. */
+#define ZPSE_PAL_PROJ_TILES 2u
 
 /* Price of a plane's tile records, from a sample of `tiles` tiles spread
  * evenly over it.
@@ -2811,7 +2814,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * Later checkpoints are also better evidence, and the exact rule above
      * the loop still fires the moment the tiles have overtaken the form. */
     proj_at = ZPSE_PAL_PROJ_TILES;
-    proj_shift = 2u;
+    proj_shift = 1u;
     pos = 16u;
     for (t = 0; t < tc; t++) {
         uint32_t seg_pos = t * 256u;
