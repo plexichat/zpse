@@ -26,6 +26,7 @@
  *     src/zpse_unity.c -ldl -o /tmp/benchcol
  * Run:
  *   taskset -c 0 /tmp/benchcol [iters] [reps] [case|all] [codec|all] [blk_kb]
+ *   taskset -c 0 /tmp/benchcol stats [case|all]   (-DZPSE_TRIAL_STATS)
  * blk_kb is optional (16/32/64/128/256, default 64); the corpus stays
  * 4 MiB (block count scales), so older 4-arg invocations are unchanged.
  * .github/workflows/bench-columnar.yml runs exactly this on every push. */
@@ -590,9 +591,7 @@ static void print_host(void)
 #endif
 }
 
-int main(int argc, char **argv)
-{
-    static const struct { const char *name; void (*gen)(void); } cases[] = {
+static const struct { const char *name; void (*gen)(void); } cases[] = {
         { "i32_seq", gen_i32_seq }, { "i64_mixed", gen_i64_mixed },
         { "dict_u8", gen_dict_u8 }, { "dict_u16le", gen_dict_u16le },
         { "float_mix", gen_float_mixed }, { "bools_nulls", gen_bools_nulls },
@@ -600,9 +599,158 @@ int main(int argc, char **argv)
         { "ts_us", gen_timestamps }, { "uuid_mix", gen_uuid_mixed },
         { "text_en", gen_text_en }, { "json_rows", gen_json_rows },
         { "log_lines", gen_log_lines }, { "sorted_near", gen_sorted_near },
-        { "zeros_burst", gen_zeros_burst }, { "ts_gapped", gen_ts_gapped },
-        { "dna_2bit", gen_dna_2bit }, { "utf8_multi", gen_utf8_multi },
-    };
+        { "zeros_burst", gen_zeros_burst }, { "ts_gapped", gen_ts_gapped },        {"dna_2bit", gen_dna_2bit}, {"utf8_multi", gen_utf8_multi},
+};
+
+/* ------------------------------------------------------------------ *
+ * `stats`: which predictors does the encoder actually trial, and how often
+ * per searched tile?
+ *
+ * This exists because a predictor's classify cost says nothing about its
+ * share of encode time unless the encoder asks for it, and that is not
+ * observable from outside the library. Built with -DZPSE_TRIAL_STATS the
+ * library keeps two counters (tile.c / segment.c) and this mode prints them
+ * per corpus case, over exactly the corpora the shootout below uses. Same
+ * corpus, same block size, same entry point -- so the counts are the ones
+ * the throughput rows pay for.
+ *
+ * The denominator is SEARCHED tiles: tiles written by the all-hit run or
+ * the repeat cache never reach the predictor search, so counting them would
+ * understate the true per-tile trial rate.
+ *
+ * Round-trip is verified before the counters are read, so a case whose
+ * stream changed cannot be reported as a win.
+ * ------------------------------------------------------------------ */
+#if defined(ZPSE_TRIAL_STATS)
+extern uint32_t zpse_trial_calls[12];
+extern uint32_t zpse_trial_search_tiles;
+extern uint32_t zpse_stats_palettable;
+extern uint32_t zpse_stats_palette_emits;
+extern uint32_t zpse_stats_literal_emits;
+
+static const char *const pred_names[12] = {
+    "CONST_ZERO", "LANE_PREVIOUS", "LANE_DELTA", "ORDER1",
+    "ORDER2", "STRIDE_1", "STRIDE_2", "STRIDE_4",
+    "STRIDE_8", "TILE_CONSTANT", "LANE_AVERAGE", "STRIDE_3"
+};
+
+static int run_trial_stats(const char *only)
+{
+    const int nc = (int)(sizeof cases / sizeof cases[0]);
+    uint32_t total[12] = {0};
+    uint32_t total_tiles = 0;
+    int i, p;
+
+    printf("trial stats: predictors CLASSIFIED (candidate attempts) per "
+           "corpus case\n");
+    printf("corpus: %zu x %zu KiB blocks of the shootout's own generators\n",
+           g_nb, g_blk / 1024u);
+    printf("| case | searched tiles | trials | per tile | palettable | "
+           "palette | literal | %s |\n", "busiest three");
+    printf("|---|---:|---:|---:|---:|---:|---:|---|\n");
+    for (i = 0; i < nc; i++) {
+        uint32_t before[12];
+        uint32_t got[12];
+        uint32_t tiles0, tiles, ntr = 0;
+        uint32_t pal0, pemit0, lemit0, pal_n, pemit_n, lemit_n;
+        size_t b;
+        int k;
+
+        if (only[0] && !strstr(cases[i].name, only))
+            continue;
+        g_rng = 0x1234u + (uint32_t)i * 7919u;
+        cases[i].gen();
+        for (p = 0; p < 12; p++)
+            before[p] = zpse_trial_calls[p];
+        tiles0 = zpse_trial_search_tiles;
+        pal0 = zpse_stats_palettable;
+        pemit0 = zpse_stats_palette_emits;
+        lemit0 = zpse_stats_literal_emits;
+        for (b = 0; b < g_nb; b++) {
+            uint8_t *src = g_in + b * g_blk;
+            size_t cn = z_comp(src, g_blk, g_comp, g_blk + 1024u);
+            if (cn == 0 || cn > g_blk + 1024u) {
+                printf("| %s | compress failed |\n", cases[i].name);
+                return 1;
+            }
+            if (z_decomp(g_comp, cn, g_out, g_blk) != 0 ||
+                memcmp(g_out, src, g_blk) != 0) {
+                printf("| %s | round-trip FAILED |\n", cases[i].name);
+                return 1;
+            }
+        }
+        tiles = zpse_trial_search_tiles - tiles0;
+        pal_n = zpse_stats_palettable - pal0;
+        pemit_n = zpse_stats_palette_emits - pemit0;
+        lemit_n = zpse_stats_literal_emits - lemit0;
+        for (p = 0; p < 12; p++) {
+            got[p] = zpse_trial_calls[p] - before[p];
+            ntr += got[p];
+            total[p] += got[p];
+        }
+        total_tiles += tiles;
+        /* Busiest three of this case, by count. */
+        {
+            int b1 = -1, b2 = -1, b3 = -1;
+            char busy[128];
+            int ord[12];
+            int n = 0;
+
+            for (p = 0; p < 12; p++)
+                ord[n++] = p;
+            for (k = 1; k < n; k++) { /* insertion sort, descending */
+                int v = ord[k];
+                int j = k - 1;
+                while (j >= 0 && got[ord[j]] < got[v]) {
+                    ord[j + 1] = ord[j];
+                    j--;
+                }
+                ord[j + 1] = v;
+            }
+            b1 = ord[0]; b2 = ord[1]; b3 = ord[2];
+            snprintf(busy, sizeof busy, "%s %u, %s %u, %s %u",
+                     pred_names[b1], (unsigned)got[b1],
+                     pred_names[b2], (unsigned)got[b2],
+                     pred_names[b3], (unsigned)got[b3]);
+            printf("| %s | %u | %u | %.2f | %u | %u | %u | %s |\n",
+                   cases[i].name, (unsigned)tiles, (unsigned)ntr,
+                   tiles ? (double)ntr / (double)tiles : 0.0,
+                   (unsigned)pal_n, (unsigned)pemit_n, (unsigned)lemit_n,
+                   busy);
+        }
+    }
+    printf("\npredictor totals over every case (share of all trials):\n");
+    printf("| predictor | id | trials | share |\n|---|---:|---:|---:|\n");
+    {
+        uint32_t all = 0u;
+
+        for (p = 0; p < 12; p++)
+            all += total[p];
+        for (p = 0; p < 12; p++) {
+            printf("| %s | %d | %u | %.1f%% |\n", pred_names[p], p,
+                   (unsigned)total[p],
+                   all ? 100.0 * (double)total[p] / (double)all : 0.0);
+        }
+        printf("| **searched tiles** | | %u | trials/tile %.2f |\n",
+               (unsigned)total_tiles,
+               total_tiles ? (double)all / (double)total_tiles : 0.0);
+    }
+    return 0;
+}
+#else
+static int run_trial_stats(const char *only)
+{
+    (void)only;
+    printf("stats mode needs a build defining ZPSE_TRIAL_STATS:\n"
+           "  cc -std=c11 -O2 -DZPSE_TRIAL_STATS -Iinclude \\\n"
+           "     tests/benchmarks/bench_columnar.c src/zpse_unity.c -ldl \\\n"
+           "     -o /tmp/benchcol && /tmp/benchcol stats\n");
+    return 2;
+}
+#endif /* ZPSE_TRIAL_STATS */
+
+int main(int argc, char **argv)
+{
     const int nc = (int)(sizeof cases / sizeof cases[0]);
     int iters = argc > 1 ? atoi(argv[1]) : 30;
     int reps = argc > 2 ? atoi(argv[2]) : 5;
@@ -633,6 +781,13 @@ int main(int argc, char **argv)
     g_comp = malloc(g_blk * 2 + 4096u);
     g_out = malloc(g_blk);
     if (!g_in || !g_comp || !g_out) { printf("oom\n"); return 1; }
+    /* `stats [case]`: predictor trial accounting instead of the shootout.
+     * Needs -DZPSE_TRIAL_STATS (see run_trial_stats). */
+    if (argc > 1 && strcmp(argv[1], "stats") == 0) {
+        return run_trial_stats(argc > 2 && strcmp(argv[2], "all") != 0
+                                   ? argv[2]
+                                   : "");
+    }
     load_all();
 
     codecs[0] = (Codec){ "zpse","default",1,z_cbound,z_comp,z_decomp };

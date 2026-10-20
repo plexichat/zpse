@@ -1403,6 +1403,20 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
 }
 #endif /* ZPSE_TILE_HAVE_AVX2 */
 
+/* Opt-in trial accounting (-DZPSE_TRIAL_STATS): a count of classify calls
+ * per predictor id. Nothing about the encoder's candidates is observable
+ * from outside it, so "which predictors does this corpus actually trial?"
+ * cannot be measured without a counter -- and the answer decides where
+ * encoder optimisation effort should go (a predictor that is never
+ * prescreened costs nothing, however slow its classify is). The counters
+ * exist only in a build that defines the macro; `tests/benchmarks/
+ * bench_columnar.c stats` is the reader, and it reports the counts per
+ * corpus case and per searched tile. A classify call is one candidate
+ * attempt: one predictor, one tile, one pass. */
+#if defined(ZPSE_TRIAL_STATS)
+uint32_t zpse_trial_calls[12];
+#endif
+
 /* Classify one tile: fill cl->words / cl->k / cl->at_pred / constant_C
  * and advance the lane state exactly as the decoder will. */
 static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
@@ -1414,6 +1428,9 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     uint32_t *words = cl->words;
     uint16_t k = 0;
     uint16_t p;
+#if defined(ZPSE_TRIAL_STATS)
+    zpse_trial_calls[predictor_id]++;
+#endif
     /* Range accumulators live in locals, not in *cl: the exception loop
      * runs up to Nt times per tile and a struct store/reload through the
      * caller's pointer per exception is pure overhead when all three are
