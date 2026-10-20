@@ -176,7 +176,9 @@ static void ceilings(void) {
     for (i = 0; i < n; i++) vsink += zpse_crc32c(in, 65536);
     t1 = now_ns();
     printf("crc32c 64KiB            %8.2f GB/s\n", 65536.0 / ((t1 - t0) / n));
-    printf("(both directions must also verify a CRC32-C of every 64 KiB block)\n");
+    printf("(memcpy is the RAW fallback's cost; a block pays the CRC32-C rate\n"
+           " only when its stream carries the optional payload checksum, which\n"
+           " the API's default -- and every row here -- do not)\n");
 }
 
 int main(int argc, char **argv) {

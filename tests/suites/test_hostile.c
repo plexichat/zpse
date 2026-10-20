@@ -23,12 +23,22 @@ static int fails = 0;
 
 static uint32_t clen = 0;
 
-static void refresh(void) {
+static void refresh_flags(uint32_t flags) {
     uint32_t dummy = 0;
-    int rc = zpse_compress_block(input, sizeof input, comp, sizeof comp,
-                                 &dummy, 0, 1, enc_arena);
+    int rc = zpse_compress_block_ex(input, sizeof input, comp, sizeof comp,
+                                    &dummy, 0, 1, flags, enc_arena);
     (void)rc;
     clen = dummy;
+}
+
+/* The default stream (no payload checksum, as in LZ4). */
+static void refresh(void) {
+    refresh_flags(0u);
+}
+
+/* The same input with the optional payload CRC tag. */
+static void refresh_crc(void) {
+    refresh_flags((uint32_t)ZPSE_ENC_CHECKSUM);
 }
 
 int main(void) {
@@ -49,10 +59,11 @@ int main(void) {
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc == PSE_BAD_HEADER_CRC, "bad header CRC rejected");
 
-    /* Payload corruption with intact header -> BAD_PAYLOAD_CRC. Use
-     * incompressible input so the block takes the RAW path, where any
-     * payload byte flip provably changes only values (structure of a
-     * coded block could break earlier with a different code). */
+    /* Payload corruption with intact header -> BAD_PAYLOAD_CRC, when the
+     * stream asks for the checksum. Use incompressible input so the block
+     * takes the RAW path, where any payload byte flip provably changes
+     * only values (structure of a coded block could break earlier with a
+     * different code). */
     {
         uint32_t r = 0x12345u;
         int i;
@@ -60,11 +71,21 @@ int main(void) {
             r = r * 1664525u + 1013904223u;
             input[i] = (uint8_t)(r >> 24);
         }
-        refresh();
+        refresh_crc();
         memcpy(work, comp, clen);
         work[100] ^= 0xFF;
         rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
         CHECK(rc == PSE_BAD_PAYLOAD_CRC, "bad payload CRC rejected");
+        /* The default stream carries no checksum, so the same flip is a
+         * value change the format never promised to detect -- that is the
+         * trade the default makes, and it is asserted here so a future
+         * "always emit the CRC" change cannot pass unnoticed. */
+        refresh();
+        memcpy(work, comp, clen);
+        work[100] ^= 0xFF;
+        rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
+        CHECK(rc == PSE_OK && memcmp(out, input, sizeof input) != 0,
+              "default stream has no payload CRC (flip undetected)");
         for (i = 0; i < (int)sizeof input; i++) input[i] = (uint8_t)(i & 0xFF);
         refresh();
     }
