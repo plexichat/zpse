@@ -30,6 +30,23 @@ jobs:
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/benchmarks/bench_columnar.c src/zpse_unity.c -ldl -o /tmp/benchcol
+          # The stats mode is compiled only with -DZPSE_TRIAL_STATS; building
+          # it here keeps that opt-in instrument from rotting away.
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -DZPSE_TRIAL_STATS \
+            -Iinclude tests/benchmarks/bench_columnar.c src/zpse_unity.c \
+            -ldl -o /tmp/benchcol-stats
+      - name: Predictor trial stats (what the encoder really runs)
+        run: |
+          taskset -c 0 /tmp/benchcol-stats stats all | tee /tmp/benchcol-stats.txt
+          {
+            echo '### which predictors the encoder actually trials'
+            echo
+            echo 'Classify calls per predictor over the same eighteen corpora,'
+            echo 'counted in a -DZPSE_TRIAL_STATS build; the denominator is'
+            echo 'tiles whose search ran. Informational, like the table below.'
+            echo
+            cat /tmp/benchcol-stats.txt
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Run the matrix (18 cases x 5 codecs, single core)
         run: |
           taskset -c 0 /tmp/benchcol 12 3 all all | tee /tmp/benchcol.txt
@@ -53,5 +70,6 @@ jobs:
           path: |
             /tmp/benchcol.txt
             /tmp/benchcol-16k.txt
+            /tmp/benchcol-stats.txt
           if-no-files-found: error
           retention-days: 90

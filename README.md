@@ -174,6 +174,21 @@ Benchmarks live in `tests/benchmarks/`: `bench.c` for the in-process table
 above, `bench_columnar.c` for columnar data, and `bench_vs.sh` for the
 cross-tool comparison (zstd, lz4, brotli, gzip, xz, when installed).
 
+`bench_columnar stats` answers a different question: which predictors the
+encoder actually trials, and how often per searched tile, over the same
+corpora. Nothing about the encoder's candidate set is observable from
+outside the library, so it needs a build that defines `ZPSE_TRIAL_STATS`
+(compile-time only; the counters do not exist otherwise):
+
+```
+cc -std=c11 -O2 -DZPSE_TRIAL_STATS -Iinclude \
+   tests/benchmarks/bench_columnar.c src/zpse_unity.c -ldl -o /tmp/bc && \
+   taskset -c 0 /tmp/bc stats all
+```
+
+Use it before optimising a predictor: a predictor that is never prescreened
+costs nothing however slow its classify is.
+
 ## Known limitations
 
 * **No entropy coder and no match finder.** Ratio loses badly to zstd on

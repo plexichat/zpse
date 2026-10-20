@@ -15,6 +15,23 @@
 #include "zpse/types.h"
 #include "zpse/vector.h"
 
+#if defined(ZPSE_TRIAL_STATS)
+/* Opt-in accounting for the encoder's own decisions (see tile.c for the
+ * per-predictor half). Defined here rather than next to the code that
+ * bumps them because the dense-form counters are read by functions that
+ * sit above the segment encoder body in this file. */
+/* Tiles whose predictor search ran (see the increment in
+ * zpse_segment_encode). The partner of zpse_trial_calls[] in tile.c. */
+uint32_t zpse_trial_search_tiles;
+/* Dense-form accounting: planes the full alphabet scan found palettable
+ * (2..16 values), planes the palette form actually replaced the tiles of,
+ * and planes the literal form replaced them of. A plane that is
+ * palettable but never emits costs a full alphabet scan and nothing else,
+ * so the pair separates "the form is used" from "the form was considered". */
+uint32_t zpse_stats_palettable;
+uint32_t zpse_stats_palette_emits;
+uint32_t zpse_stats_literal_emits;
+#endif
 
 /* STRIDE period of an all-hit STRIDE record (predictor ids 5..8). Mirrors
  * tile_stride_of in src/tile.c, spelled out here so a change to the enum
@@ -2280,6 +2297,9 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
     /* A dense segment always reports tile_count == 1 (Sec. 6.3). */
     h->tile_count = 1u;
     zpse_segment_header_serialize(payload_out, h);
+#if defined(ZPSE_TRIAL_STATS)
+    zpse_stats_palette_emits++;
+#endif
     return (int)at;
 }
 
@@ -2357,6 +2377,9 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
     /* A dense segment always reports tile_count == 1 (Sec. 6.3). */
     h->tile_count = 1u;
     zpse_segment_header_serialize(payload_out, h);
+#if defined(ZPSE_TRIAL_STATS)
+    zpse_stats_literal_emits++;
+#endif
     return (int)at;
 }
 
@@ -2951,6 +2974,15 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             rep_slot_key = key;
         }
 
+        /* Opt-in trial accounting (-DZPSE_TRIAL_STATS, see tile.c).
+         * Counted here, not at the top of the loop, so the denominator is
+         * the tiles whose predictor search actually ran: a tile the
+         * all-hit run or the repeat cache wrote without one contributes
+         * no trials and no tile. "Trials per tile" below is therefore
+         * trials per SEARCHED tile. */
+#if defined(ZPSE_TRIAL_STATS)
+        zpse_trial_search_tiles++;
+#endif
         seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
                            have_avx2, &zero_cheap, ks);
         best_p = 0;
@@ -3230,6 +3262,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             pal_m = seg_plane_alphabet(plane, plane_len, 16u, pal_bits);
             if (pal_m >= 2u && pal_m <= 16u) {
                 uint32_t pc = seg_dense_palette_cost(plane_len, pal_m);
+#if defined(ZPSE_TRIAL_STATS)
+                zpse_stats_palettable++;
+#endif
 
                 if (pc <= payload_cap &&
                     (byte_budget == 0u || pc <= byte_budget)) {
