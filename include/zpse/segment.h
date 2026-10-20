@@ -1,7 +1,7 @@
 #ifndef ZPSE_SEGMENT_H
 #define ZPSE_SEGMENT_H
 
-/* Segment encode/decode (SPEC Sec. 6). A segment payload is a 16-B
+/* Segment encode/decode. A segment payload is a 16-B
  * header followed by tile_count prefixed tile records -- or, for a plane
  * the encoder coded with the dense form (Sec. 6.3), a sequence of dense
  * records and no tiles. */

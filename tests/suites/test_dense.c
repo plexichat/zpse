@@ -1,4 +1,4 @@
-/* Dense segment records (SPEC Sec. 6.3): the decoder must reconstruct a
+/* Dense segment records: the decoder must reconstruct a
  * plane from ONE predictor, ONE mask and ONE residual stream, and must
  * reject every malformed shape with an error rather than a decode.
  *
@@ -291,7 +291,7 @@ static void hand_checked(void)
           "hand plane, lane-delta, sparse mask");
 }
 
-/* A record AREA may hold several records back to back (SPEC Sec. 6.3);
+/* A record AREA may hold several records back to back;
  * the segment's decoded size is their sum and the second one starts where
  * the first ends. */
 static void sequence_case(void)

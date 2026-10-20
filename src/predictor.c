@@ -150,7 +150,7 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
                 return PSE_BAD_ARG;
             }
             for (p = 0; p < nt; p++) {
-                /* Segment-absolute addressing (SPEC Sec. 7): the stream
+                /* Segment-absolute addressing: the stream
                  * is segment-scoped, so the guard is on seg_pos + p.
                  * NOTE: batch form is still only exact for stateless
                  * predictors; tile reconstruction uses the online loop

@@ -4,7 +4,7 @@
 #include <string.h>
 
 /* Unity-build safe: no globals, no allocation, helpers are `static`.
- * Scalar C paths are normative and bit-exact per SPEC Secs. 7-10;
+ * Scalar C paths are normative and bit-exact;
  * SIMD paths are dispatched at runtime and MUST match scalar output. */
 
 /* ---- Architecture detection (compile time) ---- */
@@ -277,7 +277,7 @@ void zpse_inv_transpose8_64B(uint8_t *dst, const uint8_t *segs[8],
  * 64 B = 8 steps x 8 lanes. History evolves across steps: for each lane
  * L, step q predicts (2*last - prev) mod 256, then last/prev advance to
  * (pred, last). This matches the scalar LANE_DELTA recurrence of
- * SPEC Sec. 7.1 applied in position order. */
+ * applied in position order. */
 
 static void zpse_lane_delta_scalar(uint8_t *out, const uint8_t last[8],
                                    const uint8_t prev[8])
@@ -340,7 +340,7 @@ void zpse_predict_lane_delta_64B(uint8_t *pred_out, const uint8_t last[8],
 }
 
 /* ---- Monolithic reconstruct: RAW_BITMAP + EXCLUSION_U8 ----
- * Scalar bit-exact reference (SPEC Secs. 7-9). Bit p (LSB-first) set =>
+ * Scalar bit-exact reference. Bit p (LSB-first) set =>
  * exception: consume next residual r, x = (r < pred) ? r : r + 1;
  * else x = pred. AVX-512 (vpexpandb) path is intentionally omitted;
  * scalar is used on all arches (allowed: SIMD paths are optional). */
@@ -374,7 +374,7 @@ int zpse_reconstruct_bitmap_excl_u8(uint8_t *dst, const uint8_t *pred,
             r = (unsigned)residuals[consumed];
             consumed++;
             /* EXCLUSION_U8 residuals are in [0,254]; 255 is forbidden
-             * outside RAW_ACTUAL_BYTES (SPEC Sec. 9). */
+             * outside RAW_ACTUAL_BYTES. */
             if (r > 254u) {
                 return PSE_BAD_RESIDUAL;
             }

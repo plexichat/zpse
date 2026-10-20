@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Colexicographic (Macaulay) combinadics, SPEC Sec. 8.1-8.2.
+/* Colexicographic (Macaulay) combinadics.
  * Ranks are 4-limb little-endian u256. Portable C11 (no __int128,
  * MSVC-safe). No malloc; no VLAs; stack use is O(1) limbs.
  *
@@ -270,7 +270,7 @@ ZpseU256 zpse_comb_rank(const uint16_t *c, uint16_t k)
     if (c == NULL)
         return rank;
     for (t = 0; t < k; t++) {
-        /* j = t+1 is 1-based (SPEC rank = SUM C(c_j, j)). Cold
+        /* j = t+1 is 1-based (rank = SUM C(c_j, j)). Cold
          * (encode-side) path: exact single-value recurrence; the
          * division-free MUST in Sec. 8.2 governs the hot unrank loop. */
         ZpseU256 term = zpse_comb_choose_u256(c[t], (uint16_t)(t + 1u));
@@ -334,7 +334,7 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
     if (payload_len < 1u || payload_len > 32u)
         return PSE_BAD_ENUMERATIVE_RANK;
 
-    /* Minimal byte length for C(nt,k); SPEC requires
+    /* Minimal byte length for C(nt,k); the format requires
      * mask_payload_size == L exactly. */
     L = zpse_comb_payload_len(nt, k, NULL);
     if (L < 0)
@@ -425,7 +425,7 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
 #endif /* __SIZEOF_INT128__ */
 
     if (comb_scratch != NULL) {
-        /* Division-free hot path (SPEC Sec. 8.2 strategy (b)): one Pascal
+        /* Division-free hot path): one Pascal
          * row C(x, 0..k) in scratch ((k+1) u256 <= 256*32 = 8 KiB),
          * maintained with u256 adds ascending and u256 subs descending.
          * Decisions are identical to the reference descending scan. */

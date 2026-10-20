@@ -16,7 +16,7 @@ extern "C" {
 
 const char *zpse_version_string(void); /* "1.0.0" */
 
-/* One-shot block calls (SPEC Sec. 4, 11).
+/* One-shot block calls.
  *
  * The plain calls emit no optional fields: in particular no payload
  * CRC32-C (ZPSE_ENC_CHECKSUM is off), which is the LZ4-style default --
@@ -43,7 +43,7 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint32_t *out_len_out,
                           void *dec_arena_256k);
 
-/* One-shot frame calls (SPEC Sec. 3). */
+/* One-shot frame calls. */
 int zpse_compress_frame(const uint8_t *in, size_t n,
                         uint8_t *out, size_t out_cap,
                         size_t *out_len_out,

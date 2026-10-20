@@ -1,7 +1,7 @@
 #ifndef ZPSE_RESIDUAL_H
 #define ZPSE_RESIDUAL_H
 
-/* Residual codecs (SPEC Sec. 9). Exclusion mapping is the shared
+/* Residual codecs. Exclusion mapping is the shared
  * primitive; per-mode packers handle the payload layout. All decoders
  * unpack into exclusion-residual bytes exc_out[K] in [0,254] (mode 1
  * yields raw actual bytes instead — see below), then tile.h inverts. */

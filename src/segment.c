@@ -983,7 +983,7 @@ static const uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
  * 32-byte chunk; its accidental matches are masked out.
  *
  * The two lane-history predictions need the tile's ENTRY state at the
- * start (every tile resets its lanes, SPEC Sec. 7), so for p < 8 the
+ * start (every tile resets its lanes), so for p < 8 the
  * LANE_PREVIOUS operand is `init` and for p < 16 so is the LANE_DELTA /
  * LANE_AVERAGE second operand. Those are the first 8 and first 16 lanes
  * of the first chunk, so one blend each fixes chunk 0 and every later
@@ -1420,7 +1420,7 @@ static uint32_t seg_stride_of(uint8_t pred)
 
 /* 1 iff `pred` misses at least one of the first `limit` positions. The lane
  * histories start at `literal` because every tile the encoder writes is
- * classified with the reset bit set (SPEC Sec. 7). Returns 0 both for "no
+ * classified with the reset bit set. Returns 0 both for "no
  * miss in the window" and for a predictor this cannot reason about, which
  * the caller treats the same way: ask the prescreen. */
 static int seg_pred_miss_within(const uint8_t *a, uint16_t nt, uint8_t pred,
@@ -1854,7 +1854,7 @@ static int seg_flat_abort(ZpseEncoder *e, uint16_t nt, uint32_t coded,
     return (e->flat_covered >= flat_abort_min) ? 1 : 0;
 }
 
-/* Dense record form for a constant plane (SPEC Sec. 6.3).
+/* Dense record form for a constant plane.
  *
  * An all-hit tile costs ten bytes (two of length prefix, eight of tile
  * header) and a dense record costs twelve for 4 KiB, so a plane that is a
@@ -2100,7 +2100,7 @@ static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane_len,
 }
 
 /* Size of the dense palette form for a plane of `m` distinct values
- * (SPEC Sec. 6.3): one record per ZPSE_DENSE_MAX_LEN bytes, each a 12-byte
+ *: one record per ZPSE_DENSE_MAX_LEN bytes, each a 12-byte
  * header, a palette of m and ceil(ns * ceil(log2 m) / 8) packed indices.
  *
  * The palette is sized by the plane's whole alphabet, not by what each
@@ -2126,7 +2126,7 @@ static uint32_t seg_dense_palette_cost(uint32_t plane_len, uint32_t m)
     return total;
 }
 
-/* Dense palette record form (SPEC Sec. 6.3) for a plane of at most
+/* Dense palette record form for a plane of at most
  * sixteen distinct byte values.
  *
  * This is the shape a 4-bit image has before any transform and the shape
@@ -2440,7 +2440,7 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
            (uint32_t)(((uint64_t)sum * tc + nsum / 2u) / nsum);
 }
 
-/* Price of the dense constant form for a plane (SPEC Sec. 6.3): the
+/* Price of the dense constant form for a plane: the
  * segment header plus twelve bytes per 4 KiB chunk, no payload. Returns
  * UINT32_MAX when the plane is not one byte value end to end, which the
  * word-wise test settles in one compare for every plane that is not. */
@@ -2628,7 +2628,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * classification this encoder never asks for. */
     zpse_lane_reset_hist(lanes, initial_literal);
 
-    /* Constant-plane tracking, which lets the dense form (SPEC Sec. 6.3)
+    /* Constant-plane tracking, which lets the dense form
      * skip its own scan: a tile the all-hit run writes is constant -- k ==
      * 0 forces prediction == actual at every position, and under a reset
      * tile every predictor's fixed point is one value -- so one byte per
@@ -2690,7 +2690,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         }
     }
 
-    /* Dense palette form (SPEC Sec. 6.3): a plane whose alphabet is small
+    /* Dense palette form: a plane whose alphabet is small
      * is cheaper as one palette stream than as one predictor search per
      * tile -- both in bytes and, at decode, in work (segment.c's
      * seg_dense_palette_emit). Pricing it means scanning the plane, so it
@@ -3107,7 +3107,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         pos += 2u + (uint32_t)best_len;
 
-        /* The palette form (SPEC Sec. 6.3) is priced from the first tile
+        /* The palette form is priced from the first tile
          * that needs a mask or a residual -- the moment the plane is known
          * to be dense rather than periodic -- and only when that tile is
          * losing: a record that fits in an eighth of its own bytes pays for
@@ -3186,7 +3186,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     }
 
     /* The plane may be one byte value end to end, which the dense record
-     * form (SPEC Sec. 6.3) codes in 12 bytes per 4 KiB instead of the ten
+     * form codes in 12 bytes per 4 KiB instead of the ten
      * bytes per 256-byte tile the run path above just wrote. The rewrite
      * only ever shrinks the record area, so every bound checked above still
      * holds. Offered first so a constant plane keeps the form it has

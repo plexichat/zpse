@@ -111,7 +111,7 @@ int zpse_frame_header_read(ZpseFrameHeader *h, const uint8_t in[32])
         }
     }
     /* content_size / block_count sentinel-vs-validity mismatch is advisory
-     * only (SPEC Sec. 3.1): no rejection here. */
+     * only: no rejection here. */
     want = zpse_crc32c(in, 28u);
     if (want != tmp.header_crc32c) {
         return PSE_BAD_HEADER_CRC;
@@ -191,7 +191,7 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         if (blk_out != uncomp_sz) {
             return PSE_BAD_HEADER;
         }
-        /* SPEC Sec. 4.1: payload CRC MUST be verified when the block flag
+        /* Payload CRC MUST be verified when the block flag
          * OR the frame flag tags it. The block layer covers its own flag;
          * close the gap for foreign frames with F_BLOCK_CRC=1, B_CRC=0. */
         if ((fh.frame_flags & ZPSE_F_BLOCK_CRC) != 0u) {
