@@ -1,6 +1,7 @@
 # Columnar in-process benchmark: zpse against zstd / lz4 / zlib / brotli on
-# ten column-shaped corpora (int/float/dictionary/timestamp/bool columns),
-# every codec fed identical bytes, framed identically (64 KiB blocks), one
+# eighteen corpora (int/float/dictionary/timestamp/bool columns plus
+# text/JSON/log/sorted/zeros/gapped-ts/DNA/UTF-8 byte streams), every
+# codec fed identical bytes, framed identically (64 KiB blocks), one
 # pinned core, everything in RAM, every decode verified before it is timed.
 #
 # Informational, like workflows/bench.yml: a slower number than the last run
@@ -27,16 +28,19 @@ jobs:
             zstd lz4 brotli zlib1g
       - name: Build the harness
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude \
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/benchmarks/bench_columnar.c src/zpse_unity.c -ldl -o /tmp/benchcol
-      - name: Run the matrix (10 cases x 5 codecs, single core)
+      - name: Run the matrix (18 cases x 5 codecs, single core)
         run: |
           taskset -c 0 /tmp/benchcol 12 3 all all | tee /tmp/benchcol.txt
+          taskset -c 0 /tmp/benchcol 6 2 all all 16 | tee /tmp/benchcol-16k.txt
           {
             echo '### columnar in-process, single core'
             echo
-            echo '4 MiB per case as 64 x 64 KiB blocks; identical bytes per'
-            echo 'codec; every decode verified; best-of-N; ratios are'
+            echo '4 MiB per case as 64 x 64 KiB blocks (plus a 256 x 16 KiB'
+            echo 'sweep in the second artifact); identical bytes per codec;'
+            echo 'every decode verified; best(med/max)-of-N with a ratio x'
+            echo 'encode-speed eff column and a per-codec summary; ratios are'
             echo 'input:output. Levels: zpse default, zstd -3, lz4 fast,'
             echo 'zlib -6, brotli q5 (see the versions line).'
             echo 'Host lines ride in the same file, above the table.'
@@ -46,6 +50,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: bench-columnar
-          path: /tmp/benchcol.txt
+          path: |
+            /tmp/benchcol.txt
+            /tmp/benchcol-16k.txt
           if-no-files-found: error
           retention-days: 90

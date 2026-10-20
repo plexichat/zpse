@@ -1,20 +1,33 @@
 /* Columnar in-process shootout: zpse vs zstd / lz4 / zlib / brotli.
  *
  * One thread (pin the runner with taskset -c 0), every codec fed the same
- * bytes, framed the same way (64 KiB blocks), best-of-N, and every decode
- * verified by memcmp before anything is timed. Ratios print as input:output
- * ("x:1"); rates as GB/s above 1000 MB/s. Nothing touches disk in the
- * timed region: corpora are generated in RAM.
+ * bytes, framed the same way (64 KiB blocks by default), best/med/max-of-N
+ * across reps, and every decode verified by memcmp before anything is timed.
+ * Ratios print as input:output ("x:1"); rates as GB/s above 1000 MB/s.
+ * Nothing touches disk in the timed region: corpora are generated in RAM.
+ *
+ * The 18 corpora mix column shapes (int/float/dictionary/timestamp/bool)
+ * with byte-stream shapes that stress different paths: english text, JSON
+ * rows, log lines, near-sorted ints, zeros-with-bursts, gapped time series,
+ * a 2-bit DNA alphabet, and multilingual UTF-8.
+ *
+ * The per-cell encode/decode fields print best (median/max) across reps so
+ * a noisy cloud runner cannot hide behind one lucky rep; `eff` is
+ * ratio x encode-best-MB/s, a single ratio-vs-speed number. A per-codec
+ * summary (mean ratio, mean encode, mean decode across the run cases)
+ * closes the table as the encode-vs-decode split summary.
  *
  * The competitors are the system runtimes, loaded with dlopen, so no -dev
  * headers are needed anywhere. A runtime that fails to load is announced
  * and skipped, never silently zeroed.
  *
  * Build (Linux; libs on the usual paths):
- *   cc -std=c11 -O2 -DNDEBUG -Iinclude tests/bench_columnar.c \
+ *   cc -std=c11 -O2 -DNDEBUG -Iinclude tests/benchmarks/bench_columnar.c \
  *     src/zpse_unity.c -ldl -o /tmp/benchcol
  * Run:
- *   taskset -c 0 /tmp/benchcol [iters] [reps] [case|all] [codec|all]
+ *   taskset -c 0 /tmp/benchcol [iters] [reps] [case|all] [codec|all] [blk_kb]
+ * blk_kb is optional (16/32/64/128/256, default 64); the corpus stays
+ * 4 MiB (block count scales), so older 4-arg invocations are unchanged.
  * .github/workflows/bench-columnar.yml runs exactly this on every push. */
 #if !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
@@ -32,9 +45,13 @@
 
 #include "zpse/zpse.h"
 
-#define BLK (65536u)
-#define NB (64u)
-#define CSIZE ((size_t)BLK * NB)
+#define BLK_DFLT (65536u)
+#define NB_DFLT (64u)
+#define CORPUS ((size_t)BLK_DFLT * NB_DFLT) /* 4 MiB per case, fixed */
+
+static size_t g_blk = BLK_DFLT; /* bytes per block, argv[5] */
+static size_t g_nb = NB_DFLT;   /* block count, scales with g_blk */
+#define CSIZE (CORPUS) /* corpus bytes per case, always 4 MiB */
 
 static uint8_t *g_in;
 static uint8_t *g_comp;
@@ -54,6 +71,13 @@ static uint32_t rnd(void)
 {
     g_rng = g_rng * UINT32_C(1664525) + UINT32_C(1013904223);
     return g_rng >> 24;
+}
+/* full-width LCG output for wide ranges (gaps, offsets); rnd() above
+ * only yields a byte, so `rnd() % 4096` would silently clip to 0..255. */
+static uint32_t rnd32(void)
+{
+    g_rng = g_rng * UINT32_C(1664525) + UINT32_C(1013904223);
+    return g_rng;
 }
 
 /* ---- columnar generators: 4 MiB each, fixed seed, identical bytes ---- */
@@ -152,6 +176,200 @@ static void gen_uuid_mixed(void)
     }
 }
 
+/* english text: ~68 chars/line, Zipf-ish word reuse, spaces + newlines.
+ * Rewards match finders and literal entropy coding. */
+static void gen_text_en(void)
+{
+    static const char *words[] = {
+        "the","of","and","to","a","in","is","that","for","it","as","was",
+        "with","be","on","are","this","have","from","or","had","by","not",
+        "but","what","we","can","out","other","were","all","there","when",
+        "column","block","codec","ratio","speed","encode","decode","cache",
+        "delta","match","window","stream","buffer","offset","length"
+    };
+    static const char *ends[] = { ".", ".", ".", "?", "!", ",", ",", ";", ":" };
+    size_t o = 0;
+    unsigned col = 0;
+    while (o < CSIZE) {
+        uint32_t r = rnd();
+        const char *w = words[r % (sizeof words / sizeof words[0])];
+        size_t wl = strlen(w);
+        if (col + wl + 1u > 68u) {
+            if (o < CSIZE) { g_in[o++] = '\n'; col = 0; }
+            continue;
+        }
+        if (col) { if (o < CSIZE) g_in[o++] = ' '; col++; }
+        for (size_t k = 0; k < wl && o < CSIZE; k++) g_in[o++] = (uint8_t)w[k];
+        col += (unsigned)wl;
+        if (rnd() % 13u == 0u) {
+            const char *e = ends[rnd() % (sizeof ends / sizeof ends[0])];
+            if (o < CSIZE) g_in[o++] = (uint8_t)e[0];
+            col++;
+        }
+    }
+}
+
+/* JSON rows: small objects, repeated keys, mixed value types.
+ * Key repetition rewards dictionary matches. */
+static void gen_json_rows(void)
+{
+    static const char *st[] = { "ok", "retry", "fail", "queued", "active" };
+    size_t o = 0;
+    uint32_t id = 100000;
+    while (o + 96 < CSIZE) {
+        uint32_t q = rnd() % 900u;
+        char row[96];
+        int n = snprintf(row, sizeof row,
+            "{\"id\":%u,\"st\":\"%s\",\"q\":%u,\"t\":%.3f}\n",
+            id, st[rnd() % 5u], q, (double)q * 0.137 + (double)(id % 17u));
+        if (n <= 0) break;
+        memcpy(g_in + o, row, (size_t)n);
+        o += (size_t)n;
+        id += 1u + rnd() % 3u;
+    }
+    while (o < CSIZE) g_in[o++] = '\n';
+}
+
+/* log lines: timestamp + level + module + message template with counters.
+ * Long common prefixes, then a high-entropy tail. */
+static void gen_log_lines(void)
+{
+    static const char *lv[] = { "INFO", "INFO", "INFO", "WARN", "ERROR", "DEBUG" };
+    static const char *md[] = { "net", "store", "sched", "auth", "cache", "rpc" };
+    static const char *ms[] = {
+        "request done", "connection reset", "cache miss on key",
+        "flush batch wrote rows", "retry backoff tick", "heartbeat ok"
+    };
+    size_t o = 0;
+    uint32_t seq = 7000;
+    while (o + 112 < CSIZE) {
+        char row[112];
+        int n = snprintf(row, sizeof row,
+            "2026-10-20T12:%02u:%02u.%03u %-5s [%s] #%u %s=%u\n",
+            (seq / 60u) % 60u, seq % 60u, rnd() % 1000u,
+            lv[rnd() % 6u], md[rnd() % 6u], seq,
+            ms[rnd() % 6u], rnd() % 100000u);
+        if (n <= 0) break;
+        memcpy(g_in + o, row, (size_t)n);
+        o += (size_t)n;
+        seq += 1u + rnd() % 7u;
+    }
+    while (o < CSIZE) g_in[o++] = '\n';
+}
+
+/* near-sorted i32: mostly ascending (+0..3) with ~2% random swaps across
+ * a 256-entry window. Sorted runs collapse under delta; the swaps price
+ * the mispredict path instead of letting it idle. */
+static void gen_sorted_near(void)
+{
+    uint32_t *w = (uint32_t *)g_in;
+    size_t nw = CSIZE / 4, i;
+    uint32_t v = 42;
+    for (i = 0; i < nw; i++) { v += rnd() % 4u; w[i] = v; }
+    for (i = 256; i < nw; i++)
+        if (rnd() % 50u == 0u) {
+            size_t j = i - (rnd() % 256u);
+            uint32_t t = w[i]; w[i] = w[j]; w[j] = t;
+        }
+}
+
+/* zeros-with-bursts: ~98% zeros, random incompressible bursts.
+ * RLE-friendly stretches with incompressible islands in between. */
+static void gen_zeros_burst(void)
+{
+    size_t i = 0;
+    memset(g_in, 0, CSIZE);
+    while (i < CSIZE) {
+        size_t bl, k;
+        i += (size_t)(rnd32() % 8192u);
+        if (i >= CSIZE) break;
+        bl = 32u + (rnd32() % 480u);
+        if (i + bl > CSIZE) bl = CSIZE - i;
+        for (k = 0; k < bl; k++) g_in[i + k] = (uint8_t)rnd();
+        i += bl;
+    }
+}
+
+/* gapped time series: 1 s base cadence, ~5% gaps of 7-70 s, small
+ * jitter, value = slow drift + noise. Delta-of-delta friendly except
+ * at the gaps, which is exactly the interesting bit. */
+static void gen_ts_gapped(void)
+{
+    uint64_t ts = 1760966400000000ull;
+    uint32_t val = 20000;
+    for (size_t i = 0; i < CSIZE; i += 12) {
+        uint64_t tj;
+        uint32_t vj;
+        int k;
+        if (rnd() % 20u == 0u) ts += (uint64_t)(7000000u + rnd32() % 63000000u);
+        else ts += 999000ull + (uint64_t)(rnd32() % 2001u);
+        val += 3u + rnd() % 11u + (rnd() % 200u == 0u ? rnd32() % 500u : 0u);
+        tj = ts; vj = val;
+        for (k = 0; k < 8; k++) g_in[i+(size_t)k]=(uint8_t)(tj>>(8*k));
+        g_in[i+8]=(uint8_t)vj; g_in[i+9]=(uint8_t)(vj>>8);
+        g_in[i+10]=(uint8_t)(vj>>16); g_in[i+11]=(uint8_t)(vj>>24);
+    }
+}
+
+/* DNA alphabet: {A,C,G,T} packed 2-bit (4 bases/byte). 2-bit entropy
+ * with short tandem repeats every ~64 bases; dense-symbol path test. */
+static void gen_dna_2bit(void)
+{
+    static const uint8_t ab[] = { 0, 1, 2, 3 };
+    size_t i = 0;
+    while (i < CSIZE) {
+        uint8_t motif[9], b = 0;
+        size_t ml = 3u + rnd() % 7u, bl = 0, k;
+        int q;
+        for (k = 0; k < ml; k++) motif[k] = ab[rnd() % 4u];
+        while (bl < 64 && i < CSIZE) {
+            b = 0;
+            for (q = 0; q < 4 && bl < 64 && i < CSIZE; q++, bl++) {
+                uint8_t base = (bl < ml * 3u) ? motif[bl % ml] : ab[rnd() % 4u];
+                b |= (uint8_t)(base << (2 * q));
+                if (q == 3) g_in[i++] = b;
+            }
+            if (bl % 4u && i < CSIZE) g_in[i++] = b;
+        }
+    }
+}
+
+/* UTF-8 multilingual: english words + CJK + emoji + Cyrillic, space
+ * separated, line wrapped. Multi-byte sequences break byte-pair
+ * assumptions; word reuse keeps matches alive. */
+static void gen_utf8_multi(void)
+{
+    static const char *tok[] = {
+        "the", "column",
+        "\xe6\x95\xb0\xe6\x8d\xae", /* shuju */
+        "\xe5\x9d\x97",             /* kuai */
+        "\xf0\x9f\x9a\x80",         /* rocket */
+        "\xd0\xb4\xd0\xb0\xd0\xbd\xd0\xbd\xd1\x8b\xd0\xb5", /* dannye */
+        "codec",
+        "\xe7\xbc\x96\xe7\xa0\x81", /* bianma */
+        "\xf0\x9f\x93\xa6",         /* package */
+        "ratio", "speed",
+        "\xd1\x81\xd0\xba\xd0\xbe\xd1\x80\xd0\xbe\xd1\x81\xd1\x82\xd1\x8c"
+    };
+    size_t o = 0;
+    unsigned col = 0;
+    while (o + 16 < CSIZE) {
+        const char *w = tok[rnd() % (sizeof tok / sizeof tok[0])];
+        size_t wl = strlen(w);
+        if (col > 64u) {
+            if (o < CSIZE) g_in[o++] = '\n';
+            col = 0;
+            continue;
+        }
+        if (col && o + wl + 1 < CSIZE) { g_in[o++] = ' '; col++; }
+        if (o + wl >= CSIZE) break;
+        memcpy(g_in + o, w, wl);
+        o += wl;
+        col += (unsigned)wl;
+    }
+    while (o < CSIZE) g_in[o++] = ' ';
+}
+
 /* ---- codec abstraction: zpse direct, rivals via dlopen ---- */
 typedef struct {
     const char *name, *level;
@@ -161,7 +379,7 @@ typedef struct {
     int (*decomp)(const uint8_t *in, size_t cn, uint8_t *out, size_t n);
 } Codec;
 
-static size_t z_cbound(size_t n) { (void)n; return (size_t)BLK + 1024u; }
+static size_t z_cbound(size_t n) { (void)n; return g_blk + 1024u; }
 static size_t z_comp(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
 {
     uint32_t l = 0;
@@ -273,12 +491,20 @@ static void load_all(void)
     if (h_brd) p_BrotliDecoderDecompress = dlsym(h_brd,"BrotliDecoderDecompress");
 }
 
-/* ---- main: same bytes, 64 KiB blocks, best-of-reps, memcmp-checked ----
- * argv: [iters] [reps] [only_case] [only_codec]; "all" = no filter
+/* ---- main: same bytes, N x blk_kb blocks, best/med/max-of-reps ----
+ * argv: [iters] [reps] [only_case] [only_codec] [blk_kb]; "all" = no filter
  * (empty strings cannot be passed through the wsl/powershell boundary).
+ * blk_kb (optional): 16/32/64/128/256, default 64. The corpus stays
+ * 4 MiB; the block count scales (256/128/64/32/16).
  *
  * Presentation: ratios as input:output ("x:1"), rates as GB/s above
- * 1000 MB/s -- both computed from the same per-iteration timings. */
+ * 1000 MB/s. Each encode/decode cell prints best (median/max) across
+ * reps -- the best for the headline, the median for the typical run,
+ * the max per-block ns spread as jitter signal. `eff` is ratio times
+ * best encode MB/s: one ratio-vs-speed number per cell. The trailing
+ * summary averages ratio/encode/decode per codec across the run cases
+ * (encode-vs-decode split at a glance). Every decode is memcmp-verified
+ * before it is timed. */
 
 static void fmt_ratio(char *b, size_t n, size_t in, size_t out)
 {
@@ -291,6 +517,23 @@ static void fmt_rate(char *b, size_t n, double mb_s)
     } else {
         snprintf(b, n, "%.0f MB/s", mb_s);
     }
+}
+/* median-of-reps helper: insertion sort on ≤32 reps, no libm needed. */
+static double med_of(double *v, int n)
+{
+    int i, j;
+    for (i = 1; i < n; i++) {
+        double t = v[i];
+        j = i - 1;
+        while (j >= 0 && v[j] > t) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = t;
+    }
+    if (n % 2) return v[n / 2];
+    return (v[n / 2 - 1] + v[n / 2]) * 0.5;
+}
+static double ratio_of(size_t in, size_t out)
+{
+    return out ? (double)in / (double)out : 0.0;
 }
 
 /* ---- host: CPU/RAM/OS/compiler, printed above the results so a saved
@@ -355,6 +598,10 @@ int main(int argc, char **argv)
         { "float_mix", gen_float_mixed }, { "bools_nulls", gen_bools_nulls },
         { "decimal8", gen_decimal_str }, { "rle_lens", gen_rle_lengths },
         { "ts_us", gen_timestamps }, { "uuid_mix", gen_uuid_mixed },
+        { "text_en", gen_text_en }, { "json_rows", gen_json_rows },
+        { "log_lines", gen_log_lines }, { "sorted_near", gen_sorted_near },
+        { "zeros_burst", gen_zeros_burst }, { "ts_gapped", gen_ts_gapped },
+        { "dna_2bit", gen_dna_2bit }, { "utf8_multi", gen_utf8_multi },
     };
     const int nc = (int)(sizeof cases / sizeof cases[0]);
     int iters = argc > 1 ? atoi(argv[1]) : 30;
@@ -362,11 +609,29 @@ int main(int argc, char **argv)
     const char *only = (argc > 3 && strcmp(argv[3], "all") != 0) ? argv[3] : "";
     const char *onlyc = (argc > 4 && strcmp(argv[4], "all") != 0) ? argv[4] : "";
     Codec codecs[5];
-    int i, c, r, b;
+    /* per-codec summary accumulators: mean ratio / encode / decode */
+    double sum_ratio[5] = { 0, 0, 0, 0, 0 };
+    double sum_enc[5] = { 0, 0, 0, 0, 0 };
+    double sum_dec[5] = { 0, 0, 0, 0, 0 };
+    int sum_n[5] = { 0, 0, 0, 0, 0 };
+    int i, c, r;
+    long blk_kb = argc > 5 ? atol(argv[5]) : 64L;
+
+    if (iters < 1) iters = 1;
+    if (reps < 1) reps = 1;
+    if (reps > 32) reps = 32;
+    /* optional per-block-size reporting: corpus stays 4 MiB, count scales */
+    if (blk_kb != 16L && blk_kb != 32L && blk_kb != 64L &&
+        blk_kb != 128L && blk_kb != 256L) {
+        printf("bad blk_kb %ld: want 16/32/64/128/256\n", blk_kb);
+        return 2;
+    }
+    g_blk = (size_t)blk_kb * 1024u;
+    g_nb = CORPUS / g_blk;
 
     g_in = malloc(CSIZE);
-    g_comp = malloc((size_t)BLK * 2 + 4096u);
-    g_out = malloc(BLK);
+    g_comp = malloc(g_blk * 2 + 4096u);
+    g_out = malloc(g_blk);
     if (!g_in || !g_comp || !g_out) { printf("oom\n"); return 1; }
     load_all();
 
@@ -386,8 +651,8 @@ int main(int argc, char **argv)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     print_host();
-    printf("columnar in-process: 4 MiB/case as 64x64 KiB blocks, single core, "
-           "best-of-reps\n");
+    printf("columnar in-process: 4 MiB/case as %zux%zu KiB blocks, single core, "
+           "best(med/max)-of-%d reps\n", g_nb, g_blk / 1024u, reps);
     printf("levels: zpse default, zstd -3, lz4 fast, zlib -6, brotli q5; "
            "identical bytes per codec, every decode verified\n");
     printf("versions: zpse %s | zstd %s | lz4 %s | zlib %s | brotli %u.%u.%u\n",
@@ -398,8 +663,24 @@ int main(int argc, char **argv)
            p_BrotliEncoderVersion ? (p_BrotliEncoderVersion() >> 24) & 255u : 0u,
            p_BrotliEncoderVersion ? (p_BrotliEncoderVersion() >> 16) & 255u : 0u,
            p_BrotliEncoderVersion ? (p_BrotliEncoderVersion() >> 8) & 255u : 0u);
-    printf("| case | codec | ratio | encode | decode |\n");
-    printf("|---|---|---:|---:|---:|\n");
+    {
+        const char *miss[4];
+        int nmiss = 0, k;
+        if (!codecs[1].ok) miss[nmiss++] = "zstd";
+        if (!codecs[2].ok) miss[nmiss++] = "lz4";
+        if (!codecs[3].ok) miss[nmiss++] = "zlib";
+        if (!codecs[4].ok) {
+            miss[nmiss++] = (h_bre || h_brd) ? "brotli(partial)" : "brotli";
+        }
+        if (nmiss > 0) {
+            printf("skip: ");
+            for (k = 0; k < nmiss; k++)
+                printf("%s%s", miss[k], k + 1 < nmiss ? ", " : "");
+            printf(" runtime missing, those cells omitted (never zeroed)\n");
+        }
+    }
+    printf("| case | codec | ratio | encode best(med/max) | decode best(med/max) | eff |\n");
+    printf("|---|---|---:|---|---:|---:|\n");
     for (i = 0; i < nc; i++) {
         if (only[0] && !strstr(cases[i].name, only)) continue;
         g_rng = 0x1234u + (uint32_t)i * 7919u;
@@ -407,7 +688,15 @@ int main(int argc, char **argv)
         for (c = 0; c < 5; c++) {
             Codec *k = &codecs[c];
             size_t tot_c = 0, worst = 0, *clens;
-            double be = 0.0, bd = 0.0;
+            /* per-rep per-block ns: best = headline, med = typical,
+             * max = jitter signal. cap 32 reps (clamped above). */
+            double erep[32], drep[32];
+            int nrep = 0;
+            double be_ns, med_e, max_e, bd_ns, med_d, max_d;
+            double enc_mb, med_enc_mb, max_enc_mb;
+            double dec_mb, med_dec_mb, max_dec_mb;
+            double ratio, eff;
+            size_t b;
             int fail = 0;
             int myiters = iters;
             int slow;
@@ -416,49 +705,96 @@ int main(int argc, char **argv)
             /* slow codecs get fewer timed iters; ratio is unaffected */
             slow = (k == &codecs[3] || k == &codecs[4]);
             if (slow) myiters = (iters + 3) / 4;
-            worst = k->cbound(BLK);
-            clens = malloc(sizeof(size_t) * NB);
+            worst = k->cbound(g_blk);
+            clens = malloc(sizeof(size_t) * g_nb);
             if (!clens) { printf("oom\n"); return 1; }
-            for (b = 0; b < (int)NB; b++) {
-                size_t cl = k->comp(g_in + (size_t)b * BLK, BLK, g_comp, worst);
+            for (b = 0; b < g_nb; b++) {
+                size_t cl = k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
                 if (!cl) { fail = 1; break; }
-                if (k->decomp(g_comp, cl, g_out, BLK) != 0 ||
-                    memcmp(g_out, g_in + (size_t)b * BLK, BLK) != 0) { fail = 1; break; }
+                if (k->decomp(g_comp, cl, g_out, g_blk) != 0 ||
+                    memcmp(g_out, g_in + b * g_blk, g_blk) != 0) { fail = 1; break; }
                 clens[b] = cl; tot_c += cl;
             }
             if (fail) {
-                printf("| %s | %s | FAILED | - | - |\n", cases[i].name, k->name);
+                printf("| %s | %s | FAILED | - | - | - |\n", cases[i].name, k->name);
                 free(clens); continue;
             }
             for (r = 0; r < reps; r++) {
                 double t0 = now_ns(), t1, e_ns;
-                for (b = 0; b < (int)NB; b++)
+                double s0, s1, dsum = 0.0;
+                int dmul = myiters * (slow ? 3 : 10);
+                for (b = 0; b < g_nb; b++)
                     for (int t = 0; t < myiters; t++)
-                        k->comp(g_in + (size_t)b * BLK, BLK, g_comp, worst);
+                        k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
                 t1 = now_ns();
-                e_ns = (t1 - t0) / ((double)NB * myiters);
-                if (be == 0.0 || e_ns < be) be = e_ns;
-                for (b = 0; b < (int)NB; b++) {
-                    size_t cl = clens[b];
-                    double s0, s1, d_ns;
-                    k->comp(g_in + (size_t)b * BLK, BLK, g_comp, worst);
+                e_ns = (t1 - t0) / ((double)g_nb * myiters);
+                for (b = 0; b < g_nb; b++) {
+                    /* re-encode to restore the verified bytes, then time
+                     * the decode of exactly those bytes */
+                    k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
                     s0 = now_ns();
-                    for (int t = 0; t < myiters * (slow ? 3 : 10); t++)
-                        k->decomp(g_comp, cl, g_out, BLK);
+                    for (int t = 0; t < dmul; t++)
+                        k->decomp(g_comp, clens[b], g_out, g_blk);
                     s1 = now_ns();
-                    d_ns = (s1 - s0) / (myiters * (slow ? 3 : 10));
-                    if (bd == 0.0 || d_ns < bd) bd = d_ns;
+                    dsum += (s1 - s0) / dmul;
                 }
+                erep[r] = e_ns;
+                drep[r] = dsum / (double)g_nb;
+                nrep++;
             }
+            be_ns = erep[0]; max_e = erep[0];
+            bd_ns = drep[0]; max_d = drep[0];
+            for (r = 1; r < nrep; r++) {
+                if (erep[r] < be_ns) be_ns = erep[r];
+                if (erep[r] > max_e) max_e = erep[r];
+                if (drep[r] < bd_ns) bd_ns = drep[r];
+                if (drep[r] > max_d) max_d = drep[r];
+            }
+            med_e = med_of(erep, nrep);
+            med_d = med_of(drep, nrep);
             {
-                char rb[16], eb[24], db[24];
+                char rb[16], eb[32], mb_e[24], xb_e[24];
+                char db[32], mb_d[24], xb_d[24], fb[24];
+                enc_mb = (double)g_blk * 1000.0 / be_ns;
+                med_enc_mb = (double)g_blk * 1000.0 / med_e;
+                max_enc_mb = (double)g_blk * 1000.0 / max_e;
+                dec_mb = (double)g_blk * 1000.0 / bd_ns;
+                med_dec_mb = (double)g_blk * 1000.0 / med_d;
+                max_dec_mb = (double)g_blk * 1000.0 / max_d;
+                ratio = ratio_of(CSIZE, tot_c);
+                eff = ratio * enc_mb;
                 fmt_ratio(rb, sizeof rb, CSIZE, tot_c);
-                fmt_rate(eb, sizeof eb, (double)BLK * 1000.0 / be);
-                fmt_rate(db, sizeof db, (double)BLK * 1000.0 / bd);
-                printf("| %s | %s %s | %s | %s | %s |\n", cases[i].name,
-                       k->name, k->level, rb, eb, db);
+                fmt_rate(eb, sizeof eb, enc_mb);
+                fmt_rate(mb_e, sizeof mb_e, med_enc_mb);
+                fmt_rate(xb_e, sizeof xb_e, max_enc_mb);
+                fmt_rate(db, sizeof db, dec_mb);
+                fmt_rate(mb_d, sizeof mb_d, med_dec_mb);
+                fmt_rate(xb_d, sizeof xb_d, max_dec_mb);
+                snprintf(fb, sizeof fb, "%.0f", eff);
+                printf("| %s | %s %s | %s | %s (%s/%s) | %s (%s/%s) | %s |\n",
+                       cases[i].name, k->name, k->level, rb,
+                       eb, mb_e, xb_e, db, mb_d, xb_d, fb);
+                sum_ratio[c] += ratio;
+                sum_enc[c] += enc_mb;
+                sum_dec[c] += dec_mb;
+                sum_n[c]++;
             }
             free(clens);
+        }
+    }
+    printf("\nsummary (mean across run cases; encode vs decode split):\n");
+    printf("| codec | cases | mean ratio | mean encode | mean decode |\n");
+    printf("|---|---|---:|---:|---:|\n");
+    for (c = 0; c < 5; c++) {
+        if (sum_n[c] == 0) continue;
+        {
+            char rb[16], eb[24], db[24];
+            double mr = sum_ratio[c] / sum_n[c];
+            snprintf(rb, sizeof rb, "%.2f:1", mr);
+            fmt_rate(eb, sizeof eb, sum_enc[c] / sum_n[c]);
+            fmt_rate(db, sizeof db, sum_dec[c] / sum_n[c]);
+            printf("| %s %s | %d | %s | %s | %s |\n",
+                   codecs[c].name, codecs[c].level, sum_n[c], rb, eb, db);
         }
     }
     free(g_in); free(g_comp); free(g_out);
