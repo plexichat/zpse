@@ -22,7 +22,10 @@
  * stays reachable and tests/test_parity.c can require the two to agree. */
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) && !defined(_MSC_VER)
-#define ZPSE_RES_SSSE3 __attribute__((target("ssse3")))
+/* Also pins 64-byte alignment: see the note on ZPSE_TILE_AVX2 in tile.c.
+ * These are the loops that carry dense-tile decode and residual packing, and
+ * their cost otherwise shifts with the placement of unrelated code. */
+#define ZPSE_RES_SSSE3 __attribute__((target("ssse3"), aligned(64)))
 #define ZPSE_RES_HAVE_SSSE3 1
 #elif defined(__SSSE3__)
 #define ZPSE_RES_SSSE3
@@ -889,6 +892,293 @@ static const uint16_t m3_pair_off[11] = {
         (W) = q_;                                                           \
     } while (0)
 
+#if ZPSE_RES_HAVE_AVX2
+
+/* Magic constants for q = w / M, exact for every w < M^G (the only range a
+ * group word can hold), as (magic, extra shift) with
+ *
+ *     q = ((uint64)w * magic) >> (32 + sh)
+ *
+ * magic = ceil(2^(32+sh) / M), chosen so the rounding error times M^G
+ * stays inside 2^(32+sh): (magic*M - 2^(32+sh)) * M^G <= 2^(32+sh) is
+ * what makes floor(w*magic / 2^(32+sh)) == floor(w/M) for every w below
+ * the bound, and it holds for all eleven M. magic fits in 32 bits for each
+ * of them, so one unsigned 32x32 -> 64 multiply is the whole quotient.
+ * tests/suites/test_units.c sweeps every M and every K through the packer
+ * and this unpacker, which is what pins these constants: the scalar loops
+ * below share the table, so a change that only the vector path could see
+ * would fail there. */
+static const uint32_t m3_div_magic[16] = {
+    0u, 0u, 0u, UINT32_C(2863311531), 0u, UINT32_C(1717986919),
+    UINT32_C(715827883), UINT32_C(613566757), 0u, UINT32_C(477218589),
+    UINT32_C(429496730), UINT32_C(390451573), UINT32_C(357913942),
+    UINT32_C(330382100), UINT32_C(306783379), UINT32_C(286331154)
+};
+
+static const uint8_t m3_div_sh[16] = {
+    0u, 0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+};
+
+/* High 32 bits of the eight unsigned 32x32 products, per 32-bit lane.
+ * AVX2's multiply-high is 64-bit-lane only, so the even and the odd lanes
+ * are multiplied separately (each 4 products) and blended back together;
+ * `magic_hi` is magic with its low 32 bits in every 64-bit lane, which is
+ * what the odd-lane multiply of the shifted word needs. */
+static ZPSE_RES_AVX2 __attribute__((always_inline)) inline __m256i
+m3_mulhi32(__m256i a, __m256i magic, __m256i magic_hi, int sh)
+{
+    __m256i lo = _mm256_mul_epu32(a, magic);
+    __m256i hi = _mm256_mul_epu32(_mm256_srli_epi64(a, 32), magic_hi);
+
+    /* Same shift on both halves: the shift count is 32 + sh, which is a
+     * compile-time constant in the two callers below, so this is one
+     * immediate shift each. */
+    lo = _mm256_srli_epi64(lo, 32);
+    hi = _mm256_slli_epi64(_mm256_srli_epi64(hi, 32), 32);
+    if (sh != 0) {
+        lo = _mm256_srli_epi64(lo, sh);
+        hi = _mm256_srli_epi64(hi, sh);
+    }
+    return _mm256_blend_epi32(lo, hi, 0xAA);
+}
+
+/* Eight groups' worth of nibble-packed digits, expanded to bytes.
+ *
+ * For M in [11,15] a digit is below 15 and a group holds 7 or 8 of them,
+ * so the whole group fits in the nibbles of one 32-bit lane. The lanes
+ * hold consecutive groups, so the expansion is two byte-shuffles: the
+ * even digits (bit 4i of lane j) and the odd ones interleave per group,
+ * and with G == 8 that interleave is already the output layout -- 8 bytes
+ * per group, groups 0,1 in the low half of one register and 4,5 in the
+ * high half. With G == 7 one fixed shuffle per 128-bit half closes each
+ * 8-byte record up to 7 bytes; the two bytes of padding it leaves behind
+ * are the start of the next half's record, which is stored afterwards. */
+static ZPSE_RES_AVX2 __attribute__((always_inline)) inline void
+m3_nib_expand8(uint8_t *dst, __m256i acc, uint32_t g)
+{
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    __m256i lo = _mm256_and_si256(acc, nib);
+    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(acc, 4), nib);
+    __m256i a = _mm256_unpacklo_epi8(lo, hi); /* groups 0,1 | 4,5 */
+    __m256i b = _mm256_unpackhi_epi8(lo, hi); /* groups 2,3 | 6,7 */
+
+    if (g == 8u) {
+        _mm_storeu_si128((__m128i *)(void *)(dst + 0u),
+                         _mm256_castsi256_si128(a));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 16u),
+                         _mm256_castsi256_si128(b));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 32u),
+                         _mm256_extracti128_si256(a, 1));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 48u),
+                         _mm256_extracti128_si256(b, 1));
+    } else {
+        const __m256i close = _mm256_setr_epi8(
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, (char)0x80,
+            (char)0x80, 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14,
+            (char)0x80, (char)0x80);
+        __m256i ca = _mm256_shuffle_epi8(a, close);
+        __m256i cb = _mm256_shuffle_epi8(b, close);
+
+        /* Stored in this order: each store's two pad bytes are the start
+         * of the record the next one writes (dst+14 and dst+28 are group
+         * 2's and group 4's first byte), and the last one's two land in
+         * the slack the caller's buffer has. */
+        _mm_storeu_si128((__m128i *)(void *)(dst + 0u),
+                         _mm256_castsi256_si128(ca));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 14u),
+                         _mm256_castsi256_si128(cb));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 28u),
+                         _mm256_extracti128_si256(ca, 1));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 42u),
+                         _mm256_extracti128_si256(cb, 1));
+    }
+}
+
+/* The same two helpers four groups wide, for the tail an eight-group batch
+ * cannot take: k = 256 with M = 15 is 36 whole groups, so four of them are
+ * left after four batches of eight. */
+static ZPSE_RES_AVX2 __attribute__((always_inline)) inline __m128i
+m3_mulhi32x4(__m128i a, __m128i magic, __m128i magic_hi, int sh)
+{
+    __m128i lo = _mm_mul_epu32(a, magic);
+    __m128i hi = _mm_mul_epu32(_mm_srli_epi64(a, 32), magic_hi);
+
+    lo = _mm_srli_epi64(lo, 32);
+    hi = _mm_slli_epi64(_mm_srli_epi64(hi, 32), 32);
+    if (sh != 0) {
+        lo = _mm_srli_epi64(lo, sh);
+        hi = _mm_srli_epi64(hi, sh);
+    }
+    /* 32-bit lanes 1 and 3 come from `hi`: two 16-bit lanes each, 0xCC. */
+    return _mm_blend_epi16(lo, hi, 0xCC);
+}
+
+static ZPSE_RES_AVX2 __attribute__((always_inline)) inline void
+m3_nib_expand4(uint8_t *dst, __m128i acc, uint32_t g)
+{
+    const __m128i nib = _mm_set1_epi8(0x0F);
+    __m128i lo = _mm_and_si128(acc, nib);
+    __m128i hi = _mm_and_si128(_mm_srli_epi16(acc, 4), nib);
+    __m128i a = _mm_unpacklo_epi8(lo, hi); /* groups 0,1 */
+    __m128i b = _mm_unpackhi_epi8(lo, hi); /* groups 2,3 */
+
+    if (g == 8u) {
+        _mm_storeu_si128((__m128i *)(void *)(dst + 0u), a);
+        _mm_storeu_si128((__m128i *)(void *)(dst + 16u), b);
+    } else {
+        const __m128i close = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 8, 9,
+                                            10, 11, 12, 13, 14,
+                                            (char)0x80, (char)0x80);
+
+        _mm_storeu_si128((__m128i *)(void *)(dst + 0u),
+                         _mm_shuffle_epi8(a, close));
+        _mm_storeu_si128((__m128i *)(void *)(dst + 14u),
+                         _mm_shuffle_epi8(b, close));
+    }
+}
+
+/* Nibble-packed base-M unpack for M in [11,15]: eight groups (eight 32-bit
+ * words, one 32-byte load) per step, each group's digits accumulated as
+ * nibbles of its lane by a shift-or, then expanded by shuffles.
+ *
+ * The pair-LUT form the scalar loops use cannot be vectorised -- its table
+ * lookup is a gather -- so this path divides instead. Every step is a
+ * multiply-high, a multiply, a subtract and a shift-or on eight lanes at
+ * once, i.e. one digit for eight groups for about the cost the scalar
+ * pair loop pays for two digits of one group. Writes 8*g bytes per batch
+ * to `dst` (plus two bytes of padding in the g == 7 case), which may
+ * therefore reach 8*g + 2 bytes past the buffer start.
+ *
+ * Returns the number of groups consumed, or 0 if a group word was out of
+ * range (any word >= M^G leaves a non-zero quotient after G digits, which
+ * is exactly the scalar loops' own check). */
+#define ZPSE_M3_NIB(MM, GG)                                                 \
+    case (MM): {                                                           \
+        const __m256i magic = _mm256_set1_epi32((int)m3_div_magic[(MM)]);   \
+        const __m256i magic_hi = _mm256_srli_epi64(magic, 32);             \
+        const __m256i mvec = _mm256_set1_epi32((MM));                      \
+        const __m128i magic4 = _mm_set1_epi32((int)m3_div_magic[(MM)]);     \
+        const __m128i magic4_hi = _mm_srli_epi64(magic4, 32);              \
+        const __m128i mvec4 = _mm_set1_epi32((MM));                        \
+        const int sh = (int)m3_div_sh[(MM)];                               \
+        uint32_t n = 0u;                                                   \
+        /* Two bytes may be written past the last group of a batch, so a     \
+         * batch is only taken while at least two digits follow it: the      \
+         * scalar loops that finish the tile then overwrite them. */        \
+        while (n + 8u <= nfull &&                                          \
+               (uint32_t)k - (n + 8u) * (uint32_t)(GG) >= 2u) {            \
+            const uint8_t *p = payload + 1u + (j + n) * 4u;                \
+            __m256i w = _mm256_loadu_si256(                                \
+                (const __m256i *)(const void *)p);                         \
+            __m256i acc = _mm256_setzero_si256();                          \
+            __m256i q;                                                     \
+            acc = _mm256_slli_epi32(                                       \
+                _mm256_sub_epi32(w, _mm256_mullo_epi32(                    \
+                    (q = m3_mulhi32(w, magic, magic_hi, sh)), mvec)), 0);   \
+            w = q;                                                         \
+            ZPSE_M3_NIB_STEPS(2);                                          \
+            ZPSE_M3_NIB_STEPS(3);                                          \
+            ZPSE_M3_NIB_STEPS(4);                                          \
+            ZPSE_M3_NIB_STEPS(5);                                          \
+            ZPSE_M3_NIB_STEPS(6);                                          \
+            ZPSE_M3_NIB_STEPS(7);                                          \
+            if ((GG) == 8) {                                               \
+                ZPSE_M3_NIB_STEPS(8);                                      \
+            }                                                              \
+            if (_mm256_testz_si256(w, w) == 0) {                           \
+                *consumed = 0u;                                            \
+                return PSE_BAD_RESIDUAL;                                   \
+            }                                                              \
+            m3_nib_expand8(dst + n * (uint32_t)(GG), acc, (GG));           \
+            n += 8u;                                                       \
+        }                                                                  \
+        while (n + 4u <= nfull &&                                          \
+               (uint32_t)k - (n + 4u) * (uint32_t)(GG) >= 2u) {            \
+            const uint8_t *p4 = payload + 1u + (j + n) * 4u;               \
+            __m128i w4 = _mm_loadu_si128(                                  \
+                (const __m128i *)(const void *)p4);                        \
+            __m128i acc4 = _mm_setzero_si128();                            \
+            __m128i q4;                                                    \
+            acc4 = _mm_slli_epi32(                                         \
+                _mm_sub_epi32(w4, _mm_mullo_epi32(                         \
+                    (q4 = m3_mulhi32x4(w4, magic4, magic4_hi, sh)),         \
+                    mvec4)), 0);                                           \
+            w4 = q4;                                                       \
+            ZPSE_M3_NIB_STEPS4(2);                                         \
+            ZPSE_M3_NIB_STEPS4(3);                                         \
+            ZPSE_M3_NIB_STEPS4(4);                                         \
+            ZPSE_M3_NIB_STEPS4(5);                                         \
+            ZPSE_M3_NIB_STEPS4(6);                                         \
+            ZPSE_M3_NIB_STEPS4(7);                                         \
+            if ((GG) == 8) {                                               \
+                ZPSE_M3_NIB_STEPS4(8);                                     \
+            }                                                              \
+            if (_mm_testz_si128(w4, w4) == 0) {                            \
+                *consumed = 0u;                                            \
+                return PSE_BAD_RESIDUAL;                                   \
+            }                                                              \
+            m3_nib_expand4(dst + n * (uint32_t)(GG), acc4, (GG));          \
+            n += 4u;                                                       \
+        }                                                                  \
+        *consumed = n;                                                     \
+        return PSE_OK;                                                     \
+    }                                                                      \
+    break;
+
+/* The four-wide forms of the same two macros. */
+#define ZPSE_M3_NIB_STEPS4(I)                                              \
+    do {                                                                   \
+        acc4 = _mm_or_si128(                                               \
+            acc4,                                                          \
+            _mm_slli_epi32(                                                \
+                _mm_sub_epi32(                                             \
+                    w4, _mm_mullo_epi32(                                   \
+                            (q4 = m3_mulhi32x4(w4, magic4, magic4_hi, sh)),  \
+                            mvec4)),                                        \
+                4 * ((I) - 1)));                                           \
+        w4 = q4;                                                           \
+    } while (0)
+
+/* One more digit for the batch: acc |= (w - (w/M)*M) << 4*(i-1). The
+ * shift count is a literal at each use, which is what keeps it an
+ * immediate. */
+#define ZPSE_M3_NIB_STEPS(I)                                               \
+    do {                                                                   \
+        acc = _mm256_or_si256(                                             \
+            acc,                                                           \
+            _mm256_slli_epi32(                                             \
+                _mm256_sub_epi32(                                          \
+                    w, _mm256_mullo_epi32(                                 \
+                           (q = m3_mulhi32(w, magic, magic_hi, sh)),        \
+                           mvec)),                                         \
+                4 * ((I) - 1)));                                           \
+        w = q;                                                             \
+    } while (0)
+
+static ZPSE_RES_AVX2 int residual_decode_mode3_nib(
+    const uint8_t *payload, uint32_t nfull, uint32_t k, uint8_t m,
+    uint8_t *dst, uint32_t *consumed)
+{
+    uint32_t j = 0u;
+
+    *consumed = 0u;
+    switch (m) {
+    ZPSE_M3_NIB(11, 8)
+    ZPSE_M3_NIB(12, 8)
+    ZPSE_M3_NIB(13, 8)
+    ZPSE_M3_NIB(14, 7)
+    ZPSE_M3_NIB(15, 7)
+    default:
+        return PSE_OK;
+    }
+}
+
+#undef ZPSE_M3_NIB
+#undef ZPSE_M3_NIB_STEPS
+#undef ZPSE_M3_NIB_STEPS4
+
+#endif /* ZPSE_RES_HAVE_AVX2 */
+
 static int residual_decode_mode3(const uint8_t *payload,
                                  uint16_t payload_len, uint16_t k,
                                  uint8_t *exc_out)
@@ -899,6 +1189,7 @@ static int residual_decode_mode3(const uint8_t *payload,
     uint32_t nfull;
     uint32_t j;
     uint32_t bad = 0u;
+    int rc;
 
     if (payload_len < 1u) {
         return PSE_BAD_RESIDUAL;
@@ -918,6 +1209,21 @@ static int residual_decode_mode3(const uint8_t *payload,
      * multiple of G -- is always left to the single-group loop at the end.
      * Writing it in a batched loop would put bytes past k. */
     nfull = (((uint32_t)k % (uint32_t)g) == 0u) ? ng : ng - 1u;
+
+    j = 0u;
+#if ZPSE_RES_HAVE_AVX2
+    /* Nibble-packed batches of eight groups (see residual_decode_mode3_nib).
+     * One group is always left to the scalar loops below, so the two bytes
+     * of padding the g == 7 stores can leave past a batch always land in a
+     * group those loops then write in full. */
+    if (g >= 7u && g <= 8u && nfull >= 9u &&
+        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        rc = residual_decode_mode3_nib(payload, nfull, k, m, exc_out, &j);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+    }
+#endif
 
     /* Two digits per step.
      *
@@ -943,7 +1249,7 @@ static int residual_decode_mode3(const uint8_t *payload,
      * cycles a digit after GCC packs them into SSE lanes, eight spills.
      * What this loop leaves over (fewer than six groups) the four-group
      * loop below runs. */
-    for (j = 0u; j + 6u <= nfull; j += 6u) {
+    for (; j + 6u <= nfull; j += 6u) {
         const uint8_t *p = payload + 1u + j * 4u;
         uint32_t w0 = zpse_load_u32le(p);
         uint32_t w1 = zpse_load_u32le(p + 4u);
@@ -1673,7 +1979,74 @@ static int residual_encode_mode3(const uint8_t *exc_in, uint16_t k,
         return PSE_BAD_ARG;
     }
     out[0] = m;
-    for (j = 0; j < ng; j++) {
+    j = 0u;
+    /* One multiply a digit, six groups at a time.
+     *
+     * The power-sum form below carries two multiplies per digit: one for
+     * the digit's own contribution and one to advance the M^i weight, and
+     * that second one is a serial chain of its own. Horner's rule --
+     * word = (((d0*M + d1)*M + d2)*M + ...) -- produces the same integer
+     * (every prefix is below M^G < 2^32, so nothing wraps) for a single
+     * multiply per digit, and with M named as a literal at each arm the
+     * compiler turns that multiply into a shift-add pair. Six groups' chains
+     * run side by side, so the loop is bound by mul/shift throughput rather
+     * than by a seven-deep dependency. Measured in isolation on the
+     * palette16 residual stream (119 digits, M = 15): ~440 cycles for the
+     * power-sum form, ~270 for this one, and the tile's own encode moved
+     * by ~7% overall. The groups after the last whole batch -- five at
+     * most, and the short final one -- keep the power sum. */
+    {
+        uint32_t nfull =
+            (((uint32_t)k % (uint32_t)g) == 0u) ? ng : ng - 1u;
+
+        switch (m) {
+#define ZPSE_M3_ENC6(MM, GG)                                                \
+        case (MM): {                                                        \
+            while (j + 6u <= nfull) {                                       \
+                const uint8_t *b = exc_in + j * (uint32_t)(GG);             \
+                uint32_t w0 = 0u;                                           \
+                uint32_t w1 = 0u;                                           \
+                uint32_t w2 = 0u;                                           \
+                uint32_t w3 = 0u;                                           \
+                uint32_t w4 = 0u;                                           \
+                uint32_t w5 = 0u;                                           \
+                uint32_t i;                                                 \
+                /* Most significant digit first: the field carries d_i at     \
+                 * M^i, so the loop starts at the last byte of each group. */ \
+                for (i = (GG); i-- > 0u;) {                                 \
+                    w0 = w0 * (MM) + b[i];                                  \
+                    w1 = w1 * (MM) + b[(GG) + i];                           \
+                    w2 = w2 * (MM) + b[2u * (GG) + i];                      \
+                    w3 = w3 * (MM) + b[3u * (GG) + i];                      \
+                    w4 = w4 * (MM) + b[4u * (GG) + i];                      \
+                    w5 = w5 * (MM) + b[5u * (GG) + i];                      \
+                }                                                           \
+                zpse_store_u32le(out + 1u + j * 4u, w0);                    \
+                zpse_store_u32le(out + 5u + j * 4u, w1);                    \
+                zpse_store_u32le(out + 9u + j * 4u, w2);                    \
+                zpse_store_u32le(out + 13u + j * 4u, w3);                   \
+                zpse_store_u32le(out + 17u + j * 4u, w4);                   \
+                zpse_store_u32le(out + 21u + j * 4u, w5);                   \
+                j += 6u;                                                    \
+            }                                                               \
+        } break
+        ZPSE_M3_ENC6(3, 20);
+        ZPSE_M3_ENC6(5, 13);
+        ZPSE_M3_ENC6(6, 11);
+        ZPSE_M3_ENC6(7, 10);
+        ZPSE_M3_ENC6(9, 9);
+        ZPSE_M3_ENC6(10, 9);
+        ZPSE_M3_ENC6(11, 8);
+        ZPSE_M3_ENC6(12, 8);
+        ZPSE_M3_ENC6(13, 8);
+        ZPSE_M3_ENC6(14, 7);
+        ZPSE_M3_ENC6(15, 7);
+#undef ZPSE_M3_ENC6
+        default:
+            break;
+        }
+    }
+    for (; j < ng; j++) {
         uint32_t base = j * (uint32_t)g;
         uint32_t rem = (uint32_t)k - base;
         uint32_t cnt = (rem >= g) ? g : rem;
