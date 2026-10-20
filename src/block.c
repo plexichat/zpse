@@ -14,7 +14,7 @@
 
 #include <string.h>
 
-/* Block envelope codec (SPEC Sec. 4, 5, 11).
+/* Block envelope codec.
  * No allocation; staging uses caller arenas. Helpers static. */
 
 static int zpse_block_scount_valid(uint8_t sc)
@@ -274,6 +274,24 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
      * caller's buffer for the identity shape above). */
     {
         ZpseLaneState lanes;
+        /* A 16-wide interleave transposes sixteen planes whose bases are
+         * then `seg_len` apart -- for a 64 KiB block exactly 4096, and the
+         * L1 set index is (address / 64) mod 64, so a group's sixteen
+         * lines all land on one set; that is why the inverse stages a
+         * copy of every plane before transposing it. Laying the planes
+         * out 4160 apart (one extra cache line per plane) walks the set
+         * index along by one per plane and keeps every plane aligned, and
+         * then the inverse can read them in place: measured 1.28-1.46x
+         * faster than the staged form (see zpse_t16x16_inverse_direct).
+         * Only id 6 reaches the w == 16 inverse path, so only it is laid
+         * out this way; the planes go eight and eight into the two 64 KiB
+         * decoder regions, which needs 7 * 4160 + 4096 = 33216 bytes of
+         * each. */
+        int skew_layout = (identity_shape == 0 &&
+                           h.transform_id == (uint8_t)ZPSE_T_TRANSPOSE_16 &&
+                           scount == 16u) ? 1 : 0;
+        uint32_t skew_off = 0;
+
         lanes.order1 = d->order1;
         lanes.o2val = d->o2val;
         lanes.o2conf = d->o2conf;
@@ -289,6 +307,14 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 
             if (identity_shape != 0) {
                 plane = output;
+            } else if (skew_layout != 0) {
+                uint8_t *region = (s < 8) ? d->recon : d->out_stage;
+
+                if (s == 8u) {
+                    skew_off = 0;
+                }
+                plane = region + skew_off;
+                skew_off += seg_lens[s] + ZPSE_D_PLANE_SKEW;
             }
             /* No lane reset here. zpse_segment_decode established the
              * segment's entry state itself, from the initial_literal of

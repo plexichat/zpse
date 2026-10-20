@@ -1,7 +1,7 @@
 #ifndef ZPSE_ARENA_H
 #define ZPSE_ARENA_H
 
-/* Fixed arena layouts (SPEC_V1.md Sec. 12). Caller-owned, 64-byte
+/* Fixed arena layouts. Caller-owned, 64-byte
  * aligned, zeroed at context creation. No allocation afterwards. */
 
 #include <stddef.h>
@@ -31,6 +31,17 @@
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
 #define ZPSE_D_SZ_GUARD     0x0B800u
+
+/* Padding block decode leaves between the segment planes it writes for a
+ * 16-wide interleave, so that the inverse transpose can read them in
+ * place instead of staging a copy of each. The L1 set index is
+ * (address / 64) mod 64, so planes exactly 4096 bytes apart all land on
+ * one set; 4096 + 64 is 65 lines, which advances the set by one per
+ * plane, and -- what 16 bytes would not -- keeps every plane on a cache
+ * line boundary, so the segment decoder's stores stay aligned. Purely a
+ * placement inside recon/out_stage, never part of the stream. Eight
+ * planes per region need 7 * 4160 + 4096 = 33216 bytes. */
+#define ZPSE_D_PLANE_SKEW   64u
 
 /* Encoder offsets. */
 #define ZPSE_E_OFF_CTRL     0x00000u
