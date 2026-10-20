@@ -603,6 +603,38 @@ static ZPSE_T_AVX2 void zpse_t16x16_forward_blocked(const uint8_t *const in[16],
     }
 }
 
+/* Direct gather: the same network reading the sixteen planes in place.
+ *
+ * Staging exists only to break the L1 set conflict of planes exactly
+ * `rows` apart -- for a 64 KiB block that is 4096 bytes, and the L1 set
+ * index is (address / 64) mod 64, so all sixteen lines of a group land
+ * on one set. A caller that lays the planes out with a skew has already
+ * broken that conflict, and for it the copy is pure cost. Measured with
+ * the same kernel and the same output buffer, in one process,
+ * alternating, 64 KiB per run:
+ *
+ *   staged, 256 B per plane        2730-2900 ns
+ *   direct, planes 4096 B apart    4670-4830 ns  (0.58x -- the conflict)
+ *   direct, planes 4160 B apart    2000-2600 ns  (1.28-1.46x)
+ *
+ * 4160 rather than a fractional skew because the planes then stay on
+ * cache-line boundaries, which the segment decoder's stores care about:
+ * a 16-byte skew measured faster in this harness and ~7% *slower* end to
+ * end, every plane's writes splitting a line. Block decode lays the
+ * planes of a 16-wide interleave out that way (ZPSE_D_PLANE_SKEW), so it
+ * reaches this path; everything else keeps the staging, and both produce
+ * identical bytes -- same kernel, only the source pointers differ. */
+static ZPSE_T_AVX2 void zpse_t16x16_inverse_direct(const uint8_t *const in[16],
+                                                   uint8_t *const out[16],
+                                                   uint32_t groups)
+{
+    uint32_t g;
+
+    for (g = 0; g < groups; g++) {
+        zpse_t16x16_avx2(in, g * 16u, out, g * 256u);
+    }
+}
+
 /* Inverse of the above, blocked the other way round: one 64-byte line from
  * each of the sixteen planes into a 1 KiB buffer, then four groups out of
  * the buffer.
@@ -1088,11 +1120,28 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
                 uint8_t *tout[16];
                 unsigned t;
 
+                uintptr_t stride;
+                int skewed;
+
                 for (t = 0; t < 16u; t++) {
                     tin[t] = segs[t];
                     tout[t] = out + (size_t)t * 16u;
                 }
-                zpse_t16x16_inverse_blocked(tin, tout, rows);
+                /* The L1 set index is (address / 64) mod 64, so segment
+                 * bases a multiple of 4096 apart put every group's
+                 * sixteen lines on one set -- that is the case staging
+                 * exists for. Any other stride has the conflict broken
+                 * already, and then reading the planes in place beats
+                 * copying them (see zpse_t16x16_inverse_direct); block
+                 * decode lays out a 16-wide interleave that way. Both
+                 * paths produce identical bytes. */
+                stride = (uintptr_t)segs[1] - (uintptr_t)segs[0];
+                skewed = ((stride & (uintptr_t)4095u) != 0u) ? 1 : 0;
+                if (skewed != 0 && rows >= 16u) {
+                    zpse_t16x16_inverse_direct(tin, tout, rows / 16u);
+                } else {
+                    zpse_t16x16_inverse_blocked(tin, tout, rows);
+                }
                 g = rows / 16u; /* the tail loop below is already covered */
             } else
 #endif /* ZPSE_T_HAVE_AVX2 */

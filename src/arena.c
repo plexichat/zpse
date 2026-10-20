@@ -32,8 +32,10 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
      *   order1/o2val/o2conf  reset by zpse_lane_reset() at every segment
      *              start, and by the selective per-tile reset
      *   comb       zeroed by zpse_comb_unrank() before it is read
-     *   out_stage  unused by the block path; still carved out because
-     *              callers may use it and the layout is normative
+     *   out_stage  written before it is read: block decode puts the last
+     *              eight planes of a 16-wide interleave here, skewed (see
+     *              ZPSE_D_PLANE_SKEW), and the inverse transform reads
+     *              them back; no other block shape touches it
      * The control-cushion region is reserved and never read. */
     d->arena = base;
     d->recon = base + ZPSE_D_OFF_RECON;
