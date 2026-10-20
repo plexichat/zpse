@@ -2283,6 +2283,83 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
     return (int)at;
 }
 
+/* Dense record form for a plane with no structure to predict: a plane whose
+ * bytes are close to uniform is coded by the tile path as one record per 256
+ * bytes that carries the bytes themselves -- an ALL_EXCEPTION-ish mask of a
+ * handful of bytes and a RAW_ACTUAL residual of nearly all 256 -- so the
+ * plane pays ten bytes of framing and a full nine-predictor search per tile
+ * to store its own bytes, growing them by ~6%.
+ *
+ * The dense form already has the shape: an ALL_EXCEPTION mask makes every
+ * position an exception and RAW_ACTUAL then means the residual IS the plane,
+ * so the decoder runs no prediction at all and reconstructs the plane with
+ * one copy (dense.c, the ALL_EXCEPTION + constant-predictor path). One
+ * 12-byte header per ZPSE_DENSE_MAX_LEN bytes replaces the per-tile framing,
+ * so a 4 KiB plane costs plane_len + 12 instead of ~plane_len + 250: both
+ * smaller AND a copy instead of a predictor chain per tile.
+ *
+ * Only offered to a plane whose alphabet is too wide for the palette form
+ * (more than sixteen distinct values) and only when the tiles already coded
+ * or their projection say they will lose, exactly like the palette form --
+ * `lit_len` is exact (nothing about the form is re-derived per record), so
+ * the comparison in the loop can be trusted where the palette's is an upper
+ * bound. */
+static uint32_t seg_dense_literal_cost(uint32_t plane_len)
+{
+    uint32_t chunks = (plane_len + ZPSE_DENSE_MAX_LEN - 1u) /
+                      ZPSE_DENSE_MAX_LEN;
+
+    return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
+           chunks * (uint32_t)ZPSE_DENSE_HEADER_SIZE + plane_len;
+}
+
+static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
+                                  const uint8_t *plane, uint32_t plane_len,
+                                  uint32_t pos, int replace,
+                                  uint32_t byte_budget, uint32_t payload_cap)
+{
+    uint32_t cost = seg_dense_literal_cost(plane_len);
+    uint32_t at;
+    uint32_t off;
+
+    if ((cost >= pos && replace == 0) || cost > payload_cap) {
+        return 0;
+    }
+    if (byte_budget != 0u && cost > byte_budget) {
+        return 0;
+    }
+    at = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+    for (off = 0u; off < plane_len; off += ZPSE_DENSE_MAX_LEN) {
+        uint32_t ns = plane_len - off;
+
+        if (ns > ZPSE_DENSE_MAX_LEN) {
+            ns = ZPSE_DENSE_MAX_LEN;
+        }
+        zpse_store_u16le(payload_out + at, (uint16_t)(10u + ns));
+        payload_out[at + 2u] = (uint8_t)(ZPSE_DENSE_MARKER |
+                                         (uint8_t)ZPSE_M_ALL_EXCEPTION |
+                                         ((uint8_t)ZPSE_R_RAW_ACTUAL << 3));
+        /* TILE_CONSTANT is the predictor the ALL_EXCEPTION path accepts, and
+         * its constant is unused: RAW_ACTUAL supplies every byte, so the
+         * decoder never resolves a prediction for this record. */
+        payload_out[at + 3u] = (uint8_t)ZPSE_P_TILE_CONSTANT;
+        payload_out[at + 4u] = 0u;
+        payload_out[at + 5u] = 0u;
+        zpse_store_u16le(payload_out + at + 6u, (uint16_t)ns);
+        zpse_store_u16le(payload_out + at + 8u, 0u);
+        zpse_store_u16le(payload_out + at + 10u, (uint16_t)ns);
+        if (ns != 0u) {
+            memcpy(payload_out + at + (uint32_t)ZPSE_DENSE_HEADER_SIZE,
+                   plane + off, (size_t)ns);
+        }
+        at += (uint32_t)ZPSE_DENSE_HEADER_SIZE + ns;
+    }
+    /* A dense segment always reports tile_count == 1 (Sec. 6.3). */
+    h->tile_count = 1u;
+    zpse_segment_header_serialize(payload_out, h);
+    return (int)at;
+}
+
 /* Tiles a palette decision prices before deciding, and the plane size in
  * tiles below which it does not price at all. See the projection in
  * zpse_segment_encode. */
@@ -2564,6 +2641,15 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     uint32_t pal_len;
     uint32_t pal_m;
     int pal_try;
+    /* Price of the dense literal form, or 0 when the plane is not a
+     * candidate for it (its alphabet fits the palette form, or the form
+     * does not fit the budget). */
+    uint32_t lit_len;
+    int lit_try;
+    /* Tile count at which the literal form's projection is evaluated next,
+     * and the shift that divides by it (see the tile loop). */
+    uint32_t lit_proj_at;
+    uint32_t lit_proj_shift;
     /* Tile count at which the palette projection is evaluated next, and the
      * shift that divides by it (see the projection in the tile loop). */
     uint32_t proj_at;
@@ -2712,6 +2798,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                   : 0;
     pal_len = 0u;
     pal_m = 0u;
+    lit_len = 0u;
+    lit_try = 1;
+    lit_proj_at = 2u;
+    lit_proj_shift = 1u;
     memset(rep_off, 0, sizeof rep_off);
     memset(rep_key, 0, sizeof rep_key);
 
@@ -2737,6 +2827,19 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 return dn;
             }
             pal_len = 0u; /* not emittable after all: keep tiling */
+        }
+        /* The literal form's price is exact, so this is a real comparison: the
+         * moment the tiles written exceed it, the form is the smaller of the
+         * two and the rest of the plane is work whose bytes would be thrown
+         * away. */
+        if (lit_len != 0u && pos >= lit_len) {
+            int dn = seg_dense_literal_emit(&h, payload_out, plane, plane_len,
+                                            pos, 0, byte_budget, payload_cap);
+
+            if (dn != 0) {
+                return dn;
+            }
+            lit_len = 0u;
         }
         uint16_t ks[12];
         uint8_t cand[3];
@@ -3141,6 +3244,33 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             }
         }
 
+        /* ---- Dense literal form -------------------------------- *
+         * A plane with a wide alphabet and no structure to predict has no
+         * form smaller than its own bytes, and the tile path spends ten
+         * bytes of framing and a nine-predictor search per 256 bytes to
+         * discover that -- record for record, ~6% larger than the bytes it
+         * codes. The dense literal form stores the plane with one 12-byte
+         * header per 4 KiB instead, so it is both smaller and a copy at
+         * decode (see seg_dense_literal_emit).
+         *
+         * Priced on the same evidence as the palette form -- a tile that is
+         * losing by more than 8x cannot be paying for itself -- and only
+         * when the palette form is not on the table: a plane of at most
+         * sixteen values is always smaller as a palette than as a literal,
+         * so that plane keeps the form it has always had. `lit_len` is
+         * exact, so the comparisons below are real size comparisons rather
+         * than the upper bound the palette's price is. */
+        if (lit_try != 0 && pal_len == 0u &&
+            2u + (uint32_t)best_len >= (uint32_t)(nt >> 3)) {
+            uint32_t lc = seg_dense_literal_cost(plane_len);
+
+            lit_try = 0;
+            if (lc <= payload_cap &&
+                (byte_budget == 0u || lc <= byte_budget)) {
+                lit_len = lc;
+            }
+        }
+
         /* The form is priced and the tiles have not caught up with it. Ask
          * the tiles ALREADY CODED whether they are going to: if the plane's
          * tile total is going to be larger than the palette by a margin, the
@@ -3161,7 +3291,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * and it is free, because those tiles are coded either way. Coding
          * a few more of them before deciding costs a losing palette plane a
          * handful of pipelines; it saves every winning plane the sample. */
-        if (pal_len != 0u && pos < pal_len && t + 1u == proj_at) {
+        if (pal_len != 0u && t + 1u == proj_at) {
             const uint32_t hdr = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
             uint32_t proj = hdr +
                             (uint32_t)(((uint64_t)(pos - hdr) * tc) >>
@@ -3170,11 +3300,37 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
 
             proj_shift++;
             proj_at <<= 1;
-            if (proj - (proj >> 3) >= pal_len) {
+            if (pos < pal_len && proj - (proj >> 3) >= pal_len) {
                 dn = seg_dense_palette_emit(&h, payload_out, plane,
                                             plane_len, pal_m, pal_bits,
                                             pos, 1, byte_budget,
                                             payload_cap);
+                if (dn != 0) {
+                    return dn;
+                }
+            }
+        }
+
+        /* The literal form's own projection, from HALF the plane rather than
+         * a quarter and on its own schedule: its tiles are the same size to
+         * within a byte or two (a random plane has no regions), so two tiles
+         * already say what the rest will cost, and every tile coded before
+         * the form is taken is a pipeline whose bytes are thrown away. The
+         * margin is a thirty-second rather than the palette's eighth because
+         * this form wins by a few percent, not by a quarter -- an eighth
+         * would never let it fire. */
+        if (lit_len != 0u && pos < lit_len && t + 1u == lit_proj_at) {
+            const uint32_t hdr = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+            uint32_t proj = hdr +
+                            (uint32_t)(((uint64_t)(pos - hdr) * tc) >>
+                                       lit_proj_shift);
+            int dn;
+
+            lit_proj_shift++;
+            lit_proj_at <<= 1;
+            if (proj - (proj >> 5) >= lit_len) {
+                dn = seg_dense_literal_emit(&h, payload_out, plane, plane_len,
+                                            pos, 1, byte_budget, payload_cap);
                 if (dn != 0) {
                     return dn;
                 }
@@ -3209,6 +3365,18 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
                                         pal_m, pal_bits, pos, 0, byte_budget,
                                         payload_cap);
+
+        if (dn != 0) {
+            return dn;
+        }
+    }
+    /* Same for the literal form: offered last so a plane that is constant or
+     * has a small alphabet keeps the form it has always had, and only taken
+     * when every tile record written turned out to cost more than a copy of
+     * the plane. */
+    if (lit_len != 0u) {
+        int dn = seg_dense_literal_emit(&h, payload_out, plane, plane_len,
+                                        pos, 0, byte_budget, payload_cap);
 
         if (dn != 0) {
             return dn;
