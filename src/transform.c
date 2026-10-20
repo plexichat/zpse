@@ -7,12 +7,15 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ *
- * SSE2 fast paths for the two transform shapes the encoder actually
- * trials. For a block of 16 bytes or more `zpse_block_encode` only ever
- * forwards transform ids 0 (RAW_BYTES), 6 (TRANSPOSE_16) and 1 (DELTA8),
- * so the width `w` is 1 or 16 there; every other width (2, 4, 8, the
- * delta/xor transposes and the stride transpose) reaches the scalar
- * loops below, which stay the normative reference.
+ * SSE2 fast paths for the transform widths. For a block of 16 bytes or
+ * more `zpse_block_encode` only ever forwards transform ids 0 (RAW_BYTES),
+ * 6 (TRANSPOSE_16) and 1 (DELTA8), so the width `w` is 1 or 16 there; the
+ * narrow widths (2, 4 and 8 -- the plain and delta transposes) are decoded
+ * from streams other encoders produce, and they are the slowest shapes in
+ * the format, so they get the same treatment: a parity split, or its
+ * inverse merge, in place of one strided byte per load and per store.
+ * Every path below is byte-for-byte the scalar loops' output, which stay
+ * the normative reference.
  *
  * SSE2 is architectural on x86-64, so this needs no runtime dispatch and
  * no per-function target attribute. That is deliberate: the normal build
@@ -751,6 +754,310 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
     }
 }
 
+#if ZPSE_T_HAVE_SSE2
+/* The evens of two 16-byte vectors, back to back, and the odds likewise.
+ * The words of a vector ARE its byte pairs, so masking the low bytes and
+ * shifting out the high ones is exactly a byte-parity split; packus then
+ * compacts both halves into one 16-byte result. Every split below is a
+ * nest of these, and every merge its inverse (an unpack). */
+static __m128i zpse_parity_evens(__m128i a, __m128i b)
+{
+    const __m128i mask = _mm_set1_epi16(0x00FF);
+
+    return _mm_packus_epi16(_mm_and_si128(a, mask), _mm_and_si128(b, mask));
+}
+
+static __m128i zpse_parity_odds(__m128i a, __m128i b)
+{
+    return _mm_packus_epi16(_mm_srli_epi16(a, 8), _mm_srli_epi16(b, 8));
+}
+
+/* Undo one plane's sixteen delta (or xor) bytes in registers: an inclusive
+ * byte prefix sum is log2(16) shift-adds, the xor chain the same with xors,
+ * and the byte that crosses the chunk is the chunk's own last byte --
+ * exactly the value the byte-at-a-time chain carries, so the result is
+ * byte-identical to it. `carry` is threaded through the chunk. */
+static __m128i zpse_chain_undo(__m128i x, uint8_t *carry, int delta)
+{
+    uint8_t add;
+
+    if (delta) {
+        x = _mm_add_epi8(x, _mm_slli_si128(x, 1));
+        x = _mm_add_epi8(x, _mm_slli_si128(x, 2));
+        x = _mm_add_epi8(x, _mm_slli_si128(x, 4));
+        x = _mm_add_epi8(x, _mm_slli_si128(x, 8));
+        add = (uint8_t)_mm_cvtsi128_si32(_mm_srli_si128(x, 15));
+        x = _mm_add_epi8(x, _mm_set1_epi8((char)*carry));
+        *carry = (uint8_t)(*carry + add);
+    } else {
+        x = _mm_xor_si128(x, _mm_slli_si128(x, 1));
+        x = _mm_xor_si128(x, _mm_slli_si128(x, 2));
+        x = _mm_xor_si128(x, _mm_slli_si128(x, 4));
+        x = _mm_xor_si128(x, _mm_slli_si128(x, 8));
+        add = (uint8_t)_mm_cvtsi128_si32(_mm_srli_si128(x, 15));
+        x = _mm_xor_si128(x, _mm_set1_epi8((char)*carry));
+        *carry ^= add;
+    }
+    return x;
+}
+
+/* The narrow widths are one byte permutation: byte i of the records belongs
+ * to plane (i mod w), so the split is log2(w) levels of parity splits and
+ * the merge log2(w) levels of byte interleaves. A group is sixteen rows --
+ * 16*w input bytes in, 16 bytes per plane out -- which keeps the whole
+ * working set in registers: nothing here allocates, so these paths stay
+ * usable on the decode side, which has no scratch of its own.
+ *
+ * The scalar loops they replace moved one strided byte per load and one per
+ * store: 15.2-15.6 us forward and 18.1-18.6 us inverse per 64 KiB, against
+ * 2.9/3.0 for the 16-wide transpose. */
+
+static void zpse_split2(uint8_t *const segs[16], const uint8_t *in,
+                        uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        const uint8_t *q = in + (size_t)g * 2u;
+        __m128i a = _mm_loadu_si128((const __m128i *)(const void *)q);
+        __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(q + 16));
+
+        _mm_storeu_si128((__m128i *)(void *)(segs[0] + g),
+                         zpse_parity_evens(a, b));
+        _mm_storeu_si128((__m128i *)(void *)(segs[1] + g),
+                         zpse_parity_odds(a, b));
+    }
+}
+
+static void zpse_split4(uint8_t *const segs[16], const uint8_t *in,
+                        uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        const uint8_t *q = in + (size_t)g * 4u;
+        __m128i a = _mm_loadu_si128((const __m128i *)(const void *)q);
+        __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(q + 16));
+        __m128i c = _mm_loadu_si128((const __m128i *)(const void *)(q + 32));
+        __m128i d = _mm_loadu_si128((const __m128i *)(const void *)(q + 48));
+        /* Level 1: bytes of class 0|2 (evens) and 1|3 (odds), per half. */
+        __m128i e1 = zpse_parity_evens(a, b);
+        __m128i o1 = zpse_parity_odds(a, b);
+        __m128i e2 = zpse_parity_evens(c, d);
+        __m128i o2 = zpse_parity_odds(c, d);
+
+        /* Level 2: even and odd positions of each half of those streams. */
+        _mm_storeu_si128((__m128i *)(void *)(segs[0] + g),
+                         zpse_parity_evens(e1, e2));
+        _mm_storeu_si128((__m128i *)(void *)(segs[1] + g),
+                         zpse_parity_evens(o1, o2));
+        _mm_storeu_si128((__m128i *)(void *)(segs[2] + g),
+                         zpse_parity_odds(e1, e2));
+        _mm_storeu_si128((__m128i *)(void *)(segs[3] + g),
+                         zpse_parity_odds(o1, o2));
+    }
+}
+
+static void zpse_split8(uint8_t *const segs[16], const uint8_t *in,
+                        uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        const uint8_t *q = in + (size_t)g * 8u;
+        __m128i a0 = _mm_loadu_si128((const __m128i *)(const void *)q);
+        __m128i a1 = _mm_loadu_si128((const __m128i *)(const void *)(q + 16));
+        __m128i a2 = _mm_loadu_si128((const __m128i *)(const void *)(q + 32));
+        __m128i a3 = _mm_loadu_si128((const __m128i *)(const void *)(q + 48));
+        __m128i a4 = _mm_loadu_si128((const __m128i *)(const void *)(q + 64));
+        __m128i a5 = _mm_loadu_si128((const __m128i *)(const void *)(q + 80));
+        __m128i a6 = _mm_loadu_si128((const __m128i *)(const void *)(q + 96));
+        __m128i a7 = _mm_loadu_si128((const __m128i *)(const void *)(q + 112));
+        /* Level 1: the parity split of each 32-byte span. */
+        __m128i ev01 = zpse_parity_evens(a0, a1);
+        __m128i od01 = zpse_parity_odds(a0, a1);
+        __m128i ev23 = zpse_parity_evens(a2, a3);
+        __m128i od23 = zpse_parity_odds(a2, a3);
+        __m128i ev45 = zpse_parity_evens(a4, a5);
+        __m128i od45 = zpse_parity_odds(a4, a5);
+        __m128i ev67 = zpse_parity_evens(a6, a7);
+        __m128i od67 = zpse_parity_odds(a6, a7);
+        /* Level 2: the evens and odds of the two spans of each parity.
+         * Slots 0-3 hold the even residues of the group's first and second
+         * half in turn, 4-7 the odd ones. */
+        __m128i p0 = zpse_parity_evens(ev01, ev23);
+        __m128i p4 = zpse_parity_odds(ev01, ev23);
+        __m128i p1 = zpse_parity_evens(ev45, ev67);
+        __m128i p5 = zpse_parity_odds(ev45, ev67);
+        __m128i p2 = zpse_parity_evens(od01, od23);
+        __m128i p6 = zpse_parity_odds(od01, od23);
+        __m128i p3 = zpse_parity_evens(od45, od67);
+        __m128i p7 = zpse_parity_odds(od45, od67);
+
+        /* Level 3: one residue per plane. */
+        _mm_storeu_si128((__m128i *)(void *)(segs[0] + g),
+                         zpse_parity_evens(p0, p1));
+        _mm_storeu_si128((__m128i *)(void *)(segs[1] + g),
+                         zpse_parity_evens(p2, p3));
+        _mm_storeu_si128((__m128i *)(void *)(segs[2] + g),
+                         zpse_parity_evens(p4, p5));
+        _mm_storeu_si128((__m128i *)(void *)(segs[3] + g),
+                         zpse_parity_evens(p6, p7));
+        _mm_storeu_si128((__m128i *)(void *)(segs[4] + g),
+                         zpse_parity_odds(p0, p1));
+        _mm_storeu_si128((__m128i *)(void *)(segs[5] + g),
+                         zpse_parity_odds(p2, p3));
+        _mm_storeu_si128((__m128i *)(void *)(segs[6] + g),
+                         zpse_parity_odds(p4, p5));
+        _mm_storeu_si128((__m128i *)(void *)(segs[7] + g),
+                         zpse_parity_odds(p6, p7));
+    }
+}
+
+static void zpse_merge2(uint8_t *out, const uint8_t *const segs[16],
+                        uint32_t rows, uint8_t *carry, int delta)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        __m128i a = _mm_loadu_si128(
+            (const __m128i *)(const void *)(segs[0] + g));
+        __m128i b = _mm_loadu_si128(
+            (const __m128i *)(const void *)(segs[1] + g));
+        uint8_t *d = out + (size_t)g * 2u;
+
+        if (carry != 0) {
+            a = zpse_chain_undo(a, carry, delta);
+            b = zpse_chain_undo(b, carry + 1, delta);
+        }
+        _mm_storeu_si128((__m128i *)(void *)d, _mm_unpacklo_epi8(a, b));
+        _mm_storeu_si128((__m128i *)(void *)(d + 16),
+                         _mm_unpackhi_epi8(a, b));
+    }
+}
+
+static void zpse_merge4(uint8_t *out, const uint8_t *const segs[16],
+                        uint32_t rows, uint8_t *carry, int delta)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        __m128i p[4];
+        __m128i lo[2];
+        __m128i hi[2];
+        uint8_t *d = out + (size_t)g * 4u;
+        unsigned t;
+
+        for (t = 0; t < 4u; t++) {
+            __m128i x = _mm_loadu_si128(
+                (const __m128i *)(const void *)(segs[t] + g));
+
+            p[t] = carry != 0 ? zpse_chain_undo(x, carry + t, delta) : x;
+        }
+        /* Classes 0|1 and 2|3 interleave pairwise, then the two halves. */
+        lo[0] = _mm_unpacklo_epi8(p[0], p[1]);
+        hi[0] = _mm_unpackhi_epi8(p[0], p[1]);
+        lo[1] = _mm_unpacklo_epi8(p[2], p[3]);
+        hi[1] = _mm_unpackhi_epi8(p[2], p[3]);
+        _mm_storeu_si128((__m128i *)(void *)d,
+                         _mm_unpacklo_epi16(lo[0], lo[1]));
+        _mm_storeu_si128((__m128i *)(void *)(d + 16),
+                         _mm_unpackhi_epi16(lo[0], lo[1]));
+        _mm_storeu_si128((__m128i *)(void *)(d + 32),
+                         _mm_unpacklo_epi16(hi[0], hi[1]));
+        _mm_storeu_si128((__m128i *)(void *)(d + 48),
+                         _mm_unpackhi_epi16(hi[0], hi[1]));
+    }
+}
+
+static void zpse_merge8(uint8_t *out, const uint8_t *const segs[16],
+                        uint32_t rows, uint8_t *carry, int delta)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        __m128i c[8];
+        uint8_t *d = out + (size_t)g * 8u;
+        unsigned t;
+
+        for (t = 0; t < 8u; t++) {
+            __m128i x = _mm_loadu_si128(
+                (const __m128i *)(const void *)(segs[t] + g));
+
+            c[t] = carry != 0 ? zpse_chain_undo(x, carry + t, delta) : x;
+        }
+        /* Level 3, undone: class t and class t+4 were the evens and odds of
+         * the same pair of streams. */
+        __m128i p0 = _mm_unpacklo_epi8(c[0], c[4]);
+        __m128i p1 = _mm_unpackhi_epi8(c[0], c[4]);
+        __m128i p2 = _mm_unpacklo_epi8(c[1], c[5]);
+        __m128i p3 = _mm_unpackhi_epi8(c[1], c[5]);
+        __m128i p4 = _mm_unpacklo_epi8(c[2], c[6]);
+        __m128i p5 = _mm_unpackhi_epi8(c[2], c[6]);
+        __m128i p6 = _mm_unpacklo_epi8(c[3], c[7]);
+        __m128i p7 = _mm_unpackhi_epi8(c[3], c[7]);
+        /* Level 2, undone: the same pairing one level down. */
+        __m128i ev01 = _mm_unpacklo_epi8(p0, p4);
+        __m128i ev23 = _mm_unpackhi_epi8(p0, p4);
+        __m128i ev45 = _mm_unpacklo_epi8(p1, p5);
+        __m128i ev67 = _mm_unpackhi_epi8(p1, p5);
+        __m128i od01 = _mm_unpacklo_epi8(p2, p6);
+        __m128i od23 = _mm_unpackhi_epi8(p2, p6);
+        __m128i od45 = _mm_unpacklo_epi8(p3, p7);
+        __m128i od67 = _mm_unpackhi_epi8(p3, p7);
+        /* Level 1, undone: the parity-2 spans rebuild the eight 16-byte
+         * pieces of the group, in input order. */
+        _mm_storeu_si128((__m128i *)(void *)d,
+                         _mm_unpacklo_epi8(ev01, od01));
+        _mm_storeu_si128((__m128i *)(void *)(d + 16),
+                         _mm_unpackhi_epi8(ev01, od01));
+        _mm_storeu_si128((__m128i *)(void *)(d + 32),
+                         _mm_unpacklo_epi8(ev23, od23));
+        _mm_storeu_si128((__m128i *)(void *)(d + 48),
+                         _mm_unpackhi_epi8(ev23, od23));
+        _mm_storeu_si128((__m128i *)(void *)(d + 64),
+                         _mm_unpacklo_epi8(ev45, od45));
+        _mm_storeu_si128((__m128i *)(void *)(d + 80),
+                         _mm_unpackhi_epi8(ev45, od45));
+        _mm_storeu_si128((__m128i *)(void *)(d + 96),
+                         _mm_unpacklo_epi8(ev67, od67));
+        _mm_storeu_si128((__m128i *)(void *)(d + 112),
+                         _mm_unpackhi_epi8(ev67, od67));
+    }
+}
+
+/* `rows` interleaved rows in, w contiguous planes out. The caller handles
+ * the ragged tail (plane lengths differ by at most one row) and the
+ * delta/xor chains, which run on the contiguous planes. */
+static void zpse_split_narrow(uint8_t *const segs[16], const uint8_t *in,
+                              uint32_t rows, uint8_t w)
+{
+    if (w == 2u) {
+        zpse_split2(segs, in, rows);
+    } else if (w == 4u) {
+        zpse_split4(segs, in, rows);
+    } else {
+        zpse_split8(segs, in, rows);
+    }
+}
+
+/* The inverse: w contiguous planes in, the interleaved rows out. When
+ * `carry` is not NULL each plane's sixteen bytes are first restored from the
+ * chain in registers, and `carry[t]` holds the byte that crosses the group. */
+static void zpse_merge_narrow(uint8_t *out, const uint8_t *const segs[16],
+                              uint32_t rows, uint8_t w, uint8_t *carry,
+                              int delta)
+{
+    if (w == 2u) {
+        zpse_merge2(out, segs, rows, carry, delta);
+    } else if (w == 4u) {
+        zpse_merge4(out, segs, rows, carry, delta);
+    } else {
+        zpse_merge8(out, segs, rows, carry, delta);
+    }
+}
+#endif /* ZPSE_T_HAVE_SSE2 */
+
 static int zpse_valid_count(uint8_t v)
 {
     return (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) ? 1 : 0;
@@ -1046,6 +1353,38 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
         }
         return PSE_OK;
     }
+    /* The narrow widths (2, 4 and 8) are one byte permutation, and a
+     * permutation does not care whether a chain follows it. The parity
+     * splits above produce the contiguous planes; the delta/xor chains then
+     * run on them exactly as the 16-wide path runs them, sixteen bytes per
+     * step instead of one strided load per byte. */
+    if (w == 2u || w == 4u || w == 8u) {
+        uint32_t rows = seg_lens[0];
+        uint32_t full, r2;
+
+        for (s = 1; s < w; s++) {
+            if (seg_lens[s] < rows) {
+                rows = seg_lens[s];
+            }
+        }
+        full = (rows / 16u) * 16u;
+        zpse_split_narrow(segs, in, full, w);
+        /* Ragged rows: the planes can differ in length by one. */
+        for (s = 0; s < w; s++) {
+            uint32_t len = seg_lens[s];
+
+            for (r2 = full; r2 < len; r2++) {
+                segs[s][r2] = in[(uint32_t)s + r2 * (uint32_t)w];
+            }
+        }
+        if (delta || xorr) {
+            for (s = 0; s < w; s++) {
+                zpse_plane_chain_inplace(segs[s], seg_lens[s], meta->seeds[s],
+                                         delta);
+            }
+        }
+        return PSE_OK;
+    }
 #endif /* ZPSE_T_HAVE_SSE2 */
 
     for (s = 0; s < w; s++) {
@@ -1219,6 +1558,29 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
             }
             return PSE_OK;
         }
+        /* The narrow widths have no chain to restore here: the merge IS the
+         * transform, so the same helper covers them. */
+        if (w == 2u || w == 4u || w == 8u) {
+            uint32_t rows = seg_lens[0];
+            uint32_t full, r2;
+
+            for (s = 1; s < w; s++) {
+                if (seg_lens[s] < rows) {
+                    rows = seg_lens[s];
+                }
+            }
+            full = (rows / 16u) * 16u;
+            zpse_merge_narrow(out, segs, full, w, 0, 0);
+            /* Ragged rows: the planes can differ in length by one. */
+            for (s = 0; s < w; s++) {
+                uint32_t len = seg_lens[s];
+
+                for (r2 = full; r2 < len; r2++) {
+                    out[(uint32_t)s + r2 * (uint32_t)w] = segs[s][r2];
+                }
+            }
+            return PSE_OK;
+        }
 #endif /* ZPSE_T_HAVE_SSE2 */
         for (s = 0; s < w; s++) {
             const uint8_t *src = segs[s];
@@ -1275,6 +1637,41 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
 #endif /* ZPSE_T_HAVE_SSE2 */
     }
 #if ZPSE_T_HAVE_SSE2
+    /* The narrow widths with a chain: the same permutation, with each
+     * plane's sixteen bytes restored from the chain in registers on the way
+     * in; see zpse_merge_narrow for why the carry is the chain's own last
+     * byte. */
+    if (w == 2u || w == 4u || w == 8u) {
+        uint32_t rows = seg_lens[0];
+        uint32_t full, r2;
+        uint8_t carry[16];
+
+        for (s = 1; s < w; s++) {
+            if (seg_lens[s] < rows) {
+                rows = seg_lens[s];
+            }
+        }
+        for (s = 0; s < w; s++) {
+            carry[s] = prev[s];
+        }
+        full = (rows / 16u) * 16u;
+        zpse_merge_narrow(out, segs, full, w, carry, delta);
+        /* Ragged rows, continued from each plane's carry. */
+        for (s = 0; s < w; s++) {
+            uint32_t len = seg_lens[s];
+            uint8_t p = carry[s];
+
+            for (r2 = full; r2 < len; r2++) {
+                uint8_t e = segs[s][r2];
+                uint8_t d = delta ? (uint8_t)(e + p) : (uint8_t)(e ^ p);
+
+                p = d;
+                out[(uint32_t)s + r2 * (uint32_t)w] = d;
+            }
+        }
+        return PSE_OK;
+    }
+
     /* The 16-wide delta/xor inverse: the chain is what the byte-at-a-time
      * loop below serialises, so it is done 16 rows at a time inside
      * registers -- an inclusive byte prefix sum (log2(16) shift-adds) or
