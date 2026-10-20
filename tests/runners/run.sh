@@ -17,7 +17,10 @@ set -u
 # build or test log must never be able to pass by being filtered.
 set -o pipefail
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+# Two levels up: this script lives in tests/runners/, so the repository
+# root is its grandparent. (It sat in tests/ itself before the tree was
+# reorganised; one level up now points at tests/ and every build fails.)
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
 inc="$repo/include"
 unity="$repo/src/zpse_unity.c"
 tmp="${TMPDIR:-/tmp}/zpse-tests"
@@ -46,7 +49,10 @@ for t in test_roundtrip test_combinadic test_hostile test_units test_stride3 tes
     src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
-    if ! "$CC" -std=c11 -O2 -Wall -Wextra -I "$inc" "$src" "$unity" -o "$bin"; then
+    # tests/corpus is on the include path for the suites that share the
+    # sized corpus header (test_sizes); it moved there with the corpus.
+    if ! "$CC" -std=c11 -O2 -Wall -Wextra -I "$inc" \
+        -I "$repo/tests/corpus" "$src" "$unity" -o "$bin"; then
         echo "BUILD FAILED: $t"
         fail=1
         continue
