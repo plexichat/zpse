@@ -444,6 +444,20 @@ ZPSE_DEFINE_PREFIX_SCAN32(zpse_prefix_xor32, _mm256_xor_si256, ZPSE_XOR8)
 #define ZPSE_T16_GROUPS 32u
 #endif
 
+/* Groups of sixteen rows the inverse stages per plane before transposing
+ * them; see zpse_t16x16_inverse_blocked. It sat at four (64 bytes, one
+ * cache line per plane) while the forward half of this file collects
+ * thirty-two, so each 4 KiB-strided line load bought the inverse only
+ * four groups. Staging 256 bytes per plane -- sixteen groups, 4 KiB of
+ * buffer -- measured 3100 -> 2760 ns per 64 KiB for this transform alone
+ * (G = 4/8/16/32 giving 3100/2950/2760/2700, best of six runs each),
+ * about +12% and in line with the forward's blocking. Thirty-two groups
+ * (8 KiB) is no faster in isolation and slower in place: the transpose's
+ * output has to share L1 with that much staging. */
+#ifndef ZPSE_T16_ISTAGE
+#define ZPSE_T16_ISTAGE 16u
+#endif
+
 /* One 16-row group: 16 rows of 16 bytes become 16 columns of 16 bytes.
  * The sixteen bases are passed once for the whole plane and the group's
  * byte offset separately, so a caller that walks many groups builds no
@@ -607,29 +621,31 @@ static ZPSE_T_AVX2 void zpse_t16x16_inverse_blocked(const uint8_t *const in[16],
                                                     uint32_t rows)
 {
     /* Aligned: the staging stores are aligned _mm256 stores, and every
-     * plane's run inside it starts on a 64-byte boundary. */
-    uint8_t buf[16u * 64u] __attribute__((aligned(64)));
+     * plane's run inside it starts on a 64-byte boundary -- which is why
+     * ZPSE_T16_ISTAGE must be even (a run of 16 * G bytes, aligned when
+     * that is a multiple of 32). */
+    uint8_t buf[16u * 16u * ZPSE_T16_ISTAGE] __attribute__((aligned(64)));
     const uint8_t *bin[16];
     uint32_t g = 0u;
     uint32_t q;
     unsigned t;
 
     for (t = 0; t < 16u; t++) {
-        bin[t] = buf + (size_t)t * 64u;
+        bin[t] = buf + (size_t)t * 16u * (size_t)ZPSE_T16_ISTAGE;
     }
-    for (; (g + 4u) * 16u <= rows; g += 4u) {
+    for (; (g + ZPSE_T16_ISTAGE) * 16u <= rows; g += ZPSE_T16_ISTAGE) {
         for (t = 0; t < 16u; t++) {
-            const __m256i a = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(in[t] + (size_t)g * 16u));
-            const __m256i b = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(in[t] + (size_t)g * 16u + 32u));
+            const uint8_t *src = in[t] + (size_t)g * 16u;
+            uint8_t *dst = buf + (size_t)t * 16u * (size_t)ZPSE_T16_ISTAGE;
+            uint32_t j;
 
-            _mm256_store_si256((__m256i *)(void *)(buf + (size_t)t * 64u),
-                               a);
-            _mm256_store_si256((__m256i *)(void *)(buf + (size_t)t * 64u + 32u),
-                               b);
+            for (j = 0; j < (uint32_t)(16u * ZPSE_T16_ISTAGE); j += 32u) {
+                _mm256_store_si256((__m256i *)(void *)(dst + j),
+                                   _mm256_loadu_si256(
+                                       (const __m256i *)(const void *)(src + j)));
+            }
         }
-        for (q = 0; q < 4u; q++) {
+        for (q = 0; q < (uint32_t)ZPSE_T16_ISTAGE; q++) {
             zpse_t16x16_avx2(bin, q * 16u, out, (g + q) * 256u);
         }
     }
