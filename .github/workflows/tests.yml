@@ -55,6 +55,11 @@ jobs:
             /tmp/zpse_cli d /tmp/out.zpse /tmp/out.bin
             cmp "$f" /tmp/out.bin
           done
+      - name: Encode stage profiler still builds
+        run: |
+          set -e
+          ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Iinclude tests/tools/enc_profile.c src/zpse_unity.c -o /tmp/enc_profile
+          /tmp/enc_profile 1 zeros | head -20
 
   windows:
     name: windows / msys2 gcc
