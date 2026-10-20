@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#endif
+
 #include "zpse/bits.h"
 #include "zpse/dense.h"
 #include "zpse/mask.h"
@@ -41,6 +45,29 @@ static uint64_t seg_load_u64(const uint8_t *p)
 
     memcpy(&w, p, sizeof w);
     return w;
+}
+
+/* ---- 256-byte fill for a full constant tile ------------------------- *
+ * A const tile's prediction is one byte, so the tile is that byte
+ * everywhere: the fill is a memset of exactly 256 bytes, and on a sparse
+ * plane (K of ~3 in 256) it is the largest single item of the tile.
+ * `memset` with a runtime length does not inline, and both the call and
+ * the `rep stosb` glibc picks at this size pay a start-up that is several
+ * times what the 256 bytes themselves cost; 256 is known here, so this is
+ * sixteen 16-byte stores with no branch and no call. SSE2 is baseline on
+ * x86-64, so no dispatch is needed; every other target keeps the call. */
+ZPSE_ALWAYS_INLINE void seg_fill_256(uint8_t *dst, uint8_t c)
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+    const __m128i v = _mm_set1_epi8((char)c);
+    unsigned i;
+
+    for (i = 0; i < 256u; i += 16u) {
+        _mm_storeu_si128((__m128i *)(void *)(dst + i), v);
+    }
+#else
+    memset(dst, c, 256u);
+#endif
 }
 
 /* ---- Inline constant-tile decode ------------------------------------ *
@@ -124,6 +151,105 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
         c = mp[0];
         mp++;
     }
+
+    /* ---- Sparse mask, direct residuals --------------------------- *
+     * The two sparse mask modes ARE an ascending position list, and the
+     * two direct residual modes ARE one byte per exception (the exclusion
+     * residual, or the actual byte). For those the 8-word mask and the
+     * residual buffer are both detours: a 32-byte clear, a bit-walk per
+     * exception, and a call to expand K bytes -- on the planes this path
+     * exists for (K of ~3 in 256) most of what a tile costs. So decode
+     * the positions into `pos[]` and resolve each exception byte straight
+     * from the payload, with the same checks zpse_mask_decode and
+     * zpse_residual_decode make, in the same order and with the same
+     * statuses: a payload this rejects is rejected identically, and one
+     * it accepts produces the identical bytes.
+     *
+     * The lane reset is dead in both paths below as well as in this one.
+     * A full-length CONST tile reads no lane state, and the epilogue at
+     * the bottom sets both histories from the tile's own last sixteen
+     * bytes, so nothing of the entry state survives the tile. */
+    if ((mask_mode == (uint8_t)ZPSE_M_SPARSE_U8 ||
+         mask_mode == (uint8_t)ZPSE_M_SPARSE_GAPS) &&
+        (res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8 ||
+         res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) && k >= 1u) {
+        uint8_t pos[24];
+        const uint8_t *mpl = mp;
+        uint16_t mlen = th.mask_payload_size;
+        const uint8_t *rpl;
+        uint16_t jj;
+
+        if (mask_mode == (uint8_t)ZPSE_M_SPARSE_U8) {
+            uint16_t prev = 0;
+
+            if (mlen != k) {
+                return PSE_BAD_MASK;
+            }
+            for (jj = 0; jj < k; jj++) {
+                uint16_t v = mpl[jj];
+
+                /* v >= Nt cannot happen for a byte when Nt is 256, so
+                 * the ascending test is the whole of what the generic
+                 * decoder checks here. */
+                if (jj > 0u && v <= prev) {
+                    return PSE_BAD_MASK;
+                }
+                prev = v;
+                pos[jj] = (uint8_t)v;
+            }
+        } else {
+            uint8_t flag;
+            uint32_t gp = 0;
+
+            if (mlen < 1u) {
+                return PSE_BAD_MASK;
+            }
+            flag = mpl[0];
+            if (flag > 1u) {
+                return PSE_BAD_MASK;
+            }
+            if (mlen != (uint16_t)(flag != 0u ? 1u + 2u * k : 1u + k)) {
+                return PSE_BAD_MASK;
+            }
+            for (jj = 0; jj < k; jj++) {
+                uint32_t gap =
+                    (flag != 0u)
+                        ? ((uint32_t)mpl[1u + 2u * jj] |
+                           ((uint32_t)mpl[2u + 2u * jj] << 8))
+                        : (uint32_t)mpl[1u + jj];
+
+                gp = (jj == 0u) ? gap : gp + 1u + gap;
+                if (gp >= 256u) {
+                    return PSE_BAD_MASK;
+                }
+                pos[jj] = (uint8_t)gp;
+            }
+        }
+        /* Both direct residual modes are exactly K bytes; the exclusion
+         * one additionally forbids 255, which is the only value that is
+         * not a legal exclusion residual. */
+        if ((uint32_t)th.residual_payload_size != (uint32_t)k) {
+            return PSE_BAD_RESIDUAL;
+        }
+        rpl = mpl + mlen;
+        if (res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8) {
+            for (jj = 0; jj < k; jj++) {
+                if (rpl[jj] == 255u) {
+                    return PSE_BAD_RESIDUAL;
+                }
+            }
+        }
+        seg_fill_256(out, c);
+        for (jj = 0; jj < k; jj++) {
+            out[pos[jj]] = (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL)
+                               ? rpl[jj]
+                               : zpse_exclusion_inverse(rpl[jj], c);
+        }
+        memcpy(lanes->last, out + 248u, sizeof lanes->last);
+        memcpy(lanes->second_last, out + 240u, sizeof lanes->second_last);
+        return 1;
+    }
+
     /* CONST reads no table, so a reset is the histories only (this is what
      * zpse_lane_reset_for does for predictor 0 and 9). */
     if (tile_reset != 0) {
