@@ -25,22 +25,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             zstd lz4 brotli zlib1g
-      - name: Host info (CPU, RAM, OS, compiler)
-        run: |
-          {
-            echo '### host'
-            echo
-            echo '```'
-            echo "os: $(uname -srmo)"
-            echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
-            echo "cpus: $(nproc) ($(grep -c '^processor' /proc/cpuinfo) in /proc/cpuinfo)"
-            echo "ram: $(free -h | awk '/^Mem:/ {print $2 \" total, \" $7 \" available\"}')"
-            echo "mhz: $(awk -F: '/cpu MHz/ {print $2; exit}' /proc/cpuinfo | xargs) MHz"
-            echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2 | xargs | cut -c1-200)..."
-            cc --version | head -1
-            echo '```'
-          } | tee /tmp/host_info.txt
-          cat /tmp/host_info.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Build the harness
         run: |
           cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude \
@@ -55,14 +39,13 @@ jobs:
             echo 'codec; every decode verified; best-of-N; ratios are'
             echo 'input:output. Levels: zpse default, zstd -3, lz4 fast,'
             echo 'zlib -6, brotli q5 (see the versions line).'
+            echo 'Host lines ride in the same file, above the table.'
             echo
             cat /tmp/benchcol.txt
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-columnar
-          path: |
-            /tmp/benchcol.txt
-            /tmp/host_info.txt
+          path: /tmp/benchcol.txt
           if-no-files-found: error
           retention-days: 90
