@@ -466,8 +466,15 @@ static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep)
  * ------------------------------------------------------------------ */
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) && !defined(_MSC_VER)
-#define ZPSE_TILE_AVX2 __attribute__((target("avx2")))
-#define ZPSE_TILE_AVX2P __attribute__((target("avx2,popcnt")))
+/* Every kernel also pins its own 64-byte alignment. Their inner loops are
+ * branch-light AVX2 blocks whose throughput depends on where the loop body
+ * lands inside a 32-byte fetch window, and with plain -O2 the placement
+ * moves with the size of any unrelated function in the translation unit: a
+ * purely encoder-side edit of this file once moved palette16 decode from
+ * 2.15 to 2.03 GB/s without touching a decode instruction. Aligning the
+ * entries makes the kernels' cost a property of their own code. */
+#define ZPSE_TILE_AVX2 __attribute__((target("avx2"), aligned(64)))
+#define ZPSE_TILE_AVX2P __attribute__((target("avx2,popcnt"), aligned(64)))
 #define ZPSE_TILE_HAVE_AVX2 1
 #elif defined(__AVX2__)
 #define ZPSE_TILE_AVX2
@@ -805,6 +812,21 @@ static const uint8_t tile_cmp_lut[256][8] = {
  * maximum of unsigned bytes and a zero can never raise one -- which is
  * also why the SMALLEST delta is accumulated as the maximum of its
  * complement below. */
+/* Compact eight exception lanes' prediction, residual and actual into
+ * dst[o..]: the mask byte selects, through the 64-bit table above, which of
+ * the eight source bytes land in the packed 64-bit store. */
+#define TILE_CL_CMP3(tp_, tr_, ta_, o_, pd_, rd_, ad_, mask8_)               \
+    do {                                                                     \
+        const __m128i _c = _mm_loadl_epi64(                                   \
+            (const __m128i *)(const void *)tile_cmp_lut[(mask8_)]);           \
+        _mm_storel_epi64((__m128i *)(void *)((tp_) + (o_)),                   \
+                         _mm_shuffle_epi8((pd_), _c));                        \
+        _mm_storel_epi64((__m128i *)(void *)((tr_) + (o_)),                   \
+                         _mm_shuffle_epi8((rd_), _c));                        \
+        _mm_storel_epi64((__m128i *)(void *)((ta_) + (o_)),                   \
+                         _mm_shuffle_epi8((ad_), _c));                        \
+    } while (0)
+
 static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
 {
     __m128i m = _mm_max_epu8(_mm256_castsi256_si128(v),
@@ -819,8 +841,8 @@ static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
 
 /* Fold the 256-byte residual-presence array into `seen`, returning how
  * many distinct values it holds. */
-static ZPSE_TILE_AVX2 unsigned tile_pres_fold(const uint8_t *pres,
-                                              uint32_t seen[8])
+static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
+                                               uint32_t seen[8])
 {
     const __m256i z = _mm256_setzero_si256();
     unsigned i;
@@ -831,7 +853,7 @@ static ZPSE_TILE_AVX2 unsigned tile_pres_fold(const uint8_t *pres,
             (const __m256i *)(const void *)(pres + i * 32u));
 
         seen[i] = (uint32_t)~_mm256_movemask_epi8(_mm256_cmpeq_epi8(q, z));
-        nu += (unsigned)tile_popcount32(seen[i]);
+        nu += (unsigned)_mm_popcnt_u32(seen[i]);
     }
     return nu;
 }
@@ -847,9 +869,15 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
     uint8_t c, uint32_t s, const uint32_t words[8], ZpseTileClass *cl,
     uint8_t *rmax_o, uint8_t *dmin_o, uint8_t *dmax_o)
 {
-    uint8_t tp[272];
-    uint8_t tr[272];
-    uint8_t ta[272];
+    /* The compacted exception arrays are written straight into the
+     * classification: an 8-byte store per 16 lanes lands exactly where the
+     * caller reads them from, and the three memcpys the staged form paid at
+     * the end of every dense tile (up to 768 bytes of copy) disappear. The
+     * stores may run 7 bytes past the last entry, which is why the arrays
+     * carry 8 bytes of slack (tile.h). */
+    uint8_t *const tp = cl->at_pred;
+    uint8_t *const tr = cl->res_at_exc;
+    uint8_t *const ta = cl->act_at_exc;
     uint32_t k = 0u;
     unsigned ch;
     unsigned i;
@@ -970,28 +998,29 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
             _mm256_xor_si256(_mm256_or_si256(db, _mm256_xor_si256(ex, all)),
                              all));
 
+        /* Eight exception lanes at a time. Unrolling the two 16-lane halves
+         * and precomputing the four sub-mask popcounts was measured both
+         * ways: it takes the popcount-to-store dependency off the 32 group
+         * stores of a tile, but costs more live 128-bit registers than the
+         * loop form on a nearly-all-exception tile (text: +15 cycles a tile
+         * of classify), so the shorter form stays. */
         for (h = 0; h < 2u; h++) {
-            __m128i pd = h ? _mm256_extracti128_si256(pv, 1) : _mm256_castsi256_si128(pv);
-            __m128i rd = h ? _mm256_extracti128_si256(r, 1) : _mm256_castsi256_si128(r);
-            __m128i ad = h ? _mm256_extracti128_si256(v, 1) : _mm256_castsi256_si128(v);
-            unsigned m0 = (m >> (16u * h)) & 0xFFu;
-            unsigned m1 = (m >> (16u * h + 8u)) & 0xFFu;
-            __m128i c0 = _mm_loadl_epi64((const __m128i *)(const void *)tile_cmp_lut[m0]);
-            __m128i c1 = _mm_loadl_epi64((const __m128i *)(const void *)tile_cmp_lut[m1]);
-            _mm_storel_epi64((__m128i *)(void *)(tp + k), _mm_shuffle_epi8(pd, c0));
-            _mm_storel_epi64((__m128i *)(void *)(tr + k), _mm_shuffle_epi8(rd, c0));
-            _mm_storel_epi64((__m128i *)(void *)(ta + k), _mm_shuffle_epi8(ad, c0));
-            k += (uint32_t)_mm_popcnt_u32(m0);
-            _mm_storel_epi64((__m128i *)(void *)(tp + k), _mm_shuffle_epi8(_mm_srli_si128(pd, 8), c1));
-            _mm_storel_epi64((__m128i *)(void *)(tr + k), _mm_shuffle_epi8(_mm_srli_si128(rd, 8), c1));
-            _mm_storel_epi64((__m128i *)(void *)(ta + k), _mm_shuffle_epi8(_mm_srli_si128(ad, 8), c1));
-            k += (uint32_t)_mm_popcnt_u32(m1);
+            const __m128i pd =
+                h ? _mm256_extracti128_si256(pv, 1) : _mm256_castsi256_si128(pv);
+            const __m128i rd =
+                h ? _mm256_extracti128_si256(r, 1) : _mm256_castsi256_si128(r);
+            const __m128i ad =
+                h ? _mm256_extracti128_si256(v, 1) : _mm256_castsi256_si128(v);
+            const unsigned m0 = (m >> (16u * h)) & 0xFFu;
+            const unsigned m1 = (m >> (16u * h + 8u)) & 0xFFu;
+
+            TILE_CL_CMP3(tp, tr, ta, k, pd, rd, ad, m0);
+            k = (uint16_t)(k + _mm_popcnt_u32(m0));
+            TILE_CL_CMP3(tp, tr, ta, k, _mm_srli_si128(pd, 8),
+                         _mm_srli_si128(rd, 8), _mm_srli_si128(ad, 8), m1);
+            k = (uint16_t)(k + _mm_popcnt_u32(m1));
         }
     }
-
-    memcpy(cl->at_pred, tp, k);
-    memcpy(cl->res_at_exc, tr, k);
-    memcpy(cl->act_at_exc, ta, k);
 
     /* distinct-residual set. cl->seen is the complete set up to the point
      * where it is complete enough: word w bit j of cl->seen is "value
@@ -1077,7 +1106,7 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
  * seg_pos >= 16: it makes the scalar `d < s` fallback to `init`
  * unreachable. This function therefore requires a == seg_base + seg_pos,
  * which is how zpse_segment_encode calls it (and the only caller). */
-static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
+static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
                                               const uint8_t *actual,
                                               uint16_t nt,
                                               uint8_t predictor_id, int fam,
@@ -1110,12 +1139,19 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
      * input and the 304-byte staging copy disappears. `stg` stays for the
      * other families and for short tiles, whose records are not the hot
      * case: a segment's tiles are all full except its last. */
-    const int direct = (fam == TILE_FAM_CONST &&
-                        nt == (uint16_t)ZPSE_MAX_TILE_LEN);
+    const int direct =
+        (nt == (uint16_t)ZPSE_MAX_TILE_LEN &&
+         (fam == TILE_FAM_CONST ||
+          /* STRIDE reads only bytes at or before the tile, and a tile that
+           * starts 16 bytes into the plane has all of them in place, so a
+           * full STRIDE tile is read directly too: the 288-byte staging
+           * copy below (16 head + 256 body + pad) is not needed for the
+           * predictors the encoder actually screens, which is where most
+           * of the tiles of a dense plane are classified. */
+          (fam == TILE_FAM_STRIDE && seg_pos >= 16u)));
     const uint8_t *tile_bytes;
 
     (void)seg_base;
-    (void)seg_pos;
     (void)initial_literal;
 
     if (fam == TILE_FAM_CONST) {
@@ -1154,8 +1190,11 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
             if (fam == TILE_FAM_CONST) {
                 pv = cvec;
             } else if (fam == TILE_FAM_STRIDE) {
+                /* tile_bytes has the 16 preceding plane bytes right before
+                 * it in the staged case, so this one expression covers both
+                 * the in-place and the staged read. */
                 pv = _mm256_loadu_si256(
-                    (const __m256i *)(const void *)(stg + 16u + p - s));
+                    (const __m256i *)(const void *)(tile_bytes + p - s));
             } else {
                 const __m256i h8 = _mm256_loadu_si256(
                     (const __m256i *)(const void *)(stg + 8u + p));
@@ -1186,7 +1225,7 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                 pv = cvec;
             } else if (fam == TILE_FAM_STRIDE) {
                 pv = _mm256_loadu_si256(
-                    (const __m256i *)(const void *)(stg + 16u + p - s));
+                    (const __m256i *)(const void *)(tile_bytes + p - s));
             } else {
                 const __m256i h8 = _mm256_loadu_si256(
                     (const __m256i *)(const void *)(stg + 8u + p));
@@ -1272,8 +1311,15 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
                 while (w != 0u) {
                     uint16_t pos = (uint16_t)(wi * 32u + tile_ctz32(w));
 
-                    TILE_TAKE_EXC_MASKED(pos, stg[16u + (uint32_t)pos - s],
-                                         stg[16u + (uint32_t)pos]);
+                    /* tile_bytes, not stg: a full STRIDE tile is read in
+                     * place (see `direct`), where stg holds nothing. The
+                     * signed offset keeps a position below the stride
+                     * reading before the tile, which is the staged head or
+                     * real plane bytes. */
+                    TILE_TAKE_EXC_MASKED(pos,
+                                         tile_bytes[(ptrdiff_t)pos -
+                                                    (ptrdiff_t)s],
+                                         tile_bytes[pos]);
                     w &= w - 1u;
                 }
             }
@@ -1347,7 +1393,7 @@ static ZPSE_TILE_AVX2 void tile_classify_avx2(ZpseLaneState *lanes,
         uint16_t nu = 0;
 
         for (i = 0; i < 8u; i++)
-            nu = (uint16_t)(nu + (uint16_t)tile_popcount32(cl->seen[i]));
+            nu = (uint16_t)(nu + (uint16_t)_mm_popcnt_u32(cl->seen[i]));
         if (nu > (uint16_t)ZPSE_TILE_NU_CAP) {
             tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP);
             nu = (uint16_t)ZPSE_TILE_NU_CAP;
@@ -2614,6 +2660,16 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         }
     }
     memset(w + total + 1u, 0, 32u);
+
+    /* An all-exception tile (a palette or noise plane under STRIDE_1) would
+     * look like the one mask the fill has nothing to do for -- the rank of
+     * position p is p + 1, so out is the exception values end to end. The
+     * obvious shortcut, a copy in place of the ladder-and-shuffle kernel,
+     * was measured and is a loss at every width tried (8-byte steps,
+     * 32-byte vectors, even memcpy): that kernel is ~25 instructions per 32
+     * positions and already runs out of the same registers the values
+     * arrive in, while a 256-byte copy has to go through the store buffer.
+     * So the fill runs for every mask and this case needs no branch. */
 
 #if ZPSE_TILE_HAVE_AVX2
     if ((uint32_t)nt >= 16u &&
