@@ -125,10 +125,10 @@ enumerative (combinadic) rank and their residuals through an exclusion map.
 Seven mask modes and five residual modes are chosen per tile by a priced
 search.
 
-The five transforms are identity, delta-8, xor-8, byte-transpose of width
-2/4/8/16, and delta-plus-transpose; a stride variant also exists for
-interleaved data. A plane that is one value throughout has a dense form that
-codes 4 KiB in twelve bytes.
+The transforms are identity, delta-8, xor-8, byte-transpose of width 2/4/8/16,
+delta-plus-transpose at the same widths, and a stride variant for interleaved
+data. A plane that is one value throughout has a dense form that codes 4 KiB
+in twelve bytes.
 
 Everything is bounds-checked on the way in, and the checks are the interesting
 half of the decoder: every length, count, mode and rank is validated before
