@@ -247,16 +247,16 @@ absolute numbers move with the machine and the clock, the shape does not.
 
 | pattern | ratio | encoded bytes | encode GB/s | decode GB/s |
 | --- | --- | --- | --- | --- |
-| zeros | 0.004 | 248 | 36.2 | 55.7 |
-| incr | 0.040 | 2619 | 5.96 | 10.2 |
-| random | 1.000 | 65568 | 3.17 | 20.4 |
-| sparse | 0.060 | 3962 | 2.03 | 6.34 |
-| strided | 0.040 | 2624 | 3.94 | 10.1 |
-| const5A | 0.004 | 248 | 36.1 | 53.9 |
-| alt00FF | 0.009 | 608 | 7.16 | 10.1 |
-| sawtooth | 0.116 | 7584 | 2.97 | 6.75 |
-| lowentropy | 0.508 | 33288 | 2.07 | 12.8 |
-| sparse2 | 0.019 | 1255 | 4.55 | 8.81 |
+| zeros | 0.004 | 248 | 36.5 | 55.2 |
+| incr | 0.040 | 2619 | 6.39 | 10.8 |
+| random | 1.000 | 65568 | 3.92 | 20.6 |
+| sparse | 0.060 | 3962 | 2.15 | 6.49 |
+| strided | 0.040 | 2624 | 3.77 | 10.7 |
+| const5A | 0.004 | 248 | 36.6 | 55.0 |
+| alt00FF | 0.009 | 608 | 7.12 | 9.56 |
+| sawtooth | 0.116 | 7584 | 3.46 | 7.13 |
+| lowentropy | 0.508 | 33288 | 2.34 | 18.3 |
+| sparse2 | 0.019 | 1255 | 4.88 | 8.63 |
 
 The table is one session (both columns re-measured together) and the deltas
 below are paired measurements, so the absolute columns move between machines
@@ -1711,6 +1711,50 @@ variant of that decoder threaded through `zpse_dense_decode`,
 ceiling is the same 8 bytes per cycle the separate pass already runs at,
 so the win is the overlap (up to ~1.2 us, ~25 % of the row), not the
 hashing. It is the next thing to try here, and it needs that plumbing.
+
+### Ranking candidates on a quarter of the proxy window
+
+Before any trial runs, `zpse_block_proxy` ranks the transform candidates so
+the sweep can drop the ones a 6% margin already rules out. On the ten bench
+rows it was the second largest cost of an encode after the trials
+themselves -- 13.5k to 23k cycles of a 64 KiB block, 13-25% of it, against
+the 8.5k of CRC the block has to pay anyway.
+
+The proxy prices a plane's tiles with `seg_prescreen` alone (no classify, no
+pack), and only the ORDER of two candidates' sums is ever read, so it never
+needed every tile: it sampled every second one and priced the skipped ones
+at the sample's average. The stride is now four for a full 16 KiB window (64
+tiles, 16 sampled) and stays two below that. Measured with rdtsc inside an
+instrumented block encode, best of five rounds: proxy 18.0k -> 11.5k cycles.
+
+Paired binaries, alternating order, best of three rounds, encode GB/s:
+
+| pattern | before | after |
+| --- | --- | --- |
+| `incr` | 5.56 | 6.39 |
+| `random` | 3.57 | 3.91 |
+| `sparse` | 2.04 | 2.14 |
+| `strided` | 3.63 | 3.77 |
+| `sawtooth` | 3.23 | 3.41 |
+| `lowentropy` | 2.04 | 2.31 |
+| `sparse2` | 4.47 | 4.82 |
+
+`zeros`, `const5A` and `alt00FF` are unchanged (they settle in one trial
+before the proxy matters), and the decode column moves by nothing: the
+change is entirely in the ranking, which is encoder-side.
+
+No byte moves. All ten `clen` values, every one of the 768 pinned lengths in
+`tests/test_sizes.c`, and the 2,718-case fuzz corpus are unchanged -- the
+fuzz total is 9,267,955 bytes either way, with the same digest.
+
+The window gate is a measurement, not caution: at a stride of four on every
+plane the size gate caught three 8 KiB cases of the corpus that grew by 281
+bytes each, because an 8 KiB block is proxied by eight tiles that way, and
+eight tiles of evidence is not enough to rank candidates on. Only a full
+window, where a quarter is still sixteen tiles, takes the coarser sample.
+
+(Also here: `tests/tools/enc_profile.c` was missing `<time.h>` and did not
+build outside MSVC. That is the tool this section's numbers came from.)
 
 ## License
 
