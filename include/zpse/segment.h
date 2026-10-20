@@ -46,12 +46,15 @@ int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n);
  * trial that cannot beat the raw envelope anyway, and a trial it abandons
  * is reported exactly like one the budget stopped.
  *
- * Two shapes are written in the dense form (Sec. 6.3), and only when that
+ * Three shapes are written in the dense form (Sec. 6.3), and only when that
  * is strictly smaller than the tile records they replace: a plane that is
  * one byte value end to end (12 bytes per 4 KiB against 10 per 256-byte
- * tile, so the last tile of a short plane keeps its record), and a plane
- * of at most sixteen distinct byte values (one palette stream per 4 KiB,
- * ALL_EXCEPTION mask, no prediction to reconstruct). The dense records
+ * tile, so the last tile of a short plane keeps its record), a plane of at
+ * most sixteen distinct byte values (one palette stream per 4 KiB,
+ * ALL_EXCEPTION mask, no prediction to reconstruct), and a plane with no
+ * structure to predict (ALL_EXCEPTION + RAW_ACTUAL, i.e. the plane stored
+ * as its own residual, which is what the tile path would spend ten bytes of
+ * framing and a predictor search per 256 bytes to do). The dense records
  * reconstruct exactly the plane they replace, tile_count is 1, and every
  * other plane's bytes are unchanged. */
 /* Prescreen-only size estimate of one transformed plane, used to rank (and
