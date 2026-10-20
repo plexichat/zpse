@@ -716,6 +716,41 @@ static ZPSE_T_AVX2 void zpse_prefix_stream_avx2(uint8_t *dst, const uint8_t *in,
 
 #endif /* ZPSE_T_HAVE_AVX2 */
 
+/* In-place delta/xor over one contiguous plane: p[j] = p[j] - p[j-1]
+ * (delta) or p[j] ^ p[j-1] (xor), with p[-1] == seed. The stride-16
+ * gather the transposed delta used to do per byte alongside the chain is
+ * what made it slow; the plane is contiguous by the time this runs, so a
+ * 16-byte step only needs the previous chunk's last byte as the incoming
+ * "prv[0]". That byte is read before the store overwrites it. */
+static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
+                                     int delta)
+{
+    uint8_t prev = seed;
+    uint32_t q;
+
+#if ZPSE_T_HAVE_SSE2
+    for (q = 0; (size_t)q + 16u <= (size_t)n; q += 16u) {
+        __m128i cur = _mm_loadu_si128((const __m128i *)(const void *)(p + q));
+        __m128i prv = _mm_or_si128(_mm_slli_si128(cur, 1),
+                                   _mm_cvtsi32_si128((int)prev));
+        uint8_t carry = p[q + 15u];
+
+        _mm_storeu_si128((__m128i *)(void *)(p + q),
+                         delta ? _mm_sub_epi8(cur, prv)
+                               : _mm_xor_si128(cur, prv));
+        prev = carry;
+    }
+#else
+    q = 0;
+#endif /* ZPSE_T_HAVE_SSE2 */
+    for (; q < n; q++) {
+        uint8_t raw = p[q];
+
+        p[q] = delta ? (uint8_t)(raw - prev) : (uint8_t)(raw ^ prev);
+        prev = raw;
+    }
+}
+
 static int zpse_valid_count(uint8_t v)
 {
     return (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) ? 1 : 0;
@@ -945,7 +980,7 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
         }
         return PSE_OK;
     }
-    if (w == 16u && !delta && !xorr) {
+    if (w == 16u) {
         uint32_t rows = seg_lens[0];
         uint32_t g;
 
@@ -996,6 +1031,17 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
 
             for (j = g * 16u; j < len; j++) {
                 segs[s][j] = in[(uint32_t)s + j * 16u];
+            }
+        }
+        /* The delta/xor chain runs on the contiguous plane the transpose
+         * just produced, not on the stride-16 gather: same bytes (each
+         * plane is one byte position across consecutive records, chain and
+         * seed included), but 16 bytes per step instead of one strided load
+         * per byte. */
+        if (delta || xorr) {
+            for (s = 0; s < w; s++) {
+                zpse_plane_chain_inplace(segs[s], seg_lens[s],
+                                         meta->seeds[s], delta);
             }
         }
         return PSE_OK;
@@ -1228,6 +1274,80 @@ int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
         return PSE_OK;
 #endif /* ZPSE_T_HAVE_SSE2 */
     }
+#if ZPSE_T_HAVE_SSE2
+    /* The 16-wide delta/xor inverse: the chain is what the byte-at-a-time
+     * loop below serialises, so it is done 16 rows at a time inside
+     * registers -- an inclusive byte prefix sum (log2(16) shift-adds) or
+     * prefix xor per plane -- and the 16 planes are then interleaved by the
+     * same 16x16 transpose the non-delta inverse uses. The carry that crosses
+     * a group is the chain's own last byte, exactly the value the scalar loop
+     * carries, so the two produce identical output. */
+    if (w == 16u) {
+        uint32_t rows = seg_lens[0];
+        uint32_t g;
+        uint8_t pv[16];
+
+        for (s = 1; s < w; s++) {
+            if (seg_lens[s] < rows) {
+                rows = seg_lens[s];
+            }
+        }
+        for (s = 0; s < w; s++) {
+            pv[s] = prev[s];
+        }
+        for (g = 0; (g + 1u) * 16u <= rows; g++) {
+            __m128i r[16];
+            unsigned t;
+
+            for (t = 0; t < 16u; t++) {
+                __m128i v = _mm_loadu_si128(
+                    (const __m128i *)(const void *)(segs[t] + (size_t)g * 16u));
+                uint8_t add;
+
+                if (delta) {
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
+                } else {
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 1));
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 2));
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 4));
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 8));
+                }
+                /* Byte 15 of the prefix is the whole chunk's total (or xor),
+                 * which is what the next group's carry becomes. */
+                add = (uint8_t)_mm_cvtsi128_si32(_mm_srli_si128(v, 15));
+                v = delta ? _mm_add_epi8(v, _mm_set1_epi8((char)pv[t]))
+                          : _mm_xor_si128(v, _mm_set1_epi8((char)pv[t]));
+                pv[t] = (uint8_t)(delta ? (uint8_t)(pv[t] + add)
+                                        : (uint8_t)(pv[t] ^ add));
+                r[t] = v;
+            }
+            zpse_t16x16(r);
+            for (t = 0; t < 16u; t++) {
+                _mm_storeu_si128(
+                    (__m128i *)(void *)(out + (size_t)g * 256u +
+                                        (size_t)t * 16u),
+                    r[t]);
+            }
+        }
+        for (s = 0; s < w; s++) {
+            const uint8_t *src = segs[s];
+            uint32_t len = seg_lens[s];
+            uint8_t p = pv[s];
+            uint32_t jj;
+
+            for (jj = g * 16u; jj < len; jj++) {
+                uint8_t e = src[jj];
+                uint8_t d = delta ? (uint8_t)(e + p) : (uint8_t)(e ^ p);
+                p = d;
+                out[(uint32_t)s + jj * 16u] = d;
+            }
+        }
+        return PSE_OK;
+    }
+#endif /* ZPSE_T_HAVE_SSE2 */
     for (s = 0; s < w; s++) {
         const uint8_t *src = segs[s];
         uint32_t len = seg_lens[s];
