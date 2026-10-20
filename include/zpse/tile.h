@@ -110,6 +110,47 @@ int zpse_tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                        const uint8_t *seg_base, uint32_t seg_pos,
                        ZpseTileClass *cl);
 
+/* Same classification without cl->at_pred, the predictions at the
+ * exception positions. It is the one product the encoder usually does not
+ * read: a packed record takes its bytes from cl->res_at_exc or
+ * cl->act_at_exc, and the predictions only for PALETTE_BITS,
+ * PACKED_BASE_M and SIGNED_DELTA. Measured over the eighteen corpora,
+ * 82% of the tiles the encoder searches pack as RAW_ACTUAL, and the
+ * at_pred compaction is ~66 cycles of a ~320-cycle exception pass, so
+ * skipping it is worth ~13% of a classify on a dense tile.
+ *
+ * Everything else -- words, k, constant_C, res_at_exc, act_at_exc, seen,
+ * nu, rmax/dmin/dmax and the lane state -- is exactly what
+ * zpse_tile_classify produces. at_pred is left untouched (not zeroed);
+ * a caller that packs a mode which reads it must first call
+ * zpse_tile_fill_at_pred_reset. Adding an entry point rather than
+ * changing the existing one keeps zpse_tile_classify's contract (and
+ * zpse_tile_encode, which passes through arbitrary modes) intact. */
+int zpse_tile_classify_lean(ZpseLaneState *lanes, const uint8_t *actual,
+                            uint16_t nt, uint8_t predictor_id,
+                            uint8_t initial_literal, int tile_reset,
+                            const uint8_t *seg_base, uint32_t seg_pos,
+                            ZpseTileClass *cl);
+
+/* Write cl->at_pred for a classification from zpse_tile_classify_lean: the
+ * prediction at every exception position, ascending, byte for byte what
+ * zpse_tile_classify would have written.
+ *
+ * Valid only for a tile classified with tile_reset != 0, where every lane
+ * history starts at `initial_literal`; that is the discipline
+ * zpse_segment_encode uses for every tile it writes (the per-tile reset
+ * bit is always 1). It is a separate call so the cost lands only on the
+ * tiles whose packed mode reads the predictions.
+ *
+ * Predictors 0, 1, 2, 5, 6, 7, 8, 9, 10 and 11 are supported -- the ten
+ * the encoder classifies. ORDER1/ORDER2 return PSE_BAD_PREDICTOR: they
+ * would have to rebuild their tables byte by byte, and the encoder never
+ * asks for them. */
+int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
+                                 uint16_t nt, const uint8_t *seg_base,
+                                 uint32_t seg_pos, uint8_t initial_literal,
+                                 ZpseTileClass *cl);
+
 /* Pack a classification into a wire record for one (mask_mode,
  * res_mode) pair. Returns record bytes written (excl. the u16 prefix)
  * or negative status. Does not touch lane state. */

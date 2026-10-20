@@ -2495,11 +2495,19 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
             uint8_t rr;
             int n;
 
-            if (zpse_tile_classify(lanes, actual, nt, pred, initial_literal, 1,
-                                   plane, seg_pos, &cl) != PSE_OK) {
+            if (zpse_tile_classify_lean(lanes, actual, nt, pred,
+                                        initial_literal, 1, plane, seg_pos,
+                                        &cl) != PSE_OK) {
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
+            if (rr == (uint8_t)ZPSE_R_PALETTE_BITS ||
+                rr == (uint8_t)ZPSE_R_PACKED_BASE_M ||
+                rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+                (void)zpse_tile_fill_at_pred_reset(pred, actual, nt, plane,
+                                                   seg_pos, initial_literal,
+                                                   &cl);
+            }
             n = zpse_tile_pack(pred, &cl, nt, actual, mm, rr, 1, e->hist,
                                4096u, e->comb);
             if (n < 8) {
@@ -3189,13 +3197,21 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             ZpseTileClass cl;
             uint8_t mm;
             uint8_t rr;
-            int rc = zpse_tile_classify(lanes, actual, nt, pred,
-                                        initial_literal, 1, plane, seg_pos,
-                                        &cl);
+            int rc = zpse_tile_classify_lean(lanes, actual, nt, pred,
+                                             initial_literal, 1, plane,
+                                             seg_pos, &cl);
             if (rc != PSE_OK) {
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
+            /* Only the modes that read the predictions pay for them. */
+            if (rr == (uint8_t)ZPSE_R_PALETTE_BITS ||
+                rr == (uint8_t)ZPSE_R_PACKED_BASE_M ||
+                rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+                (void)zpse_tile_fill_at_pred_reset(pred, actual, nt, plane,
+                                                   seg_pos, initial_literal,
+                                                   &cl);
+            }
 #if defined(ZPSE_TRIAL_STATS)
             zpse_stats_modes[((uint32_t)mm << 3) | (uint32_t)rr]++;
 #endif
