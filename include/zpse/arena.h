@@ -90,6 +90,11 @@ typedef struct ZpseEncoder {
     uint8_t *comb;        /* 8 KiB */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
+    /* Which optional fields this encoder emits (ZPSE_ENC_* in
+     * constants.h). The one-shot API leaves it 0, i.e. no payload
+     * checksum; zpse_compress_block_ex / zpse_compress_frame_ex set it
+     * from their flags argument after zpse_encoder_init. */
+    uint32_t enc_flags;
     /* Trial-level progress for zpse_segment_encode's flat abort: the length
      * of the leading run of tiles whose record cost at least as much as the
      * bytes it codes, and the flag that ends that run (set by the first tile

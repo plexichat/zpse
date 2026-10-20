@@ -70,9 +70,18 @@ int main(void) {
         int rc;
 
         memset(in, 0x5A, sizeof in);
+        /* The payload CRC is off by default (LZ4-style), so the arithmetic
+         * CRC path -- and its rejection -- is exercised through the opt-in.
+         * The default stream must not carry the flag at all. */
         rc = zpse_compress_block(in, sizeof in, comp, sizeof comp, &cl, 0, 1,
                                  ea);
         CHECK(rc == PSE_OK, "const block encodes (rc=%d)", rc);
+        CHECK(zpse_block_header_parse(&h, comp, cl) == 0 &&
+              (h.block_flags & ZPSE_B_CRC) == 0,
+              "default block carries no payload CRC");
+        rc = zpse_compress_block_ex(in, sizeof in, comp, sizeof comp, &cl, 0,
+                                    1, ZPSE_ENC_CHECKSUM, ea);
+        CHECK(rc == PSE_OK, "const block encodes with a CRC (rc=%d)", rc);
         CHECK(cl < sizeof comp && zpse_block_header_parse(&h, comp, cl) == 0,
               "const block header parses");
         CHECK((h.block_flags & ZPSE_B_CRC) != 0 &&

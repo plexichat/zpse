@@ -42,6 +42,15 @@
 #define ZPSE_B_HAS_META         (UINT8_C(1) << 4)
 #define ZPSE_B_RESERVED_MASK    (UINT8_C(0xE0))
 
+/* Encoder options (API): which optional fields a stream carries. The
+ * payload CRC32-C is optional in the format (block flag ZPSE_B_CRC,
+ * Sec. 4), and it is OFF by default -- the same choice LZ4 makes for its
+ * frame checksum. Emitting it costs the encoder a pass over the whole
+ * block it just produced, and costing the DECODER a pass over an output
+ * it just computed, so a stream that does not ask for it does not pay.
+ * Every decoder here verifies it whenever a stream carries it. */
+#define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
+
 /* Segment flags (Sec. 6.1). Only 0x01 is legal in v1. */
 #define ZPSE_S_LEN_PREFIX       (UINT8_C(1) << 0)
 #define ZPSE_S_DIR_BIT          (UINT8_C(1) << 1)

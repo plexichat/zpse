@@ -19,6 +19,17 @@ int zpse_compress_block(const uint8_t *in, uint32_t n,
                         uint32_t seq, int is_last,
                         void *enc_arena_384k)
 {
+    /* The default stream carries no optional fields: no payload CRC. */
+    return zpse_compress_block_ex(in, n, out, out_cap, out_len_out, seq,
+                                  is_last, 0u, enc_arena_384k);
+}
+
+int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
+                           uint8_t *out, uint32_t out_cap,
+                           uint32_t *out_len_out,
+                           uint32_t seq, int is_last, uint32_t enc_flags,
+                           void *enc_arena_384k)
+{
     ZpseEncoder enc;
     int rc;
 
@@ -28,10 +39,14 @@ int zpse_compress_block(const uint8_t *in, uint32_t n,
     if (n == 0 || n > 65536u) {
         return PSE_BAD_BLOCK_SIZE;
     }
+    if ((enc_flags & ~(uint32_t)ZPSE_ENC_CHECKSUM) != 0u) {
+        return PSE_BAD_ARG;
+    }
     rc = zpse_encoder_init(&enc, enc_arena_384k, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
     }
+    enc.enc_flags = enc_flags;
     rc = zpse_block_encode(&enc, in, n, seq, is_last, out, out_cap);
     if (rc < 0) {
         return rc;
@@ -71,6 +86,17 @@ int zpse_compress_frame(const uint8_t *in, size_t n,
                         uint32_t nominal_block_size,
                         void *enc_arena_384k)
 {
+    /* The default stream carries no optional fields: no payload CRC. */
+    return zpse_compress_frame_ex(in, n, out, out_cap, out_len_out,
+                                  nominal_block_size, 0u, enc_arena_384k);
+}
+
+int zpse_compress_frame_ex(const uint8_t *in, size_t n,
+                           uint8_t *out, size_t out_cap,
+                           size_t *out_len_out,
+                           uint32_t nominal_block_size, uint32_t enc_flags,
+                           void *enc_arena_384k)
+{
     ZpseEncoder enc;
     int rc;
 
@@ -83,10 +109,14 @@ int zpse_compress_frame(const uint8_t *in, size_t n,
     if (nominal_block_size == 0 || nominal_block_size > 65536u) {
         return PSE_BAD_ARG;
     }
+    if ((enc_flags & ~(uint32_t)ZPSE_ENC_CHECKSUM) != 0u) {
+        return PSE_BAD_ARG;
+    }
     rc = zpse_encoder_init(&enc, enc_arena_384k, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
     }
+    enc.enc_flags = enc_flags;
     rc = zpse_frame_encode(&enc, in, n, nominal_block_size,
                            out, out_cap, out_len_out);
     if (rc < 0) {

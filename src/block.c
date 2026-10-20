@@ -639,7 +639,9 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_store_u32le(ent + 4, seg_sizes[s]);
     }
 
-    flags = (uint8_t)(ZPSE_B_RESET | ZPSE_B_CRC);
+    flags = (uint8_t)(ZPSE_B_RESET |
+                      (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+                           ? ZPSE_B_CRC : 0u));
     if (meta_len > 0) {
         flags |= ZPSE_B_HAS_META;
     }
@@ -1296,11 +1298,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * at the first differing byte, so a block that is not constant pays one
      * compare and writes no pointer. */
     e->const_plane = 0;
-    if (zpse_segment_plane_is_const(in, n)) {
-        in_crc = zpse_crc32c_repeat(in[0], (size_t)n);
-        e->const_plane = in;
+    if ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u) {
+        if (zpse_segment_plane_is_const(in, n)) {
+            in_crc = zpse_crc32c_repeat(in[0], (size_t)n);
+            e->const_plane = in;
+        } else {
+            in_crc = zpse_crc32c(in, n);
+        }
     } else {
-        in_crc = zpse_crc32c(in, n);
+        /* No checksum asked for: nothing reads the field, so it is left
+         * 0 and the pass over the block is not paid at all. */
+        in_crc = 0u;
     }
 
     /* Attempt order: identity first unless the sample says DELTA8's plane
@@ -1668,7 +1676,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n) {
         uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n;
         ZpseBlockHeader h;
-        uint8_t flags = (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET | ZPSE_B_CRC);
+        uint8_t flags = (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET |
+                                  (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+                                       ? ZPSE_B_CRC : 0u));
         uint32_t decoded_crc;
         if (is_last) {
             flags |= ZPSE_B_LAST;
