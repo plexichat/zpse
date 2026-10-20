@@ -23,7 +23,8 @@
 # third-party tool is skipped, not an error.
 set -uo pipefail
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+# Two levels up: this script lives in tests/benchmarks/.
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
 inc="$repo/include"
 unity="$repo/src/zpse_unity.c"
 SIZE="${SIZE:-4194304}"
