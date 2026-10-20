@@ -79,14 +79,18 @@ typedef struct ZpseTileClass {
     uint8_t  dmax;
     uint32_t seen[8];      /* 256-bit set of exclusion residuals seen, cut
                             * to its lowest popcount(seen) == nu bits */
-    uint8_t  at_pred[256]; /* predictions at exception positions, ascending */
-    uint8_t  res_at_exc[256]; /* exclusion residuals at those positions:
+    /* The three per-exception arrays hold up to 256 entries and are written
+     * by 8-byte stores that may run up to 7 bytes past the last real entry
+     * (the dense compaction and tile_gather_act_avx2 both store a whole
+     * 64-bit group at a time), so each has 8 bytes of slack. */
+    uint8_t  at_pred[264]; /* predictions at exception positions, ascending */
+    uint8_t  res_at_exc[264]; /* exclusion residuals at those positions:
                                * exclusion_forward(actual[p], at_pred[j]).
                                * Filled by classify (and by tile_encode),
                                * so the packers read them instead of
                                * walking the tile a second time. */
     uint8_t  act_valid;    /* 1 iff act_at_exc[0..k) was filled by classify */
-    uint8_t  act_at_exc[256]; /* actual[p] at the exception positions,
+    uint8_t  act_at_exc[264]; /* actual[p] at the exception positions,
                                * ascending: the RAW_ACTUAL residual payload,
                                * produced while classifying so the packer
                                * does not have to gather it again. */

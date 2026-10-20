@@ -225,6 +225,14 @@ int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
     if (nt > 256)
         nt = 256;
 #if ZPSE_MASK_HAVE_SIMD
+    /* A full 256-position mask needs no trimming, so the copy, the
+     * zero-fill and the final AND below are all no-ops for it -- and a full
+     * tile is what every dense shape has. Counting the caller's words
+     * directly is one 32-byte read instead of a read, a copy and two
+     * writes; this runs once per packed tile (the encoder re-checks the
+     * count it is about to size the mask from). */
+    if (nt == 256u)
+        return zpse_mask_popcount256_sse2(words);
     {
         /* Trim the bits at or above nt in a local copy (the caller's
          * array is read-only here), then one vector pass counts the lot:
