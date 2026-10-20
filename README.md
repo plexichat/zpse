@@ -1756,6 +1756,57 @@ window, where a quarter is still sixteen tiles, takes the coarser sample.
 (Also here: `tests/tools/enc_profile.c` was missing `<time.h>` and did not
 build outside MSVC. That is the tool this section's numbers came from.)
 
+### Palette16: where its 1375 cycles a tile go, and two changes that measured worse
+
+`palette16` (the corpus's 16-value shuffled shape) is the slowest row in the
+corpus by a factor of five: 352k cycles per 64 KiB block, 1375 a tile, against
+`random`'s 65k. Decomposing one block with rdtsc inside the instrumented
+encoder (cycles a tile, 256 tiles, brackets included so the parts read high
+by a constant):
+
+| stage | cycles/tile |
+| --- | ---: |
+| prescreen | 145 |
+| classify | 606 |
+| \ \ chunks (the 8 prediction/compact passes) | 246 |
+| \ \ distinct-residual set (`seen`) | 253 |
+| mode search | 113 |
+| pack | 390 |
+| \ \ mask | 40 |
+| \ \ mode-3 base-M packer | 270 |
+
+The residuals of such a tile take fifteen values, so the winning residual mode
+is `PACKED_BASE_M` with M = 15 -- seven digits to a 32-bit word -- and the
+mode-3 packer's six-group Horner batch covers 18 of the tile's ~23 groups.
+
+Two changes aimed at the two biggest items measured worse and were reverted:
+
+**The `seen` pass (253 cycles).** It builds a 256-byte presence array by
+scattering one byte per residual, then folds it with eight 32-byte compares
+into the 256-bit set. Replacing that with the obvious word form --
+`seen[r >> 5] |= 1 << (r & 31)`, stopping as soon as the set holds the
+seventeen values the palette length needs, with no array and no fold -- reads
+like a clear win and is not one: 397k-399k cycles a block, **14% worse**. The
+scattered byte stores are independent and retire in parallel; the
+read-modify-write form puts a load-store dependency on a data-dependent
+address in every iteration, and the fold it replaces is eight loads and eight
+`movemask`s.
+
+**The mode-3 tail (five groups past the batch).** It packs those groups with
+the power-sum form, two multiplies a digit including a serial weight advance.
+Rewriting it as Horner chains, one multiply a digit, produced the same
+integers and measured 355k-371k cycles, **2-5% worse**: those five groups run
+one after another in the tail loop, so their "independent" chains do not
+overlap the way the six inside the batch do, and Horner trades two pipelined
+multiplies for one with a three-cycle latency on its dependent path.
+
+What is left is the real encoding work. The next thing worth trying here is
+the eight-lane form the *decoder* already uses: pack eight base-M groups at
+once with `vpmulld`, which needs the eight digits of a step in one vector.
+With a digit stride of seven bytes that transposition is the whole problem --
+AVX2 has no byte gather -- and `vpgatherdd` per step measured slower than the
+six-group batch when it was priced on paper.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
