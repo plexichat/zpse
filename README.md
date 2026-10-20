@@ -1807,6 +1807,74 @@ With a digit stride of seven bytes that transposition is the whole problem --
 AVX2 has no byte gather -- and `vpgatherdd` per step measured slower than the
 six-group batch when it was priced on paper.
 
+### Decode: a path census, and the constant tile without its mask
+
+The rung above cut `seg_tile_decode_const` down to the sequence the general
+entry point would have run. This one asked a different question first: which
+of the decoder's paths do the ten bench rows actually take? A census build
+(scratch, never committed) counts the branch each tile enters, and one
+64 KiB block per row says more than the GB/s table did:
+
+| row | segment record | per-tile path |
+| --- | --- | --- |
+| `zeros`, `const5A`, `lowentropy` | one dense record | no tile loop at all |
+| `random` | block RAW | fused copy + CRC |
+| `incr`, `strided` | all-hit run | 254 tiles batched, 1 general |
+| `alt00FF` | 16 dense segments | no tile loop at all |
+| `sparse` | 256 tile records | 256 x inline constant tile |
+| `sawtooth` | 256 tile records | 224 repeated-record copies, 32 lane tiles |
+| `sparse2` | 15 dense + 1 tiled | 16 constant, 3 general |
+
+So the slow rows split cleanly: `sparse` is 256 constant tiles, `sawtooth`
+is repeated copies plus 32 lane reconstructions, and everything else already
+runs through a batched or dense path. Timing the constant path in isolation
+over its real records (a copy of `seg_tile_decode_const` with each stage
+switchable) gives, per tile: 13 cycles of header + validation, ~16 mask, ~16
+residual, ~26 fill + scatter + history, ~23 entry and dispatch, 95 total.
+Two of those are the library's: `memset(dst, c, 256)` measured 43 cycles here
+against 8 for sixteen 16-byte stores, because a runtime `memset` is a call or
+a `rep stosb` whose start-up dwarfs 256 bytes.
+
+**The sparse mask modes do not need a mask** (`src/segment.c`). `SPARSE_U8`
+is K position bytes and `SPARSE_GAPS` is K gaps: both *are* the ascending
+exception list, and `EXCLUSION_U8`/`RAW_ACTUAL` are one byte per exception.
+Materialising the 8-word mask from them and walking it back with `ctz` costs
+a 32-byte clear, a bit-walk per exception and two calls, which on a plane
+with K of ~3 in 256 is most of what a tile costs. The constant path now
+decodes positions into a K-byte array and resolves each exception byte
+straight from the payload, with the same checks `zpse_mask_decode` and
+`zpse_residual_decode` make, in the same order, returning the same statuses;
+the fill is sixteen 16-byte stores (SSE2 is baseline on x86-64, so no
+dispatch). Every other mask or residual mode, every other predictor and
+every shape it cannot prove well formed still falls through to the general
+entry point, unchanged. `sparse` decode **6.66 -> 9.89 GB/s (+48%)**, best
+of four alternating pairs; `sparse2` +3%; the eight rows this path never
+reaches are flat.
+
+Two more changes were built, measured and dropped:
+
+**Batching runs of repeated records.** `sawtooth` copies 224 tiles from the
+tile before them, so a run is a period-256 fill and looks like the all-hit
+STRIDE batch. It is not worth it: each segment holds only 16 tiles, so the
+run is 13 long, and the doubling fill's `memcpy` calls cost about what the
+13 per-tile copies did -- measured flat in three paired runs (6.3-7.2 GB/s
+both ways), and slightly worse with an inline copy. Reverted whole.
+
+**Inline record compares.** Replacing the repeat test's `memcmp` with 16-byte
+SSE2 compares is a textbook call overhead, and it measured inside the noise
+of a throttling host (the same machine's `memcpy` ceiling moved from 65 to
+24 GB/s between runs during this round). Reverted rather than shipped on an
+unmeasurable difference.
+
+What the ablations say is left, per 64 KiB block: the payload CRC32-C costs
+8.2-8.5k cycles (0.13 cycles/byte, about 89% of what three `crc32` chains can
+issue on this Zen 3), and the inverse transform 10.7-11.8k for both `delta8`
+(a byte prefix scan) and the 16-segment transpose. Those two alone bound a
+non-identity block at ~14 GB/s, which is where `incr`, `strided` and
+`alt00FF` now sit (10.5-10.8). Getting past it means overlapping the CRC with
+the transform rather than speeding up either, and that is a different kind of
+change from the ones above.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
