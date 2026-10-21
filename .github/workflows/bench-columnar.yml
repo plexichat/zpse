@@ -66,6 +66,28 @@ jobs:
             echo
             cat /tmp/benchcol.txt
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: The encoder effort levels, side by side
+        run: |
+          # The four levels trade size for time, and the level axis is the
+          # last argument: 4 = FASTEST, 2 = FASTER, 0 = BALANCED,
+          # 6 = MAX (the effort is bits 1-2 of the flags). The same
+          # binary measures all of them, so the numbers are comparable
+          # with each other and with the table above.
+          for lvl in 4 2 0 6; do
+            echo "### enc_flags=$lvl"
+            taskset -c 0 /tmp/benchcol 8 2 all zpse 64 "$lvl" \
+              | grep -E '^\| (zpse|case)' | head -30
+          done | tee /tmp/benchcol-levels.txt
+          {
+            echo '### the four encoder levels, same corpora, same binary'
+            echo
+            echo 'FASTEST, FASTER, BALANCED and MAX, in that order: the'
+            echo 'fastest writes the biggest block and the deepest the'
+            echo 'smallest. The ratio column is input:output and the'
+            echo 'encode column is MB/s of uncompressed bytes.'
+            echo
+            cat /tmp/benchcol-levels.txt
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: What a purpose-built codec for each column achieves
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
@@ -89,6 +111,7 @@ jobs:
             /tmp/benchcol.txt
             /tmp/benchcol-16k.txt
             /tmp/benchcol-stats.txt
+            /tmp/benchcol-levels.txt
             /tmp/colref.txt
           if-no-files-found: error
           retention-days: 90
