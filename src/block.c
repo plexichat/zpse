@@ -1379,7 +1379,11 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_OUTPUT_OVERFLOW;
     }
     payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz);
+                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
+                             (e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
+                                     (uint32_t)ZPSE_ENC_FASTEST
+                                 ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                 : (uint32_t)ZPSE_LZ_HASH_BITS);
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }
