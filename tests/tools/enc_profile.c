@@ -22,14 +22,19 @@
  * Builds against the amalgamation like every other tool in this
  * directory. Exit 0.
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-/* clock_gettime is POSIX, and a strict -std=c11 hides it unless the
- * feature test macro says so. */
+/* clock_gettime is POSIX, and a strict -std=c11 hides it unless the feature
+ * test macro says so -- and it has to be said BEFORE the first system header,
+ * because those include features.h, which pins the feature set for the rest
+ * of the translation unit. Defining it after <stdio.h> left this file
+ * building here (where a host compiler defaults to GNU mode) and failing on
+ * the CI runner, whose C99/C11 builds do not: "implicit declaration of
+ * clock_gettime" and an undeclared CLOCK_MONOTONIC. */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h> /* struct timespec + clock_gettime on the POSIX path */
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
