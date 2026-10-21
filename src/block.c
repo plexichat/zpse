@@ -1590,15 +1590,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * candidate's fixed structural envelope -- block header, block
              * segment directory and one 16-byte segment header per plane --
              * taken back out. The sample can only see content; the envelope
-             * is a constant it cannot judge, and charging a width-16 shape
-             * 192 bytes of extra envelope is what let a width-4 shape win the
-             * ranking on a block whose best shape is a width-8 transpose
-             * ("spike every 256": 404 + 112 envelopes for the width-4
-             * against 436 + 176 for the width-8, so the totals said 404 < 436
-             * while the content said 292 > 260 -- and the block is 1419
-             * against 1211). Pruning compares content; the trial order below
-             * still compares totals, because that is what the block will
-             * cost. */
+             * is a constant it cannot judge, and it is what made the two
+             * orders disagree on "spike every 256": the width-4 shape prices
+             * at 404 + 112 bytes of envelope against 436 + 176 for the
+             * width-8, so totals said 404 < 436 while the content said
+             * 292 > 260 -- and the block is 1419 against 1211. A candidate
+             * whose content beats the winner's can therefore not be dropped
+             * on its total alone (see the prune below). */
             {
                 uint32_t env = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
                                16u * (uint32_t)scounts[ci];
@@ -1622,25 +1620,21 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * Anything that could not be priced is kept and sorts last (it has
              * no price to order by, and the sweep must not drop it).
              *
-             * The boundary is on the CONTENT price (see the comment where
-             * pc[] is filled in): the envelope is not a measurement, so it
-             * must not decide which shapes are worth a trial. The winner is
-             * always kept whatever its content price says, so the loss when
-             * the two orders disagree is one trial, not a worse block. */
-            uint32_t plimit = pc[pick] + (pc[pick] >> 4);
-            /* ...and a candidate whose content is that close but whose total
-             * is not is one the sample contradicts itself about: the only
-             * thing it can be charging is the envelope, which the trial will
-             * charge too. Half again the winner's total is the widest the
-             * two orders can disagree by a margin worth a trial. */
-            uint32_t wide = ex[pick] + (ex[pick] >> 1);
+             * Two things get a trial: a total within the margin, and a
+             * candidate whose CONTENT beats the winner's (see where pc[] is
+             * filled in). The second is the case the margin cannot cover --
+             * a shape whose envelope is what puts it behind -- and it costs
+             * one bounded trial only on blocks where the two orders actually
+             * disagree. The winner is always kept, so the loss there is a
+             * trial, never a different block. */
+            uint32_t limit = ex[pick] + (ex[pick] >> 4);
             int kept = 0;
             int win = -1;
             uint8_t win_idx = idx[pick];
 
             for (ci = 0; ci < ncand; ci++) {
-                if (ci == pick || pc[ci] == UINT32_MAX ||
-                    (pc[ci] <= plimit && ex[ci] <= wide)) {
+                if (ci == pick || ex[ci] == UINT32_MAX ||
+                    ex[ci] <= limit || pc[ci] < pc[pick]) {
                     if (ci == pick) {
                         win = kept;
                     }
