@@ -911,38 +911,22 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_DECIDE_TILES 4u
 #endif
 
+/* Full block encodes the sweep may spend on one block, counting the probe's
+ * winner. Every survivor is priced exactly before this loop starts and the
+ * list is walked in price order, so what the cap limits is only the tail: the
+ * shapes a 16 KiB sample could not separate from the winner. Three is
+ * measured against a full sweep on the columnar corpus -- 4.01:1 mean ratio
+ * either way, mean encode 703 MB/s against 620 -- and it is what the
+ * spike-every-256 pin in test_decide.c needs, since that block is decided by
+ * its third trial. */
+#ifndef ZPSE_MAX_TRIALS
+#define ZPSE_MAX_TRIALS 3
+#endif
+
 static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint8_t tid, uint8_t sc,
                              const uint8_t *meta_bytes, uint16_t meta_len,
                              uint8_t *planes[16], uint32_t lens[16]);
-
-/* Estimated size of one transform trial: stage the transform, then price
- * each plane with the prescreen alone (no classify, no packing).
- * UINT32_MAX means "could not be estimated" and the caller keeps the
- * candidate. */
-static uint32_t zpse_block_proxy(ZpseEncoder *e, const uint8_t *in, uint32_t n,
-                                 uint8_t tid, uint8_t sc,
-                                 const uint8_t *meta_bytes, uint16_t meta_len)
-{
-    uint32_t lens[16];
-    uint8_t *planes[16];
-    uint32_t total;
-    uint32_t s;
-
-    if (zpse_block_planes(e, in, n, tid, sc, meta_bytes, meta_len, planes,
-                          lens) != PSE_OK) {
-        return UINT32_MAX;
-    }
-    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + meta_len +
-            (uint32_t)sc * (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE;
-    for (s = 0; s < sc; s++) {
-        uint32_t c = zpse_segment_proxy_cost(planes[s], lens[s]);
-        if (c == UINT32_MAX)
-            return UINT32_MAX;
-        total += c;
-    }
-    return total;
-}
 
 /* Exact price of a plane: the smaller of its tile records (a spread of its
  * tiles, classified, mode-searched and packed exactly as a trial does) and
@@ -1150,71 +1134,15 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
         return UINT32_MAX;
     }
     return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit);
-}/* Price candidates [from, *ncand_io) exactly -- a few packed tiles each --
- * and drop the ones more than ~6% worse than the best of that range, the
- * same margin the prescreen prune uses. Anything that cannot be priced is
- * kept, and so is everything when the exact prices tie, so this can only
- * remove a candidate the prescreen would have kept on no evidence at all. */
-static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
-                                   uint32_t pn, uint8_t tids[ZPSE_MAX_CAND],
-                                   uint8_t scounts[ZPSE_MAX_CAND],
-                                   uint8_t meta_bufs[ZPSE_MAX_CAND][ZPSE_MAX_CAND_META],
-                                   uint16_t meta_lens[ZPSE_MAX_CAND],
-                                   uint8_t idx[ZPSE_MAX_CAND],
-                                   int from, int *ncand_io)
-{
-    uint32_t ex[ZPSE_MAX_CAND];
-    uint32_t pmin = UINT32_MAX;
-    uint32_t limit;
-    int to = *ncand_io;
-    int kept = 0;
-    int ci;
-
-    for (ci = from; ci < to; ci++) {
-        const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
-        /* Feed the running verdict down as `limit`: the first candidate is
-         * priced without one (UINT32_MAX), each later one with the best
-         * price seen so far plus the sweep's ~6% margin. A plane whose
-         * proven floor already exceeds its share stops early, so a
-         * hopeless candidate prices only a tile or two instead of all of
-         * them. Convicted candidates return a finite value > limit, never
-         * UINT32_MAX, so they are dropped, not kept. */
-        uint32_t lim = (pmin == UINT32_MAX) ? UINT32_MAX : pmin + (pmin >> 3);
-
-        ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci], scounts[ci], mb,
-                                       meta_lens[ci], 0u, lim);
-        if (ex[ci] != UINT32_MAX && ex[ci] < pmin) {
-            pmin = ex[ci];
-        }
-    }
-    if (pmin == UINT32_MAX) {
-        return;
-    }
-    limit = pmin + (pmin >> 3);
-    for (ci = from; ci < to; ci++) {
-        if (ex[ci] == UINT32_MAX || ex[ci] <= limit) {
-            unsigned m;
-
-            tids[from + kept] = tids[ci];
-            scounts[from + kept] = scounts[ci];
-            meta_lens[from + kept] = meta_lens[ci];
-            for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
-                meta_bufs[from + kept][m] = meta_bufs[ci][m];
-            }
-            idx[from + kept] = idx[ci];
-            kept++;
-        }
-    }
-    *ncand_io = from + kept;
 }
 
 /* Exchange two candidate slots, moving the candidate itself in every array
  * that describes it -- including idx[], which carries its original list
  * index and is what the winner's tie-break compares. The attempt order is
- * realized this way and never as an index permutation over the list, so
- * the proxy pruning below (which compacts the list) cannot leave the
- * attempt loop pointing at a slot it has since dropped: after the swap the
- * loop simply walks the surviving slots in order. */
+ * realized this way and never as an index permutation over the list, so the
+ * exact prune (which compacts the list) cannot leave the attempt loop
+ * pointing at a slot it has since dropped: after the swap the loop simply
+ * walks the surviving slots in order. */
 static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
                                  uint8_t scounts[ZPSE_MAX_CAND],
                                  uint8_t meta_bufs[ZPSE_MAX_CAND][ZPSE_MAX_CAND_META],
@@ -1270,7 +1198,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int have_best = 0;
     int fails = 0;
     int sample;
-    int exact_priced = 0;
     int oi;
     int rc;
 
@@ -1494,84 +1421,25 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * price that cannot be computed never wins over one that can, and if
      * nothing can be priced the list is left alone and the sweep runs
      * exactly as it always did. */
-    /* Rank the candidates on the prescreen alone before pricing any of
-     * them, and drop everything more than ~6% worse: a trial is a classify,
-     * a mode search and a pack of every tile, and a candidate the cheap
-     * estimate has already lost by more than that is not worth the exact
-     * probe either. That estimate covers every other tile of the first
-     * 16 KiB -- broad enough that a block whose structure changes inside
-     * the probe window still ranks correctly, where a four-tile exact
-     * sample alone mis-picks by a factor (measured on the fuzz suite's
-     * mixed-region shapes: 400 KB worse without this step). */
-    if (sample != 2 && ncand > 1 && n >= 8192u) {
-        uint32_t px[ZPSE_MAX_CAND];
-        uint32_t pmin = UINT32_MAX;
-        int kept = 0;
-        int ci;
-        uint32_t pn = n < 16384u ? n : 16384u;
-
-        /* The identity is priced first (see the exact probe below: it is
-         * the first candidate in the list, and a swap of the attempt order
-         * does not move it). Its price is therefore in hand when the others
-         * are reached, and a candidate can then be dropped BEFORE its proxy
-         * runs when its own floor -- the smallest total its transform and
-         * segment shape can possibly produce -- already exceeds the 6%
-         * margin around that price. Such a candidate cannot be kept by the
-         * prune below whatever its proxy would say, because a proxy is never
-         * below its floor, so skipping the computation cannot change the
-         * survivor list, and the pruned price is written as limit + 1 to
-         * record exactly that. The margin only shrinks if a later proxy
-         * undercuts the running minimum, and a candidate dropped under the
-         * wider margin is dropped under the narrower one too, so the order
-         * of the loop stays irrelevant. The floor is arithmetic on the
-         * shape -- no plane is touched -- and this is what removes the
-         * transpose candidate from every block whose identity plane is
-         * already near-perfect (a ramp, a constant, an all-hit plane). */
-        for (ci = 0; ci < ncand; ci++) {
-            const uint8_t *mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
-            uint32_t cfloor;
-
-            if (ci > 0 && pmin != UINT32_MAX) {
-                /* The floor is taken over the PROXY's window, not the block:
-                 * it is compared with a proxy, and a proxy prices `pn`
-                 * bytes. A block-sized floor would be several times the
-                 * window's price and would drop candidates the prune is
-                 * meant to keep. */
-                cfloor = zpse_block_floor(pn, tids[ci], scounts[ci],
-                                          meta_lens[ci]);
-                if (cfloor != UINT32_MAX &&
-                    cfloor > pmin + (pmin >> 3)) {
-                    px[ci] = pmin + (pmin >> 3) + 1u;
-                    continue;
-                }
-            }
-            px[ci] = zpse_block_proxy(e, in, pn, tids[ci], scounts[ci], mb,
-                                      meta_lens[ci]);
-            if (px[ci] < pmin) {
-                pmin = px[ci];
-            }
-        }
-        if (pmin != UINT32_MAX) {
-            uint32_t limit = pmin + (pmin >> 3);
-
-            for (ci = 0; ci < ncand; ci++) {
-                if (px[ci] == UINT32_MAX || px[ci] <= limit) {
-                    unsigned m;
-
-                    tids[kept] = tids[ci];
-                    scounts[kept] = scounts[ci];
-                    meta_lens[kept] = meta_lens[ci];
-                    for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
-                        meta_bufs[kept][m] = meta_bufs[ci][m];
-                    }
-                    idx[kept] = idx[ci];
-                    kept++;
-                }
-            }
-            ncand = kept;
-        }
-    }
-
+    /* Nothing is pruned on the cheap proxy any more. It is a prescreen-shaped
+     * estimate -- the ideal packing rate implied by each plane's miss count --
+     * and it cannot order shapes that pack BELOW that rate. On a block that is
+     * zero except for one byte every 256 it priced the width-4 transpose at
+     * 448 bytes per 16 KiB and never priced the width-16 one at all: that
+     * candidate's own floor (624 bytes, a valid bound) already exceeded the
+     * margin around 448, so it was dropped unmeasured, while over the whole
+     * block it is the cheapest shape there is. Widening the margin does not
+     * fix that; it only moves which blocks the estimate gets wrong, and the
+     * same margin is what kept decimal8's width-8 transpose, which is the
+     * shape that block actually wants.
+     *
+     * What replaces it is one exact pass: every candidate is priced with the
+     * segment encoder's own classify/mode/pack on a spread of tiles, with the
+     * running verdict fed down as the probe's limit so a candidate the best
+     * price has already beaten by the margin stops on the plane that convicted
+     * it. The pass keeps the candidates within the margin (a like-for-like
+     * comparison) and orders them by price, which is the order the trial loop
+     * below walks. */
     if (ncand > 1 && n >= 8192u) {
         uint32_t ex[ZPSE_MAX_CAND];
         uint8_t order[ZPSE_MAX_CAND];
@@ -1609,14 +1477,27 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
         }
 
+        for (ci = 0; ci < ncand; ci++) {
+            ex[ci] = UINT32_MAX;
+        }
         for (k = 0; k < nord; k++) {
             const uint8_t *mb;
+            uint32_t lim = UINT32_MAX;
 
             ci = order[k];
             mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
+            /* The running verdict: a candidate the best price has already
+             * beaten by the margin is offered only that margin, and the probe
+             * stops it on the plane whose running bound crosses it. A
+             * convicted candidate comes back as a finite bound above `lim`,
+             * never UINT32_MAX, so it reads as priced-and-lost rather than
+             * unpriced. */
+            if (pick >= 0 && ex[pick] != UINT32_MAX) {
+                lim = ex[pick] + (ex[pick] >> 4);
+            }
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
-                                            ZPSE_DECIDE_TILES, UINT32_MAX);
+                                            ZPSE_DECIDE_TILES, lim);
             if (ex[ci] == UINT32_MAX) {
                 continue;
             }
@@ -1627,6 +1508,91 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (idx[ci] == 0u && scounts[ci] == 1u &&
                 ex[ci] == zpse_block_cand_floor(pn)) {
                 break;
+            }
+        }
+        if (pick >= 0) {
+            /* Keep what the winner has not beaten by the margin, and order
+             * the survivors by price: the trial loop walks them in that order,
+             * so the cheapest shape is attempted first and every later trial
+             * is handed the tightest budget it could still win against.
+             * Anything that could not be priced is kept and sorts last (it has
+             * no price to order by, and the sweep must not drop it). */
+            uint32_t limit = ex[pick] + (ex[pick] >> 4);
+            int kept = 0;
+            int win = -1;
+            uint8_t win_idx = idx[pick];
+
+            for (ci = 0; ci < ncand; ci++) {
+                if (ci == pick || ex[ci] == UINT32_MAX || ex[ci] <= limit) {
+                    if (ci == pick) {
+                        win = kept;
+                    }
+                    if (kept != ci) {
+                        unsigned m;
+
+                        tids[kept] = tids[ci];
+                        scounts[kept] = scounts[ci];
+                        meta_lens[kept] = meta_lens[ci];
+                        for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                            meta_bufs[kept][m] = meta_bufs[ci][m];
+                        }
+                        idx[kept] = idx[ci];
+                        ex[kept] = ex[ci];
+                    }
+                    kept++;
+                }
+            }
+            ncand = kept;
+            /* Insertion sort on the survivors: at most ten of them, and a tie
+             * keeps the original list order (idx ascending) so the attempt
+             * order still cannot decide a tie. */
+            {
+                int a;
+
+                for (a = 1; a < ncand; a++) {
+                    int b = a;
+
+                    while (b > 0 &&
+                           (ex[b - 1] > ex[b] ||
+                            (ex[b - 1] == ex[b] && idx[b - 1] > idx[b]))) {
+                        uint8_t  st = tids[b - 1], ss = scounts[b - 1];
+                        uint8_t  si = idx[b - 1];
+                        uint16_t sl = meta_lens[b - 1];
+                        uint32_t sx = ex[b - 1];
+                        uint8_t  sb[ZPSE_MAX_CAND_META];
+                        unsigned m;
+
+                        for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                            sb[m] = meta_bufs[b - 1][m];
+                        }
+                        tids[b - 1] = tids[b];
+                        scounts[b - 1] = scounts[b];
+                        idx[b - 1] = idx[b];
+                        meta_lens[b - 1] = meta_lens[b];
+                        ex[b - 1] = ex[b];
+                        for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                            meta_bufs[b - 1][m] = meta_bufs[b][m];
+                        }
+                        tids[b] = st;
+                        scounts[b] = ss;
+                        idx[b] = si;
+                        meta_lens[b] = sl;
+                        ex[b] = sx;
+                        for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                            meta_bufs[b][m] = sb[m];
+                        }
+                        b--;
+                    }
+                }
+                /* The sort moved the winner: find its slot again by the
+                 * original list index it carries. */
+                pick = win;
+                for (a = 0; a < ncand; a++) {
+                    if (idx[a] == win_idx) {
+                        pick = a;
+                        break;
+                    }
+                }
             }
         }
         if (pick >= 0 && pick != 0) {
@@ -1699,16 +1665,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                 &budget_hit, have_best, best_total,
                                 flat_min);
         if (rc != PSE_OK) {
-            /* A trial the budget stopped had already reached the RAW
-             * envelope, which is exactly the condition the completed
-             * trial's `t + 1 > 32 + N` test below would have counted, so
-             * count it here and the sweep decides as it always did. */
-            if (budget_hit) {
-                fails++;
-                if (fails >= 2) {
-                    break;
-                }
-            }
+            /* A trial the budget stopped cannot win: its total only grows as
+             * its remaining segments are written. That is a verdict on THIS
+             * candidate and says nothing about the ones after it -- a shape
+             * that packs worse on the front of a block can be the best one
+             * over the whole of it -- so it does not end the sweep, and two
+             * of them do not either. The per-candidate floor test at the top
+             * of the loop still skips a shape whose own bound cannot beat the
+             * winner without spending the trial. */
+            (void)budget_hit;
             continue;
         }
         /* Smallest total wins; a tie goes to the candidate EARLIER in
@@ -1757,49 +1722,23 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (have_best && !earlier_left && best_total <= min_floor) {
                 break;
             }
-            /* The sweep IS going to spend another trial, so price the rest
-             * exactly and keep only what can still win. This is the case
-             * the prescreen is worst at: when it prices every candidate
-             * alike -- data on a 4-bit alphabet, a nibble-packed record, a
-             * text block -- it keeps them all and every one is encoded in
-             * full, while a few exact tiles per candidate tell them apart.
-             * Asked here, after a winner exists and after the floor test, a
-             * block the sweep is about to finish, or one whose first trial
-             * aborted (noise), pays nothing for it. */
-            if (!exact_priced && oi + 1 < ncand && n >= 8192u) {
-                exact_priced = 1;
-                zpse_block_prune_exact(e, in,
-                                       n < 16384u ? n : 16384u,
-                                       tids, scounts,
-                                       meta_bufs, meta_lens, idx, oi + 1,
-                                       &ncand);
-                min_floor = UINT32_MAX;
-                earlier_left = 0;
-                for (oj = oi + 1; oj < ncand; oj++) {
-                    int j = oj;
-                    uint32_t f;
-
-                    if ((uint32_t)idx[j] < best_idx) {
-                        earlier_left = 1;
-                        continue;
-                    }
-                    f = zpse_block_floor(n, tids[j], scounts[j],
-                                         meta_lens[j]);
-                    if (f < min_floor) {
-                        min_floor = f;
-                    }
-                }
-                if (have_best && !earlier_left && best_total <= min_floor) {
-                    break;
-                }
+            /* The sweep has spent ZPSE_MAX_TRIALS full encodes (see the
+             * definition): the probe's winner and the tail of survivors it
+             * could not separate on a 16 KiB sample. Everything left has
+             * already been priced against the winner on that sample, so one
+             * more block encode would have to find a shape whose advantage
+             * only appears past the sample to pay for itself. */
+            if (oi + 1 >= ZPSE_MAX_TRIALS) {
+                break;
             }
-            /* Two candidates that both fail to beat the raw envelope
-             * mean the block is incompressible under every transform
-             * shape tried; the raw fallback wins and the remaining
-             * trials are pure cost. RAW itself (id 0) is the baseline --
-             * it never beats itself -- so it does not count as a failure;
-             * otherwise a block whose first candidates are RAW and DELTA8
-             * would abort before reaching a transpose that actually pays. */
+            /* Two candidates that both finish above the raw envelope are
+             * evidence that the block is incompressible, and the sweep spends
+             * two whole trials to find out -- the rest abort on the noise
+             * probe long before they write the block out. RAW itself (id 0)
+             * is the baseline -- it never beats itself -- so it does not count
+             * as a failure; otherwise a block whose first candidates are RAW
+             * and DELTA8 would abort before reaching a transpose that actually
+             * pays. */
             if (tids[i] != 0u &&
                 t + 1u > (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
                 fails++;

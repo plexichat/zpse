@@ -5,12 +5,16 @@
  * because the block decision saw the form that would be used rather than a
  * per-tile estimate of it:
  *
- *   alternating 0x00/0xFF  the identity costs 2618 bytes; transposed, all
- *                          sixteen planes are one byte value and the dense
- *                          record form writes twelve bytes per 4 KiB, so
- *                          the block is 608.
- *   two-byte spikes        the identity costs 3126; the transposed phases
- *                          are constant, so 1255.
+ *   alternating 0x00/0xFF  split into its two byte phases, each phase is
+ *                          one byte value, and the dense record form writes
+ *                          them at twelve bytes per 4 KiB: 272.
+ *   two-byte spikes        at width 8, seven of the phases are constant and
+ *                          are written in the dense form at twelve bytes per
+ *                          4 KiB: 1211. The width-16 shape of the same block
+ *                          is the one a 16 KiB sample mis-prices by a factor,
+ *                          so this pin also covers the sweep keeping it in
+ *                          the list instead of pruning it on the cheap
+ *                          estimate, and deciding it on a full trial.
  *   4-bit noise            one palette stream is cheaper than any predictor
  *                          search per tile, so the tile loop stops as soon
  *                          as the palette is priced and 33288 is written.
@@ -70,14 +74,14 @@ int main(void)
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
     }
-    check("alt00FF", 65536u, 608u);
+    check("alt00FF", 65536u, 272u);
 
     memset(in, 0, sizeof in);
     for (i = 0; i < 65536u; i += 256u) {
         in[i] = (uint8_t)i;
         in[i + 1u] = (uint8_t)(i >> 8);
     }
-    check("spike every 256", 65536u, 1255u);
+    check("spike every 256", 65536u, 1211u);
 
     {
         uint32_t r = 0xBEEFu;
