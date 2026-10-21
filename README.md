@@ -110,6 +110,91 @@ So: pick zpse when decode latency, allocation behaviour and output
 determinism matter more than ratio, and pick zstd when the bytes matter more
 than the clock.
 
+### Columnar data
+
+The ten patterns above are byte streams. Real columnar data is not: it is
+typed records with a known width and a known order. Seven such corpora are in
+the benchmark set — `ts_seq`, `ts_ns`, `float_sparse`, `var_string`,
+`sparse_mix`, `geo_point`, `struct_offsets` — and they are the cases where
+"pick zstd" is the wrong advice, because the right answer is not a block codec
+at all.
+
+Same harness as the table above (4 MiB per pattern, `zstd -3` on the command
+line, only the compressed size compared):
+
+| column | zpse | zstd -3 | |
+| --- | ---: | ---: | --- |
+| `ts_seq` (i64 µs timestamps) | 0.2638 | 0.2564 | zstd 3% smaller |
+| `ts_ns` (i64 ns timestamps) | 0.2605 | 0.2564 | zstd 2% smaller |
+| `float_sparse` (f32 readings) | 0.3957 | 0.2398 | zstd 1.7x smaller |
+| `var_string` (JSON-ish records) | 1.0005 | 0.2123 | zstd 4.7x smaller |
+| `sparse_mix` (nullable i64) | 0.1479 | 0.1020 | zstd 1.5x smaller |
+| `geo_point` (lat/lon + cell) | 0.0766 | 0.0338 | zstd 2.3x smaller |
+| `struct_offsets` (i32 offsets) | 0.2955 | 0.7808 | **zpse 2.6x smaller** |
+
+Three of those rows are worth reading twice.
+
+`struct_offsets` is a strictly increasing array of byte offsets — nothing in
+it repeats, so zstd's match finder has nothing to match and lands at 0.78,
+worse than storing the raw column. zpse's stride and lane-delta predictors
+read the monotone sequence directly and get 0.30. *A block codec with no
+match finder is not simply a worse match finder; on data with no redundancy
+to match, it is a different codec, and it can win.*
+
+`var_string` is the other end: high-cardinality JSON-ish text, where every
+value is unique. zpse falls back to raw (1.0005) because none of its ten
+predictors help, and zstd's match finder finds the repeated keys and gets
+0.21. This is the "no match finder" limitation showing up on realistic text
+rather than on a synthetic ramp, and it is the row that decides against zpse
+for this data.
+
+The timestamp rows are the interesting middle: zstd is 2–3% ahead of zpse on
+both, which is to say they are within noise of each other on data a
+delta-of-delta codec is made for.
+
+### What the structure is worth
+
+The zstd column above compares two block codecs. It cannot say what the
+structure is *worth*, because zstd is not exploiting it as a column — it is
+exploiting it as something a match finder happens to like.
+`tests/benchmarks/bench_colref.c` answers that by running, for each column, a
+codec built for that shape — a delta-of-delta for nanosecond timestamps, a
+null bitmap for a nullable column, a frame of reference for increasing
+offsets, Gorilla XOR for repeated floats — against zpse on the same bytes.
+Both sides see 64 KiB chunks, so only the coding model differs.
+
+| column | reference codec | reference | zpse | |
+| --- | --- | ---: | ---: | --- |
+| `ts_seq` | delta + varint | 4.00:1 | 3.79:1 | zpse 1.1x bigger |
+| `ts_ns` | double delta | 4.56:1 | 3.84:1 | zpse 1.2x bigger |
+| `float_sparse` | Gorilla XOR | 2.68:1 | 2.53:1 | zpse 1.1x bigger |
+| `var_string` | *(none helps)* | — | 1.00:1 | block codec territory |
+| `sparse_mix` | null bitmap | 10.44:1 | 6.76:1 | zpse 1.5x bigger |
+| `geo_point` | zigzag + delta | 6.10:1 | 13.06:1 | **zpse 2.1x smaller** |
+| `struct_offsets` | frame of reference | 2.56:1 | 3.38:1 | **zpse 1.3x smaller** |
+
+The reference codecs are deliberately plain reference points, not proposals —
+`tests/suites/test_colref.c` proves each one round-trips, so every size here
+is one a real codec reached rather than an estimate.
+
+Two results deserve their own note. On `geo_point` and `struct_offsets` zpse
+*beats* the purpose-built codec, and the reason is visible in the stream: the
+encoder picks the 16-wide byte transpose, which for a fixed-width record is
+exactly the column split a columnar format does by hand. zpse finds it
+without a schema, because splitting bytes into planes and predicting each
+plane is what its model already does. That is the strongest argument in the
+tree for the byte-oriented design, and it is an accident worth naming.
+
+On `sparse_mix` the gap is real and it is the one that would cost something:
+null suppression is a typed feature zpse does not have, and a 92%-null
+column is worth 10.44:1 to a codec that knows the nulls are whole records.
+1.5x is what zpse pays for not knowing.
+
+The other four are within 20% of a purpose-built codec, without any of the
+schema that would make such a codec possible to ship. The `var_string` row
+is the honest limit: no column codec helps there either, and the answer is a
+block codec with a match finder.
+
 ## What it does
 
 A **frame** is a 32-byte header (magic `PSE1`, version, content size, block
@@ -161,18 +246,25 @@ powershell -File tests/runners/run.ps1   # Windows
 ```
 
 The runner builds and runs the suites (`roundtrip`, `combinadic`, `hostile`,
-`units`, `stride3`, `dense`, `decide`, `sizes`), then builds `parity`, `fuzz`
-and `lseed` three times — default, `-DZPSE_FORCE_SCALAR` and
-`-DZPSE_FORCE_TRIAL_SWAP` — and requires identical digests and per-case output
-across all three. The first two prove the SIMD paths are bit-exact; the third
-permutes the encoder's candidate order and proves that the order cannot change
-a single compressed byte. `test_hostile` drives truncations, header and payload
-corruption, reserved bits, bad transforms, output overflow and stream
-recomputation, and must see the documented status for each.
+`units`, `stride3`, `dense`, `decide`, `fillpred`, `sizes`, `colref`,
+`colcorpus`), then builds `parity`, `fuzz` and `lseed` three times — default,
+`-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` — and requires identical
+digests and per-case output across all three. The first two prove the SIMD
+paths are bit-exact; the third permutes the encoder's candidate order and
+proves that the order cannot change a single compressed byte. `test_hostile`
+drives truncations, header and payload corruption, reserved bits, bad
+transforms, output overflow and stream recomputation, and must see the
+documented status for each. `test_colref` proves the reference column codecs
+round-trip, and `test_colcorpus` proves the two benchmark harnesses generate
+the same bytes for every columnar corpus.
 
 Benchmarks live in `tests/benchmarks/`: `bench.c` for the in-process table
-above, `bench_columnar.c` for columnar data, and `bench_vs.sh` for the
-cross-tool comparison (zstd, lz4, brotli, gzip, xz, when installed).
+above, `bench_columnar.c` for columnar data, `bench_colref.c` for what a
+purpose-built column codec gets on the same bytes, and `bench_vs.sh` for the
+cross-tool comparison (zstd, lz4, brotli, gzip, xz, when installed). The
+columnar corpora are generated by `tests/corpus/columnar_gen.h`, shared by
+the in-process harness and the file-based corpus writer so both tables are
+about the same bytes.
 
 `bench_columnar stats` answers a different question: which predictors the
 encoder actually trials, and how often per searched tile, over the same
@@ -192,7 +284,13 @@ costs nothing however slow its classify is.
 ## Known limitations
 
 * **No entropy coder and no match finder.** Ratio loses badly to zstd on
-  redundant data, as shown above. This is a design choice, not a to-do.
+  redundant data, as shown above. This is a design choice, not a to-do. The
+  columnar section shows the sharpest version of it: on high-cardinality text
+  zpse falls back to raw and zstd gets 4.7x.
+* **No column semantics.** A nullable column costs 1.5x what null suppression
+  would give it, and nothing in the format knows what a record boundary is.
+  The byte transpose recovers the split for fixed-width records by accident;
+  it cannot recover the *meaning* of a null.
 * **Frame index is not implemented.** The `ZPSE_F_FRAME_INDEX` flag is
   refused rather than emitted with a wrong offset.
 * **64 KiB blocks, no cross-block state.** Each block is independent, which is

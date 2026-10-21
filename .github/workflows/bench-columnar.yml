@@ -66,6 +66,22 @@ jobs:
             echo
             cat /tmp/benchcol.txt
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: What a purpose-built codec for each column achieves
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+            tests/benchmarks/bench_colref.c src/zpse_unity.c -o /tmp/colref
+          taskset -c 0 /tmp/colref 12 3 | tee /tmp/colref.txt
+          {
+            echo '### what a column codec would get, versus zpse'
+            echo
+            echo 'For each typed column: a codec built for that shape'
+            echo '(double-delta, null bitmap, frame of reference, Gorilla'
+            echo 'XOR) against zpse on the same bytes, 64 KiB chunks both'
+            echo 'sides. The gap is what zpse'"'"'s schema-free design costs.'
+            echo 'Informational.'
+            echo
+            cat /tmp/colref.txt
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-columnar
@@ -73,5 +89,6 @@ jobs:
             /tmp/benchcol.txt
             /tmp/benchcol-16k.txt
             /tmp/benchcol-stats.txt
+            /tmp/colref.txt
           if-no-files-found: error
           retention-days: 90
