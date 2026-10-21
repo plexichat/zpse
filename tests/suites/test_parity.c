@@ -54,8 +54,8 @@ static uint8_t tile_rec[1024];
 static uint8_t tile_dec[256];
 static uint8_t tile_comb[0x2000]; /* ZPSE_*_SZ_COMB */
 static uint8_t tile_o1[8 * 256];
-static uint8_t tile_o2v[8 * 4096];
-static uint8_t tile_o2c[8 * 4096];
+/* ORDER2 state: 8 x 4096 {value, confidence} pairs, interleaved. */
+static uint8_t tile_o2[8 * 4096 * 4];
 static uint8_t tile_rec2[1024]; /* second record of the chained sweep */
 
 static uint64_t tile_rng;
@@ -278,8 +278,9 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     memset(&L, 0, sizeof L);
     L.order1 = tile_o1;
-    L.o2val = tile_o2v;
-    L.o2conf = tile_o2c;
+    L.o2 = tile_o2;
+    L.gen = 0u;
+    L.gen = 0u;
     zpse_lane_reset(&L, lit);
     memset(&cl, 0, sizeof cl);
     rc = zpse_tile_classify(&L, tile_plane + off, nt, pid, lit, 1,
@@ -325,8 +326,9 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     /* decode(pack(classify(tile))) == tile, at this nt. */
     memset(&L2, 0, sizeof L2);
     L2.order1 = tile_o1;
-    L2.o2val = tile_o2v;
-    L2.o2conf = tile_o2c;
+    L2.o2 = tile_o2;
+    L2.gen = 0u;
+    L2.gen = 0u;
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 1, tile_plane, off,
@@ -391,8 +393,9 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     memset(&L, 0, sizeof L);
     L.order1 = tile_o1;
-    L.o2val = tile_o2v;
-    L.o2conf = tile_o2c;
+    L.o2 = tile_o2;
+    L.gen = 0u;
+    L.gen = 0u;
     zpse_lane_reset(&L, lit);
     memset(&cl, 0, sizeof cl);
     rc = zpse_tile_classify(&L, tile_plane + off, nt, pid, lit, 1,
@@ -430,8 +433,9 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     for (d = 0; d < 2; d++) {
         memset(&L2, 0, sizeof L2);
         L2.order1 = tile_o1;
-        L2.o2val = tile_o2v;
-        L2.o2conf = tile_o2c;
+        L2.o2 = tile_o2;
+        L2.gen = 0u;
+        L2.gen = 0u;
         zpse_lane_reset(&L2, lit);
         memset(tile_dec, 0x5A, sizeof tile_dec);
         rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 1, tile_plane,
@@ -449,8 +453,9 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     memset(&L2, 0, sizeof L2);
     L2.order1 = tile_o1;
-    L2.o2val = tile_o2v;
-    L2.o2conf = tile_o2c;
+    L2.o2 = tile_o2;
+    L2.gen = 0u;
+    L2.gen = 0u;
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc0 = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 0, tile_plane, off,
@@ -544,8 +549,9 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
 
     memset(&L, 0, sizeof L);
     L.order1 = tile_o1;
-    L.o2val = tile_o2v;
-    L.o2conf = tile_o2c;
+    L.o2 = tile_o2;
+    L.gen = 0u;
+    L.gen = 0u;
     zpse_lane_reset(&L, lit);
     memset(&clA, 0, sizeof clA);
     memset(&clB, 0, sizeof clB);
@@ -620,8 +626,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     if (pid == 3u) {
         emix(acc, tile_o1, sizeof tile_o1);
     } else if (pid == 4u) {
-        emix(acc, tile_o2v, sizeof tile_o2v);
-        emix(acc, tile_o2c, sizeof tile_o2c);
+        emix(acc, tile_o2, sizeof tile_o2);
     }
 
     /* Decode both records in sequence: the first resets, the second
@@ -630,8 +635,9 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
      * the second tile against. */
     memset(&L2, 0, sizeof L2);
     L2.order1 = tile_o1;
-    L2.o2val = tile_o2v;
-    L2.o2conf = tile_o2c;
+    L2.o2 = tile_o2;
+    L2.gen = 0u;
+    L2.gen = 0u;
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)nA, lit, 1, tile_plane, 0u,
@@ -790,8 +796,9 @@ int main(void)
 
                             memset(&L, 0, sizeof L);
                             L.order1 = tile_o1;
-                            L.o2val = tile_o2v;
-                            L.o2conf = tile_o2c;
+                            L.o2 = tile_o2;
+                            L.gen = 0u;
+                            L.gen = 0u;
                             zpse_lane_reset(&L, lits[lit_i]);
                             memset(&cl, 0, sizeof cl);
                             rc = zpse_tile_classify(&L, tile_plane + off, 256u,
@@ -848,8 +855,9 @@ int main(void)
                             /* decode(pack(classify(tile))) == tile */
                             memset(&L2, 0, sizeof L2);
                             L2.order1 = tile_o1;
-                            L2.o2val = tile_o2v;
-                            L2.o2conf = tile_o2c;
+                            L2.o2 = tile_o2;
+                            L2.gen = 0u;
+                            L2.gen = 0u;
                             zpse_lane_reset(&L2, lits[lit_i]);
                             memset(tile_dec, 0xA5, sizeof tile_dec);
                             rc = zpse_tile_decode(&L2, tile_rec,

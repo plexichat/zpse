@@ -40,7 +40,8 @@ static unsigned char E[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static uint8_t in[65536];
 static uint8_t comp[200000];
 static uint8_t plane[65536];
-static uint8_t o1[8 * 256], o2v[8 * 4096], o2c[8 * 4096];
+/* ORDER2 state: 8 x 4096 {value, confidence, generation} entries. */
+static uint8_t o1[8 * 256], o2[8 * 4096 * 4];
 static uint8_t rec[2048];
 static uint8_t scratch[8192];
 
@@ -172,8 +173,9 @@ static void profile_one(int idx, int reps)
     make_pattern(idx);
     zpse_encoder_init(&e, E, sizeof E);
     lanes.order1 = o1;
-    lanes.o2val = o2v;
-    lanes.o2conf = o2c;
+    lanes.o2 = o2;
+    lanes.gen = 0u;
+    lanes.gen = 0u;
     {
         uint32_t l = 0;
         if (zpse_compress_block(in, sizeof in, comp, sizeof comp, &l, 0, 1, E)

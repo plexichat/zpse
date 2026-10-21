@@ -28,7 +28,7 @@ struct ZpseTileHeader;
  *   FAM_LANEHIST 1, 2, 10     x_hat from 8 lane histories (stateful)
  *   FAM_STRIDE   5, 6, 7, 8   x_hat == stream[abs - S]
  *   FAM_ORDER1   3            x_hat == order1[lane][last] (stateful)
- *   FAM_ORDER2   4            x_hat == o2val[lane][hash] (stateful)
+ *   FAM_ORDER2   4            x_hat == o2[lane][hash].value (stateful)
  *
  * FAM_CONST, FAM_CONSTC and FAM_STRIDE never read the lane histories or
  * the ORDER tables, so their loops carry no cross-position state: the
@@ -1595,25 +1595,34 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     }
 
     default: { /* TILE_FAM_ORDER2 */
-        uint8_t *val = lanes->o2val;
-        uint8_t *conf = lanes->o2conf;
+        uint8_t *tab = lanes->o2;
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint8_t last = lanes->last[lane];
             uint8_t second = lanes->second_last[lane];
-            size_t off = lane * 4096u + (size_t)zpse_order2_index(second, last);
-            uint8_t xhat = val[off];
+            size_t off = (lane * 4096u +
+                          (size_t)zpse_order2_index(second, last)) * 4u;
+            uint8_t *val = &tab[off];
+            uint8_t *conf = &tab[off + 1u];
+            /* An entry is learned only if this tile wrote it: the
+             * generation says so. An entry nobody has learned predicts
+             * the initial literal. */
+            int learned = (uint16_t)tab[off + 2u] == (uint16_t)(lanes->gen & 0xFFu) &&
+                          (uint16_t)tab[off + 3u] == (uint16_t)(lanes->gen >> 8);
+            uint8_t xhat = learned ? *val : initial_literal;
             uint8_t x = actual[p];
             if (x != xhat)
                 TILE_TAKE_EXC(p, xhat, x);
-            if (conf[off] == 0u) {
-                val[off] = x;
-                conf[off] = 1u;
-            } else if (x == xhat) {
-                if (conf[off] < 255u)
-                    conf[off]++;
+            if (!learned) {
+                *val = x;
+                *conf = 1u;
+                tab[off + 2u] = (uint8_t)(lanes->gen & 0xFFu);
+                tab[off + 3u] = (uint8_t)(lanes->gen >> 8);
+            } else if (x == *val) {
+                if (*conf < 255u)
+                    (*conf)++;
             } else {
-                conf[off]--;
+                (*conf)--;
             }
             lanes->second_last[lane] = last;
             lanes->last[lane] = x;
@@ -4036,14 +4045,19 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
             o1[lane * 256u + (size_t)last] = x;
         }
     } else {
-        uint8_t *val = lanes->o2val;
-        uint8_t *conf = lanes->o2conf;
+        uint8_t *tab = lanes->o2;
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint8_t last = lanes->last[lane];
             uint8_t second = lanes->second_last[lane];
-            size_t off = lane * 4096u + (size_t)zpse_order2_index(second, last);
-            uint8_t xhat = val[off];
+            size_t off = (lane * 4096u +
+                          (size_t)zpse_order2_index(second, last)) * 4u;
+            uint8_t *val = &tab[off];
+            uint8_t *conf = &tab[off + 1u];
+            /* An entry is learned only if this tile wrote it. */
+            int learned = (uint16_t)tab[off + 2u] == (uint16_t)(lanes->gen & 0xFFu) &&
+                          (uint16_t)tab[off + 3u] == (uint16_t)(lanes->gen >> 8);
+            uint8_t xhat = learned ? *val : initial_literal;
             uint8_t x;
             if (((words[p >> 5] >> (p & 31u)) & 1u) == 0u) {
                 x = xhat;
@@ -4055,14 +4069,16 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
                 x = zpse_exclusion_inverse(resid[j++], xhat);
             }
             out[p] = x;
-            if (conf[off] == 0u) {
-                val[off] = x;
-                conf[off] = 1u;
-            } else if (x == xhat) {
-                if (conf[off] < 255u)
-                    conf[off]++;
+            if (!learned) {
+                *val = x;
+                *conf = 1u;
+                tab[off + 2u] = (uint8_t)(lanes->gen & 0xFFu);
+                tab[off + 3u] = (uint8_t)(lanes->gen >> 8);
+            } else if (x == *val) {
+                if (*conf < 255u)
+                    (*conf)++;
             } else {
-                conf[off]--;
+                (*conf)--;
             }
             lanes->second_last[lane] = last;
             lanes->last[lane] = x;

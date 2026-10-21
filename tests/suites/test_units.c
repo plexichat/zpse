@@ -21,8 +21,8 @@ static int fails = 0;
 } while (0)
 
 static uint8_t o1[8 * 256];
-static uint8_t o2v[8 * 4096];
-static uint8_t o2c[8 * 4096];
+/* ORDER2 state: 8 x 4096 {value, confidence} pairs, interleaved. */
+static uint8_t o2[8 * 4096 * 4];
 static uint8_t comb[8192];
 
 int main(void) {
@@ -185,9 +185,9 @@ int main(void) {
         CHECK(zpse_decoder_init(&d, da, sizeof da - 1) == PSE_BAD_ARG, "dec short");
         CHECK(zpse_decoder_init(&d, da + 1, sizeof da - 1) == PSE_BAD_ARG, "dec misaligned");
         CHECK(zpse_decoder_init(&d, da, sizeof da) == 0, "dec ok");
-        CHECK(d.recon == da + 0x1000 && d.comb == da + 0x31800, "dec carve");
+        CHECK(d.recon == da + 0x1000 && d.comb == da + 0x41800, "dec carve");
         CHECK(zpse_encoder_init(&e, ea, sizeof ea) == 0, "enc ok");
-        CHECK(e.best == ea + 0x31000 && e.hist == ea + 0x53800, "enc carve");
+        CHECK(e.best == ea + 0x31000 && e.hist == ea + 0x63800, "enc carve");
         CHECK(!zpse_arena_is_aligned(NULL) && zpse_arena_is_aligned(da), "aligned?");
     }
 
@@ -463,8 +463,8 @@ int main(void) {
                 int ok = 0, tried = 0;
                 const uint8_t mmodes[] = {1, 2, 3, 4, 5, 0, 6};
                 for (mm = 0; mm < 7; mm++) {
-                    ZpseLaneState le = {{0},{0},o1,o2v,o2c};
-                    ZpseLaneState ld = {{0},{0},o1,o2v,o2c};
+                    ZpseLaneState le = {{0},{0},o1,o2,0};
+                    ZpseLaneState ld = {{0},{0},o1,o2,0};
                     int wlen, got;
                     zpse_lane_reset(&le, data[0]);
                     wlen = zpse_tile_encode(&le, data, 256, (uint8_t)pid,
@@ -486,8 +486,8 @@ int main(void) {
         }
         /* Constant tile: K=0 / K=Nt paths. */
         {
-            ZpseLaneState le = {{0},{0},o1,o2v,o2c};
-            ZpseLaneState ld = {{0},{0},o1,o2v,o2c};
+            ZpseLaneState le = {{0},{0},o1,o2,0};
+            ZpseLaneState ld = {{0},{0},o1,o2,0};
             int wlen, got;
             memcpy(seg + 64, cdata, 256);
             zpse_lane_reset(&le, 0x41);

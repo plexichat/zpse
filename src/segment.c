@@ -435,6 +435,9 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         int tile_reset;
         int got;
 
+        /* Once a tile, on both sides: see the encoder's loop. */
+        lanes->gen++;
+
         if ((uint32_t)t + 1u < tile_count) {
             nt_exp = 256u;
         } else {
@@ -2488,6 +2491,13 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                 cand[ncand++] = second_p;
             }
         }
+        /* A generation no real tile uses, so the entries this pass
+         * leaves behind read as unlearned to the tile that follows. The
+         * lane state's own generation is put back afterwards: the
+         * pricing pass is not a tile. */
+        uint16_t gen_save = lanes->gen;
+
+        lanes->gen = 0xFFFFu;
         for (ci = 0u; ci < ncand; ci++) {
             uint8_t pred = cand[ci];
             ZpseTileClass cl;
@@ -2525,6 +2535,7 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                 tile_len = n;
             }
         }
+        lanes->gen = gen_save;
         if (tile_len < 0) {
             return UINT32_MAX;
         }
@@ -2858,6 +2869,13 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
         const uint8_t *actual = plane + seg_pos;
 
+        /* The generation advances once a tile, on both sides, over the
+         * same tiles in the same order: the encoder's winning trial and
+         * the decoder's block. An ORDER2 entry is learned only if its
+         * generation is this one, so this is the reset that replaced the
+         * table wipe. */
+        lanes->gen++;
+
         if (pal_len != 0u && pos >= pal_len) {                int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
                                                 pal_m, pal_bits, pos, 0,
                                                 byte_budget, payload_cap);
@@ -2881,7 +2899,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             lit_len = 0u;
         }
         uint16_t ks[12];
-        uint8_t cand[3];
+        uint8_t cand[5];
         uint32_t ncand = 0;
         uint32_t ci;
         int best_len = -1;

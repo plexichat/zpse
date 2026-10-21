@@ -34,8 +34,8 @@
 
 static uint8_t plane[1024 + 64];
 static uint8_t o1[8 * 256];
-static uint8_t o2v[8 * 4096];
-static uint8_t o2c[8 * 4096];
+static uint8_t o2[8 * 4096 * 4];
+
 
 static ZpseTileClass ref_cl;
 static ZpseTileClass lean_cl;
@@ -136,8 +136,7 @@ int main(void)
      * tail so a full-tile read past a short tile stays in bounds. */
     memset(plane, 0, sizeof plane);
     memset(o1, 0, sizeof o1);
-    memset(o2v, 0, sizeof o2v);
-    memset(o2c, 0, sizeof o2c);
+    memset(o2, 0, sizeof o2);
 
     for (si = 0; si < 4u; si++) {
         for (pi = 0; pi < sizeof preds; pi++) {
@@ -162,8 +161,9 @@ int main(void)
                         memset(&ref_cl, 0xA5, sizeof ref_cl);
                         memset(&lean_cl, 0x5A, sizeof lean_cl);
                         a.order1 = o1;
-                        a.o2val = o2v;
-                        a.o2conf = o2c;
+                        a.o2 = o2;
+                        a.gen = 0u;
+                        a.gen = 0u;
                         b = a;
                         rc = zpse_tile_classify(&a, plane + off, nt, pid, lit,
                                                 1, plane, off, &ref_cl);

@@ -15,7 +15,7 @@
  *   - by zpse_segment_decode (the code under test), and
  *   - by the reference below, which walks the same records but hardcodes
  *     the documented segment-start state (histories = initial literal,
- *     order1 = initial literal, o2val = initial literal, o2conf = 0) and
+ *     order1 = initial literal, o2 = all zero (unlearned) and
  *     the documented per-tile reset rule instead of deriving either from
  *     the library.
  *
@@ -52,13 +52,18 @@ static uint8_t ref[65536];
 
 /* Reference tables: the documented segment-start state. */
 static uint8_t r_o1[8 * 256];
-static uint8_t r_o2val[8 * 4096];
-static uint8_t r_o2conf[8 * 4096];
+/* ORDER2 state: 8 x 4096 {value, confidence} pairs, interleaved, so a
+ * prediction and its confidence share a cache line. A confidence of
+ * zero means "unlearned", and an unlearned entry predicts the literal. */
+static uint8_t r_o2[8 * 4096 * 4];
 static uint8_t r_last[8];
 static uint8_t r_second[8];
 
 static int fails = 0;
 static unsigned nc = 0;
+/* ORDER2's generation, the same counter the library keeps: an entry is
+ * learned only if its generation is the current tile's. */
+static uint16_t r_gen;
 
 static void ref_start(uint8_t lit)
 {
@@ -69,8 +74,8 @@ static void ref_start(uint8_t lit)
         r_second[l] = lit;
     }
     memset(r_o1, lit, sizeof r_o1);
-    memset(r_o2val, lit, sizeof r_o2val);
-    memset(r_o2conf, 0, sizeof r_o2conf);
+    memset(r_o2, 0, sizeof r_o2);
+    r_gen = 0u;
 }
 
 static void ref_tile(uint8_t pid, int reset, uint8_t lit, uint16_t nt,
@@ -87,8 +92,7 @@ static void ref_tile(uint8_t pid, int reset, uint8_t lit, uint16_t nt,
         if (pid == (uint8_t)ZPSE_P_ORDER1) {
             memset(r_o1, lit, sizeof r_o1);
         } else if (pid == (uint8_t)ZPSE_P_ORDER2) {
-            memset(r_o2val, lit, sizeof r_o2val);
-            memset(r_o2conf, 0, sizeof r_o2conf);
+            memset(r_o2, 0, sizeof r_o2);
         }
     }
 
@@ -96,18 +100,26 @@ static void ref_tile(uint8_t pid, int reset, uint8_t lit, uint16_t nt,
         uint16_t p;
         uint16_t j = 0;
 
+        r_gen++;
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint8_t last = r_last[lane];
             uint8_t second = r_second[lane];
             uint8_t xhat;
             uint8_t x;
+            int learned = 0;
 
             if (pid == (uint8_t)ZPSE_P_ORDER1) {
                 xhat = r_o1[lane * 256u + (size_t)last];
             } else if (pid == (uint8_t)ZPSE_P_ORDER2) {
-                xhat = r_o2val[lane * 4096u +
-                               (size_t)zpse_order2_index(second, last)];
+                size_t off = (lane * 4096u +
+                              (size_t)zpse_order2_index(second, last)) * 4u;
+
+                learned = (uint16_t)r_o2[off + 2u] ==
+                              (uint16_t)(r_gen & 0xFFu) &&
+                          (uint16_t)r_o2[off + 3u] ==
+                              (uint16_t)(r_gen >> 8);
+                xhat = learned ? r_o2[off] : lit;
             } else { /* STRIDE_1 over the decoded stream */
                 xhat = (p < 1u) ? lit : dst[p - 1u];
             }
@@ -121,17 +133,19 @@ static void ref_tile(uint8_t pid, int reset, uint8_t lit, uint16_t nt,
 
                 r_o1[off] = x;
             } else if (pid == (uint8_t)ZPSE_P_ORDER2) {
-                size_t off = lane * 4096u +
-                             (size_t)zpse_order2_index(second, last);
+                size_t off = (lane * 4096u +
+                              (size_t)zpse_order2_index(second, last)) * 4u;
 
-                if (r_o2conf[off] == 0u) {
-                    r_o2val[off] = x;
-                    r_o2conf[off] = 1u;
-                } else if (x == xhat) {
-                    if (r_o2conf[off] < 255u)
-                        r_o2conf[off]++;
+                if (!learned) {
+                    r_o2[off] = x;
+                    r_o2[off + 1u] = 1u;
+                    r_o2[off + 2u] = (uint8_t)(r_gen & 0xFFu);
+                    r_o2[off + 3u] = (uint8_t)(r_gen >> 8);
+                } else if (x == r_o2[off]) {
+                    if (r_o2[off + 1u] < 255u)
+                        r_o2[off + 1u]++;
                 } else {
-                    r_o2conf[off]--;
+                    r_o2[off + 1u]--;
                 }
             }
             r_second[lane] = last;
@@ -204,11 +218,20 @@ static int run_case(const char *name, int ntiles, const uint8_t *pids,
         ref_tile(pids[t], resets[t] != 0, lit, 256u, words, resid,
                  ref + (size_t)t * 256u);
 
-    /* Library pass. */
+    /* Library pass. The lane state starts at generation 0, exactly as a
+     * block decode does: zpse_segment_decode advances it once per tile, so
+     * the first tile of this segment sees generation 1 -- the same value
+     * the reference counted. A block decode wipes the ORDER2 table once
+     * per block before its first tile, so a fresh table is what a new
+     * block sees; do the same here, or the previous case's stamps (all of
+     * which start at generation 1 too) would read as this case's. */
     memset(out, 0xA5, sizeof out);
+    memset(D.o2, 0, (size_t)ZPSE_D_SZ_O2);
+    memset(&dl, 0, sizeof dl);
     dl.order1 = D.order1;
-    dl.o2val = D.o2val;
-    dl.o2conf = D.o2conf;
+    dl.o2 = D.o2;
+    dl.gen = 0u;
+    dl.gen = 0u;
     rc = zpse_segment_decode(&D, &dl, payload, pos, out,
                              (uint32_t)ntiles * 256u, &got);
     if (rc != PSE_OK) {

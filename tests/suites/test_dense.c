@@ -201,8 +201,8 @@ static int decode(uint32_t payload_len, uint8_t *got, uint32_t *got_len)
         return rc;
     }
     lanes.order1 = d.order1;
-    lanes.o2val = d.o2val;
-    lanes.o2conf = d.o2conf;
+    lanes.o2 = d.o2;
+    lanes.gen = 0u;
     return zpse_segment_decode(&d, &lanes, seg, payload_len, got,
                                ZPSE_DENSE_MAX_LEN, got_len);
 }
@@ -334,8 +334,8 @@ static void sequence_case(void)
 
         rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
         lanes.order1 = d.order1;
-        lanes.o2val = d.o2val;
-        lanes.o2conf = d.o2conf;
+        lanes.o2 = d.o2;
+        lanes.gen = 0u;
         if (rc == PSE_OK) {
             rc = zpse_segment_decode(&d, &lanes, seg, 16u + len_a + len_b,
                                      seqout, (uint32_t)sizeof seqout, &got_len);
@@ -383,8 +383,8 @@ static void sequence_case(void)
             got_len = 0u;
             rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
             lanes.order1 = d.order1;
-            lanes.o2val = d.o2val;
-            lanes.o2conf = d.o2conf;
+            lanes.o2 = d.o2;
+            lanes.gen = 0u;
             if (rc == PSE_OK) {
                 rc = zpse_segment_decode(&d, &lanes, seg, 16u + l1 + l2,
                                          seqout, (uint32_t)sizeof seqout,
@@ -405,8 +405,8 @@ static void sequence_case(void)
 
         rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
         lanes.order1 = d.order1;
-        lanes.o2val = d.o2val;
-        lanes.o2conf = d.o2conf;
+        lanes.o2 = d.o2;
+        lanes.gen = 0u;
         if (rc == PSE_OK) {
             rc = zpse_segment_decode(&d, &lanes, seg, 16u + len_a + len_b - 1u,
                                      seqout, (uint32_t)sizeof seqout, &gl);
@@ -590,8 +590,8 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
     rc = zpse_encoder_init(&e, EARENA, sizeof EARENA);
     CHECK(rc == PSE_OK, "encoder arena init");
     lanes.order1 = e.order1;
-    lanes.o2val = e.o2val;
-    lanes.o2conf = e.o2conf;
+    lanes.o2 = e.o2;
+    lanes.gen = 0u;
     len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, n, literal, seg,
                                         (uint32_t)sizeof seg, 0u, 0u);
     cases++;
@@ -619,8 +619,8 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
     memset(&dlanes, 0, sizeof dlanes);
     rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
     dlanes.order1 = d.order1;
-    dlanes.o2val = d.o2val;
-    dlanes.o2conf = d.o2conf;
+    dlanes.o2 = d.o2;
+    dlanes.gen = 0u;
     if (rc == PSE_OK) {
         rc = zpse_segment_decode(&d, &dlanes, seg, len, big,
                                  (uint32_t)sizeof big, &got_len);
@@ -651,8 +651,8 @@ static void emitter_palette(void)
     CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == PSE_OK,
           "encoder arena init (palette)");
     lanes.order1 = e.order1;
-    lanes.o2val = e.o2val;
-    lanes.o2conf = e.o2conf;
+    lanes.o2 = e.o2;
+    lanes.gen = 0u;
 
     /* Sixteen values, four bits each: the shape lowentropy has. */
     for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
@@ -826,8 +826,8 @@ static void emitter_not_constant(void)
     CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == PSE_OK,
           "encoder arena init (per-tile)");
     lanes.order1 = e.order1;
-    lanes.o2val = e.o2val;
-    lanes.o2conf = e.o2conf;
+    lanes.o2 = e.o2;
+    lanes.gen = 0u;
     len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, 4096u, plane[0],
                                         seg, (uint32_t)sizeof seg, 0u, 0u);
     cases++;
