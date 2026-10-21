@@ -82,5 +82,6 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     e->flat_covered = 0u;
     e->flat_paid = 0u;
     e->const_plane = 0;
+    e->ascii_gate = 0u;
     return PSE_OK;
 }

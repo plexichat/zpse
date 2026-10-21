@@ -202,6 +202,31 @@ int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt)
 #define ZPSE_ASCII_GROUP 8u
 
 /* Bytes a group of r (1..8) ASCII bytes packs to: ceil(7r/8). */
+uint32_t zpse_ascii_len(uint32_t n)
+{
+    return n - (n >> 3);
+}
+
+int zpse_ascii_scan(const uint8_t *p, uint32_t n)
+{
+    uint64_t acc = 0u;
+    uint32_t i = 0u;
+
+    if (p == 0) {
+        return 0;
+    }
+    for (; i + 8u <= n; i += 8u) {
+        uint64_t w;
+
+        memcpy(&w, p + i, sizeof w);
+        acc |= w;
+    }
+    for (; i < n; i++) {
+        acc |= p[i];
+    }
+    return (acc & UINT64_C(0x8080808080808080)) == 0u;
+}
+
 static uint32_t tile_ascii_group_out(unsigned r)
 {
     return (7u * r + 7u) >> 3;

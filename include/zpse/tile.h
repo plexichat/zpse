@@ -182,6 +182,12 @@ uint32_t zpse_tile_ascii_len(uint16_t nt);
  * 32 ORs and one test for a full tile. */
 int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt);
 
+/* The same test over any length (a whole block, not just a tile), and the
+ * packed length of a run of that many bytes: ceil(7n/8) == n - n/8. The
+ * block encoder uses the pair to decide the form before it sweeps. */
+int zpse_ascii_scan(const uint8_t *p, uint32_t n);
+uint32_t zpse_ascii_len(uint32_t n);
+
 /* Unpack one ASCII payload (exactly zpse_tile_ascii_len(nt) - 8 bytes)
  * into nt bytes. Exposed so a decoder walking a run of consecutive ASCII
  * records can skip the per-tile entry point: the form reads no lane state

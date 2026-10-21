@@ -1379,7 +1379,11 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_OUTPUT_OVERFLOW;
     }
     payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz);
+                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
+                             (e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
+                                     (uint32_t)ZPSE_ENC_FASTEST
+                                 ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                 : (uint32_t)ZPSE_LZ_HASH_BITS);
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }
@@ -1395,6 +1399,76 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_fix_header_crc(dst);
     *total_out = total;
     return PSE_OK;
+}
+
+/* The ASCII gate's sample: how many bytes of the block are priced, and with
+ * how many tiles. Eight tiles is enough for the prescreen to tell prose
+ * from structure, and small enough that the whole decision costs a few
+ * thousand cycles against the ~200,000 a 64 KiB sweep spends. */
+#ifndef ZPSE_ASCII_SAMPLE
+#define ZPSE_ASCII_SAMPLE 2048u
+#endif
+#ifndef ZPSE_ASCII_SAMPLE_TILES
+#define ZPSE_ASCII_SAMPLE_TILES 4u
+#endif
+#ifndef ZPSE_ASCII_MIN_BLOCK
+#define ZPSE_ASCII_MIN_BLOCK 4096u
+#endif
+
+/* Should this block take the seven-bit form without a sweep?
+ *
+ * Three shapes are priced on the head of the block and again on its tail,
+ * each with the probe's limit set to what the form would cost over the same
+ * span. The probe stops a candidate the moment its running price crosses
+ * the limit, so on prose each of these prices is a few tile classifications
+ * rather than a transform of the whole window. A shape that comes back at
+ * or under the limit is a shape that could beat the form, and then the
+ * answer is no: the sweep keeps the block, and the tile loop still offers
+ * the form per tile, so nothing is lost but the shortcut.
+ *
+ * The tail sample is what keeps a block of text with a compressible tail --
+ * or the reverse -- out of the shortcut; both ends have to look like prose.
+ * The three shapes are the ones a text block could plausibly want:
+ * identity, DELTA8 (digits and numbers), and a width-4 transpose (tabular
+ * text). Widths 2, 8 and 16 price within a few percent of width 4 on the
+ * data this fires on, and they cost the same samples again. */
+static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
+                                 uint32_t n)
+{
+    static const uint8_t tids[3] = {0u, 1u, 4u};
+    static const uint8_t scs[3] = {1u, 1u, 4u};
+    static const uint16_t metas[3] = {0u, 1u, 0u};
+    uint32_t pn = n < (uint32_t)ZPSE_ASCII_SAMPLE ? n
+                                                  : (uint32_t)ZPSE_ASCII_SAMPLE;
+    uint32_t alim = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + zpse_ascii_len(pn);
+    unsigned j;
+
+    if (e == 0 || in == 0 || pn < 256u) {
+        return 0;
+    }
+    for (j = 0; j < 3u; j++) {
+        uint32_t h;
+
+        if ((uint32_t)scs[j] > pn) {
+            continue;
+        }
+        h = zpse_block_proxy_exact(e, in, pn, tids[j], scs[j], in, metas[j],
+                                   ZPSE_ASCII_SAMPLE_TILES, alim, 1);
+        if (h == UINT32_MAX || h <= alim) {
+            return 0;
+        }
+        if (n > pn) {
+            uint32_t t = zpse_block_proxy_exact(e, in + (n - pn), pn, tids[j],
+                                                scs[j], in, metas[j],
+                                                ZPSE_ASCII_SAMPLE_TILES,
+                                                alim, 1);
+
+            if (t == UINT32_MAX || t <= alim) {
+                return 0;
+            }
+        }
+    }
+    return 1;
 }
 
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -1565,6 +1639,43 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         /* No checksum asked for: nothing reads the field, so it is left
          * 0 and the pass over the block is not paid at all. */
         in_crc = 0u;
+    }
+
+    /* ---- ASCII gate -------------------------------------------- *
+     * A block whose bytes are all below 0x80 has a form that costs seven
+     * bits a byte -- 224 bytes per 256-byte tile -- with no predictor, no
+     * mask and no residual codec. On prose that is the best this encoder
+     * can do, and today it finds it the expensive way: the sweep prices
+     * every shape, then encodes one in full, then the tile loop offers the
+     * seven-bit form per tile and compares. Nine tenths of that work is
+     * the sweep discovering that nothing predicts English.
+     *
+     * So the decision is taken here, before the sweep, and it is taken on
+     * the evidence the sweep itself would have used: four tiles of the
+     * identity, DELTA8 and width-4 transposed planes, priced exactly with
+     * the probe's own limit set to what the seven-bit form would cost over
+     * the same span. A probe that comes back ABOVE that limit has been
+     * convicted -- it stopped early on a plane that could not win -- and if
+     * all three shapes are convicted there is nothing left for the sweep to
+     * try: a transform is one of those three or a width the sample did not
+     * see, and the widths all price alike on the data this fires on.
+     *
+     * The gate never fires on data that compresses: a constant or periodic
+     * ASCII plane prices at its own floor, far below seven bits a byte, so
+     * the sample does not convict and the block keeps the sweep it has
+     * always had. Only MAX opts out -- it has the LZ form, which beats
+     * seven bits on prose (1.26-5.07:1 on the Silesia text files), and
+     * that trial is the point of the level. */
+    e->ascii_gate = 0u;
+    if ((e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) !=
+            (uint32_t)ZPSE_ENC_MAX &&
+        n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK && zpse_ascii_scan(in, n) &&
+        zpse_block_ascii_gate(e, in, n)) {
+        e->ascii_gate = 1u;
+        /* Identity only: one trial, which now packs instead of searching,
+         * and no pricing pass or second opinion to pay for first. */
+        ncand = 1;
+        sample_flat = 0;
     }
 
     /* Attempt order: identity first unless the sample says DELTA8's plane

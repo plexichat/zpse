@@ -3119,6 +3119,31 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * what the comparison after the sweep uses at the ratio levels, so
          * the scan is not wasted there either. */
         ascii_ok = (nt >= 8u && zpse_tile_is_ascii(actual, nt)) ? 1 : 0;
+        /* The block encoder's gate: its samples have already shown that
+         * no cheap shape beats seven bits a byte on this block, so the
+         * record is written here and the prescreen, the classify, the mode
+         * search and the pack are skipped for the whole block. That is the
+         * difference between a text block costing a full sweep per tile
+         * and costing a scan and a bit pack -- and the form is the same
+         * bytes either way, so the stream is unchanged. */
+        if (ascii_ok && e->ascii_gate != 0u) {
+            uint32_t alen = zpse_tile_ascii_len(nt);
+
+            if (pos + 2u + alen > payload_cap) {
+                return seg_no_room(&h, payload_out, plane, plane_len,
+                                   initial_literal, pos, byte_budget,
+                                   payload_cap);
+            }
+            zpse_store_u16le(payload_out + pos, (uint16_t)alen);
+            (void)zpse_tile_pack_ascii(actual, nt, payload_out + pos + 2u,
+                                       payload_cap - pos - 2u);
+            pos += 2u + alen;
+            dense_ok = 0;
+            if (seg_flat_abort(e, nt, 2u + alen, flat_abort_min)) {
+                return PSE_OUTPUT_OVERFLOW;
+            }
+            continue;
+        }
 
         /* Opt-in trial accounting (-DZPSE_TRIAL_STATS, see tile.c).
          * Counted here, not at the top of the loop, so the denominator is

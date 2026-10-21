@@ -114,12 +114,19 @@ typedef struct ZpseEncoder {
      * trial and reset by the caller per trial. */
     uint32_t flat_covered;
     uint32_t flat_paid;
-    /* The block input pointer, when zpse_block_encode has proved that whole
+    /* The block input pointer, when        zpse_block_encode has proved that whole
      * input is one byte value while choosing its CRC form. zpse_segment_encode
      * skips its own plane scan when it is handed this very pointer (the
      * identity trial's plane does not copy), so a constant block is scanned
      * once. NULL for every block that is not constant, and reset per block. */
     const uint8_t *const_plane;
+    /* Set by zpse_block_encode when its decision sample has proved that the
+     * tile path loses to the seven-bit ASCII form on this block. The segment
+     * encoder then writes an ASCII record for every ASCII tile without a
+     * prescreen, a classify, a mode search or a pack -- the form's price is
+     * known before the first tile, which is the whole of why the gate exists.
+     * Never read by the decoder, and reset per block. */
+    uint8_t ascii_gate;
 } ZpseEncoder;
 
 int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len);
