@@ -423,6 +423,12 @@ static int z_decomp(const uint8_t *in, size_t cn, uint8_t *out, size_t n)
     return l == n ? 0 : -1;
 }
 
+/* Short names for ZpseTransformId (types.h), indexed by transform id. */
+static const char *tname[12] = {
+    "RAW", "D8", "X8", "T2", "T4", "T8", "T16",
+    "DT2", "DT4", "DT8", "DT16", "STR"
+};
+
 static void *h_zstd, *h_lz4, *h_z, *h_bre, *h_brd;
 static size_t (*p_ZSTD_compressBound)(size_t);
 static size_t (*p_ZSTD_compress)(void*,size_t,const void*,size_t,int);
@@ -899,6 +905,7 @@ int main(int argc, char **argv)
         if (only[0] && !strstr(cases[i].name, only)) continue;
         g_rng = 0x1234u + (uint32_t)i * 7919u;
         cases[i].gen();
+        uint64_t tcount[12] = { 0 };
         for (c = 0; c < 5; c++) {
             Codec *k = &codecs[c];
             size_t tot_c = 0, worst = 0, *clens;
@@ -928,6 +935,11 @@ int main(int argc, char **argv)
                 if (k->decomp(g_comp, cl, g_out, g_blk) != 0 ||
                     memcmp(g_out, g_in + b * g_blk, g_blk) != 0) { fail = 1; break; }
                 clens[b] = cl; tot_c += cl;
+                if (k == &codecs[0]) {
+                    ZpseBlockHeader bh;
+                    if (zpse_block_header_parse(&bh, g_comp, ZPSE_BLOCK_HEADER_SIZE) == 0 &&
+                        bh.transform_id < 12u) tcount[bh.transform_id]++;
+                }
             }
             if (fail) {
                 printf("| %s | %s | FAILED | - | - | - |\n", cases[i].name, k->name);
@@ -988,6 +1000,22 @@ int main(int argc, char **argv)
                 printf("| %s | %s %s | %s | %s (%s/%s) | %s (%s/%s) | %s |\n",
                        cases[i].name, k->name, k->level, rb,
                        eb, mb_e, xb_e, db, mb_d, xb_d, fb);
+                if (k == &codecs[0]) {
+                    char tbuf[160];
+                    size_t tb = 0;
+                    int first = 1, t;
+                    for (t = 0; t < 12; t++) {
+                        if (tcount[t]) {
+                            if (!first) tbuf[tb++] = ' ';
+                            first = 0;
+                            tb += (size_t)snprintf(tbuf + tb, sizeof tbuf - tb,
+                                                   "%s=%llu", tname[t],
+                                                   (unsigned long long)tcount[t]);
+                        }
+                    }
+                    if (first) snprintf(tbuf, sizeof tbuf, "(no blocks)");
+                    printf("transforms(%s): %s\n", cases[i].name, tbuf);
+                }
                 sum_ratio[c] += ratio;
                 sum_enc[c] += enc_mb;
                 sum_dec[c] += dec_mb;
