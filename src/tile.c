@@ -979,47 +979,29 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
              * tile has seven such chunks out of eight. Bits at or above
              * nt are never set by the chunk macro, so a full word implies
              * a full chunk and k + 32 <= 256 always holds here. */
-            /* Eight lanes at a time, in position order: the low half of
-             * each 128-bit lane holds positions h*8..h*8+7 and its high
-             * half the next eight, so the four 8-byte stores cover the
-             * chunk in order. (Storing a whole 128-bit lane with one
-             * 8-byte store would put positions 16..23 after 0..7 and
-             * drop 8..15 -- the unit-order trap this path has to avoid
-             * just like the general one.) */
+            /* Sixteen lanes per store, in position order: the low half of
+             * the 256-bit vector holds positions p..p+15 and its high half
+             * p+16..p+31, so a 16-byte store of each half lands the chunk
+             * in the array in order. Two stores per array, instead of the
+             * four the same bytes used to take. */
             const __m128i plo = _mm256_castsi256_si128(pv);
             const __m128i rlo = _mm256_castsi256_si128(r);
+            const __m128i vlo = _mm256_castsi256_si128(v);
             const __m128i phi = _mm256_extracti128_si256(pv, 1);
             const __m128i rhi = _mm256_extracti128_si256(r, 1);
+            const __m128i vhi = _mm256_extracti128_si256(v, 1);
 
             rmaxv = _mm256_max_epu8(rmaxv, r);
             dmaxv = _mm256_max_epu8(dmaxv, db);
             ndminv = _mm256_max_epu8(ndminv, _mm256_xor_si256(db, all));
             if (want_at_pred) {
-                _mm_storel_epi64((__m128i *)(void *)(tp + k), plo);
-                _mm_storel_epi64((__m128i *)(void *)(tp + k + 8u),
-                                 _mm_srli_si128(plo, 8));
-                _mm_storel_epi64((__m128i *)(void *)(tp + k + 16u), phi);
-                _mm_storel_epi64((__m128i *)(void *)(tp + k + 24u),
-                                 _mm_srli_si128(phi, 8));
+                _mm_storeu_si128((__m128i *)(void *)(tp + k), plo);
+                _mm_storeu_si128((__m128i *)(void *)(tp + k + 16u), phi);
             }
-            _mm_storel_epi64((__m128i *)(void *)(tr + k), rlo);
-            _mm_storel_epi64((__m128i *)(void *)(tr + k + 8u),
-                             _mm_srli_si128(rlo, 8));
-            _mm_storel_epi64((__m128i *)(void *)(tr + k + 16u), rhi);
-            _mm_storel_epi64((__m128i *)(void *)(tr + k + 24u),
-                             _mm_srli_si128(rhi, 8));
-            {
-                /* the actual bytes of a full word are the chunk itself */
-                const __m128i vlo = _mm256_castsi256_si128(v);
-                const __m128i vhi = _mm256_extracti128_si256(v, 1);
-
-                _mm_storel_epi64((__m128i *)(void *)(ta + k), vlo);
-                _mm_storel_epi64((__m128i *)(void *)(ta + k + 8u),
-                                 _mm_srli_si128(vlo, 8));
-                _mm_storel_epi64((__m128i *)(void *)(ta + k + 16u), vhi);
-                _mm_storel_epi64((__m128i *)(void *)(ta + k + 24u),
-                                 _mm_srli_si128(vhi, 8));
-            }
+            _mm_storeu_si128((__m128i *)(void *)(tr + k), rlo);
+            _mm_storeu_si128((__m128i *)(void *)(tr + k + 16u), rhi);
+            _mm_storeu_si128((__m128i *)(void *)(ta + k), vlo);
+            _mm_storeu_si128((__m128i *)(void *)(ta + k + 16u), vhi);
             k += 32u;
             continue;
         }
@@ -1046,7 +1028,13 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
          * ways: it takes the popcount-to-store dependency off the 32 group
          * stores of a tile, but costs more live 128-bit registers than the
          * loop form on a nearly-all-exception tile (text: +15 cycles a tile
-         * of classify), so the shorter form stays. */
+         * of classify), so the shorter form stays.
+         *
+         * A group whose mask byte is zero has no exception in it, so there
+         * is nothing to compact and nothing to advance over: skipping it
+         * saves a LUT load, two shuffles and two stores. On a tile with a
+         * few exceptions per chunk that is most of the groups; on a dense
+         * one the test is a branch that is never taken. */
         for (h = 0; h < 2u; h++) {
             const __m128i pd =
                 h ? _mm256_extracti128_si256(pv, 1) : _mm256_castsi256_si128(pv);
@@ -1057,11 +1045,15 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
             const unsigned m0 = (m >> (16u * h)) & 0xFFu;
             const unsigned m1 = (m >> (16u * h + 8u)) & 0xFFu;
 
-            TILE_CL_CMP3(tp, tr, ta, k, pd, rd, ad, m0);
-            k = (uint16_t)(k + _mm_popcnt_u32(m0));
-            TILE_CL_CMP3(tp, tr, ta, k, _mm_srli_si128(pd, 8),
-                         _mm_srli_si128(rd, 8), _mm_srli_si128(ad, 8), m1);
-            k = (uint16_t)(k + _mm_popcnt_u32(m1));
+            if (m0 != 0u) {
+                TILE_CL_CMP3(tp, tr, ta, k, pd, rd, ad, m0);
+                k = (uint16_t)(k + _mm_popcnt_u32(m0));
+            }
+            if (m1 != 0u) {
+                TILE_CL_CMP3(tp, tr, ta, k, _mm_srli_si128(pd, 8),
+                             _mm_srli_si128(rd, 8), _mm_srli_si128(ad, 8), m1);
+                k = (uint16_t)(k + _mm_popcnt_u32(m1));
+            }
         }
     }
 
