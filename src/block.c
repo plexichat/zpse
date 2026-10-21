@@ -34,6 +34,87 @@
 /* Block envelope codec.
  * No allocation; staging uses caller arenas. Helpers static. */
 
+/* Opt-in block-sweep accounting (-DZPSE_BLOCK_STATS): what the transform
+ * sweep actually spent on a block. The encoder's candidate list is not
+ * observable from outside it, so "how many candidates did this block
+ * really try, and how many of those tries were wasted?" cannot be measured
+ * without counters -- and that answer decides where the sweep's cost is.
+ *
+ * Each counter is a global, so a multi-threaded caller would race; the
+ * counters exist to answer questions about a benchmark run, not to be
+ * part of the format. */
+#if defined(ZPSE_BLOCK_STATS)
+/* Blocks encoded (one call to zpse_block_encode that got past the size
+ * checks). The denominator for every per-block average below. */
+uint32_t zpse_block_blocks;
+/* Candidates the list BUILT, before any pruning. */
+uint32_t zpse_block_cands_built;
+/* Candidates the decision probe PRICED (one exact probe per candidate). */
+uint32_t zpse_block_cands_priced;
+/* Candidates that survived the probe's margin and went into the trial
+ * loop. */
+uint32_t zpse_block_cands_kept;
+/* Full block encodes actually SPENT (a trial that ran to the end of the
+ * block). */
+uint32_t zpse_block_trials;
+/* Trials skipped by the per-candidate floor bound without any work. */
+uint32_t zpse_block_trials_skipped;
+/* How many times a trial was won, by transform id (0..10: RAW_BYTES,
+ * DELTA8, and the plain/delta transposes at widths 2/4/8/16). */
+uint32_t zpse_block_wins[16];
+/* Total compressed bytes each transform id produced across all trials. */
+uint32_t zpse_block_bytes[16];
+/* How many trials each transform id ran. */
+uint32_t zpse_block_trials_by_tid[16];
+/* The winning transform id of each block, counted (one entry per block).
+ * Slot 15 is the RAW fallback: the sweep found nothing that paid and the
+ * block went out raw. */
+uint32_t zpse_block_win_tid[16];
+/* Where the winner sat in the trial order: the histogram of "which trial
+ * actually won", 0 = the first trial. It is the direct answer to "is the
+ * sweep's own ordering already right most of the time?", and therefore to
+ * "would trying fewer candidates cost compressed size?". */
+uint32_t zpse_block_win_pos[32];
+/* How much smaller the final winner was than the FIRST trial's total,
+ * summed over the blocks, and how many blocks had a first trial that was
+ * not the winner. A non-zero sum means the later trials earned their
+ * keep; a zero sum means they did not. */
+uint32_t zpse_block_first_trial_delta;
+uint32_t zpse_block_first_trial_lost;
+/* The margin, in bytes, between the probe's best price and the worst
+ * survivor's price -- the width of the band the probe kept. Summed. */
+uint32_t zpse_block_margin_sum;
+/* The best price the probe produced. Summed, for a per-block average. */
+uint32_t zpse_block_price_sum;
+/* Blocks where the probe's winner was also the trial loop's winner: the
+ * probe got it right. */
+uint32_t zpse_block_probe_correct;
+/* Cycles spent in the decision probe (exact prices) and in the trial
+ * loop (full block encodes), so the split between "deciding which shape to
+ * try" and "trying the shapes" is measured rather than assumed. Read
+ * with rdtsc, so the two counters are comparable to each other but not
+ * to wall-clock time. */
+uint64_t zpse_block_probe_cycles;
+uint64_t zpse_block_trial_cycles;
+/* A serialising cycle read: the counter must not be reordered across the
+ * work it measures. LFENCE is enough on every x86-64 that runs this
+ * build's AVX2 paths. */
+static uint64_t blk_rdtsc(void)
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+    uint32_t lo;
+    uint32_t hi;
+
+    __asm__ __volatile__("lfence" ::: "memory");
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    __asm__ __volatile__("lfence" ::: "memory");
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+#else
+    return 0u;
+#endif
+}
+#endif
+
 static int zpse_block_scount_valid(uint8_t sc)
 {
     return sc == 1 || sc == 2 || sc == 4 || sc == 8 || sc == 16;
@@ -898,15 +979,20 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_TILES 8u
 #endif
 
-/* Tiles the decision probe prices per candidate (see the sweep decision in
- * zpse_block_encode): paid once per candidate against a full trial's 256
- * tiles. Four is measured against sixteen: the 768-case clen corpus came
- * out byte-identical either way, the 2,718-case fuzz corpus came out
- * 34,174 bytes SMALLER at four (a coarse estimate ties more often, and a
- * tie goes to the earlier candidate -- the identity, which is the better
- * prior on the mixed blocks where the sample is noisiest), and it took
- * 22 us off a 64 KiB block's encode that the probe was spending to price
- * candidates it then rejected. */
+/* Tiles the decision probe prices per plane of a SINGLE-segment candidate
+ * (see the sweep decision in zpse_block_encode): paid once per candidate
+ * against a full trial's 256 tiles. Four is measured against sixteen: the
+ * 768-case clen corpus came out byte-identical either way, the 2,718-case
+ * fuzz corpus came out 34,174 bytes SMALLER at four (a coarse estimate ties
+ * more often, and a tie goes to the earlier candidate -- the identity, which
+ * is the better prior on the mixed blocks where the sample is noisiest), and
+ * it took 22 us off a 64 KiB block's encode that the probe was spending to
+ * price candidates it then rejected.
+ *
+ * A candidate with more than one plane is priced one tile per plane instead,
+ * whatever this says: the planes of a transpose are not interchangeable, so
+ * there is no fewer-planes estimate of it that is not biased (see
+ * zpse_block_exact_sum). */
 #ifndef ZPSE_DECIDE_TILES
 #define ZPSE_DECIDE_TILES 4u
 #endif
@@ -997,36 +1083,34 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
 {
     uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u;
     uint32_t records = 0u;
-    uint32_t avg_rec;
-    uint32_t sum_rec;
-    unsigned priced = 0u;
-    unsigned step = 1u;
     unsigned s;
 
     /* 0 means "the probe's own default", exactly as zpse_block_exact_plane
-     * reads it; it is resolved here because it divides the budget. */
+     * reads it; it is resolved here because it is the depth this function
+     * asks a single-segment plane for. */
     if (tiles == 0u || tiles > ZPSE_DECIDE_TILES) {
         tiles = (tiles == 0u) ? ZPSE_PROBE_TILES : ZPSE_DECIDE_TILES;
     }
-    /* The budget is per CANDIDATE, not per plane: a 16-segment transpose has
-     * sixteen planes, and pricing a tile in every one of them measured
-     * sixteen tiles to buy four tiles' worth of information (12.5 us of a
-     * 27 us block on the lowentropy row). Price `tiles` of the planes
-     * instead, one tile each.
+    /* Every plane is priced, one tile each. A transpose's planes are NOT
+     * interchangeable, and an estimate that prices a stride of them and
+     * charges the rest the average of those is not merely coarse -- it is
+     * biased towards whatever the priced planes happen to be worth. On the
+     * decimal8 corpus the planes of the width-16 delta-transpose differ by
+     * several times over, and pricing four of the sixteen (0, 4, 8, 12) put
+     * the whole candidate at 1648 bytes on the 16 KiB window against the
+     * 3728 it actually costs over the block, so it beat the width-8 plain
+     * transpose (3276 -- and the cheapest shape the block has) by a margin
+     * the block does not have. One tile in each of the sixteen planes prices
+     * it at its cost, and the transpose that really wins is the one the
+     * probe picks.
      *
-     * The planes that are not priced still get the constant test, because
-     * that is the one form a tile price cannot see and it is cheap: the
-     * phases of a transpose are constant whenever the source repeats with
-     * the transpose period, and that is exactly the case a spread of four
-     * planes can miss (a spike every 256 bytes lands in one phase). A plane
-     * that is not constant is priced at the priced planes' average. */
-    if (sc > 1u) {
-        step = ((unsigned)sc + tiles - 1u) / tiles;
-        if (step == 0u) {
-            step = 1u;
-        }
-    }
-    for (s = 0u; s < sc; s += step) {
+     * The price of the deeper pass is 60 plane-tiles for the ten candidates
+     * of a 64 KiB block instead of 36: mean columnar encode 666 MB/s against
+     * 794, for decimal8 4.62:1 -> 5.82:1 and 3.96:1 -> 4.01:1 over the
+     * corpus. The constant test that used to stand in for the planes that
+     * were not priced is gone with them: a plane that is priced needs no
+     * stand-in. */
+    for (s = 0u; s < sc; s++) {
         /* The running share: everything still unspent below `limit`
          * belongs to the planes not yet priced, and this plane may spend
          * its envelope plus a fair piece of it. UINT32_MAX (no verdict in
@@ -1049,7 +1133,6 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
             }
             /* c is 16 + the plane's record area folded up to its tile count. */
             records += c - 16u;
-            priced++;
 
             /* Early exit: if the running lower bound on the candidate total
              * already exceeds `limit`, this candidate cannot win. Return the
@@ -1067,23 +1150,7 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
             }
         }
     }
-    if (priced == 0u) {
-        return UINT32_MAX;
-    }
-    sum_rec = records;
-    avg_rec = records / priced;
-    if (step > 1u) {
-        for (s = 0u; s < sc; s++) {
-            uint32_t d;
-
-            if ((s % step) == 0u) {
-                continue;
-            }
-            d = zpse_segment_const_cost(planes[s], lens[s]);
-            sum_rec += (d != UINT32_MAX) ? (d - 16u) : avg_rec;
-        }
-    }
-    total += (uint32_t)sc * 16u + sum_rec;
+    total += (uint32_t)sc * 16u + records;
     return total;
 }
 
@@ -1330,6 +1397,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     /* Every candidate writes the same decoded CRC into its header (it is
      * the CRC of the uncompressed block), so it is computed once here
      * instead of once per trial over the same 64 KiB. */
+#if defined(ZPSE_BLOCK_STATS)
+    zpse_block_blocks++;
+    zpse_block_cands_built += (uint32_t)ncand;
+#endif
     /* A one-value block can take its CRC arithmetically. The scan is the
      * segment encoder's own AVX2 one, and its answer is handed back to that
      * encoder by pointer (e->const_plane) so the identity trial skips its
@@ -1446,6 +1517,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * below walks. */
     if (ncand > 1 && n >= 8192u) {
         uint32_t ex[ZPSE_MAX_CAND];
+        uint32_t pc[ZPSE_MAX_CAND];
         uint8_t order[ZPSE_MAX_CAND];
         int nord = 0;
         /* Price on the first 16 KiB only: staging a transform costs about
@@ -1483,10 +1555,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
         for (ci = 0; ci < ncand; ci++) {
             ex[ci] = UINT32_MAX;
+            pc[ci] = UINT32_MAX;
         }
         for (k = 0; k < nord; k++) {
             const uint8_t *mb;
             uint32_t lim = UINT32_MAX;
+#if defined(ZPSE_BLOCK_STATS)
+            uint64_t t_cycle = blk_rdtsc();
+#endif
 
             ci = order[k];
             mb = meta_lens[ci] > 0 ? meta_bufs[ci] : in;
@@ -1502,8 +1578,32 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
                                             ZPSE_DECIDE_TILES, lim);
+#if defined(ZPSE_BLOCK_STATS)
+            zpse_block_cands_priced++;
+            zpse_block_probe_cycles += blk_rdtsc() - t_cycle;
+#endif
             if (ex[ci] == UINT32_MAX) {
+                pc[ci] = UINT32_MAX;
                 continue;
+            }
+            /* The content price: what the sample actually measured, with the
+             * candidate's fixed structural envelope -- block header, block
+             * segment directory and one 16-byte segment header per plane --
+             * taken back out. The sample can only see content; the envelope
+             * is a constant it cannot judge, and charging a width-16 shape
+             * 192 bytes of extra envelope is what let a width-4 shape win the
+             * ranking on a block whose best shape is a width-8 transpose
+             * ("spike every 256": 404 + 112 envelopes for the width-4
+             * against 436 + 176 for the width-8, so the totals said 404 < 436
+             * while the content said 292 > 260 -- and the block is 1419
+             * against 1211). Pruning compares content; the trial order below
+             * still compares totals, because that is what the block will
+             * cost. */
+            {
+                uint32_t env = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
+                               16u * (uint32_t)scounts[ci];
+
+                pc[ci] = ex[ci] > env ? ex[ci] - env : 0u;
             }
             if (pick < 0 || ex[ci] < ex[pick] ||
                 (ex[ci] == ex[pick] && idx[ci] < idx[pick])) {
@@ -1520,14 +1620,27 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * so the cheapest shape is attempted first and every later trial
              * is handed the tightest budget it could still win against.
              * Anything that could not be priced is kept and sorts last (it has
-             * no price to order by, and the sweep must not drop it). */
-            uint32_t limit = ex[pick] + (ex[pick] >> 4);
+             * no price to order by, and the sweep must not drop it).
+             *
+             * The boundary is on the CONTENT price (see the comment where
+             * pc[] is filled in): the envelope is not a measurement, so it
+             * must not decide which shapes are worth a trial. The winner is
+             * always kept whatever its content price says, so the loss when
+             * the two orders disagree is one trial, not a worse block. */
+            uint32_t plimit = pc[pick] + (pc[pick] >> 4);
+            /* ...and a candidate whose content is that close but whose total
+             * is not is one the sample contradicts itself about: the only
+             * thing it can be charging is the envelope, which the trial will
+             * charge too. Half again the winner's total is the widest the
+             * two orders can disagree by a margin worth a trial. */
+            uint32_t wide = ex[pick] + (ex[pick] >> 1);
             int kept = 0;
             int win = -1;
             uint8_t win_idx = idx[pick];
 
             for (ci = 0; ci < ncand; ci++) {
-                if (ci == pick || ex[ci] == UINT32_MAX || ex[ci] <= limit) {
+                if (ci == pick || pc[ci] == UINT32_MAX ||
+                    (pc[ci] <= plimit && ex[ci] <= wide)) {
                     if (ci == pick) {
                         win = kept;
                     }
@@ -1547,6 +1660,25 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
             }
             ncand = kept;
+#if defined(ZPSE_BLOCK_STATS)
+            /* The compaction above moved the winner to slot `win` (the
+             * slot `kept` held when the winner was copied), so its price
+             * is ex[win], not ex[pick] -- `pick` still names the slot the
+             * winner had BEFORE the compaction. */
+            {
+                uint32_t best_price = ex[win];
+                uint32_t worst = 0u;
+
+                zpse_block_cands_kept += (uint32_t)kept;
+                zpse_block_price_sum += best_price;
+                for (ci = 0; ci < kept; ci++) {
+                    if (ex[ci] != UINT32_MAX && ex[ci] > worst) {
+                        worst = ex[ci];
+                    }
+                }
+                zpse_block_margin_sum += worst - best_price;
+            }
+#endif
             /* Insertion sort on the survivors: at most ten of them, and a tie
              * keeps the original list order (idx ascending) so the attempt
              * order still cannot decide a tie. */
@@ -1664,6 +1796,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * early after a trial do spend one. Counting the trials themselves is
      * what the cap means: "the sweep has spent N full encodes". */
     int ntried = 0;
+#if defined(ZPSE_BLOCK_STATS)
+    /* The total the first trial produced, and whether it succeeded at all.
+     * The difference between it and the block's final winner is exactly
+     * what the later trials bought. */
+    uint32_t first_trial_total = 0u;
+    int have_first_trial = 0;
+    /* The slot (in trial order) that produced the current winner. */
+    int win_pos = -1;
+#endif
 
     for (oi = 0; oi < ncand; oi++) {
         int i = oi;
@@ -1690,15 +1831,35 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (have_best && (uint32_t)idx[i] > best_idx &&
             zpse_block_floor(n, tids[i], scounts[i], meta_lens[i]) >
                 best_total) {
+#if defined(ZPSE_BLOCK_STATS)
+            zpse_block_trials_skipped++;
+#endif
             continue;
         }
         mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
         ntried++;
+#if defined(ZPSE_BLOCK_STATS)
+        zpse_block_trials++;
+        zpse_block_trials_by_tid[tids[i] & 15u]++;
+#endif
+#if defined(ZPSE_BLOCK_STATS)
+        {
+            uint64_t t_cycle = blk_rdtsc();
+
+            rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
+                                    meta_lens[i], is_last, seq,
+                                    e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
+                                    &budget_hit, have_best, best_total,
+                                    flat_min);
+            zpse_block_trial_cycles += blk_rdtsc() - t_cycle;
+        }
+#else
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq,
                                 e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
                                 &budget_hit, have_best, best_total,
                                 flat_min);
+#endif
         if (rc != PSE_OK) {
             /* A trial the budget stopped cannot win: its total only grows as
              * its remaining segments are written. That is a verdict on THIS
@@ -1709,6 +1870,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * of the loop still skips a shape whose own bound cannot beat the
              * winner without spending the trial. */
             (void)budget_hit;
+#if defined(ZPSE_BLOCK_STATS)
+            if (!have_first_trial) {
+                /* The first trial failed, so there is no first-trial total to
+                 * compare against: the block's winner was found by a later
+                 * trial with nothing to beat. */
+                have_first_trial = 1;
+                first_trial_total = UINT32_MAX;
+            }
+#endif
             /* A trial the budget stopped is still a full block encode
              * attempt, so it counts against the flat-block cap. */
             if (sample_flat && ntried >= ZPSE_FLAT_TRIALS) {
@@ -1737,7 +1907,20 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             best_total = t;
             best_idx = (uint32_t)idx[i];
             have_best = 1;
+#if defined(ZPSE_BLOCK_STATS)
+            zpse_block_bytes[tids[i] & 15u] += t;
+            /* The winner changed: the previous holder's win is undone, so
+             * the per-tid win count is tracked at the end of the block
+             * rather than here. */
+            win_pos = oi;
+#endif
         }
+#if defined(ZPSE_BLOCK_STATS)
+        if (!have_first_trial) {
+            have_first_trial = 1;
+            first_trial_total = t;
+        }
+#endif
         /* Early exit over the candidates that are LEFT, not over all of
          * them: a trial whose own envelope is bigger (16 segments, or a
          * metadata byte) cannot reach a size the identity trial can, so
@@ -1816,6 +1999,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_block_header_serialize(out, &h);
         zpse_block_fix_header_crc(out);
         memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
+#if defined(ZPSE_BLOCK_STATS)
+        /* The RAW fallback won, but it is not a transform win: the sweep
+         * found nothing that paid, and the block went out raw. */
+        zpse_block_win_tid[15u]++;
+#endif
         return (int)total;
     }
 
@@ -1823,5 +2011,34 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_OUTPUT_OVERFLOW;
     }
     memcpy(out, e->best, best_total);
+#if defined(ZPSE_BLOCK_STATS)
+    {
+        /* The winner's transform id: the candidate that carried best_total.
+         * best_idx is the LIST index of the winner, and the list is sorted
+         * by price, so the winner is found by scanning for it. */
+        int wi;
+
+        for (wi = 0; wi < ncand; wi++) {
+            if ((uint32_t)idx[wi] == best_idx) {
+                break;
+            }
+        }
+        if (wi < ncand) {
+            zpse_block_wins[tids[wi] & 15u]++;
+            zpse_block_win_tid[tids[wi] & 15u]++;
+        }
+        /* Which trial won, and what the later trials bought over the first
+         * one. A winner at position 0 means the sweep's own ordering was
+         * right and every trial after it was spent for nothing. */
+        if (win_pos >= 0 && win_pos < 32) {
+            zpse_block_win_pos[win_pos]++;
+        }
+        if (have_first_trial && first_trial_total != UINT32_MAX &&
+            first_trial_total > best_total) {
+            zpse_block_first_trial_delta += first_trial_total - best_total;
+            zpse_block_first_trial_lost++;
+        }
+    }
+#endif
     return (int)best_total;
 }
