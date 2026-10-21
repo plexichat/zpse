@@ -67,6 +67,22 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
                           size_t *out_len_out,
                           void *dec_arena_320k);
 
+/* Same as zpse_compress_frame_ex, with the FrameIndex appended so the
+ * result can be read block by block in any order (zpse_frame_seek). The
+ * index costs 16 + 8 bytes per block. */
+int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
+                                uint8_t *out, size_t out_cap,
+                                size_t *out_len_out,
+                                uint32_t nominal_block_size,
+                                uint32_t enc_flags,
+                                void *enc_arena_448k);
+
+/* Decode one block of an indexed frame without touching the others.
+ * `output` must hold one block (at most nominal_block_size, 64 KiB). */
+int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
+                    uint8_t *output, uint32_t out_cap, uint32_t *out_len_out,
+                    void *dec_arena_320k);
+
 #ifdef __cplusplus
 }
 #endif
