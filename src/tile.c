@@ -1028,13 +1028,7 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
          * ways: it takes the popcount-to-store dependency off the 32 group
          * stores of a tile, but costs more live 128-bit registers than the
          * loop form on a nearly-all-exception tile (text: +15 cycles a tile
-         * of classify), so the shorter form stays.
-         *
-         * A group whose mask byte is zero has no exception in it, so there
-         * is nothing to compact and nothing to advance over: skipping it
-         * saves a LUT load, two shuffles and two stores. On a tile with a
-         * few exceptions per chunk that is most of the groups; on a dense
-         * one the test is a branch that is never taken. */
+         * of classify), so the shorter form stays. */
         for (h = 0; h < 2u; h++) {
             const __m128i pd =
                 h ? _mm256_extracti128_si256(pv, 1) : _mm256_castsi256_si128(pv);
@@ -1045,15 +1039,11 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
             const unsigned m0 = (m >> (16u * h)) & 0xFFu;
             const unsigned m1 = (m >> (16u * h + 8u)) & 0xFFu;
 
-            if (m0 != 0u) {
-                TILE_CL_CMP3(tp, tr, ta, k, pd, rd, ad, m0);
-                k = (uint16_t)(k + _mm_popcnt_u32(m0));
-            }
-            if (m1 != 0u) {
-                TILE_CL_CMP3(tp, tr, ta, k, _mm_srli_si128(pd, 8),
-                             _mm_srli_si128(rd, 8), _mm_srli_si128(ad, 8), m1);
-                k = (uint16_t)(k + _mm_popcnt_u32(m1));
-            }
+            TILE_CL_CMP3(tp, tr, ta, k, pd, rd, ad, m0);
+            k = (uint16_t)(k + _mm_popcnt_u32(m0));
+            TILE_CL_CMP3(tp, tr, ta, k, _mm_srli_si128(pd, 8),
+                         _mm_srli_si128(rd, 8), _mm_srli_si128(ad, 8), m1);
+            k = (uint16_t)(k + _mm_popcnt_u32(m1));
         }
     }
 
@@ -1451,6 +1441,11 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
  * attempt: one predictor, one tile, one pass. */
 #if defined(ZPSE_TRIAL_STATS)
 uint32_t zpse_trial_calls[12];
+uint32_t zpse_trial_search_tiles;
+uint32_t zpse_stats_palettable;
+uint32_t zpse_stats_palette_emits;
+uint32_t zpse_stats_literal_emits;
+uint32_t zpse_stats_modes[64];
 #endif
 
 /* Classify one tile: fill cl->words / cl->k / cl->at_pred / constant_C
