@@ -3118,7 +3118,13 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * prescreen confirms no predictor is close. `ascii_len` is also
          * what the comparison after the sweep uses at the ratio levels, so
          * the scan is not wasted there either. */
-        ascii_ok = (nt >= 8u && zpse_tile_is_ascii(actual, nt)) ? 1 : 0;
+        /* A gated block has already had every one of its bytes scanned for
+         * the high bit (zpse_ascii_scan over the whole block, which is what
+         * let the gate fire), so the per-tile scan here would re-prove it 256
+         * times per block. Skip it, and keep the per-tile test for the blocks
+         * that did not gate. */
+        ascii_ok = (e->ascii_gate != 0u) ? 1
+                   : ((nt >= 8u && zpse_tile_is_ascii(actual, nt)) ? 1 : 0);
         /* The block encoder's gate: its samples have already shown that
          * no cheap shape beats seven bits a byte on this block, so the
          * record is written here and the prescreen, the classify, the mode
