@@ -14,7 +14,7 @@ $unity = Join-Path $repo "src/zpse_unity.c"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "opencode/zpse-tests"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $fail = 0
-foreach ($t in @("test_roundtrip", "test_transforms", "test_combinadic", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_frame", "test_sizes", "test_colref", "test_colcorpus")) {
+foreach ($t in @("test_roundtrip", "test_transforms", "test_combinadic", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_ascii", "test_frame", "test_sizes", "test_colref", "test_colcorpus")) {
     $src = Join-Path $repo "tests/suites/$t.c"
     $exe = Join-Path $tmp "$t.exe"
     Write-Output "=== build $t ==="

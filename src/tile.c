@@ -158,6 +158,369 @@ static uint8_t tile_pick_constant(const uint8_t *actual, uint16_t nt)
     return (uint8_t)best;
 }
 
+/* ---- ASCII pack form --------------------------------------------- *
+ *
+ * 7 bits a byte, MSB first: byte i contributes its low seven bits, the
+ * stream is flushed a byte at a time, and the final partial byte is padded
+ * with zeros. The accumulator never holds more than 7 + 7 bits between
+ * flushes, so 32 bits are enough and the loop is two ALU ops per byte more
+ * than the copy it replaces. See tile.h for the record shape. */
+
+uint32_t zpse_tile_ascii_len(uint16_t nt)
+{
+    /* ceil(7*nt/8) == nt - floor(nt/8), exactly, for every Nt <= 256. */
+    return (uint32_t)ZPSE_TILE_HEADER_SIZE + (uint32_t)nt - (uint32_t)(nt >> 3);
+}
+
+int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt)
+{
+    uint64_t acc = 0u;
+    uint16_t i = 0u;
+
+    if (actual == 0)
+        return 0;
+    for (; (uint32_t)i + 8u <= (uint32_t)nt; i = (uint16_t)(i + 8u)) {
+        uint64_t w;
+
+        memcpy(&w, actual + i, sizeof w);
+        acc |= w;
+    }
+    for (; i < nt; i++)
+        acc |= actual[i];
+    return (acc & UINT64_C(0x8080808080808080)) == 0u;
+}
+
+/* Groups of eight bytes are packed independently: byte i of a group holds
+ * bits 7i..7i+6 of a 56-bit little-endian word, and the group's bytes are
+ * that word stored little-endian. A final group of r < 8 bytes stores the
+ * same word truncated to its 7r bits, in ceil(7r/8) bytes. Because the
+ * groups are byte-aligned to their own inputs, the inverse is eight
+ * independent shifts per group -- and on BMI2 exactly one pext or pdep a
+ * group, which is what makes the decode side fast. The bit order within a
+ * group is the only thing the wire fixes; a group's bytes are never
+ * reordered. */
+#define ZPSE_ASCII_GROUP 8u
+
+/* Bytes a group of r (1..8) ASCII bytes packs to: ceil(7r/8). */
+static uint32_t tile_ascii_group_out(unsigned r)
+{
+    return (7u * r + 7u) >> 3;
+}
+
+/* r bytes (r <= 8) as a 64-bit little-endian word, zero above byte r-1. */
+static uint64_t tile_ascii_gather(const uint8_t *p, unsigned r)
+{
+    uint64_t w = 0u;
+    unsigned i;
+
+    if (r == 8u) {
+        return zpse_load_u64le(p);
+    }
+    for (i = 0; i < r; i++) {
+        w |= (uint64_t)p[i] << (8u * i);
+    }
+    return w;
+}
+
+/* Eight ASCII bytes -> their 56 packed bits (bit 7i+k of the result is bit
+ * k of byte i). Eight ANDs, seven shifts and seven ORs, no table. */
+static uint64_t tile_ascii_compact8(uint64_t w)
+{
+    return (w & UINT64_C(0x000000000000007F)) |
+           ((w & UINT64_C(0x0000000000007F00)) >> 1) |
+           ((w & UINT64_C(0x00000000007F0000)) >> 2) |
+           ((w & UINT64_C(0x000000007F000000)) >> 3) |
+           ((w & UINT64_C(0x0000007F00000000)) >> 4) |
+           ((w & UINT64_C(0x00007F0000000000)) >> 5) |
+           ((w & UINT64_C(0x007F000000000000)) >> 6) |
+           ((w & UINT64_C(0x7F00000000000000)) >> 7);
+}
+
+/* And back: the 56 packed bits -> eight bytes with the high bit clear. */
+static uint64_t tile_ascii_spread8(uint64_t v)
+{
+    return (v & UINT64_C(0x000000000000007F)) |
+           ((v & UINT64_C(0x0000000000003F80)) << 1) |
+           ((v & UINT64_C(0x00000000001FC000)) << 2) |
+           ((v & UINT64_C(0x000000000FE00000)) << 3) |
+           ((v & UINT64_C(0x00000007F0000000)) << 4) |
+           ((v & UINT64_C(0x000003F800000000)) << 5) |
+           ((v & UINT64_C(0x0001FC0000000000)) << 6) |
+           ((v & UINT64_C(0x00FE000000000000)) << 7);
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(ZPSE_FORCE_SCALAR)
+#define ZPSE_ASCII_HAVE_BMI2 1
+#include <immintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+#define ZPSE_ASCII_BMI2 __attribute__((target("bmi2")))
+#else
+#define ZPSE_ASCII_BMI2
+#endif
+
+/* One instruction each: pext gathers the low seven bits of every byte, in
+ * order, into the low 56 bits, and pdep is its inverse. Both are
+ * 1-cycle-throughput on port 1, so a group costs a load, the pext and a
+ * store -- where the scalar form is 22 ALU ops. The kernels below use the
+ * intrinsics directly; this comment is the whole of the BMI2 contract. */
+
+/* Asked once per process: this is the tile path's own dispatch, and the
+ * answer cannot change while it runs. MSVC has no builtin for it and takes
+ * the scalar form, which is bit-identical. */
+static int tile_ascii_bmi2(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+#if defined(__GNUC__) || defined(__clang__)
+        cached = __builtin_cpu_supports("bmi2") ? 1 : 0;
+#else
+        cached = 0;
+#endif
+    }
+    return cached;
+}
+#else
+#define ZPSE_ASCII_HAVE_BMI2 0
+#endif
+
+/* ---- The kernels -------------------------------------------------
+ *
+ * Both directions work a full eight-byte group at a time with one 64-bit
+ * load and one 64-bit store, because that is the shape the hardware is
+ * built for: a group is a single pext or pdep on BMI2, and 22 ALU ops in
+ * the scalar form either side. The loops are written with the BMI2
+ * dispatch hoisted out of them, so the per-group branch is a compare and
+ * not an indirect call, and the wide load/store is only taken when it
+ * cannot run past the buffer (the last group, whose 7-byte payload would
+ * be read 8 wide, and the final short group, take the bounded form).
+ *
+ * Every path writes the same bytes: the layout is canonical per group, so
+ * the scalar and BMI2 builds produce identical streams and identical
+ * payload lengths, which is what the parity suite checks. */
+
+static uint32_t tile_ascii_pack_scalar(const uint8_t *in, uint32_t nt,
+                                       uint8_t *out)
+{
+    uint32_t groups = nt >> 3;
+    uint32_t rest = nt - groups * 8u;
+    uint32_t g;
+    uint32_t p = 0u;
+
+    for (g = 0; g < groups; g++) {
+        uint64_t w;
+        uint64_t v;
+
+        memcpy(&w, in + (size_t)g * 8u, sizeof w);
+        v = tile_ascii_compact8(w);
+        if (p + 8u <= groups * 7u) {
+            memcpy(out + p, &v, sizeof v); /* the byte past is rewritten */
+        } else {
+            memcpy(out + p, &v, 7u);
+        }
+        p += 7u;
+    }
+    if (rest != 0u) {
+        uint64_t v = tile_ascii_compact8(tile_ascii_gather(in + groups * 8u,
+                                                           rest));
+        uint32_t nb = tile_ascii_group_out(rest);
+        uint32_t k;
+
+        v &= (UINT64_C(1) << (7u * rest)) - UINT64_C(1);
+        for (k = 0; k < nb; k++) {
+            out[p++] = (uint8_t)(v >> (8u * k));
+        }
+    }
+    return p;
+}
+
+static void tile_ascii_unpack_scalar(const uint8_t *in, uint32_t in_len,
+                                     uint8_t *out, uint32_t nt)
+{
+    uint32_t groups = nt >> 3;
+    uint32_t rest = nt - groups * 8u;
+    uint32_t g;
+    uint32_t p = 0u;
+
+    for (g = 0; g < groups; g++) {
+        uint64_t v;
+        uint64_t w;
+
+        if (p + 8u <= in_len) {
+            memcpy(&v, in + p, sizeof v);
+            v &= UINT64_C(0x00FFFFFFFFFFFFFF);
+        } else {
+            v = tile_ascii_gather(in + p, 7u);
+        }
+        w = tile_ascii_spread8(v);
+        memcpy(out + (size_t)g * 8u, &w, sizeof w);
+        p += 7u;
+    }
+    if (rest != 0u) {
+        uint64_t v = tile_ascii_gather(in + p, tile_ascii_group_out(rest));
+        uint64_t w = tile_ascii_spread8(v);
+        uint32_t k;
+
+        for (k = 0; k < rest; k++) {
+            out[groups * 8u + k] = (uint8_t)(w >> (8u * k));
+        }
+    }
+}
+
+#if ZPSE_ASCII_HAVE_BMI2
+
+static ZPSE_ASCII_BMI2 uint32_t tile_ascii_pack_bmi2_body(const uint8_t *in,
+                                                          uint32_t nt,
+                                                          uint8_t *out)
+{
+    uint32_t groups = nt >> 3;
+    uint32_t rest = nt - groups * 8u;
+    uint32_t g;
+    uint32_t p = 0u;
+
+    for (g = 0; g < groups; g++) {
+        uint64_t w;
+        uint64_t v;
+
+        memcpy(&w, in + (size_t)g * 8u, sizeof w);
+        v = _pext_u64(w, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        if (p + 8u <= groups * 7u) {
+            memcpy(out + p, &v, sizeof v);
+        } else {
+            memcpy(out + p, &v, 7u);
+        }
+        p += 7u;
+    }
+    if (rest != 0u) {
+        uint64_t w = tile_ascii_gather(in + groups * 8u, rest);
+        uint64_t v = _pext_u64(w, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        uint32_t nb = tile_ascii_group_out(rest);
+        uint32_t k;
+
+        v &= (UINT64_C(1) << (7u * rest)) - UINT64_C(1);
+        for (k = 0; k < nb; k++) {
+            out[p++] = (uint8_t)(v >> (8u * k));
+        }
+    }
+    return p;
+}
+
+static ZPSE_ASCII_BMI2 void tile_ascii_unpack_bmi2_body(const uint8_t *in,
+                                                        uint32_t in_len,
+                                                        uint8_t *out,
+                                                        uint32_t nt)
+{
+    uint32_t groups = nt >> 3;
+    uint32_t rest = nt - groups * 8u;
+    uint32_t g = 0u;
+    uint32_t p = 0u;
+
+    /* Four groups an iteration while the eight-byte loads stay inside the
+     * payload: the four pdeps are independent, so their 3-cycle latency
+     * overlaps and the loop runs at pdep throughput (one a cycle) instead
+     * of one dependent chain at a time. */
+    while (g + 4u <= groups && p + 28u <= in_len) {
+        uint64_t a;
+        uint64_t b;
+        uint64_t c;
+        uint64_t d;
+
+        memcpy(&a, in + p, sizeof a);
+        memcpy(&b, in + p + 7u, sizeof b);
+        memcpy(&c, in + p + 14u, sizeof c);
+        memcpy(&d, in + p + 21u, sizeof d);
+        a = _pdep_u64(a & UINT64_C(0x00FFFFFFFFFFFFFF),
+                      UINT64_C(0x7F7F7F7F7F7F7F7F));
+        b = _pdep_u64(b & UINT64_C(0x00FFFFFFFFFFFFFF),
+                      UINT64_C(0x7F7F7F7F7F7F7F7F));
+        c = _pdep_u64(c & UINT64_C(0x00FFFFFFFFFFFFFF),
+                      UINT64_C(0x7F7F7F7F7F7F7F7F));
+        d = _pdep_u64(d & UINT64_C(0x00FFFFFFFFFFFFFF),
+                      UINT64_C(0x7F7F7F7F7F7F7F7F));
+        memcpy(out + (size_t)g * 8u, &a, sizeof a);
+        memcpy(out + (size_t)g * 8u + 8u, &b, sizeof b);
+        memcpy(out + (size_t)g * 8u + 16u, &c, sizeof c);
+        memcpy(out + (size_t)g * 8u + 24u, &d, sizeof d);
+        g += 4u;
+        p += 28u;
+    }
+    for (; g < groups; g++) {
+        uint64_t v;
+        uint64_t w;
+
+        if (p + 8u <= in_len) {
+            memcpy(&v, in + p, sizeof v);
+            v &= UINT64_C(0x00FFFFFFFFFFFFFF);
+        } else {
+            v = tile_ascii_gather(in + p, 7u);
+        }
+        w = _pdep_u64(v, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        memcpy(out + (size_t)g * 8u, &w, sizeof w);
+        p += 7u;
+    }
+    if (rest != 0u) {
+        uint64_t v = tile_ascii_gather(in + p, tile_ascii_group_out(rest));
+        uint64_t w = _pdep_u64(v, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        uint32_t k;
+
+        for (k = 0; k < rest; k++) {
+            out[groups * 8u + k] = (uint8_t)(w >> (8u * k));
+        }
+    }
+}
+
+static uint32_t tile_ascii_pack(const uint8_t *in, uint32_t nt, uint8_t *out)
+{
+    return tile_ascii_bmi2() ? tile_ascii_pack_bmi2_body(in, nt, out)
+                             : tile_ascii_pack_scalar(in, nt, out);
+}
+
+void zpse_tile_ascii_unpack(const uint8_t *in, uint32_t in_len,
+                            uint8_t *out, uint16_t nt)
+{
+    if (tile_ascii_bmi2()) {
+        tile_ascii_unpack_bmi2_body(in, in_len, out, nt);
+    } else {
+        tile_ascii_unpack_scalar(in, in_len, out, nt);
+    }
+}
+
+#else /* !ZPSE_ASCII_HAVE_BMI2 */
+
+static uint32_t tile_ascii_pack(const uint8_t *in, uint32_t nt, uint8_t *out)
+{
+    return tile_ascii_pack_scalar(in, nt, out);
+}
+
+void zpse_tile_ascii_unpack(const uint8_t *in, uint32_t in_len,
+                            uint8_t *out, uint16_t nt)
+{
+    tile_ascii_unpack_scalar(in, in_len, out, nt);
+}
+
+#endif /* ZPSE_ASCII_HAVE_BMI2 */
+
+int zpse_tile_pack_ascii(const uint8_t *actual, uint16_t nt,
+                         uint8_t *record_out, uint32_t record_cap)
+{
+    uint32_t need = zpse_tile_ascii_len(nt);
+    uint32_t payload = need - (uint32_t)ZPSE_TILE_HEADER_SIZE;
+
+    if (actual == 0 || record_out == 0)
+        return PSE_BAD_ARG;
+    if (record_cap < need)
+        return PSE_OUTPUT_OVERFLOW;
+    record_out[0] = zpse_tile_flags_make((uint8_t)ZPSE_M_ASCII_PACK,
+                                         (uint8_t)ZPSE_R_EXCLUSION_U8, 1);
+    record_out[1] = (uint8_t)ZPSE_P_CONST_ZERO;
+    record_out[2] = (uint8_t)(nt - 1u);
+    record_out[3] = 0u; /* no exceptions */
+    zpse_store_u16le(record_out + 4, 0u);
+    zpse_store_u16le(record_out + 6, (uint16_t)payload);
+    (void)tile_ascii_pack(actual, nt, record_out + ZPSE_TILE_HEADER_SIZE);
+    return (int)need;
+}
+
 static uint32_t tile_stride_of(uint8_t predictor_id)
 {
     switch (predictor_id) {
@@ -314,12 +677,23 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
     res_mode = zpse_tile_res_mode(th->tile_flags);
     if (th->tile_flags & ZPSE_TILE_FLAG_RESERVED_BIT)
         return PSE_UNSUPPORTED_FEATURE; /* bit 6 MUST be 0 */
-    if (mask_mode > (uint8_t)ZPSE_M_ALL_EXCEPTION)
+    if (mask_mode > (uint8_t)ZPSE_M_ASCII_PACK)
         return PSE_BAD_MASK;
     if (res_mode > (uint8_t)ZPSE_R_SIGNED_DELTA)
         return PSE_BAD_RESIDUAL; /* modes 5..7 reserved */
     if (th->predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return PSE_BAD_PREDICTOR;
+    /* The ASCII form is one exact shape; every other combination with this
+     * mask mode is malformed, and is rejected here rather than left to the
+     * decoder, which never sees a mode-7 record it did not shape-check. */
+    if (mask_mode == (uint8_t)ZPSE_M_ASCII_PACK &&
+        (res_mode != (uint8_t)ZPSE_R_EXCLUSION_U8 ||
+         th->predictor_id != (uint8_t)ZPSE_P_CONST_ZERO ||
+         th->exception_count != 0u || th->mask_payload_size != 0u ||
+         th->residual_payload_size !=
+             (uint16_t)((uint32_t)th->tile_length_minus_1 + 1u -
+                        (((uint32_t)th->tile_length_minus_1 + 1u) >> 3))))
+        return PSE_BAD_MASK;
     nt = (uint32_t)th->tile_length_minus_1 + (uint32_t)1;
     if (nt != (uint32_t)nt_expected)
         return PSE_BAD_TILE_SIZE;
@@ -1898,13 +2272,18 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
 static int tile_check_modes(uint8_t mask_mode, uint8_t res_mode, uint16_t nt,
                             uint16_t k)
 {
-    if (mask_mode > (uint8_t)ZPSE_M_ALL_EXCEPTION)
+    if (mask_mode > (uint8_t)ZPSE_M_ASCII_PACK)
         return PSE_BAD_MASK;
     if (res_mode > (uint8_t)ZPSE_R_SIGNED_DELTA)
         return PSE_BAD_RESIDUAL;
     if (k > nt)
         return PSE_BAD_MASK;
     if (mask_mode == (uint8_t)ZPSE_M_ALL_HIT) {
+        if (k != 0u)
+            return PSE_BAD_MASK;
+    } else if (mask_mode == (uint8_t)ZPSE_M_ASCII_PACK) {
+        /* The form is written by zpse_tile_pack_ascii, never by the mode
+         * search, so this only keeps the two sides' legality rules equal. */
         if (k != 0u)
             return PSE_BAD_MASK;
     } else if (mask_mode == (uint8_t)ZPSE_M_ALL_EXCEPTION) {
@@ -3765,6 +4144,31 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
     fresh = (tile_reset || (th.tile_flags & ZPSE_TILE_FLAG_RESET)) ? 1 : 0;
     if (fresh)
         zpse_lane_reset_for(lanes, initial_literal, th.predictor_id);
+
+    /* ---- ASCII pack -------------------------------------------- *
+     * No mask, no residual codec, no prediction: unpack the bytes and leave
+     * the lane state exactly where a stateless-family tile of the same
+     * bytes would leave it. zpse_tile_validate has already proved the shape
+     * (mode 7 with CONST_ZERO, an empty mask and exactly ceil(7*nt/8)
+     * payload bytes), so there is nothing left to check but the one thing
+     * the wire cannot say: whether the original bytes were really ASCII.
+     * That is the encoder's contract, and a decoder that disagrees with it
+     * gets the low seven bits of each byte -- a defined result, not a
+     * malformed stream. */
+    if (mask_mode == (uint8_t)ZPSE_M_ASCII_PACK) {
+        uint8_t ent_last[8];
+        uint8_t ent_second[8];
+
+        if (k != 0u || th.mask_payload_size != 0u ||
+            ((uint32_t)nt - ((uint32_t)nt >> 3)) !=
+                (uint32_t)th.residual_payload_size)
+            return PSE_BAD_MASK;
+        tile_capture_hist(lanes, ent_last, ent_second);
+        zpse_tile_ascii_unpack(res_ptr, (uint32_t)th.residual_payload_size,
+                               out, nt);
+        tile_history_fixup(lanes, out, nt, ent_last, ent_second);
+        return (int)nt;
+    }
 
     if (mask_mode == (uint8_t)ZPSE_M_RAW_BITMAP && nt == 256u &&
         th.mask_payload_size == 32u) {

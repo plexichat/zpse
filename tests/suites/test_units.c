@@ -223,7 +223,10 @@ int main(void) {
         CHECK(zpse_mask_derive_k(6, 5, 256, &k) != 0, "mode6 ec5 bad");
         CHECK(zpse_mask_derive_k(1, 0, 256, &k) != 0, "mode1 K=0 bad");
         CHECK(zpse_mask_derive_k(1, 255, 255, &k) != 0, "mode1 K=Nt bad");
-        CHECK(zpse_mask_derive_k(7, 0, 8, &k) != 0, "mode7 bad");
+        /* Mask mode 7 is the ASCII pack form: K is always 0 and there is
+         * no mask payload, so any exception count is malformed. */
+        CHECK(zpse_mask_derive_k(7, 0, 8, &k) == 0 && k == 0, "mode7 K=0");
+        CHECK(zpse_mask_derive_k(7, 1, 256, &k) != 0, "mode7 K=1 bad");
         CHECK(zpse_mask_derive_k(2, 3, 256, &k) == 0 && k == 3, "mode2 K=3");
     }
 

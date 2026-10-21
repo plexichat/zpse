@@ -15,6 +15,25 @@
 #include "zpse/types.h"
 #include "zpse/vector.h"
 
+/* The ASCII-pack tile record in its one shape (tile.h): an 8-byte tile
+ * header, no mask payload, and 224 packed bytes for a 256-byte tile, with
+ * mask mode 7, residual mode 0 and the per-tile reset bit -- the bytes the
+ * packer writes and nothing else. The segment decoder's run shortcut
+ * tests these four header bytes and the record length, and hands every
+ * other record to the general path. */
+#define ZPSE_ASCII_REC   232u
+#define ZPSE_ASCII_FLAGS (uint8_t)((uint8_t)ZPSE_M_ASCII_PACK | \
+                                   (uint8_t)ZPSE_TILE_FLAG_RESET)
+
+/* Every header byte of that exact record, so the shortcut below cannot
+ * accept a record the general path would reject: flags, CONST_ZERO, a
+ * 256-byte length, no exceptions, an empty mask and a 224-byte payload.
+ * rs is the length prefix the caller already read. */
+#define ZPSE_ASCII_HEAD_OK(p, rs)                                          \
+    ((rs) == (uint32_t)ZPSE_ASCII_REC && (p)[0] == ZPSE_ASCII_FLAGS &&      \
+     (p)[1] == 0u && (p)[2] == 255u && (p)[3] == 0u && (p)[4] == 0u &&      \
+     (p)[5] == 0u && (p)[6] == 224u && (p)[7] == 0u)
+
 #if defined(ZPSE_TRIAL_STATS)
 /* Which (mask_mode, res_mode) the mode search actually picks, indexed
  * mask_mode * 8 + res_mode. This is what says whether a classify product
@@ -145,6 +164,13 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     mask_mode = zpse_tile_mask_mode(rec[0]);
     res_mode = zpse_tile_res_mode(rec[0]);
     if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+        return 0;
+    }
+    /* The ASCII form carries CONST_ZERO's predictor byte -- it predicts
+     * nothing -- but its residual is the packed tile, not an exception
+     * list, and its mask mode is not one any constant fill understands.
+     * Decline: the general path decodes it. */
+    if (mask_mode == (uint8_t)ZPSE_M_ASCII_PACK) {
         return 0;
     }
     zpse_tile_read_header(rec, &th);
@@ -705,6 +731,69 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                        256u);
                 produced += 256u;
                 pos += 2u + (uint32_t)rsz;
+                continue;
+            }
+        }
+
+        /* ---- ASCII run -------------------------------------------- *
+         * Consecutive ASCII-pack records (tile.c, mask mode 7) are
+         * independent of each other and of the lane state: the form has no
+         * predictor, no mask and no residual codec, so a tile is a bit
+         * unpack of its own 224-byte payload, and the state a run leaves
+         * is just its last sixteen bytes. Taking a run here removes the
+         * per-tile header parse, validate, dispatch and history epilogue
+         * -- the difference between 3.9 GB/s through the general path and
+         * the unpack's own rate.
+         *
+         * Only the exact shape the encoder writes is accepted: flags,
+         * CONST_ZERO, no exceptions, and 232 record bytes for a 256-byte
+         * tile. Anything else -- including a malformed record that shares
+         * those four header bytes but not the length -- falls through to
+         * the general path, which re-validates everything, so no rejection
+         * changes. */
+        if (nt_exp == (uint16_t)ZPSE_MAX_TILE_LEN &&
+            ZPSE_ASCII_HEAD_OK(rec, (uint32_t)rsz)) {
+            uint32_t run = 1u;
+            uint32_t at = pos + 2u + (uint32_t)rsz;
+            uint32_t o = produced;
+            uint32_t k;
+            const uint8_t *rp = rec;
+
+            while ((uint32_t)t + run < tile_count &&
+                   at + 2u + (uint32_t)ZPSE_ASCII_REC <= payload_len) {
+                const uint8_t *nr = payload + at + 2u;
+
+                if (!ZPSE_ASCII_HEAD_OK(nr, zpse_load_u16le(payload + at))) {
+                    break;
+                }
+                at += 2u + (uint32_t)ZPSE_ASCII_REC;
+                run++;
+            }
+            /* The run only holds for a stream whose remaining tiles really
+             * are 256 bytes each; anything else is the general path's. */
+            if ((uint64_t)run * 256u <= (uint64_t)(seg_size - produced) &&
+                (uint64_t)run * 256u <= (uint64_t)(decoded_cap - produced)) {
+                for (k = 0; k < run; k++) {
+                    /* rp is the record (header) pointer; the length prefix
+                     * sits two bytes before it. */
+                    zpse_tile_ascii_unpack(
+                        rp + (uint32_t)ZPSE_TILE_HEADER_SIZE,
+                        (uint32_t)ZPSE_ASCII_REC -
+                            (uint32_t)ZPSE_TILE_HEADER_SIZE,
+                        decoded_out + o, (uint16_t)ZPSE_MAX_TILE_LEN);
+                    o += 256u;
+                    rp += 2u + (uint32_t)ZPSE_ASCII_REC;
+                }
+                memcpy(lanes->last, decoded_out + o - 8u, 8u);
+                memcpy(lanes->second_last, decoded_out + o - 16u, 8u);
+                /* One advance per tile, as the per-tile loop does; this
+                 * iteration already counted the first one. */
+                lanes->gen = (uint16_t)(lanes->gen + (uint16_t)(run - 1u));
+                produced = o;
+                pos = at;
+                t = (uint16_t)(t + (uint16_t)(run - 1u));
+                prev_rec = 0;
+                prev_ok = 0;
                 continue;
             }
         }
@@ -2539,6 +2628,19 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         if (tile_len < 0) {
             return UINT32_MAX;
         }
+        /* The encoder offers the seven-bit form for an ASCII tile as one
+         * more candidate and keeps whichever record is smaller, so the
+         * tile's cost -- and the price the sweep must rank the plane by --
+         * is the smaller of the two. Pricing only the searched record is
+         * what kept a text plane priced above RAW, which is how a text
+         * block ended up written raw at every level but MAX. The clamp can
+         * only lower a price, and only to what the tile loop really
+         * writes, so no shape can be preferred on a promise it does not
+         * keep. */
+        if (zpse_tile_is_ascii(actual, nt) &&
+            (uint32_t)tile_len > zpse_tile_ascii_len(nt)) {
+            tile_len = (int)zpse_tile_ascii_len(nt);
+        }
         sum += 2u + (uint32_t)tile_len;
         nsum++;
         /* `limit` is the sweep's running verdict: a price above it can never
@@ -2912,6 +3014,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         uint32_t wcap; /* and the capacity it is packed with */
         int rep_slot = -1; /* repeat-cache slot this tile fills, or -1 */
         uint64_t rep_slot_key = 0u; /* and the key it is filled with */
+        int ascii_ok; /* 1 iff every byte of the tile is below 0x80 */
 
         /* Bound check for the byte budget, before any work for this
          * tile: `pos` grows monotonically, so once it is past the budget
@@ -3004,6 +3107,18 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             rep_slot = (int)slot;
             rep_slot_key = key;
         }
+
+        /* ---- ASCII pack ------------------------------------------ *
+         * One 32-word scan decides it (tile.c's zpse_tile_is_ascii). When
+         * it holds, the tile has a form that costs seven bits a byte --
+         * 224 bytes for a full tile, less 2 bytes of framing than the 256
+         * the tile itself would take -- and no predictor here can be
+         * trusted to beat that on the shapes that reach this point, which
+         * is why the sweep below is skipped at the gate levels once the
+         * prescreen confirms no predictor is close. `ascii_len` is also
+         * what the comparison after the sweep uses at the ratio levels, so
+         * the scan is not wasted there either. */
+        ascii_ok = (nt >= 8u && zpse_tile_is_ascii(actual, nt)) ? 1 : 0;
 
         /* Opt-in trial accounting (-DZPSE_TRIAL_STATS, see tile.c).
          * Counted here, not at the top of the loop, so the denominator is
@@ -3300,7 +3415,14 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                                initial_literal, pos, byte_budget,
                                payload_cap);
         }
-        if (!direct) {
+        /* The ratio levels take the seven-bit form when it is smaller than
+         * what the sweep found; on text it always is, on structured ASCII
+         * the sweep wins and this costs one compare. */
+        if (ascii_ok && zpse_tile_ascii_len(nt) < (uint32_t)best_len) {
+            best_len = (int)zpse_tile_ascii_len(nt);
+            (void)zpse_tile_pack_ascii(actual, nt, payload_out + pos + 2u,
+                                       payload_cap - pos - 2u);
+        } else if (!direct) {
             memcpy(payload_out + pos + 2u, bst, (size_t)best_len);
         }
         zpse_store_u16le(payload_out + pos, (uint16_t)best_len);

@@ -125,6 +125,13 @@ int zpse_mask_derive_k(uint8_t mask_mode, uint8_t exception_count,
             return PSE_BAD_MASK;
         *k_out = k;
         return PSE_OK;
+    case ZPSE_M_ASCII_PACK:
+        /* No mask: the form has no exceptions. K is 0, and the tile's
+         * residual payload is the packed bytes (tile.c owns the length). */
+        if (exception_count != 0)
+            return PSE_BAD_MASK;
+        *k_out = 0;
+        return PSE_OK;
     case ZPSE_M_RAW_BITMAP:
     case ZPSE_M_SPARSE_U8:
     case ZPSE_M_SPARSE_GAPS:
