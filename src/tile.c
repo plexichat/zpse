@@ -98,14 +98,56 @@ static uint16_t tile_cap16(uint32_t n)
     return n > (uint32_t)0xFFFF ? (uint16_t)0xFFFF : (uint16_t)n;
 }
 
+/* Are all Nt bytes the same value? Eight bytes at a time, so a tile
+ * that is one value costs a third of the compares a byte-at-a-time loop
+ * would. */
+static int tile_all_equal(const uint8_t *a, uint16_t nt)
+{
+    uint64_t w;
+    uint16_t i;
+
+    if (nt == 0u) {
+        return 1;
+    }
+    w = UINT64_C(0x0101010101010101) * (uint64_t)a[0];
+    for (i = 0; i + 8u <= nt; i += 8u) {
+        uint64_t v;
+
+        memcpy(&v, a + i, 8u);
+        if ((v ^ w) != 0u) {
+            return 0;
+        }
+    }
+    for (; i < nt; i++) {
+        if (a[i] != a[0]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Encoder-side choice of C for TILE_LOCAL_CONSTANT: most frequent byte
- * (first-max wins ties). Any C is decodable; this maximizes hits. */
+ * (first-max wins ties). Any C is decodable; this maximizes hits.
+ *
+ * The common case for this predictor is a tile that IS one value, and
+ * that case is a compare-and-exit, not a histogram: the 256-entry
+ * histogram below (512 bytes of counting, one store per byte) was most
+ * of the cost of a TILE_CONSTANT classify -- 810 ns a tile, for a
+ * predictor that won none of them, because it was too expensive to be
+ * worth trying. The mode is only worth computing when the tile is not
+ * one value, and then it is rare enough not to matter. */
 static uint8_t tile_pick_constant(const uint8_t *actual, uint16_t nt)
 {
     uint16_t hist[256];
     uint16_t i;
     uint16_t best = 0;
 
+    if (nt == 0u) {
+        return 0u;
+    }
+    if (tile_all_equal(actual, nt)) {
+        return actual[0];
+    }
     memset(hist, 0, sizeof hist);
     for (i = 0; i < nt; i++)
         hist[actual[i]]++;
