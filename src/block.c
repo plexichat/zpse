@@ -1008,6 +1008,10 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * decided by its fifth survivor (16696 bytes against 16864 for the first
  * three), and "zero with one byte every 256" by a shape the probe ranks
  * fourth. */
+#ifndef ZPSE_PROBE_WINDOW
+#define ZPSE_PROBE_WINDOW 12288u
+#endif
+
 #ifndef ZPSE_FLAT_TRIALS
 #define ZPSE_FLAT_TRIALS 3
 #endif
@@ -1546,7 +1550,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * appears past the first quarter -- a long noise prefix in front
          * of a compressible body went to RAW -- so the window stays at
          * 16 KiB.) */
-        uint32_t pn = n < 16384u ? n : 16384u;
+        /* The window the candidates are priced on: the head of the block.
+     *
+     * It was 16 KiB -- a quarter of a 64 KiB block -- and it is now 12 KiB,
+     * because the price of the window is paid once per candidate and the
+     * sweep prices ten of them. Cutting it by a quarter is 5.4% of the whole encode
+     * over the columnar corpus, measured with the two builds alternating
+     * (698 -> 736 MB/s mean, ratio unchanged at 3.96:1, decode
+     * unchanged). The window has to be big enough for the price to
+     * mean something: the sizes corpus is what catches a window that
+     * mis-ranks, and it did not move. */
+    uint32_t pn = n < ZPSE_PROBE_WINDOW ? n : ZPSE_PROBE_WINDOW;
         int pick = -1;
         int ci;
         int k;
