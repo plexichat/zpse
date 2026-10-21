@@ -411,10 +411,10 @@ static int tile_popcount32(uint32_t w)
  * parity suite checks). */
 #define ZPSE_TILE_NU_CAP 17u
 
-/* How many residuals the presence probe looks at before it decides whether
- * the exact count is still worth walking for. */
+/* Size of one block of residuals in the presence walk, and the depth of the
+ * first, unconditional probe (see the walk in tile_dense_bk_avx2). */
 #ifndef ZPSE_TILE_PROBE
-#define ZPSE_TILE_PROBE 64u
+#define ZPSE_TILE_PROBE 32u
 #endif
 
 /* Only a tile with more than ZPSE_TILE_NU_CAP distinct residuals reaches
@@ -429,14 +429,13 @@ static int tile_popcount32(uint32_t w)
 #endif
 
 /* Reduce cl->seen to its `keep` lowest set bits, so the set can never
- * disagree with a capped nu. Caller guarantees keep < popcount. */
-static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep)
+ * disagree with a capped nu. Caller guarantees keep < total, and passes the
+ * total it has already counted rather than making this recount it. */
+static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep,
+                                         unsigned total)
 {
     unsigned w;
-    unsigned total = 0u;
 
-    for (w = 0; w < 8u; w++)
-        total += (unsigned)tile_popcount32(seen[w]);
     for (w = 0; w < 8u && total > keep; w++) {
         while (total > keep && seen[w] != 0u) {
             seen[w] &= seen[w] - 1u; /* drop the lowest set bit */
@@ -876,6 +875,30 @@ static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
     return nu;
 }
 
+/* Number of set bits in eight 32-bit words, as one nibble lookup and one
+ * SAD reduction instead of eight dependent SWAR popcounts. The classify
+ * epilogue counts cl->seen on every tile it classifies (dense or not, any
+ * family), and the same bitmap shape is the tile's exception mask, so the
+ * two users are the same sixteen bytes of vector work. */
+static ZPSE_TILE_AVX2P unsigned tile_bits_count_avx2(const uint32_t w[8])
+{
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    const __m256i plo = _mm256_setr_epi8(
+        0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,
+        0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4);
+    const __m256i wv = _mm256_loadu_si256((const __m256i *)(const void *)w);
+    const __m256i pl = _mm256_shuffle_epi8(plo, _mm256_and_si256(wv, nib));
+    const __m256i ph = _mm256_shuffle_epi8(
+        plo, _mm256_and_si256(_mm256_srli_epi16(wv, 4), nib));
+    const __m256i ps = _mm256_sad_epu8(_mm256_add_epi8(pl, ph),
+                                       _mm256_setzero_si256());
+
+    return (unsigned)((uint64_t)_mm256_extract_epi64(ps, 0) +
+                      (uint64_t)_mm256_extract_epi64(ps, 1) +
+                      (uint64_t)_mm256_extract_epi64(ps, 2) +
+                      (uint64_t)_mm256_extract_epi64(ps, 3));
+}
+
 /* `tile` is the tile's own first byte; the sixteen bytes BEFORE it are the
  * staged head (entry lane state, or the plane bytes preceding a STRIDE
  * tile), exactly as they sit behind the tile in the staging buffer. Passing
@@ -1053,16 +1076,25 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
      * The compare against zero marks the ABSENT values and the complement
      * of its movemask has a one exactly where a presence byte is nonzero.
      *
-     * The pass is therefore done in two parts, and the first is a probe:
-     * this function only runs with k >= 32, and a tile whose first 32
-     * exceptions already hold ZPSE_TILE_NU_CAP distinct residuals has
+     * The pass is therefore short whenever it can be: a tile whose first
+     * 32 exceptions already hold ZPSE_TILE_NU_CAP distinct residuals has
      * already rejected the palette mode, so the remaining entries are
-     * recorded, folded and thrown away. That is the common case for a
-     * dense tile (a 256-byte tile of text, code or noise reaches 17
-     * distinct residuals within its first ~20 exceptions), and it is the
-     * single largest cost in this function. A tile that is still under
-     * the cap after the probe -- the palettizable ones -- walks the rest
-     * exactly as before, so its count stays exact. */
+     * never touched. That is the common case for a dense tile (a 256-byte
+     * tile of text, code or noise reaches 17 distinct residuals within its
+     * first ~20 exceptions), and it is the single largest cost here.
+     *
+     * A tile still under the cap after those 32 is *not* walked to the end
+     * in one go: it continues a block at a time, folding after each block
+     * and stopping the moment the count reaches the cap. Text tiles are
+     * where this matters -- their residuals cluster into about one symbol
+     * alphabet, so the count hovers just under the cap and used to force a
+     * store for every one of the tile's ~230 residuals before the walk
+     * could conclude anything (measured: 362 cycles a tile, ~200 of them
+     * from that remainder). Now the same answer arrives after two blocks
+     * in the overwhelming majority of those tiles. The cost is a fold per
+     * block on a tile that really is palettizable, and such a tile has to
+     * see all of its residuals anyway to size its palette, so its count
+     * stays exact either way. */
     {
         uint8_t pres[256];
         const uint32_t lim =
@@ -1078,17 +1110,23 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
         }
         for (; i < lim; i++)
             pres[tr[i]] = 1u;
-        if (tile_pres_fold(pres, cl->seen) < ZPSE_TILE_NU_CAP &&
-            lim < (uint32_t)k) {
-            for (; i + 4u <= (uint32_t)k; i += 4u) {
-                pres[tr[i]] = 1u;
-                pres[tr[i + 1u]] = 1u;
-                pres[tr[i + 2u]] = 1u;
-                pres[tr[i + 3u]] = 1u;
+        if (tile_pres_fold(pres, cl->seen) < ZPSE_TILE_NU_CAP) {
+            while (i < (uint32_t)k) {
+                uint32_t end = i + (uint32_t)ZPSE_TILE_PROBE;
+
+                if (end > (uint32_t)k)
+                    end = (uint32_t)k;
+                for (; i + 4u <= end; i += 4u) {
+                    pres[tr[i]] = 1u;
+                    pres[tr[i + 1u]] = 1u;
+                    pres[tr[i + 2u]] = 1u;
+                    pres[tr[i + 3u]] = 1u;
+                }
+                for (; i < end; i++)
+                    pres[tr[i]] = 1u;
+                if (tile_pres_fold(pres, cl->seen) >= ZPSE_TILE_NU_CAP)
+                    break;
             }
-            for (; i < (uint32_t)k; i++)
-                pres[tr[i]] = 1u;
-            (void)tile_pres_fold(pres, cl->seen);
         }
     }
 
@@ -1282,29 +1320,10 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
         unsigned nexc;
 
         /* Population count of the whole mask, which is what decides
-         * between the dense compaction and the per-exception walk below:
-         * a nibble table and one SAD reduction instead of eight SWAR
-         * popcounts. Bits at or above nt are never set (the chunk macro
-         * masks them), so every set bit is an exception. */
-        {
-            const __m256i nib = _mm256_set1_epi8(0x0F);
-            const __m256i plo = _mm256_setr_epi8(
-                0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,
-                0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4);
-            const __m256i wv = _mm256_loadu_si256(
-                (const __m256i *)(const void *)words);
-            const __m256i pl = _mm256_shuffle_epi8(
-                plo, _mm256_and_si256(wv, nib));
-            const __m256i ph = _mm256_shuffle_epi8(
-                plo, _mm256_and_si256(_mm256_srli_epi16(wv, 4), nib));
-            const __m256i ps = _mm256_sad_epu8(_mm256_add_epi8(pl, ph),
-                                               _mm256_setzero_si256());
-
-            nexc = (unsigned)((uint64_t)_mm256_extract_epi64(ps, 0) +
-                              (uint64_t)_mm256_extract_epi64(ps, 1) +
-                              (uint64_t)_mm256_extract_epi64(ps, 2) +
-                              (uint64_t)_mm256_extract_epi64(ps, 3));
-        }
+         * between the dense compaction and the per-exception walk below.
+         * Bits at or above nt are never set (the chunk macro masks them),
+         * so every set bit is an exception. */
+        nexc = tile_bits_count_avx2(words);
 
         /* One walk per prediction formula, so the family and predictor
          * tests are made once per tile instead of once per exception.
@@ -1417,13 +1436,10 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
     cl->dmin = _dmin;
     cl->dmax = _dmax;
     {
-        unsigned i;
-        uint16_t nu = 0;
+        uint16_t nu = (uint16_t)tile_bits_count_avx2(cl->seen);
 
-        for (i = 0; i < 8u; i++)
-            nu = (uint16_t)(nu + (uint16_t)_mm_popcnt_u32(cl->seen[i]));
         if (nu > (uint16_t)ZPSE_TILE_NU_CAP) {
-            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP);
+            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP, nu);
             nu = (uint16_t)ZPSE_TILE_NU_CAP;
         }
         cl->nu = nu;
@@ -1638,7 +1654,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         for (l = 0; l < 8u; l++)
             nu = (uint16_t)(nu + (uint16_t)tile_popcount32(cl->seen[l]));
         if (nu > (uint16_t)ZPSE_TILE_NU_CAP) {
-            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP);
+            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP, nu);
             nu = (uint16_t)ZPSE_TILE_NU_CAP;
         }
         cl->nu = nu;
