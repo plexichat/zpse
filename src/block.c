@@ -911,16 +911,19 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_DECIDE_TILES 4u
 #endif
 
-/* Full block encodes the sweep may spend on one block, counting the probe's
- * winner. Every survivor is priced exactly before this loop starts and the
- * list is walked in price order, so what the cap limits is only the tail: the
- * shapes a 16 KiB sample could not separate from the winner. Three is
- * measured against a full sweep on the columnar corpus -- 4.01:1 mean ratio
- * either way, mean encode 703 MB/s against 620 -- and it is what the
- * spike-every-256 pin in test_decide.c needs, since that block is decided by
- * its third trial. */
-#ifndef ZPSE_MAX_TRIALS
-#define ZPSE_MAX_TRIALS 3
+/* Full block encodes the sweep may spend on a block whose own probe says it
+ * does not compress at all -- the winner's price over the 16 KiB window is at
+ * or above the same window written raw. Such a block falls back to RAW unless
+ * a shape wins on a part of it the sample did not cover, which is the one
+ * thing a sample cannot rule out, so the sweep still spends this many; it just
+ * does not spend one encode per survivor on a block that is very likely to be
+ * incompressible. Blocks the probe says DO compress are swept in full, which
+ * is what keeps the ratio: the 3-value-alphabet case of the ratio corpus is
+ * decided by its fifth survivor (16696 bytes against 16864 for the first
+ * three), and "zero with one byte every 256" by a shape the probe ranks
+ * fourth. */
+#ifndef ZPSE_FLAT_TRIALS
+#define ZPSE_FLAT_TRIALS 3
 #endif
 
 static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -1198,6 +1201,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int have_best = 0;
     int fails = 0;
     int sample;
+    int sample_flat = 0;
     int oi;
     int rc;
 
@@ -1594,6 +1598,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     }
                 }
             }
+            /* Does the probe's own winner fail to beat the raw form over the
+             * window it priced? Then the block is a raw-fallback candidate and
+             * the trial loop below is capped (ZPSE_FLAT_TRIALS). */
+            sample_flat = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn <= ex[pick];
         }
         if (pick >= 0 && pick != 0) {
             /* Move the exact-probe winner to slot 0 so the trial loop tries
@@ -1722,13 +1730,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (have_best && !earlier_left && best_total <= min_floor) {
                 break;
             }
-            /* The sweep has spent ZPSE_MAX_TRIALS full encodes (see the
-             * definition): the probe's winner and the tail of survivors it
-             * could not separate on a 16 KiB sample. Everything left has
-             * already been priced against the winner on that sample, so one
-             * more block encode would have to find a shape whose advantage
-             * only appears past the sample to pay for itself. */
-            if (oi + 1 >= ZPSE_MAX_TRIALS) {
+            /* The probe says this block does not compress (see
+             * ZPSE_FLAT_TRIALS): stop after that many full encodes. */
+            if (sample_flat && oi + 1 >= ZPSE_FLAT_TRIALS) {
                 break;
             }
             /* Two candidates that both finish above the raw envelope are
