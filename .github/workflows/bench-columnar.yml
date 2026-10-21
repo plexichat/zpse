@@ -1,8 +1,9 @@
 # Columnar in-process benchmark: zpse against zstd / lz4 / zlib / brotli on
-# eighteen corpora (int/float/dictionary/timestamp/bool columns plus
-# text/JSON/log/sorted/zeros/gapped-ts/DNA/UTF-8 byte streams), every
-# codec fed identical bytes, framed identically (64 KiB blocks), one
-# pinned core, everything in RAM, every decode verified before it is timed.
+# twenty-five corpora (int/float/dictionary/timestamp/bool columns plus
+# text/JSON/log/sorted/zeros/gapped-ts/DNA/UTF-8 byte streams and the seven
+# typed columnar categories), every codec fed identical bytes, framed
+# identically (64 KiB blocks), one pinned core, everything in RAM, every
+# decode verified before it is timed.
 #
 # Informational, like workflows/bench.yml: a slower number than the last run
 # must not fail the build, and a missing competitor runtime is skipped with
@@ -41,13 +42,14 @@ jobs:
           {
             echo '### which predictors the encoder actually trials'
             echo
-            echo 'Classify calls per predictor over the same eighteen corpora,'
-            echo 'counted in a -DZPSE_TRIAL_STATS build; the denominator is'
-            echo 'tiles whose search ran. Informational, like the table below.'
+            echo 'Classify calls per predictor over the same twenty-five'
+            echo 'corpora, counted in a -DZPSE_TRIAL_STATS build; the'
+            echo 'denominator is tiles whose search ran. Informational, like'
+            echo 'the table below.'
             echo
             cat /tmp/benchcol-stats.txt
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Run the matrix (18 cases x 5 codecs, single core)
+      - name: Run the matrix (25 cases x 5 codecs, single core)
         run: |
           taskset -c 0 /tmp/benchcol 12 3 all all | tee /tmp/benchcol.txt
           taskset -c 0 /tmp/benchcol 6 2 all all 16 | tee /tmp/benchcol-16k.txt
