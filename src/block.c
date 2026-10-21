@@ -1639,6 +1639,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
 #endif /* !ZPSE_KEEP_EXACT_SWEEP */
 
+    /* Full block encodes actually spent. The flat-block cap below counts
+     * SLOTS, and a slot can be skipped (its floor cannot beat the winner)
+     * without a trial being run -- but the two paths that leave the loop
+     * early after a trial do spend one. Counting the trials themselves is
+     * what the cap means: "the sweep has spent N full encodes". */
+    int ntried = 0;
+
     for (oi = 0; oi < ncand; oi++) {
         int i = oi;
         uint32_t t = 0;
@@ -1667,6 +1674,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             continue;
         }
         mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
+        ntried++;
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq,
                                 e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
@@ -1682,6 +1690,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * of the loop still skips a shape whose own bound cannot beat the
              * winner without spending the trial. */
             (void)budget_hit;
+            /* A trial the budget stopped is still a full block encode
+             * attempt, so it counts against the flat-block cap. */
+            if (sample_flat && ntried >= ZPSE_FLAT_TRIALS) {
+                break;
+            }
             continue;
         }
         /* Smallest total wins; a tie goes to the candidate EARLIER in
@@ -1689,6 +1702,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (!have_best || t < best_total ||
             (t == best_total && (uint32_t)idx[i] < best_idx)) {
             if (t > (uint32_t)ZPSE_E_SZ_BEST) {
+                /* The trial ran and its result cannot be kept: the block is
+                 * bigger than the best buffer, so the RAW fallback will
+                 * carry it. That is a whole block encode spent for nothing,
+                 * and on an incompressible block EVERY candidate lands
+                 * here -- so this path has to reach the flat-block cap
+                 * too, or the cap never fires for exactly the blocks that
+                 * need it. */
+                if (sample_flat && ntried >= ZPSE_FLAT_TRIALS) {
+                    break;
+                }
                 continue;
             }
             memcpy(e->best, e->cand, t);
@@ -1732,7 +1755,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
             /* The probe says this block does not compress (see
              * ZPSE_FLAT_TRIALS): stop after that many full encodes. */
-            if (sample_flat && oi + 1 >= ZPSE_FLAT_TRIALS) {
+            if (sample_flat && ntried >= ZPSE_FLAT_TRIALS) {
                 break;
             }
             /* Two candidates that both finish above the raw envelope are
