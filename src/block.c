@@ -2157,17 +2157,31 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if ((e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
             (uint32_t)ZPSE_ENC_MAX &&
         e->lz != 0) {
-        uint32_t lz_total = 0u;
+        /* Exact floor first: one command codes at most 259 bytes, so an
+         * LZ payload can never be smaller than its 8-byte header plus one
+         * 4-byte command per 259 bytes of output. A winner already under
+         * that cannot be beaten, and on the blocks the tiles already
+         * handle well -- a constant or all-hit plane is 248 bytes, far
+         * below the ~1 KiB floor of a 64 KiB block -- the whole match
+         * finder is skipped. */
+        uint32_t lz_floor = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
+                            ZPSE_LZ_MIN_PAYLOAD +
+                            4u * ((n + ZPSE_LZ_MAX_MATCH - 1u) /
+                                  ZPSE_LZ_MAX_MATCH);
 
-        rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                               (uint32_t)ZPSE_E_SZ_CAND, &lz_total);
-        if (rc == PSE_OK && (!have_best || lz_total < best_total)) {
-            memcpy(e->best, e->cand, lz_total);
-            best_total = lz_total;
-            /* 15 is the slot the statistics code gives the raw fallback:
-             * neighbours with no transform id, like the LZ form. */
-            best_idx = 15u;
-            have_best = 1;
+        if (!have_best || best_total > lz_floor) {
+            uint32_t lz_total = 0u;
+
+            rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
+                                   (uint32_t)ZPSE_E_SZ_CAND, &lz_total);
+            if (rc == PSE_OK && (!have_best || lz_total < best_total)) {
+                memcpy(e->best, e->cand, lz_total);
+                best_total = lz_total;
+                /* 15 is the slot the statistics code gives the raw fallback:
+                 * neighbours with no transform id, like the LZ form. */
+                best_idx = 15u;
+                have_best = 1;
+            }
         }
     }
 
