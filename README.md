@@ -270,6 +270,26 @@ tile form above (`ZPSE_B_RAW` and `ZPSE_B_LZ` clear), a verbatim copy
 32-byte header, and all three decode on their own, which is what makes a
 block the unit of random access.
 
+A frame encoded with `zpse_compress_frame_indexed()` ends with a
+**FrameIndex** -- a 16-byte header (magic `PXI1`, entry count, CRC32-C of the
+entries) and one `{offset, size}` pair per block, both relative to the frame
+-- and `zpse_seek_frame()` uses it to decode block *k* without touching block
+*k-1*:
+
+```c
+size_t clen = 0;
+uint8_t block[65536];
+uint32_t blen = 0;
+zpse_compress_frame_indexed(in, n, comp, sizeof comp, &clen, 65536, 0, enc_arena);
+zpse_seek_frame(comp, clen, 7, block, sizeof block, &blen, dec_arena);
+```
+
+The table is checksummed and every entry is verified against the block it
+points at, so a frame with a corrupt or truncated index is refused rather
+than followed. Without the index a frame is still decodable sequentially;
+what it cannot do is jump, because a block header carries its own size but
+not its own offset.
+
 Everything is bounds-checked on the way in, and the checks are the interesting
 half of the decoder: every length, count, mode and rank is validated before
 use, and the payload CRC32-C is verified whenever a stream carries one.
@@ -353,6 +373,11 @@ costs nothing however slow its classify is.
 * **64 KiB blocks, no cross-block state.** Each block is independent, which is
   what makes the transform and predictor code branch-light and allows random
   access, but it caps ratio on long-range redundancy.
+* **Random access costs an index.** A frame is sequential unless it was
+  encoded with one: `zpse_compress_frame_indexed` appends a 16 + 8-per-block
+  table and `zpse_seek_frame` then decodes block *k* alone, in O(1). Without
+  it the only way to block *k* is to walk the sizes in front of it, since a
+  block header does not carry its own offset.
 * **The decoder is hardened, not proven.** Bounds checks and the fuzz suite
   cover the malformed-input cases that are tested; there is no formal
   verification.

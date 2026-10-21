@@ -45,7 +45,7 @@ same() {
 
 fail=0
 
-for t in test_roundtrip test_transforms test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_sizes test_colref test_colcorpus; do
+for t in test_roundtrip test_transforms test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_frame test_sizes test_colref test_colcorpus; do
     src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
