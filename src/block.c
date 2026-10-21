@@ -1602,6 +1602,25 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * window it priced? Then the block is a raw-fallback candidate and
              * the trial loop below is capped (ZPSE_FLAT_TRIALS). */
             sample_flat = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn <= ex[pick];
+            /* ...and the same window at the OTHER end of the block, because a
+             * block whose front is noise and whose back is not is exactly the
+             * case a front-only probe calls incompressible: the "noise then
+             * constant" shapes of the ratio corpus, where capping the trials
+             * costs a quarter of the block's compressed size. One extra price,
+             * of the candidate the front window already likes, is enough to
+             * tell that apart from a block that is noise everywhere -- and
+             * only the winner is priced, not the whole list. */
+            if (sample_flat && n > pn) {
+                const uint8_t *wmb = meta_lens[pick] > 0 ? meta_bufs[pick] : in;
+                uint32_t tp = zpse_block_proxy_exact(
+                    e, in + (n - pn), pn, tids[pick], scounts[pick], wmb,
+                    meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX);
+
+                if (tp == UINT32_MAX ||
+                    tp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
+                    sample_flat = 0;
+                }
+            }
         }
         if (pick >= 0 && pick != 0) {
             /* Move the exact-probe winner to slot 0 so the trial loop tries
