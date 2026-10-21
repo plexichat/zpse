@@ -1138,15 +1138,15 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
      * the pass is what buys decimal8 4.62:1 -> 5.82:1 (3.96:1 -> 4.01:1 over
      * the corpus).
      *
-     * The cheap levels (ZPSE_ENC_FASTER and _FASTEST) price `tiles` of the
-     * planes and fill in the rest, which is the older estimate: a quarter to
-     * a sixteenth of the probe's tiles, for a ranking that is biased towards
-     * the cheap planes it happened to sample. */
-    if (!every_plane && sc > 1u) {
-        step = ((unsigned)sc + tiles - 1u) / tiles;
-        if (step == 0u) {
-            step = 1u;
-        }
+     * The cheap levels (ZPSE_ENC_FASTER and _FASTEST) used to price only a
+     * stride of the planes and charge the rest their average -- which under-
+     * prices wide transposes whose planes differ (DT8 on 2-byte records came
+     * out 49% larger than BALANCED's pick). They now price every plane, one
+     * tile each; a single tile per plane is enough to rank a transpose, and
+     * single-segment candidates still pay fewer tiles than BALANCED's four,
+     * which is where the cheap levels' speed comes from. */
+    if (!every_plane) {
+        step = 1u;
     }
     for (s = 0u; s < sc; s += step) {
         /* The running share: everything still unspent below `limit`
