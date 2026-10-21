@@ -1379,11 +1379,7 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_OUTPUT_OVERFLOW;
     }
     payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
-                             (e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
-                                     (uint32_t)ZPSE_ENC_FASTEST
-                                 ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                 : (uint32_t)ZPSE_LZ_HASH_BITS);
+                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz);
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }
@@ -2077,6 +2073,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * early after a trial do spend one. Counting the trials themselves is
      * what the cap means: "the sweep has spent N full encodes". */
     int ntried = 0;
+    /* The gate's single trial writes straight into `out` (see the loop). */
+    int direct_out = (e->ascii_gate != 0u && ncand == 1) ? 1 : 0;
+    uint8_t *tdst = e->cand;
+    uint32_t tcap = (uint32_t)ZPSE_E_SZ_CAND;
 #if defined(ZPSE_BLOCK_STATS)
     /* The total the first trial produced, and whether it succeeded at all.
      * The difference between it and the block's final winner is exactly
@@ -2119,6 +2119,19 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
         mb = meta_lens[i] > 0 ? meta_bufs[i] : in;
         ntried++;
+        /* The gated block has exactly one trial and it is going to win:
+         * the seven-bit form is smaller than the raw fallback by
+         * construction. Write it straight into the caller's buffer instead
+         * of staging it through cand/best and copying it out again -- two
+         * full-block copies that were most of what the gate's own encode
+         * cost (measured: dickens 841 -> 1.3 GB/s). */
+        if (direct_out) {
+            tdst = out;
+            tcap = out_cap;
+        } else {
+            tdst = e->cand;
+            tcap = (uint32_t)ZPSE_E_SZ_CAND;
+        }
 #if defined(ZPSE_BLOCK_STATS)
         zpse_block_trials++;
         zpse_block_trials_by_tid[tids[i] & 15u]++;
@@ -2128,18 +2141,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             uint64_t t_cycle = blk_rdtsc();
 
             rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
-                                    meta_lens[i], is_last, seq,
-                                    e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
-                                    &budget_hit, have_best, best_total,
+                                    meta_lens[i], is_last, seq, tdst, tcap,
+                                    &t, &budget_hit, have_best, best_total,
                                     flat_min);
             zpse_block_trial_cycles += blk_rdtsc() - t_cycle;
         }
 #else
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
-                                meta_lens[i], is_last, seq,
-                                e->cand, (uint32_t)ZPSE_E_SZ_CAND, &t,
-                                &budget_hit, have_best, best_total,
-                                flat_min);
+                                meta_lens[i], is_last, seq, tdst, tcap, &t,
+                                &budget_hit, have_best, best_total, flat_min);
 #endif
         if (rc != PSE_OK) {
             /* A trial the budget stopped cannot win: its total only grows as
@@ -2171,7 +2181,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * the list, so the attempt order cannot change the winner. */
         if (!have_best || t < best_total ||
             (t == best_total && (uint32_t)idx[i] < best_idx)) {
-            if (t > (uint32_t)ZPSE_E_SZ_BEST) {
+            if (!direct_out && t > (uint32_t)ZPSE_E_SZ_BEST) {
                 /* The trial ran and its result cannot be kept: the block is
                  * bigger than the best buffer, so the RAW fallback will
                  * carry it. That is a whole block encode spent for nothing,
@@ -2184,7 +2194,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
                 continue;
             }
-            memcpy(e->best, e->cand, t);
+            if (!direct_out) {
+                memcpy(e->best, tdst, t);
+            }
             best_total = t;
             best_idx = (uint32_t)idx[i];
             have_best = 1;
@@ -2328,7 +2340,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (out_cap < best_total) {
         return PSE_OUTPUT_OVERFLOW;
     }
-    memcpy(out, e->best, best_total);
+    if (!direct_out) {
+        memcpy(out, e->best, best_total);
+    }
 #if defined(ZPSE_BLOCK_STATS)
     {
         /* The winner's transform id: the candidate that carried best_total.
