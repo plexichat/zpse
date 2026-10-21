@@ -411,6 +411,12 @@ static int tile_popcount32(uint32_t w)
  * parity suite checks). */
 #define ZPSE_TILE_NU_CAP 17u
 
+/* How many residuals the presence probe looks at before it decides whether
+ * the exact count is still worth walking for. */
+#ifndef ZPSE_TILE_PROBE
+#define ZPSE_TILE_PROBE 64u
+#endif
+
 /* Only a tile with more than ZPSE_TILE_NU_CAP distinct residuals reaches
  * the trim, so it is kept out of line: inlined into the classify epilogue
  * (which every tile runs) its register pressure measurably slowed the
@@ -1059,22 +1065,28 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
      * exactly as before, so its count stays exact. */
     {
         uint8_t pres[256];
+        const uint32_t lim =
+            ((uint32_t)k < (uint32_t)ZPSE_TILE_PROBE) ? (uint32_t)k
+                                                      : (uint32_t)ZPSE_TILE_PROBE;
 
         memset(pres, 0, sizeof pres);
-        for (i = 0; i + 4u <= 32u; i += 4u) {
+        for (i = 0; i + 4u <= lim; i += 4u) {
             pres[tr[i]] = 1u;
             pres[tr[i + 1u]] = 1u;
             pres[tr[i + 2u]] = 1u;
             pres[tr[i + 3u]] = 1u;
         }
-        if (tile_pres_fold(pres, cl->seen) < ZPSE_TILE_NU_CAP) {
+        for (; i < lim; i++)
+            pres[tr[i]] = 1u;
+        if (tile_pres_fold(pres, cl->seen) < ZPSE_TILE_NU_CAP &&
+            lim < (uint32_t)k) {
             for (; i + 4u <= (uint32_t)k; i += 4u) {
                 pres[tr[i]] = 1u;
                 pres[tr[i + 1u]] = 1u;
                 pres[tr[i + 2u]] = 1u;
                 pres[tr[i + 3u]] = 1u;
             }
-            for (; i < k; i++)
+            for (; i < (uint32_t)k; i++)
                 pres[tr[i]] = 1u;
             (void)tile_pres_fold(pres, cl->seen);
         }
