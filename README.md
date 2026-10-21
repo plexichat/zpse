@@ -229,6 +229,42 @@ a long run: 5.8 GB/s on 1 KiB runs, 27 GB/s on a ramp, measured over 64 KiB
 blocks. The cheap levels are the other side of the same trade: they write
 the same shapes in less encode time.
 
+### A block that does not compress
+
+The sweep prices every candidate before it encodes one, and then encodes the
+survivors in full to see which is smallest. On a block that compresses that is
+money well spent. On a block that does not -- noise, an already-compressed
+file, a column of random identifiers -- the survivors are all going to lose to
+the raw form, and the sweep spends three whole block encodes to find out.
+
+The sweep already knows. Its price over the head window of the block, and its
+price over the tail window, both say that the block does not compress: no
+shape of it writes fewer bytes than the block itself. When the first trial
+then runs into the raw envelope -- the budget every trial carries, and the
+reason a trial that cannot win stops instead of finishing a payload that is
+thrown away -- that is the same verdict from the only side that gets to see
+the whole block, and the sweep stops there.
+
+The verdict is the trial's, not the price's, which is what keeps it honest: a
+block whose head and tail are noise but whose middle is not -- the "noise then
+constant" shape of the size corpus -- has a price that says flat and a trial
+that says otherwise, and the trial wins because it encodes the whole block. A
+block that compresses still gets its compression; only a block that really is
+noise stops after one trial. The size corpus (768 cases) grows by nothing, and
+the corpus mean encode rate goes from about 830 MB/s to about 900 MB/s.
+
+What it buys is the rows that were slowest for the wrong reason:
+
+| case | before | after | |
+| --- | ---: | ---: | --- |
+| `utf8_multi` | 230 MB/s | 590 MB/s | **2.5x** |
+| `bools_nulls` | 380 MB/s | 900 MB/s | **2.4x** |
+| `dna_2bit` | 460 MB/s | 920 MB/s | **2.0x** |
+
+At the deepest level, where the match finder is the candidate that can still
+see such a block, `utf8_multi` goes 172 MB/s -> 309 MB/s and `dna_2bit`
+424 MB/s -> 1.01 GB/s, with the same ratio on every case.
+
 ## What it does
 
 A **frame** is a 32-byte header (magic `PSE1`, version, content size, block
