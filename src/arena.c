@@ -29,7 +29,7 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
      * is re-initialised at the point of use instead --
      *   recon      fully written by the per-segment decodes before
      *              zpse_transform_inverse reads it (SUM(seg_len) == N)
-     *   order1/o2val/o2conf  reset by zpse_lane_reset() at every segment
+     *   order1/o2            reset by zpse_lane_reset() at every segment
      *              start, and by the selective per-tile reset
      *   comb       zeroed by zpse_comb_unrank() before it is read
      *   out_stage  written before it is read: block decode puts the last
@@ -41,8 +41,7 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
     d->recon = base + ZPSE_D_OFF_RECON;
     d->out_stage = base + ZPSE_D_OFF_OUT;
     d->order1 = base + ZPSE_D_OFF_ORDER1;
-    d->o2val = base + ZPSE_D_OFF_O2VAL;
-    d->o2conf = base + ZPSE_D_OFF_O2CONF;
+    d->o2 = base + ZPSE_D_OFF_O2;
     d->comb = base + ZPSE_D_OFF_COMB;
     d->shuf = base + ZPSE_D_OFF_SHUF;
     d->seg_const = 0u;
@@ -74,8 +73,7 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     e->cand = base + ZPSE_E_OFF_CAND;
     e->best = base + ZPSE_E_OFF_BEST;
     e->order1 = base + ZPSE_E_OFF_ORDER1;
-    e->o2val = base + ZPSE_E_OFF_O2VAL;
-    e->o2conf = base + ZPSE_E_OFF_O2CONF;
+    e->o2 = base + ZPSE_E_OFF_O2;
     e->comb = base + ZPSE_E_OFF_COMB;
     e->hist = base + ZPSE_E_OFF_HIST;
     e->shuf = base + ZPSE_E_OFF_SHUF;

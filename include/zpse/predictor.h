@@ -28,8 +28,23 @@ typedef struct ZpseLaneState {
     uint8_t last[8];
     uint8_t second_last[8];
     uint8_t *order1; /* 8 x 256, arena */
-    uint8_t *o2val;  /* 8 x 4096, arena */
-    uint8_t *o2conf; /* 8 x 4096, arena */
+    /* ORDER2's state: 8 x 4096 entries of {value, confidence,
+     * generation}, interleaved so the three bytes a prediction needs are
+     * in one cache line. Two separate tables meant two misses a byte,
+     * one of them to a line that held nothing the other wanted.
+     *
+     * The generation is what makes the per-tile reset O(1): an entry
+     * whose generation is not the current one was not learned by this
+     * tile, so it reads as unlearned. The old table was wiped instead,
+     * which cost 64 KiB of memset a tile. */
+    uint8_t *o2;     /* 8 x 4096 x 4, arena */
+    /* The generation this tile's ORDER2 entries carry. An entry whose
+     * generation is not this one was not learned by this tile and reads
+     * as unlearned -- which is what the per-tile wipe used to arrange,
+     * at the price of 64 KiB of memset. The counter is advanced once a
+     * tile by both sides, over the same tiles in the same order, so the
+     * two agree on which entries are current. */
+    uint16_t gen;
 } ZpseLaneState;
 
 void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal);
@@ -48,9 +63,9 @@ void zpse_lane_reset_hist(ZpseLaneState *s, uint8_t initial_literal);
 
 /* The table half of the reset on its own: exactly the memsets
  * zpse_lane_reset_for performs for the same predictor_id (order1 for
- * ORDER1; o2val and o2conf for ORDER2; nothing otherwise). 66 KiB, so a
- * caller should only reach for it when the predictor it names is really
- * about to read one of those tables. */
+ * ORDER1; nothing for ORDER2, whose table the generation makes stale
+ * instead). 2 KiB, so a caller should only reach for it when the
+ * predictor it names is really about to read one of those tables. */
 void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
                           uint8_t predictor_id);
 

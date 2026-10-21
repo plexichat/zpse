@@ -391,9 +391,15 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         uint32_t skew_off = 0;
 
         lanes.order1 = d->order1;
-        lanes.o2val = d->o2val;
-        lanes.o2conf = d->o2conf;
-        if (lanes.order1 == 0 || lanes.o2val == 0 || lanes.o2conf == 0) {
+        lanes.o2 = d->o2;
+        lanes.gen = 0u;
+        /* The generation restarts with the lane state, so the previous
+         * block's entries would carry the same stamps. One wipe per
+         * block keeps them out -- it used to be one wipe per tile. */
+        if (lanes.o2 != NULL) {
+            memset(lanes.o2, 0, (size_t)8u * 4096u * 4u);
+        }
+        if (lanes.order1 == 0 || lanes.o2 == 0) {
             return PSE_BAD_ARG;
         }
         cum = 0;
@@ -667,9 +673,15 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_OUTPUT_OVERFLOW;
     }
     lanes.order1 = e->order1;
-    lanes.o2val = e->o2val;
-    lanes.o2conf = e->o2conf;
-    if (lanes.order1 == 0 || lanes.o2val == 0 || lanes.o2conf == 0) {
+    lanes.o2 = e->o2;
+    lanes.gen = 0u;
+    /* One wipe per trial: the generation restarts with the lane state, so
+     * the previous trial's entries would carry the same stamps. It used
+     * to be one wipe per tile -- 64 KiB of memset a tile. */
+    if (lanes.o2 != NULL) {
+        memset(lanes.o2, 0, (size_t)8u * 4096u * 4u);
+    }
+    if (lanes.order1 == 0 || lanes.o2 == 0) {
         return PSE_BAD_ARG;
     }
     /* Sixteen prescreens against the tiles this trial is about to write,
@@ -1046,8 +1058,8 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
         tiles = (tiles == 0u) ? ZPSE_PROBE_TILES : ZPSE_DECIDE_TILES;
     }
     lanes.order1 = e->order1;
-    lanes.o2val = e->o2val;
-    lanes.o2conf = e->o2conf;
+    lanes.o2 = e->o2;
+    lanes.gen = 0u;
     return zpse_segment_probe_cost(e, &lanes, plane, len, tiles, limit);
 }
 

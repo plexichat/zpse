@@ -101,9 +101,17 @@ typedef struct ZpseTileClass {
 void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
                             uint8_t *mask_mode_out, uint8_t *res_mode_out);
 
-/* Predict + compare one tile against `actual`, filling cl and advancing
- * the lane state exactly as zpse_tile_decode will while decoding it.
- * Does not touch the output buffer. */
+  /* Predict + compare one tile against `actual`, filling cl and advancing
+   * the lane state exactly as zpse_tile_decode will while decoding it.
+   * Does not touch the output buffer.
+   *
+   * ORDER2's table is reset by the generation in `lanes->gen`, not by a
+   * wipe, so a caller that classifies tiles in sequence must advance
+   * `lanes->gen` once a tile -- the encoder's tile loop and the
+   * decoder's do, over the same tiles in the same order, and that is
+   * what makes an entry learned by one tile read as unlearned to the
+   * next. A caller that drives the classify directly must do the same,
+   * or the table it reads is the one the last tile left. */
 int zpse_tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                        uint16_t nt, uint8_t predictor_id,
                        uint8_t initial_literal, int tile_reset,

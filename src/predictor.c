@@ -26,6 +26,22 @@ void zpse_lane_reset_hist(ZpseLaneState *s, uint8_t initial_literal)
 /* The tables one predictor reads, in the reset state: the same values
  * zpse_lane_reset_for writes for that predictor, and nothing for the
  * predictors that read no table at all. */
+/* An ORDER2 entry is {value, confidence, generation}: the three bytes
+ * a prediction needs, in one cache line (two tables meant two misses a
+ * byte, one of them to a line that held nothing the other wanted). */
+static inline int zpse_o2_learned(const uint8_t *tab, size_t off,
+                                   uint16_t gen)
+{
+    return (uint16_t)tab[off + 2u] == (uint16_t)(gen & 0xFFu) &&
+           (uint16_t)tab[off + 3u] == (uint16_t)(gen >> 8);
+}
+
+static inline void zpse_o2_stamp(uint8_t *tab, size_t off, uint16_t gen)
+{
+    tab[off + 2u] = (uint8_t)(gen & 0xFFu);
+    tab[off + 3u] = (uint8_t)(gen >> 8);
+}
+
 void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
                           uint8_t predictor_id)
 {
@@ -33,19 +49,19 @@ void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
         return;
     }
     /* pid 3 (ORDER1) is the only reader of order1; pid 4 (ORDER2) the
-     * only reader of o2val (predict) / o2conf (update). All other
+     * only reader of o2 (predict and update). All other
      * predictors touch histories only. */
     if (predictor_id == (uint8_t)ZPSE_P_ORDER1) {
         if (s->order1 != NULL) {
             memset(s->order1, initial_literal, (size_t)8u * 256u);
         }
     } else if (predictor_id == (uint8_t)ZPSE_P_ORDER2) {
-        if (s->o2val != NULL) {
-            memset(s->o2val, initial_literal, (size_t)8u * 4096u);
-        }
-        if (s->o2conf != NULL) {
-            memset(s->o2conf, 0, (size_t)8u * 4096u);
-        }
+        /* Nothing to seed. An entry is learned only if its generation is
+         * the tile's, and the tile's generation advances every tile, so
+         * no entry can be mistaken for one this tile wrote. The wipe
+         * that used to be here -- 64 KiB of memset, a third of the
+         * classify -- is gone; the table is wiped once per trial
+         * instead, where the generation restarts. */
     }
 }
 
@@ -128,14 +144,21 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
         break;
 
     case ZPSE_P_ORDER2: /* 4 */
-        if (s->o2val == NULL) {
+        if (s->o2 == NULL) {
             return PSE_BAD_ARG;
         }
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint16_t idx = zpse_order2_index(s->second_last[lane],
                                             s->last[lane]);
-            pred_out[p] = s->o2val[lane * 4096u + (size_t)idx];
+            size_t off = (lane * 4096u + (size_t)idx) * 4u;
+
+            /* An entry nobody has learned predicts the initial literal.
+             * "Learned" means written by this tile: the generation says
+             * so. */
+            pred_out[p] = zpse_o2_learned(s->o2, off, s->gen)
+                              ? s->o2[off]
+                              : initial_literal;
         }
         break;
 
@@ -210,34 +233,31 @@ void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,
             }
         } else if (predictor_id == ZPSE_P_ORDER2) { /* 4 */
             uint16_t idx = zpse_order2_index(old_second, old_last);
-            size_t off = lane * 4096u + (size_t)idx;
-            int hit;
+            size_t off = (lane * 4096u + (size_t)idx) * 4u;
+            uint8_t *val;
+            uint8_t *conf;
 
-            if (s->o2val != NULL) {
-                hit = (x == s->o2val[off]);
-            } else if (pred != NULL) {
-                hit = (x == pred[p]);
-            } else {
+            if (s->o2 == NULL) {
+                /* No table to learn into: the caller has the
+                 * predictions and nothing else to update. */
+                (void)pred;
                 continue;
             }
-
-            if (hit) {
-                if (s->o2conf != NULL && s->o2conf[off] < 255u) {
-                    s->o2conf[off]++;
+            val = &s->o2[off];
+            conf = &s->o2[off + 1u];
+            if (!zpse_o2_learned(s->o2, off, s->gen)) {
+                /* Nobody has learned this entry, so its prediction was
+                 * the initial literal; whether the byte matched it or
+                 * not, the value now learned is the byte. */
+                *val = x;
+                *conf = 1u;
+                zpse_o2_stamp(s->o2, off, s->gen);
+            } else if (x == *val) {
+                if (*conf < 255u) {
+                    (*conf)++;
                 }
             } else {
-                if (s->o2conf != NULL) {
-                    if (s->o2conf[off] == 0u) {
-                        if (s->o2val != NULL) {
-                            s->o2val[off] = x;
-                        }
-                        s->o2conf[off] = 1u;
-                    } else {
-                        s->o2conf[off]--;
-                    }
-                } else if (s->o2val != NULL) {
-                    s->o2val[off] = x;
-                }
+                (*conf)--;
             }
         }
     }

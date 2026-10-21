@@ -17,23 +17,23 @@ int zpse_compress_block(const uint8_t *in, uint32_t n,
                         uint8_t *out, uint32_t out_cap,
                         uint32_t *out_len_out,
                         uint32_t seq, int is_last,
-                        void *enc_arena_384k)
+                        void *enc_arena_448k)
 {
     /* The default stream carries no optional fields: no payload CRC. */
     return zpse_compress_block_ex(in, n, out, out_cap, out_len_out, seq,
-                                  is_last, 0u, enc_arena_384k);
+                                  is_last, 0u, enc_arena_448k);
 }
 
 int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
                            uint8_t *out, uint32_t out_cap,
                            uint32_t *out_len_out,
                            uint32_t seq, int is_last, uint32_t enc_flags,
-                           void *enc_arena_384k)
+                           void *enc_arena_448k)
 {
     ZpseEncoder enc;
     int rc;
 
-    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_384k == 0) {
+    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
         return PSE_BAD_ARG;
     }
     if (n == 0 || n > 65536u) {
@@ -49,7 +49,7 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
          * default and reporting the size that came with it. */
         return PSE_BAD_ARG;
     }
-    rc = zpse_encoder_init(&enc, enc_arena_384k, (size_t)ZPSE_ENC_ARENA_SIZE);
+    rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
     }
@@ -65,18 +65,18 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
 int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint8_t *output, uint32_t out_cap,
                           uint32_t *out_len_out,
-                          void *dec_arena_256k)
+                          void *dec_arena_320k)
 {
     ZpseDecoder dec;
     int rc;
 
-    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_256k == 0) {
+    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
         return PSE_BAD_ARG;
     }
     if (in_len < 32u) {
         return PSE_TRUNCATED;
     }
-    rc = zpse_decoder_init(&dec, dec_arena_256k, (size_t)ZPSE_DEC_ARENA_SIZE);
+    rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
     }
@@ -91,23 +91,23 @@ int zpse_compress_frame(const uint8_t *in, size_t n,
                         uint8_t *out, size_t out_cap,
                         size_t *out_len_out,
                         uint32_t nominal_block_size,
-                        void *enc_arena_384k)
+                        void *enc_arena_448k)
 {
     /* The default stream carries no optional fields: no payload CRC. */
     return zpse_compress_frame_ex(in, n, out, out_cap, out_len_out,
-                                  nominal_block_size, 0u, enc_arena_384k);
+                                  nominal_block_size, 0u, enc_arena_448k);
 }
 
 int zpse_compress_frame_ex(const uint8_t *in, size_t n,
                            uint8_t *out, size_t out_cap,
                            size_t *out_len_out,
                            uint32_t nominal_block_size, uint32_t enc_flags,
-                           void *enc_arena_384k)
+                           void *enc_arena_448k)
 {
     ZpseEncoder enc;
     int rc;
 
-    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_384k == 0) {
+    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
         return PSE_BAD_ARG;
     }
     if (n == 0) {
@@ -126,7 +126,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
          * default and reporting the size that came with it. */
         return PSE_BAD_ARG;
     }
-    rc = zpse_encoder_init(&enc, enc_arena_384k, (size_t)ZPSE_ENC_ARENA_SIZE);
+    rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
     }
@@ -142,12 +142,12 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
 int zpse_decompress_frame(const uint8_t *in, size_t in_len,
                           uint8_t *output, size_t out_cap,
                           size_t *out_len_out,
-                          void *dec_arena_256k)
+                          void *dec_arena_320k)
 {
     ZpseDecoder dec;
     int rc;
 
-    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_256k == 0) {
+    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
         return PSE_BAD_ARG;
     }
     if (in_len == 0) {
@@ -156,7 +156,7 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
     if (in_len < 32u) {
         return PSE_TRUNCATED;
     }
-    rc = zpse_decoder_init(&dec, dec_arena_256k, (size_t)ZPSE_DEC_ARENA_SIZE);
+    rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
     }

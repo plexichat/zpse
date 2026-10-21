@@ -7,8 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ZPSE_DEC_ARENA_SIZE (256u * 1024u) /* 0x40000 */
-#define ZPSE_ENC_ARENA_SIZE (384u * 1024u) /* 0x60000 */
+#define ZPSE_DEC_ARENA_SIZE (320u * 1024u) /* 0x50000 */
+#define ZPSE_ENC_ARENA_SIZE (448u * 1024u) /* 0x70000 */
 #define ZPSE_ARENA_ALIGN    64u
 
 /* Decoder offsets. */
@@ -16,18 +16,16 @@
 #define ZPSE_D_OFF_RECON    0x01000u
 #define ZPSE_D_OFF_OUT      0x11000u
 #define ZPSE_D_OFF_ORDER1   0x21000u
-#define ZPSE_D_OFF_O2VAL    0x21800u
-#define ZPSE_D_OFF_O2CONF   0x29800u
-#define ZPSE_D_OFF_COMB     0x31800u
-#define ZPSE_D_OFF_SHUF     0x33800u
-#define ZPSE_D_OFF_GUARD    0x34800u
+#define ZPSE_D_OFF_O2       0x21800u
+#define ZPSE_D_OFF_COMB     0x41800u
+#define ZPSE_D_OFF_SHUF     0x43800u
+#define ZPSE_D_OFF_GUARD    0x44800u
 
 #define ZPSE_D_SZ_CTRL      0x01000u
 #define ZPSE_D_SZ_RECON     0x10000u
 #define ZPSE_D_SZ_OUT       0x10000u
 #define ZPSE_D_SZ_ORDER1    0x00800u
-#define ZPSE_D_SZ_O2VAL     0x08000u
-#define ZPSE_D_SZ_O2CONF    0x08000u
+#define ZPSE_D_SZ_O2        0x20000u
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
 #define ZPSE_D_SZ_GUARD     0x0B800u
@@ -50,12 +48,11 @@
 #define ZPSE_E_OFF_CAND     0x21000u
 #define ZPSE_E_OFF_BEST     0x31000u
 #define ZPSE_E_OFF_ORDER1   0x41000u
-#define ZPSE_E_OFF_O2VAL    0x41800u
-#define ZPSE_E_OFF_O2CONF   0x49800u
-#define ZPSE_E_OFF_COMB     0x51800u
-#define ZPSE_E_OFF_HIST     0x53800u
-#define ZPSE_E_OFF_SHUF     0x54800u
-#define ZPSE_E_OFF_GUARD    0x55800u
+#define ZPSE_E_OFF_O2       0x41800u
+#define ZPSE_E_OFF_COMB     0x61800u
+#define ZPSE_E_OFF_HIST     0x63800u
+#define ZPSE_E_OFF_SHUF     0x64800u
+#define ZPSE_E_OFF_GUARD    0x65800u
 
 #define ZPSE_E_SZ_CTRL      0x01000u
 #define ZPSE_E_SZ_INPUT     0x10000u
@@ -63,20 +60,18 @@
 #define ZPSE_E_SZ_CAND      0x10000u
 #define ZPSE_E_SZ_BEST      0x10000u
 #define ZPSE_E_SZ_ORDER1    0x00800u
-#define ZPSE_E_SZ_O2VAL     0x08000u
-#define ZPSE_E_SZ_O2CONF    0x08000u
+#define ZPSE_E_SZ_O2        0x20000u
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
 #define ZPSE_E_SZ_SHUF      0x01000u
 #define ZPSE_E_SZ_GUARD     0x0A800u
 
 typedef struct ZpseDecoder {
-    uint8_t *arena;       /* base, 64-B aligned, 256 KiB */
+    uint8_t *arena;       /* base, 64-B aligned, 320 KiB */
     uint8_t *recon;       /* transformed reconstruction (64 KiB) */
     uint8_t *out_stage;   /* output staging (64 KiB) */
     uint8_t *order1;      /* 2 KiB */
-    uint8_t *o2val;       /* 32 KiB */
-    uint8_t *o2conf;      /* 32 KiB */
+    uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
     uint8_t *comb;        /* 8 KiB combinadic scratch */
     uint8_t *shuf;        /* 4 KiB shuffle/CRC consts */
     /* The plane the last zpse_segment_decode produced was one byte value
@@ -90,14 +85,13 @@ typedef struct ZpseDecoder {
 } ZpseDecoder;
 
 typedef struct ZpseEncoder {
-    uint8_t *arena;       /* base, 64-B aligned, 384 KiB */
+    uint8_t *arena;       /* base, 64-B aligned, 448 KiB */
     uint8_t *input;       /* 64 KiB */
     uint8_t *tstage;      /* 64 KiB */
     uint8_t *cand;        /* 64 KiB candidate staging */
     uint8_t *best;        /* 64 KiB best staging */
     uint8_t *order1;      /* 2 KiB */
-    uint8_t *o2val;       /* 32 KiB */
-    uint8_t *o2conf;      /* 32 KiB */
+    uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
     uint8_t *comb;        /* 8 KiB */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
