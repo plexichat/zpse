@@ -410,10 +410,16 @@ typedef struct {
 } Codec;
 
 static size_t z_cbound(size_t n) { (void)n; return g_blk + 1024u; }
+/* Encoder options for the zpse rows (ZPSE_ENC_*), set from the last
+ * command-line argument so the same binary measures the speed settings:
+ *   0 (default) = ZPSE_ENC_SPEED_BALANCED, 2 = FASTER, 4 = FASTEST,
+ *   1 = BALANCED + CHECKSUM, ... */
+static uint32_t g_enc_flags = 0u;
 static size_t z_comp(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
 {
     uint32_t l = 0;
-    if (zpse_compress_block(in,(uint32_t)n,out,(uint32_t)cap,&l,0,1,g_ea)!=0) return 0;
+    if (zpse_compress_block_ex(in,(uint32_t)n,out,(uint32_t)cap,&l,0,1,
+                               g_enc_flags,g_ea)!=0) return 0;
     return l;
 }
 static int z_decomp(const uint8_t *in, size_t cn, uint8_t *out, size_t n)
@@ -829,6 +835,8 @@ int main(int argc, char **argv)
     int sum_n[5] = { 0, 0, 0, 0, 0 };
     int i, c, r;
     long blk_kb = argc > 5 ? atol(argv[5]) : 64L;
+    /* ZPSE_ENC_* options for the zpse rows; 0 is the default sweep. */
+    g_enc_flags = argc > 6 ? (uint32_t)strtoul(argv[6], NULL, 0) : 0u;
 
     if (iters < 1) iters = 1;
     if (reps < 1) reps = 1;
@@ -875,6 +883,15 @@ int main(int argc, char **argv)
            "best(med/max)-of-%d reps\n", g_nb, g_blk / 1024u, reps);
     printf("levels: zpse default, zstd -3, lz4 fast, zlib -6, brotli q5; "
            "identical bytes per codec, every decode verified\n");
+    printf("zpse encoder: enc_flags=0x%lx speed=%s%s\n",
+           (unsigned long)g_enc_flags,
+           (g_enc_flags & ZPSE_ENC_SPEED_MASK) == (uint32_t)ZPSE_ENC_FASTER
+               ? "FASTER"
+               : (g_enc_flags & ZPSE_ENC_SPEED_MASK) ==
+                         (uint32_t)ZPSE_ENC_FASTEST
+                     ? "FASTEST"
+                     : "BALANCED",
+           (g_enc_flags & ZPSE_ENC_CHECKSUM) ? " +CHECKSUM" : "");
     printf("versions: zpse %s | zstd %s | lz4 %s | zlib %s | brotli %u.%u.%u\n",
            zpse_version_string(),
            p_ZSTD_versionString ? p_ZSTD_versionString() : "n/a",
