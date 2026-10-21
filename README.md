@@ -208,7 +208,7 @@ over the columnar corpus (25 cases, 4 MiB each, 64 KiB blocks):
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| `ZPSE_ENC_MAX` | 4.49:1 | 348 MB/s | 10.7 GB/s | the default sweep, plus intra-block LZ as one more candidate |
+| `ZPSE_ENC_MAX` | 4.49:1 | 353 MB/s | 11.2 GB/s | the default sweep, plus intra-block LZ as one more candidate |
 | `ZPSE_ENC_SPEED_BALANCED` (default) | 4.01:1 | 720 MB/s | 23.1 GB/s | every candidate priced on a tile of every plane; survivors encoded in full |
 | `ZPSE_ENC_FASTER` | 4.01:1 | 916 MB/s | 22.8 GB/s | one tile per plane, then at most two full trials |
 | `ZPSE_ENC_FASTEST` | 4.00:1 | 1.19 GB/s | 22.1 GB/s | the cheap price, then one trial: the shape it likes best |
