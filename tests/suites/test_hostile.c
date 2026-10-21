@@ -90,11 +90,20 @@ int main(void) {
         refresh();
     }
 
-    /* Reserved block flag bit with repaired CRC -> UNSUPPORTED_FEATURE. */
-    memcpy(work, comp, clen); work[3] |= 0x20;
+    /* Reserved block flag bit with repaired CRC -> UNSUPPORTED_FEATURE.
+     * Bits 6 and 7 are the two the format reserves; bit 5 is the LZ form
+     * and is covered by its own check below. */
+    memcpy(work, comp, clen); work[3] |= 0x40;
     zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc == PSE_UNSUPPORTED_FEATURE, "reserved block bit rejected");
+
+    /* The LZ form on a stream that is not one: the flag alone must not be
+     * enough to read a tile payload as commands. */
+    memcpy(work, comp, clen); work[3] |= 0x20;
+    zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
+    rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
+    CHECK(rc < 0, "LZ flag on a tile payload rejected");
 
     /* Bad transform_id with repaired CRC -> BAD_TRANSFORM. */
     memcpy(work, comp, clen); work[12] = 12;

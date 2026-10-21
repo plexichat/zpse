@@ -21,7 +21,8 @@ typedef enum PseStatus {
     PSE_TRUNCATED               = -14,
     PSE_BAD_ARG                 = -15,
     PSE_OUTPUT_OVERFLOW         = -16,
-    PSE_BAD_PAYLOAD_CRC         = -17
+    PSE_BAD_PAYLOAD_CRC         = -17,
+    PSE_BAD_LZ                  = -18
 } PseStatus;
 
 static inline const char *zpse_status_name(int s) {
@@ -44,6 +45,7 @@ static inline const char *zpse_status_name(int s) {
     case PSE_BAD_ARG: return "PSE_BAD_ARG";
     case PSE_OUTPUT_OVERFLOW: return "PSE_OUTPUT_OVERFLOW";
     case PSE_BAD_PAYLOAD_CRC: return "PSE_BAD_PAYLOAD_CRC";
+    case PSE_BAD_LZ: return "PSE_BAD_LZ";
     default: return "PSE_UNKNOWN";
     }
 }

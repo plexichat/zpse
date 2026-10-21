@@ -43,12 +43,6 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
         0u) {
         return PSE_BAD_ARG;
     }
-    if ((enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
-        (uint32_t)ZPSE_ENC_SPEED_MASK) {
-        /* Level 3 is not defined: reject it rather than silently running the
-         * default and reporting the size that came with it. */
-        return PSE_BAD_ARG;
-    }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != PSE_OK) {
         return rc;
@@ -118,12 +112,6 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     }
     if ((enc_flags & ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK)) !=
         0u) {
-        return PSE_BAD_ARG;
-    }
-    if ((enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
-        (uint32_t)ZPSE_ENC_SPEED_MASK) {
-        /* Level 3 is not defined: reject it rather than silently running the
-         * default and reporting the size that came with it. */
         return PSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);

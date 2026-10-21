@@ -21,6 +21,7 @@
 #include "residual.h"
 #include "tile.h"
 #include "segment.h"
+#include "lz.h"
 #include "block.h"
 #include "frame.h"
 #include "vector.h"

@@ -890,7 +890,10 @@ int main(int argc, char **argv)
                : (g_enc_flags & ZPSE_ENC_SPEED_MASK) ==
                          (uint32_t)ZPSE_ENC_FASTEST
                      ? "FASTEST"
-                     : "BALANCED",
+                     : (g_enc_flags & ZPSE_ENC_SPEED_MASK) ==
+                               (uint32_t)ZPSE_ENC_MAX
+                           ? "MAX"
+                           : "BALANCED",
            (g_enc_flags & ZPSE_ENC_CHECKSUM) ? " +CHECKSUM" : "");
     printf("versions: zpse %s | zstd %s | lz4 %s | zlib %s | brotli %u.%u.%u\n",
            zpse_version_string(),

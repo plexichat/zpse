@@ -12,6 +12,7 @@
 #include "mask.c"
 #include "residual.c"
 #include "dense.c"
+#include "lz.c"
 #include "tile.c"
 #include "segment.c"
 #include "block.c"
