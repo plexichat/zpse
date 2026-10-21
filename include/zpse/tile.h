@@ -159,6 +159,44 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
                                  uint32_t seg_pos, uint8_t initial_literal,
                                  ZpseTileClass *cl);
 
+/* ---- ASCII pack form (mask mode ZPSE_M_ASCII_PACK) ---------------- *
+ *
+ * A tile whose bytes are all below 0x80 needs 7 bits a byte: 224 bytes for
+ * a full tile, 1.143:1, with no predictor, no exception mask and no
+ * residual codec. The payload is the tile in groups of eight bytes, each
+ * group's seven 7-bit fields packed little-endian into a 56-bit word and
+ * stored little-endian; a final short group of r bytes stores the same
+ * word truncated to 7r bits. That is one canonical encoding, so the payload
+ * length is a function of Nt alone: Nt - Nt/8 bytes.
+ *
+ * The record is a normal tile record with predictor CONST_ZERO, mask mode
+ * ASCII_PACK, residual mode EXCLUSION_U8, exception count 0, an empty mask
+ * payload and the packed bytes as the residual payload. Decoding it is a
+ * bit unpack plus the same history epilogue the stateless families use, so
+ * it carries no state a following tile could observe. */
+
+/* Record bytes (incl. the 8-byte header) the form costs for a tile. */
+uint32_t zpse_tile_ascii_len(uint16_t nt);
+
+/* 1 iff every one of the Nt bytes has its high bit clear. Word at a time:
+ * 32 ORs and one test for a full tile. */
+int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt);
+
+/* Unpack one ASCII payload (exactly zpse_tile_ascii_len(nt) - 8 bytes)
+ * into nt bytes. Exposed so a decoder walking a run of consecutive ASCII
+ * records can skip the per-tile entry point: the form reads no lane state
+ * and predicts nothing, so a run of them is a run of independent bit
+ * unpacks. The caller owns the length checks. */
+void zpse_tile_ascii_unpack(const uint8_t *in, uint32_t in_len,
+                            uint8_t *out, uint16_t nt);
+
+/* Pack a tile into the ASCII form. Returns record bytes written, or
+ * PSE_BAD_ARG / PSE_OUTPUT_OVERFLOW. Does not touch lane state and does not
+ * verify that the tile is ASCII: the caller has zpse_tile_is_ascii for
+ * that, and a byte with the high bit set would pack lossily. */
+int zpse_tile_pack_ascii(const uint8_t *actual, uint16_t nt,
+                         uint8_t *record_out, uint32_t record_cap);
+
 /* Pack a classification into a wire record for one (mask_mode,
  * res_mode) pair. Returns record bytes written (excl. the u16 prefix)
  * or negative status. Does not touch lane state. */

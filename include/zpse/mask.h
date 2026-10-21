@@ -16,7 +16,18 @@ typedef enum ZpseMaskMode {
     ZPSE_M_SPARSE_GAPS = 3,
     ZPSE_M_RUNS       = 4,
     ZPSE_M_ENUMERATIVE = 5,
-    ZPSE_M_ALL_EXCEPTION = 6
+    ZPSE_M_ALL_EXCEPTION = 6,
+    /* No exception mask at all: the tile's payload is the tile itself with
+     * the eighth bit of every byte dropped (Sec. 6.2, mode 7). Only a tile
+     * whose bytes are all below 0x80 may use it -- the encoder checks, the
+     * decoder cannot -- and it is the only mode whose mask payload is
+     * empty while K is 0 AND the residual payload is non-empty: the
+     * residual holds nt*7/8 packed bytes, and the predictor is CONST_ZERO
+     * (the form predicts nothing). 224 bytes for a full 256-byte tile, so
+     * a tile of ASCII text -- which no predictor here packs below its own
+     * size -- codes at 1.143:1 for the price of a scan and a bit pack.
+     * The bit layout is tile.h's (eight-byte groups, little endian). */
+    ZPSE_M_ASCII_PACK = 7
 } ZpseMaskMode;
 
 /* Derive K from (mask_mode, exception_count, Nt) per Sec. 6.2.
