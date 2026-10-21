@@ -14,6 +14,23 @@
 
 #include <string.h>
 
+/* Capacity of the transform sweep's candidate list, and of one candidate's
+ * transform metadata. The list used to hold three shapes -- RAW_BYTES,
+ * DELTA8 and a single plain transpose -- so both were sized to a small
+ * constant and the metadata to two bytes (DELTA8's one seed byte plus slack).
+ *
+ * The sweep now also offers the narrower plain transposes and the
+ * delta-transposes, which the format has always been able to encode and
+ * decode but the encoder never picked. DELTA_TRANSPOSE_16 carries sixteen
+ * seed bytes, so metadata grows to 16. See zpse_block_encode for why these
+ * particular shapes and how their seeds are chosen. */
+#ifndef ZPSE_MAX_CAND
+#define ZPSE_MAX_CAND 10u
+#endif
+#ifndef ZPSE_MAX_CAND_META
+#define ZPSE_MAX_CAND_META 16u
+#endif
+
 /* Block envelope codec.
  * No allocation; staging uses caller arenas. Helpers static. */
 
@@ -1139,13 +1156,14 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
  * kept, and so is everything when the exact prices tie, so this can only
  * remove a candidate the prescreen would have kept on no evidence at all. */
 static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
-                                   uint32_t pn, uint8_t tids[4],
-                                   uint8_t scounts[4],
-                                   uint8_t meta_bufs[4][2],
-                                   uint16_t meta_lens[4], uint8_t idx[4],
+                                   uint32_t pn, uint8_t tids[ZPSE_MAX_CAND],
+                                   uint8_t scounts[ZPSE_MAX_CAND],
+                                   uint8_t meta_bufs[ZPSE_MAX_CAND][ZPSE_MAX_CAND_META],
+                                   uint16_t meta_lens[ZPSE_MAX_CAND],
+                                   uint8_t idx[ZPSE_MAX_CAND],
                                    int from, int *ncand_io)
 {
-    uint32_t ex[4];
+    uint32_t ex[ZPSE_MAX_CAND];
     uint32_t pmin = UINT32_MAX;
     uint32_t limit;
     int to = *ncand_io;
@@ -1175,11 +1193,14 @@ static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
     limit = pmin + (pmin >> 4);
     for (ci = from; ci < to; ci++) {
         if (ex[ci] == UINT32_MAX || ex[ci] <= limit) {
+            unsigned m;
+
             tids[from + kept] = tids[ci];
             scounts[from + kept] = scounts[ci];
             meta_lens[from + kept] = meta_lens[ci];
-            meta_bufs[from + kept][0] = meta_bufs[ci][0];
-            meta_bufs[from + kept][1] = meta_bufs[ci][1];
+            for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                meta_bufs[from + kept][m] = meta_bufs[ci][m];
+            }
             idx[from + kept] = idx[ci];
             kept++;
         }
@@ -1194,42 +1215,53 @@ static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
  * the proxy pruning below (which compacts the list) cannot leave the
  * attempt loop pointing at a slot it has since dropped: after the swap the
  * loop simply walks the surviving slots in order. */
-static void zpse_block_swap_cand(uint8_t tids[4], uint8_t scounts[4],
-                                 uint8_t meta_bufs[4][2],
-                                 uint16_t meta_lens[4], uint8_t idx[4],
+static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
+                                 uint8_t scounts[ZPSE_MAX_CAND],
+                                 uint8_t meta_bufs[ZPSE_MAX_CAND][ZPSE_MAX_CAND_META],
+                                 uint16_t meta_lens[ZPSE_MAX_CAND],
+                                 uint8_t idx[ZPSE_MAX_CAND],
                                  int a, int b)
 {
     uint8_t t8 = tids[a];
     uint8_t s8 = scounts[a];
     uint8_t i8 = idx[a];
-    uint8_t m0 = meta_bufs[a][0];
-    uint8_t m1 = meta_bufs[a][1];
+    uint8_t mbuf[ZPSE_MAX_CAND_META];
     uint16_t l16 = meta_lens[a];
+    unsigned m;
+
+    /* Every metadata byte moves, not just the first two: a delta-transpose
+     * candidate carries up to 16 seed bytes and swapping only two of them
+     * would hand the other candidate's trial a seed it never priced. */
+    for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+        mbuf[m] = meta_bufs[a][m];
+    }
 
     tids[a] = tids[b];
     scounts[a] = scounts[b];
     idx[a] = idx[b];
-    meta_bufs[a][0] = meta_bufs[b][0];
-    meta_bufs[a][1] = meta_bufs[b][1];
     meta_lens[a] = meta_lens[b];
+    for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+        meta_bufs[a][m] = meta_bufs[b][m];
+    }
 
     tids[b] = t8;
     scounts[b] = s8;
     idx[b] = i8;
-    meta_bufs[b][0] = m0;
-    meta_bufs[b][1] = m1;
     meta_lens[b] = l16;
+    for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+        meta_bufs[b][m] = mbuf[m];
+    }
 }
 
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
 {
-    uint8_t tids[4];
-    uint8_t scounts[4];
-    uint8_t meta_bufs[4][2];
-    uint16_t meta_lens[4];
-    uint8_t idx[4];
+    uint8_t tids[ZPSE_MAX_CAND];
+    uint8_t scounts[ZPSE_MAX_CAND];
+    uint8_t meta_bufs[ZPSE_MAX_CAND][ZPSE_MAX_CAND_META];
+    uint16_t meta_lens[ZPSE_MAX_CAND];
+    uint8_t idx[ZPSE_MAX_CAND];
     uint32_t in_crc;
     int ncand = 0;
     uint32_t best_total = 0;
@@ -1291,27 +1323,77 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     meta_lens[ncand] = 1;
     ncand++;
 
-    /* Trial 3: width-appropriate plain transpose. */
-    if (n >= 16) {
-        tids[ncand] = 6;
-        scounts[ncand] = 16;
-        meta_lens[ncand] = 0;
-        ncand++;
-    } else if (n >= 8) {
-        tids[ncand] = 5;
-        scounts[ncand] = 8;
-        meta_lens[ncand] = 0;
-        ncand++;
-    } else if (n >= 4) {
-        tids[ncand] = 4;
-        scounts[ncand] = 4;
-        meta_lens[ncand] = 0;
-        ncand++;
-    } else if (n >= 2) {
-        tids[ncand] = 3;
-        scounts[ncand] = 2;
-        meta_lens[ncand] = 0;
-        ncand++;
+    /* Trials 3..: the transposed shapes, plain and delta, at every width the
+     * block is long enough to support.
+     *
+     * The list used to offer ONE plain transpose and to pick its width from
+     * n alone, so a 64 KiB block was only ever offered the width-16 shape.
+     * That left the sweep's result on the table for every columnar corpus
+     * whose record width is 4 or 8 bytes -- and, more importantly, it never
+     * offered a DELTA-TRANSPOSE at all, although the format has always been
+     * able to encode and decode ids 7..10 and tests/suites/test_transforms.c
+     * has always covered them. A delta-transpose is the shape a smooth column
+     * wants: the transpose puts one byte position per plane, and the delta
+     * chain then runs down that plane, so a slow ramp becomes a plane of
+     * near-zeros that the tile encoder can predict.
+     *
+     * Priced over the shootout's 18 corpora with tests/tools/cand_probe.c
+     * (64 KiB blocks), best shape the OLD list could pick versus best shape
+     * in the full set:
+     *
+     *   i32_seq      18904 ->  8996  DT4   -52.4%
+     *   ts_us        20640 -> 13264  DT8   -35.7%
+     *   sorted_near  21044 -> 16636  DT4   -20.9%
+     *   decimal8     14386 -> 12672  T8    -11.9%
+     *   ts_gapped    34960 -> 31680  T4     -9.4%
+     *   i64_mixed    11644 -> 10804  DT8    -7.2%
+     *
+     * 13 of the 18 improved, mean 10.99% over those, and no corpus chose a
+     * shape outside this list. The cost of the extra candidates is bounded by
+     * the prescreen below, which prices them on a 16 KiB window and drops
+     * everything more than ~6% behind the best estimate before any of them is
+     * encoded in full.
+     *
+     * Seeds: a delta-transpose carries one seed byte per plane, and the chain
+     * it seeds is p[j] = plane[j] - plane[j-1] with plane[-1] == seed, so the
+     * first byte the plane writes is plane[0] - seed. Setting the seed to the
+     * plane's own first byte makes that difference zero. Any seed round-trips
+     * (it travels in the metadata), so only size depends on the choice, and
+     * zero is the best of them. Plane s of a width-w transpose holds input
+     * positions s, s+w, s+2w, ..., so its first byte is in[s] -- which is
+     * exactly the rule DELTA8 already uses at width 1 (seed = in[0]).
+     * Verified round-trip by the full suite and by test_transforms.c. */
+    {
+        unsigned j;
+
+        for (j = 0; j < 4u; j++) {
+            uint8_t w = (uint8_t)(2u << j);
+            unsigned s;
+
+            /* N < W is forbidden by the format, and in[] must hold w bytes
+             * for the seeds below, so a block shorter than the width simply
+             * does not get that pair of candidates. */
+            if (n < (uint32_t)w) {
+                continue;
+            }
+            if (ncand + 2 > (int)ZPSE_MAX_CAND) {
+                break;
+            }
+            /* Plain transpose: no transform metadata. */
+            tids[ncand] = (uint8_t)(3u + j);
+            scounts[ncand] = w;
+            meta_lens[ncand] = 0;
+            ncand++;
+            /* Delta-transpose: one seed per plane, each the plane's own
+             * first byte, so the chain's first difference is zero. */
+            tids[ncand] = (uint8_t)(7u + j);
+            scounts[ncand] = w;
+            for (s = 0; s < w; s++) {
+                meta_bufs[ncand][s] = in[s];
+            }
+            meta_lens[ncand] = w;
+            ncand++;
+        }
     }
 
     /* Every candidate writes the same decoded CRC into its header (it is
@@ -1422,7 +1504,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * sample alone mis-picks by a factor (measured on the fuzz suite's
      * mixed-region shapes: 400 KB worse without this step). */
     if (sample != 2 && ncand > 1 && n >= 8192u) {
-        uint32_t px[4];
+        uint32_t px[ZPSE_MAX_CAND];
         uint32_t pmin = UINT32_MAX;
         int kept = 0;
         int ci;
@@ -1474,11 +1556,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
             for (ci = 0; ci < ncand; ci++) {
                 if (px[ci] == UINT32_MAX || px[ci] <= limit) {
+                    unsigned m;
+
                     tids[kept] = tids[ci];
                     scounts[kept] = scounts[ci];
                     meta_lens[kept] = meta_lens[ci];
-                    meta_bufs[kept][0] = meta_bufs[ci][0];
-                    meta_bufs[kept][1] = meta_bufs[ci][1];
+                    for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                        meta_bufs[kept][m] = meta_bufs[ci][m];
+                    }
                     idx[kept] = idx[ci];
                     kept++;
                 }
@@ -1488,8 +1573,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
 
     if (ncand > 1 && n >= 8192u) {
-        uint32_t ex[4];
-        uint8_t order[4];
+        uint32_t ex[ZPSE_MAX_CAND];
+        uint8_t order[ZPSE_MAX_CAND];
         int nord = 0;
         /* Price on the first 16 KiB only: staging a transform costs about
          * as much as the estimate itself, and a block's structure (record
@@ -1544,14 +1629,38 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 break;
             }
         }
-        if (pick >= 0) {
+        if (pick >= 0 && pick != 0) {
+            /* Move the exact-probe winner to slot 0 so the trial loop tries
+             * the most likely winner first: its total becomes best_total and
+             * the per-candidate floor exits discard shapes that provably
+             * cannot win without a full block encode. ncand is deliberately
+             * left at the prescreen survivor count -- every survivor is still
+             * encoded in full (bounded by the running-best budget), so the
+             * sweep keeps the true minimum even when the 16 KiB sample
+             * mis-ranks the candidates (a noise prefix in front of a
+             * compressible body, or two transforms within proxy error on a
+             * uniform block). The tie-break still uses the original list
+             * index carried in idx[], so the result stays order neutral. */
+            unsigned m;
+            uint8_t  tt = tids[0],  ts = scounts[0];
+            uint16_t tl = meta_lens[0];
+            uint8_t  ti = idx[0];
+            uint8_t  tb[ZPSE_MAX_CAND_META];
+
+            for (m = 0; m < ZPSE_MAX_CAND_META; m++)
+                tb[m] = meta_bufs[0][m];
             tids[0] = tids[pick];
             scounts[0] = scounts[pick];
             meta_lens[0] = meta_lens[pick];
-            meta_bufs[0][0] = meta_bufs[pick][0];
-            meta_bufs[0][1] = meta_bufs[pick][1];
             idx[0] = idx[pick];
-            ncand = 1;
+            for (m = 0; m < ZPSE_MAX_CAND_META; m++)
+                meta_bufs[0][m] = meta_bufs[pick][m];
+            tids[pick] = tt;
+            scounts[pick] = ts;
+            meta_lens[pick] = tl;
+            idx[pick] = ti;
+            for (m = 0; m < ZPSE_MAX_CAND_META; m++)
+                meta_bufs[pick][m] = tb[m];
         }
     }
 #endif /* !ZPSE_KEEP_EXACT_SWEEP */
@@ -1687,8 +1796,12 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             /* Two candidates that both fail to beat the raw envelope
              * mean the block is incompressible under every transform
              * shape tried; the raw fallback wins and the remaining
-             * trials are pure cost. */
-            if (t + 1u > (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+             * trials are pure cost. RAW itself (id 0) is the baseline --
+             * it never beats itself -- so it does not count as a failure;
+             * otherwise a block whose first candidates are RAW and DELTA8
+             * would abort before reaching a transpose that actually pays. */
+            if (tids[i] != 0u &&
+                t + 1u > (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
                 fails++;
                 if (fails >= 2) {
                     break;
