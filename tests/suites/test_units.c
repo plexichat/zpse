@@ -117,6 +117,64 @@ int main(void) {
               "disagreeing dense records fall back to the byte CRC");
     }
 
+    /* Encoder effort (ZPSE_ENC_SPEED_*): every level must write a stream the
+     * decoder reads back byte-identically, the levels must differ in what
+     * they spend, and the undefined level must be refused. The block is a
+     * ramp, which is the shape the sweep exists to find (a transposed,
+     * delta-coded plane), so the levels are measured on the case that costs
+     * the sweep the most. */
+    {
+        static unsigned char ea[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
+        static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
+        static uint8_t in[65536], comp[200000], out[65536];
+        static const uint32_t levels[3] = {
+            (uint32_t)ZPSE_ENC_SPEED_BALANCED,
+            (uint32_t)ZPSE_ENC_FASTER,
+            (uint32_t)ZPSE_ENC_FASTEST
+        };
+        uint32_t cl_bal = 0u;
+        uint32_t i;
+        int li;
+
+        for (i = 0; i < 65536u; i++) {
+            in[i] = (uint8_t)i;
+        }
+        for (li = 0; li < 3; li++) {
+            uint32_t cl = 0u, ol = 0u;
+            ZpseBlockHeader h;
+            int rc = zpse_compress_block_ex(in, sizeof in, comp, sizeof comp,
+                                            &cl, 0, 1, levels[li], ea);
+
+            CHECK(rc == PSE_OK, "speed level %d encodes (rc=%d)", li, rc);
+            CHECK(cl < sizeof comp &&
+                  zpse_block_header_parse(&h, comp, cl) == 0,
+                  "speed level %d header parses", li);
+            memset(out, 0xA5, sizeof out);
+            rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, da);
+            CHECK(rc == PSE_OK && ol == sizeof in &&
+                  memcmp(out, in, sizeof in) == 0,
+                  "speed level %d roundtrip", li);
+            if (li == 0) {
+                cl_bal = cl;
+            }
+        }
+        /* The cheap levels may lose ratio, but not by more than the sweep is
+         * worth on a block whose best shape is a transpose: this one is
+         * 2619 bytes at the default and the fastest level still has to find
+         * the width-16 shape rather than fall back to the identity. */
+        CHECK(cl_bal > 0u && cl_bal < 3000u, "balanced ramp is 2619 (got %u)",
+              cl_bal);
+        CHECK(zpse_compress_block_ex(in, sizeof in, comp, sizeof comp, &cl_bal,
+                                     0, 1,
+                                     (uint32_t)ZPSE_ENC_SPEED_MASK, ea) ==
+              PSE_BAD_ARG, "undefined speed level refused");
+        CHECK(zpse_compress_block_ex(in, sizeof in, comp, sizeof comp, &cl_bal,
+                                     0, 1,
+                                     (uint32_t)ZPSE_ENC_SPEED_BALANCED |
+                                         (UINT32_C(1) << 9), ea) ==
+              PSE_BAD_ARG, "unknown enc flag refused");
+    }
+
     /* Arenas. */
     {
         ZpseDecoder d; ZpseEncoder e;

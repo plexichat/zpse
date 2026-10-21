@@ -51,6 +51,32 @@
  * Every decoder here verifies it whenever a stream carries it. */
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 
+/* Encoder effort (ZPSE_ENC_* bits 1-2). This trades compressed size for
+ * encode time and never changes the format: every level writes a stream any
+ * decoder reads, and every level's stream decodes at the same speed, because
+ * the shapes themselves are the same. What a level changes is how the sweep
+ * decides which shape to write.
+ *
+ *   ZPSE_ENC_SPEED_BALANCED  the default: price one tile in every plane of
+ *                            every candidate, keep those within a margin of
+ *                            the best, encode each in full.
+ *   ZPSE_ENC_FASTER          price a quarter of the planes and estimate the
+ *                            rest, keeping the same survivor rule. The
+ *                            estimate under-prices the wide transposes, so
+ *                            a block whose best shape is one of those can
+ *                            come out larger than at the default.
+ *   ZPSE_ENC_FASTEST         the same cheap price, then encode only the
+ *                            single shape it likes best: one trial per
+ *                            block, no second opinion.
+ *
+ * An unsupported level is rejected with PSE_BAD_ARG rather than rounded to
+ * one of these. */
+#define ZPSE_ENC_SPEED_SHIFT    1
+#define ZPSE_ENC_SPEED_MASK     (UINT32_C(3) << ZPSE_ENC_SPEED_SHIFT)
+#define ZPSE_ENC_SPEED_BALANCED (UINT32_C(0) << ZPSE_ENC_SPEED_SHIFT)
+#define ZPSE_ENC_FASTER         (UINT32_C(1) << ZPSE_ENC_SPEED_SHIFT)
+#define ZPSE_ENC_FASTEST        (UINT32_C(2) << ZPSE_ENC_SPEED_SHIFT)
+
 /* Segment flags (Sec. 6.1). Only 0x01 is legal in v1. */
 #define ZPSE_S_LEN_PREFIX       (UINT8_C(1) << 0)
 #define ZPSE_S_DIR_BIT          (UINT8_C(1) << 1)

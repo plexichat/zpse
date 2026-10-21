@@ -1079,14 +1079,26 @@ static uint32_t zpse_block_cand_floor(uint32_t len)
            zpse_block_plane_floor(len);
 }
 
-/* Exact price of one candidate: every plane probed, summed the same way the
- * prescreen proxy sums its planes. */
+/* Exact price of one candidate, summed the same way the prescreen proxy sums
+ * its planes.
+ *
+ * `every_plane` is the default (ZPSE_ENC_SPEED_BALANCED) and prices one tile
+ * in every plane, which is the only way to rank a transpose correctly (see
+ * the comment below). The cheap levels price `tiles` planes instead and
+ * charge the rest their average, or nothing at all when they are constant:
+ * that is the estimate this code used to make everywhere, and it is wrong by
+ * design in exactly one direction -- it under-prices the wide transposes,
+ * whose planes differ most from each other. */
 static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
                                       const uint32_t lens[16], uint8_t sc,
-                                      unsigned tiles, uint32_t limit)
+                                      unsigned tiles, uint32_t limit,
+                                      int every_plane)
 {
     uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u;
     uint32_t records = 0u;
+    uint32_t tile_records = 0u;
+    unsigned tile_planes = 0u;
+    unsigned step = 1u;
     unsigned s;
 
     /* 0 means "the probe's own default", exactly as zpse_block_exact_plane
@@ -1112,8 +1124,19 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
      * of a 64 KiB block instead of 36, which is why a constant plane is
      * tested BEFORE its tile is priced (see below). Measured end to end,
      * the pass is what buys decimal8 4.62:1 -> 5.82:1 (3.96:1 -> 4.01:1 over
-     * the corpus). */
-    for (s = 0u; s < sc; s++) {
+     * the corpus).
+     *
+     * The cheap levels (ZPSE_ENC_FASTER and _FASTEST) price `tiles` of the
+     * planes and fill in the rest, which is the older estimate: a quarter to
+     * a sixteenth of the probe's tiles, for a ranking that is biased towards
+     * the cheap planes it happened to sample. */
+    if (!every_plane && sc > 1u) {
+        step = ((unsigned)sc + tiles - 1u) / tiles;
+        if (step == 0u) {
+            step = 1u;
+        }
+    }
+    for (s = 0u; s < sc; s += step) {
         /* The running share: everything still unspent below `limit`
          * belongs to the planes not yet priced, and this plane may spend
          * its envelope plus a fair piece of it. UINT32_MAX (no verdict in
@@ -1155,6 +1178,8 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
             }
             /* c is 16 + the plane's record area folded up to its tile count. */
             records += c - 16u;
+            tile_records += c - 16u;
+            tile_planes++;
 
             /* Early exit: if the running lower bound on the candidate total
              * already exceeds `limit`, this candidate cannot win. Return the
@@ -1170,6 +1195,23 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
                                           : lb);
                 }
             }
+        }
+    }
+    /* The planes the cheap levels did not price: a constant one is priced by
+     * the scan, and anything else is charged the average of the planes that
+     * were. Zero tile-priced planes means the whole candidate was constant,
+     * so there is nothing left to fill in. */
+    if (step > 1u && tile_planes > 0u) {
+        uint32_t avg = tile_records / tile_planes;
+
+        for (s = 0u; s < sc; s++) {
+            uint32_t d;
+
+            if ((s % step) == 0u) {
+                continue;
+            }
+            d = zpse_segment_const_cost(planes[s], lens[s]);
+            records += (d != UINT32_MAX) ? (d - 16u) : avg;
         }
     }
     total += (uint32_t)sc * 16u + records;
@@ -1216,7 +1258,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                                        uint32_t n, uint8_t tid, uint8_t sc,
                                        const uint8_t *meta_bytes,
                                        uint16_t meta_len, unsigned tiles,
-                                       uint32_t limit)
+                                       uint32_t limit, int every_plane)
 {
     uint32_t lens[16];
     uint8_t *planes[16];
@@ -1225,7 +1267,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                           lens) != PSE_OK) {
         return UINT32_MAX;
     }
-    return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit);
+    return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit, every_plane);
 }
 
 /* Exchange two candidate slots, moving the candidate itself in every array
@@ -1560,7 +1602,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * unchanged). The window has to be big enough for the price to
      * mean something: the sizes corpus is what catches a window that
      * mis-ranks, and it did not move. */
-    uint32_t pn = n < ZPSE_PROBE_WINDOW ? n : ZPSE_PROBE_WINDOW;
+        uint32_t pn = n < ZPSE_PROBE_WINDOW ? n : ZPSE_PROBE_WINDOW;
+        /* ZPSE_ENC_SPEED_BALANCED prices every plane of a candidate, which is
+         * what ranks a transpose correctly; the cheap levels price a stride
+         * of them and fill the rest in (see zpse_block_exact_sum). */
+        uint32_t speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
+        int every_plane = (speed != (uint32_t)ZPSE_ENC_FASTER &&
+                           speed != (uint32_t)ZPSE_ENC_FASTEST);
         int pick = -1;
         int ci;
         int k;
@@ -1609,7 +1657,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
-                                            ZPSE_DECIDE_TILES, lim);
+                                            ZPSE_DECIDE_TILES, lim,
+                                            every_plane);
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_cands_priced++;
             zpse_block_probe_cycles += blk_rdtsc() - t_cycle;
@@ -1772,7 +1821,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 const uint8_t *wmb = meta_lens[pick] > 0 ? meta_bufs[pick] : in;
                 uint32_t tp = zpse_block_proxy_exact(
                     e, in + (n - pn), pn, tids[pick], scounts[pick], wmb,
-                    meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX);
+                    meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX,
+                    every_plane);
 
                 if (tp == UINT32_MAX ||
                     tp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
@@ -1812,6 +1862,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             idx[pick] = ti;
             for (m = 0; m < ZPSE_MAX_CAND_META; m++)
                 meta_bufs[pick][m] = tb[m];
+        }
+        /* The trials each cheap level is willing to spend. The cheap ranking
+         * is biased (it under-prices the wide transposes), so its runner-up
+         * is worth one trial at FASTER; below that the second opinion is what
+         * costs the time the level exists to save. FASTEST keeps the winner
+         * only -- the setting to reach for when the encoder is the bottleneck
+         * and the stream is not. */
+        if (pick >= 0 && speed == (uint32_t)ZPSE_ENC_FASTEST) {
+            ncand = 1;
+        } else if (pick >= 0 && speed == (uint32_t)ZPSE_ENC_FASTER &&
+                   ncand > 2) {
+            ncand = 2;
         }
     }
 #endif /* !ZPSE_KEEP_EXACT_SWEEP */
