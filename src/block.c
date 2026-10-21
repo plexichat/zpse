@@ -1105,11 +1105,10 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
      * probe picks.
      *
      * The price of the deeper pass is 60 plane-tiles for the ten candidates
-     * of a 64 KiB block instead of 36: mean columnar encode 666 MB/s against
-     * 794, for decimal8 4.62:1 -> 5.82:1 and 3.96:1 -> 4.01:1 over the
-     * corpus. The constant test that used to stand in for the planes that
-     * were not priced is gone with them: a plane that is priced needs no
-     * stand-in. */
+     * of a 64 KiB block instead of 36, which is why a constant plane is
+     * tested BEFORE its tile is priced (see below). Measured end to end,
+     * the pass is what buys decimal8 4.62:1 -> 5.82:1 (3.96:1 -> 4.01:1 over
+     * the corpus). */
     for (s = 0u; s < sc; s++) {
         /* The running share: everything still unspent below `limit`
          * belongs to the planes not yet priced, and this plane may spend
@@ -1125,8 +1124,27 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
             }
         }
         {
-            uint32_t c = zpse_block_exact_plane(e, planes[s], lens[s],
-                                                sc > 1u ? 1u : tiles, share);
+            uint32_t c;
+
+            /* A constant plane does not need a tile priced: the dense record
+             * form is the cheapest way to write it (12 bytes per 4 KiB
+             * against 10 bytes per 256-byte all-hit tile), and the scan that
+             * finds this out exits at the first differing byte, so it costs
+             * nothing on a plane that is not constant. It is what keeps the
+             * deeper pass affordable on the blocks whose planes mostly are
+             * constant -- zeros, a run of offsets, a repeated string -- where
+             * a tile in each of sixteen constant planes was most of the
+             * probe. */
+            if (sc > 1u) {
+                uint32_t d = zpse_segment_const_cost(planes[s], lens[s]);
+
+                if (d != UINT32_MAX) {
+                    records += d - 16u;
+                    continue;
+                }
+            }
+            c = zpse_block_exact_plane(e, planes[s], lens[s],
+                                       sc > 1u ? 1u : tiles, share);
 
             if (c == UINT32_MAX) {
                 return UINT32_MAX;
