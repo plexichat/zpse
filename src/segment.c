@@ -3068,6 +3068,32 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                     cand[ncand++] = second_p;
                 }
             }
+            /* ORDER1 and ORDER2 are the two predictors that read a
+             * table (order1, and o2), and they are not in the
+             * prescreen's candidate list, so they can never win a tile.
+             * They can be tried when the screened predictors do badly.
+             *
+             * At most ONE of them may be in the list. A classify leaves
+             * the table it reads in the state its own chain produced, and
+             * the table is only re-seeded for the predictor the NEXT
+             * classify is for. So with both in the list, the loser's
+             * classify leaves the winner's table dirty -- and the
+             * decoder, which applies only the winner, never dirties it.
+             * The two sides then disagree about the table, and the block
+             * decodes to different bytes (measured: the decimal8 corpus
+             * failed to round-trip, the differing bytes at the tail of
+             * the tiles of the later segments).
+             *
+             * One table user with anything else is fine: the other
+             * candidates read no table, and the history fixup at the end
+             * of a tile depends on the bytes, not on the predictor. */
+#if defined(ZPSE_TRIAL_ORDER1)
+            if (bk * 2u > (uint32_t)nt) {
+                if (ncand < 4u) {
+                    cand[ncand++] = (uint8_t)ZPSE_P_ORDER1;
+                }
+            }
+#endif
             /* Near-random tile (every cheap predictor misses almost
              * everywhere): one trial is enough. A second classification
              * plus its mode search would cost the same again for a
