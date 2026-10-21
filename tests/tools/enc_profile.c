@@ -25,6 +25,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* clock_gettime is POSIX, and a strict -std=c11 hides it unless the
+ * feature test macro says so. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <time.h> /* struct timespec + clock_gettime on the POSIX path */
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
