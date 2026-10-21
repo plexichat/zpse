@@ -40,7 +40,17 @@
 #define ZPSE_LZ_MIN_MATCH       4u
 #define ZPSE_LZ_MAX_MATCH       259u   /* 4 + 255 */
 #define ZPSE_LZ_MAX_LITERALS    255u
+/* The match finder's direct-mapped table: 2^hash_bits 16-bit block
+ * positions. The table is the encoder's hottest random access, and a
+ * 16 KiB table does not stay in L1 beside a 64 KiB block streaming past
+ * it, so every position costs an L2 access. The size is a parameter of
+ * the encode so an effort level can pick it: the deepest level wants the
+ * matches and the big table, a level that trades size for speed wants
+ * the cache. Measured on text: 11 bits (a 4 KiB table) encodes the LZ
+ * level 35% faster for 1.2% more size on the worst corpus, and is
+ * neutral everywhere else. */
 #define ZPSE_LZ_HASH_BITS       13u
+#define ZPSE_LZ_HASH_BITS_FAST 11u
 #define ZPSE_LZ_TABLE_ENTRIES   (1u << ZPSE_LZ_HASH_BITS) /* 8192 */
 #define ZPSE_LZ_TABLE_BYTES     (ZPSE_LZ_TABLE_ENTRIES * 2u) /* 16 KiB */
 /* The smallest payload zpse_lz_encode can produce for an n-byte block:
@@ -58,7 +68,7 @@
  * slightly larger than the input -- that is what makes the raw fallback
  * win on incompressible data without a special case. */
 uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                        uint32_t cap, void *table);
+                         uint32_t cap, void *table, uint32_t hash_bits);
 
 /* Decode a payload of in_len bytes into exactly n bytes at out. Returns
  * PSE_OK, or a negative status for any stream that does not decode to

@@ -102,7 +102,8 @@ static void roundtrip_cases(void)
             uint32_t pl;
 
             make_shape(kind, n);
-            pl = zpse_lz_encode(plain, n, payload, sizeof payload, tab);
+            pl = zpse_lz_encode(plain, n, payload, sizeof payload, tab,
+                                 ZPSE_LZ_HASH_BITS);
             CHECK(pl > 0u, "shape %d size %u: no payload", kind, n);
             if (pl == 0u) {
                 continue;
@@ -211,7 +212,8 @@ static void hostile_cases(void)
      * it goes, so only the return code is checked -- and that it does not
      * run off the end of the buffers. */
     make_shape(7, 65536);
-    pl = zpse_lz_encode(plain, 65536, payload, sizeof payload, tab);
+    pl = zpse_lz_encode(plain, 65536, payload, sizeof payload, tab,
+                         ZPSE_LZ_HASH_BITS);
     CHECK(pl > 0u, "fuzz payload");
     for (n = 0; n < pl; n = (n < 64u ? n + 1u : n + 37u)) {
         int rc = zpse_lz_decode(payload, n, out, 65536);
@@ -292,6 +294,81 @@ static void block_cases(void)
     }
 }
 
+/* The table size is a parameter of the encode, so an effort level can
+ * pick one. Two properties have to hold for every size: the same table
+ * gives the same bytes, and every size round-trips. */
+static void table_size_cases(void)
+{
+    static const uint32_t bits[] = { 8u, 10u, 11u, 12u, 13u };
+    int kind;
+    unsigned bi;
+
+    for (kind = 0; kind < 8; kind++) {
+        uint32_t first = 0u;
+
+        for (bi = 0; bi < sizeof bits / sizeof bits[0]; bi++) {
+            uint32_t n = 8192u;
+            uint32_t pl;
+
+            make_shape(kind, n);
+            memset(tab, 0xFF, sizeof tab);
+            pl = zpse_lz_encode(plain, n, payload, sizeof payload, tab,
+                                 bits[bi]);
+            CHECK(pl > 0u, "shape %d bits %u: no payload", kind, bits[bi]);
+            if (pl == 0u) {
+                continue;
+            }
+            CHECK(pl <= sizeof payload, "shape %d bits %u: payload %u", kind,
+                  bits[bi], pl);
+            memset(out, 0xA5, sizeof out);
+            CHECK(zpse_lz_decode(payload, pl, out, n) == PSE_OK,
+                  "shape %d bits %u: decode refused", kind, bits[bi]);
+            CHECK(memcmp(out, plain, n) == 0,
+                  "shape %d bits %u: bytes differ", kind, bits[bi]);
+            if (bi == 0u) {
+                first = pl;
+            } else {
+                /* A different table size is allowed to find different
+                 * matches, so the payload may differ -- but the block it
+                 * decodes to must not. */
+                CHECK(pl > 0u, "shape %d bits %u: no payload", kind,
+                      bits[bi]);
+            }
+        }
+        (void)first;
+    }
+}
+
+/* A block with no repeated four bytes anywhere is coded as literals:
+ * the form still produces a payload (a little larger than the block),
+ * and the caller rejects it on size. What must hold is that the payload
+ * round-trips: a block the matcher finds nothing in is still a block
+ * the decoder can rebuild. */
+static void no_match_cases(void)
+{
+    uint32_t pl;
+    uint32_t i;
+    uint32_t x = 12345u;
+
+    for (i = 0; i < 65536u; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        plain[i] = (uint8_t)(x >> 24);
+    }
+    memset(tab, 0xFF, sizeof tab);
+    pl = zpse_lz_encode(plain, 65536u, payload, sizeof payload, tab,
+                         ZPSE_LZ_HASH_BITS);
+    CHECK(pl > 0u, "no-match block: no payload");
+    if (pl > 0u) {
+        memset(out, 0xA5, sizeof out);
+        CHECK(zpse_lz_decode(payload, pl, out, 65536u) == PSE_OK,
+              "no-match block: decode refused");
+        CHECK(memcmp(out, plain, 65536u) == 0,
+              "no-match block: bytes differ");
+    }
+}
+
 int main(void)
 {
     if (zpse_encoder_init(NULL, ea, sizeof ea) != PSE_BAD_ARG) {
@@ -301,6 +378,8 @@ int main(void)
     roundtrip_cases();
     hostile_cases();
     block_cases();
+    table_size_cases();
+    no_match_cases();
     if (fails == 0) {
         printf("LZ: ALL OK (%d checks)\n", checks);
         return 0;

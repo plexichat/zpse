@@ -12,7 +12,7 @@
  * is not a legitimate entry. */
 #define LZ_EMPTY 0xFFFFu
 
-static uint32_t lz_hash(const uint8_t *p)
+static uint32_t lz_hash(const uint8_t *p, uint32_t hash_bits)
 {
     /* One multiply of the first four bytes at the cursor, top bits kept:
      * the multiply's high half is where the input bits are spread out, so
@@ -20,7 +20,7 @@ static uint32_t lz_hash(const uint8_t *p)
      * the four-byte compare at the candidate is the tag check. */
     uint32_t v = zpse_load_u32le(p);
 
-    return (v * UINT32_C(2654435761)) >> (32u - ZPSE_LZ_HASH_BITS);
+    return (v * UINT32_C(2654435761)) >> (32u - hash_bits);
 }
 
 static uint64_t lz_load64(const uint8_t *p)
@@ -106,11 +106,12 @@ static void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
 }
 
 uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                        uint32_t cap, void *table)
+                        uint32_t cap, void *table, uint32_t hash_bits)
 {
     uint16_t *tab = (uint16_t *)table;
     LzOut o;
     uint32_t pos, anchor, misses, i, cmd_off, cmd_len;
+    uint32_t entries = 1u << hash_bits;
 
     if (in == 0 || dst == 0 || tab == 0) {
         return 0u;
@@ -123,7 +124,7 @@ uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < ZPSE_LZ_MIN_PAYLOAD) {
         return 0u;
     }
-    for (i = 0; i < ZPSE_LZ_TABLE_ENTRIES; i++) {
+    for (i = 0; i < entries; i++) {
         tab[i] = (uint16_t)LZ_EMPTY;
     }
     o.dst = dst;
@@ -136,7 +137,7 @@ uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     anchor = 0u;
     misses = 0u;
     while (pos + ZPSE_LZ_MIN_MATCH <= n) {
-        uint32_t h = lz_hash(in + pos);
+        uint32_t h = lz_hash(in + pos, hash_bits);
         uint32_t cand = tab[h];
         uint32_t len;
 
