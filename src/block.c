@@ -1179,7 +1179,7 @@ static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
          * hopeless candidate prices only a tile or two instead of all of
          * them. Convicted candidates return a finite value > limit, never
          * UINT32_MAX, so they are dropped, not kept. */
-        uint32_t lim = (pmin == UINT32_MAX) ? UINT32_MAX : pmin + (pmin >> 4);
+        uint32_t lim = (pmin == UINT32_MAX) ? UINT32_MAX : pmin + (pmin >> 3);
 
         ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci], scounts[ci], mb,
                                        meta_lens[ci], 0u, lim);
@@ -1190,7 +1190,7 @@ static void zpse_block_prune_exact(ZpseEncoder *e, const uint8_t *in,
     if (pmin == UINT32_MAX) {
         return;
     }
-    limit = pmin + (pmin >> 4);
+    limit = pmin + (pmin >> 3);
     for (ci = from; ci < to; ci++) {
         if (ex[ci] == UINT32_MAX || ex[ci] <= limit) {
             unsigned m;
@@ -1540,8 +1540,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 cfloor = zpse_block_floor(pn, tids[ci], scounts[ci],
                                           meta_lens[ci]);
                 if (cfloor != UINT32_MAX &&
-                    cfloor > pmin + (pmin >> 4)) {
-                    px[ci] = pmin + (pmin >> 4) + 1u;
+                    cfloor > pmin + (pmin >> 3)) {
+                    px[ci] = pmin + (pmin >> 3) + 1u;
                     continue;
                 }
             }
@@ -1552,7 +1552,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
         }
         if (pmin != UINT32_MAX) {
-            uint32_t limit = pmin + (pmin >> 4);
+            uint32_t limit = pmin + (pmin >> 3);
 
             for (ci = 0; ci < ncand; ci++) {
                 if (px[ci] == UINT32_MAX || px[ci] <= limit) {
