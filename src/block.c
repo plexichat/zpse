@@ -1363,9 +1363,16 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * not fit (which the caller reads as "this candidate lost", not as an
  * error). The block header is written last-to-first: the payload at
  * dst + 32, then the envelope around it. */
+/* A block's LZ stream is only worth taking when its commands average this
+ * many output bytes or more: below it the decoder is a command loop rather
+ * than a copy, and it loses to the tile stream it would replace (see the
+ * measurements at the call site). */
+#define ZPSE_LZ_MIN_BYTES_PER_CMD 48u
+
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
-                             uint8_t *dst, uint32_t cap, uint32_t *total_out)
+                             uint8_t *dst, uint32_t cap, uint32_t *total_out,
+                             uint32_t *cmds_out)
 {
     ZpseBlockHeader h;
     uint8_t flags;
@@ -1386,6 +1393,15 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                  : (uint32_t)ZPSE_LZ_HASH_BITS);
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
+    }
+    /* The stream's own layout gives the command count for free: a four-byte
+     * literal total, the literals padded to a word, then commands to the
+     * end of the payload. */
+    if (cmds_out != 0) {
+        uint32_t lit_total = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE);
+        uint32_t cmd_off = 4u + ((lit_total + 3u) & ~3u);
+
+        *cmds_out = (payload > cmd_off) ? (payload - cmd_off) / 4u : 0u;
     }
     total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
     flags = (uint8_t)(ZPSE_B_LZ | ZPSE_B_RESET |
@@ -2160,10 +2176,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * its remaining segments are written. That is a verdict on THIS
              * candidate and says nothing about the ones after it -- a shape
              * that packs worse on the front of a block can be the best one
-             * over the whole of it -- so it does not end the sweep, and two
-             * of them do not either. The per-candidate floor test at the top
-             * of the loop still skips a shape whose own bound cannot beat the
-             * winner without spending the trial. */
+             * over the whole of it -- so on its own it does not end the
+             * sweep. The per-candidate floor test at the top of the loop
+             * still skips a shape whose own bound cannot beat the winner
+             * without spending the trial. */
             (void)budget_hit;
 #if defined(ZPSE_BLOCK_STATS)
             if (!have_first_trial) {
@@ -2174,9 +2190,26 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 first_trial_total = UINT32_MAX;
             }
 #endif
-            /* A trial the budget stopped is still a full block encode
-             * attempt, so it counts against the flat-block cap. */
-            if (sample_flat && ntried >= ZPSE_FLAT_TRIALS) {
+            /* A trial the budget stopped is a trial whose stream was already
+             * bigger than the raw envelope before it reached the end of the
+             * block: the budget IS the raw envelope and the trial ran into
+             * it. On a block the sweep has priced as noise -- the winner's
+             * price over the head window and over the tail window is at
+             * least the raw envelope -- that is the verdict for the whole
+             * sweep, because the shapes behind this one are priced no better
+             * and run into the same budget. It saves two whole block encodes
+             * on every block of noise, which is most of what such a block
+             * costs to encode.
+             *
+             * The verdict is the trial's own, not the price's, which is what
+             * keeps it honest: a block whose head and tail are noise but
+             * whose middle is not -- the "noise then constant" shape of the
+             * size corpus -- has a price that says flat and a trial that
+             * says otherwise, and the trial wins here because it encodes the
+             * whole block. A block that compresses still gets its
+             * compression; only a block that really is noise stops after
+             * one trial. */
+            if (sample_flat) {
                 break;
             }
             continue;
@@ -2257,6 +2290,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (sample_flat && ntried >= ZPSE_FLAT_TRIALS) {
                 break;
             }
+            /* A trial that finished above the raw envelope is the same
+             * verdict the budget gives a trial that ran into it (see the
+             * budget-stopped path above): the shape does not beat the raw
+             * bytes, and on a block the sweep has priced as noise the shapes
+             * behind it are priced no better, so the sweep stops here too. */
+            if (sample_flat &&
+                t + 1u > (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+                break;
+            }
             /* Two candidates that both finish above the raw envelope are
              * evidence that the block is incompressible, and the sweep spends
              * two whole trials to find out -- the rest abort on the noise
@@ -2298,10 +2340,26 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
         if (!have_best || best_total > lz_floor) {
             uint32_t lz_total = 0u;
+            uint32_t lz_cmds = 0u;
 
             rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                   (uint32_t)ZPSE_E_SZ_CAND, &lz_total);
-            if (rc == PSE_OK && (!have_best || lz_total < best_total)) {
+                                   (uint32_t)ZPSE_E_SZ_CAND, &lz_total,
+                                   &lz_cmds);
+            /* Smaller is not enough: the two forms decode at speeds that
+             * have nothing to do with their ratio. A tile stream decodes at
+             * 5-13 GB/s whatever it holds; an LZ stream decodes at the speed
+             * of its own command loop, one 4-byte command per output run, so
+             * its rate follows the AVERAGE RUN LENGTH. Measured on this
+             * corpus, in bytes of output per command: 5.6 -> 0.6 GB/s
+             * (prose), 9 -> 1.2 (json), 17 -> 2.9 (var strings), 64 -> 8.8
+             * (sparse), 128 -> 8.4 (geo), 246 -> 24 (zeros). So the level
+             * takes LZ only when its commands average a run long enough to
+             * beat the tile stream's own decode, which is the copy loop this
+             * level exists for; a prose block whose LZ stream is 20% smaller
+             * keeps the tiles, because 0.6 GB/s is not a win over 12. */
+            if (rc == PSE_OK && (!have_best || lz_total < best_total) &&
+                (lz_cmds == 0u ||
+                 n / lz_cmds >= (uint32_t)ZPSE_LZ_MIN_BYTES_PER_CMD)) {
                 memcpy(e->best, e->cand, lz_total);
                 best_total = lz_total;
                 /* 15 is the slot the statistics code gives the raw fallback:

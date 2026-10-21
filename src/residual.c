@@ -53,7 +53,22 @@
 #define ZPSE_RES_HAVE_AVX2 0
 #endif
 
-#if ZPSE_RES_HAVE_SSSE3 || ZPSE_RES_HAVE_AVX2
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_RES_BMI2 __attribute__((target("bmi2"), aligned(64)))
+#define ZPSE_RES_HAVE_BMI2 1
+#elif defined(__BMI2__)
+#define ZPSE_RES_BMI2
+#define ZPSE_RES_HAVE_BMI2 1
+#else
+#define ZPSE_RES_BMI2
+#define ZPSE_RES_HAVE_BMI2 0
+#endif
+#else
+#define ZPSE_RES_HAVE_BMI2 0
+#endif
+
+#if ZPSE_RES_HAVE_SSSE3 || ZPSE_RES_HAVE_AVX2 || ZPSE_RES_HAVE_BMI2
 #include <immintrin.h>
 #endif
 
@@ -272,6 +287,64 @@ static ZPSE_RES_AVX2 uint16_t residual_decode_mode2_avx2_m16(
     const uint8_t *pal, const uint8_t *src, uint16_t k, uint8_t *out);
 #endif
 
+#if ZPSE_RES_HAVE_BMI2
+#define ZPSE_RES_BMI2_SSSE3 \
+    __attribute__((target("ssse3,bmi2"), aligned(64)))
+
+/* Asked once per process, like the tile path's own probe: the answer cannot
+ * change while the program runs. MSVC has no builtin for it and keeps the
+ * shift-and-mask form, which is byte-identical. */
+static int residual_bmi2(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+#if defined(__GNUC__) || defined(__clang__)
+        cached = __builtin_cpu_supports("bmi2") ? 1 : 0;
+#else
+        cached = 0;
+#endif
+    }
+    return cached;
+}
+
+/* Sixteen three-bit indices per block. The block is 48 bits -- exactly six
+ * payload bytes -- so, starting at value 0, every block starts on a byte
+ * boundary and the phase is always zero: no shift of the stream is needed.
+ * Each pdep spreads the low 24 bits of its word into the low three bits of
+ * eight bytes, which is the index vector pshufb wants, so a block costs one
+ * 6-byte load (a u32 and a u16, both inside the payload because
+ * i + 16 <= k), two pdeps, one compare and one shuffling store. The caller's
+ * shift-and-mask block stays for machines without BMI2 and produces the
+ * same bytes. */
+static ZPSE_RES_BMI2_SSSE3 uint16_t residual_mode2_b3_bmi2(
+    const uint8_t *src, uint16_t k, unsigned m, __m128i palv, __m128i limv,
+    uint8_t *exc_out)
+{
+    uint16_t i = 0u;
+    uint32_t off = 0u;
+
+    while ((uint32_t)i + 16u <= (uint32_t)k) {
+        uint64_t w = (uint64_t)zpse_load_u32le(src + off) |
+                     ((uint64_t)zpse_load_u16le(src + off + 4u) << 32);
+        uint64_t lo = _pdep_u64(w, UINT64_C(0x0707070707070707));
+        uint64_t hi = _pdep_u64(w >> 24, UINT64_C(0x0707070707070707));
+        __m128i idx = _mm_set_epi64x((long long)hi, (long long)lo);
+
+        /* m == 8 fills the width: no 3-bit index can name a palette entry
+         * that is not there. */
+        if (m != 8u && _mm_movemask_epi8(_mm_cmpgt_epi8(idx, limv)) != 0) {
+            break;
+        }
+        _mm_storeu_si128((__m128i *)(void *)(exc_out + i),
+                         _mm_shuffle_epi8(palv, idx));
+        i = (uint16_t)(i + 16u);
+        off += 6u;
+    }
+    return i;
+}
+#endif
+
 static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     const uint8_t *palette, const uint8_t *src, uint16_t k, unsigned b,
     unsigned m, uint8_t *exc_out)
@@ -310,6 +383,11 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
      * phase always fit in the first 8-byte read, so there is no second
      * load here. */
     if (b == 3u) {
+#if ZPSE_RES_HAVE_BMI2
+        if (residual_bmi2()) {
+            return residual_mode2_b3_bmi2(src, k, m, palv, limv, exc_out);
+        }
+#endif
         while ((uint32_t)i + 8u <= (uint32_t)k) {
             uint32_t bit = (uint32_t)i * 3u;
             uint32_t off = bit >> 3u;

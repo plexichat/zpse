@@ -4408,10 +4408,16 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
                             : resid,
                         res_mode);
                 } else {
-                    memset(resid + k, 0, (size_t)(256u - k) * sizeof resid[0]);
-                    if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
-                        memset(deltas + k, 0,
-                               (size_t)(256u - k) * sizeof deltas[0]);
+                    /* No zero-fill of the unit arrays past k here: this
+                     * scalar loop reads a unit only at the mask bit it is
+                     * about to consume, and consumes exactly k of them, so
+                     * the slack past the last exception is never read. It
+                     * used to be filled anyway -- 256-k zero bytes per
+                     * tile, half the tile's own output on a block whose
+                     * exception count is around 115 -- for kernels that
+                     * take an eight-byte window and need the slack, which is
+                     * the STRIDE_1 path above and the AVX2 one before it.
+                     * Both of them fill or bound their own window. */
                     j = tile_stride_recon_scalar(out, nt, s, seg_base, seg_pos,
                                                  initial_literal, words, resid,
                                                  deltas, res_mode);

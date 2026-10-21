@@ -226,17 +226,39 @@ uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     return cmd_off + cmd_len;
 }
 
-static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len)
+/* Literals are copied a 16-byte step at a time -- the size the compiler
+ * inlines -- and the sub-16 remainder with two overlapping 8-byte copies,
+ * which is one store pair instead of up to fifteen byte moves. The overlap
+ * form writes past the literal run, so it is only taken when both the
+ * source and the destination have eight readable/writable bytes of slack;
+ * the exact byte loop covers the last few bytes of a block, where they do
+ * not. `lit_total` caps the read at the literal region and `oend` the
+ * write at the output, so neither form can touch a byte the block does not
+ * own. */
+static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
+                             const uint8_t *lit_end, const uint8_t *oend)
 {
-    while (len >= 8u) {
-        memcpy(dst, src, 8u);
-        dst += 8u;
-        src += 8u;
-        len -= 8u;
+    if (len >= 16u) {
+        do {
+            memcpy(dst, src, 16u);
+            dst += 16u;
+            src += 16u;
+            len -= 16u;
+        } while (len >= 16u);
     }
-    while (len != 0u) {
-        *dst++ = *src++;
-        len--;
+    if (len != 0u) {
+        if (len <= 8u && (uint32_t)(lit_end - src) >= 16u &&
+            (uint32_t)(oend - dst) >= 8u) {
+            memcpy(dst, src, 8u);
+        } else if (len > 8u && (uint32_t)(lit_end - src) >= 16u &&
+                   (uint32_t)(oend - dst) >= 16u) {
+            memcpy(dst, src, 16u);
+        } else {
+            while (len != 0u) {
+                *dst++ = *src++;
+                len--;
+            }
+        }
     }
 }
 
@@ -251,9 +273,21 @@ static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len)
      * pass the last `off` bytes hold two periods, so a copy at twice the
      * distance is the same bytes. Four passes take the worst case (off 1)
      * from a byte loop per 64 KiB run to a 16-byte loop, which is what
-     * long runs of one value cost. */
-    while (off < 32u && len > off) {
-        memcpy(dst, dst - off, off);
+     * long runs of one value cost.
+     *
+     * Each pass is a byte loop of at most `off` bytes rather than a
+     * memcpy of `off`: off is below 16 here, the sizes are 1..15, and a
+     * call to memcpy for fifteen bytes costs far more than the fifteen
+     * byte moves it replaces -- on prose, where most matches have a small
+     * offset and a length of a few bytes, that call was the decode. */
+    while (off < 16u && len > off) {
+        uint8_t *d = dst;
+        const uint8_t *s = dst - (ptrdiff_t)off;
+        uint32_t k = off;
+
+        do {
+            *d++ = *s++;
+        } while (--k != 0u);
         dst += off;
         len -= off;
         off <<= 1;
@@ -345,7 +379,7 @@ int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         if (lit > (uint32_t)(oend - op)) {
             return PSE_BAD_LZ;
         }
-        lz_copy_literals(op, lp, lit);
+        lz_copy_literals(op, lp, lit, lend, oend);
         op += lit;
         lp += lit;
         if (off == 0u) {
