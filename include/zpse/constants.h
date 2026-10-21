@@ -13,6 +13,15 @@
 
 #define ZPSE_FRAME_HEADER_SIZE  32u
 #define ZPSE_BLOCK_HEADER_SIZE  32u
+
+/* FrameIndex (Sec. 3.4): the random-access table a frame carries when its
+ * ZPSE_F_FRAME_INDEX flag is set. It sits after the last block -- the
+ * header's frame_index_offset points at it -- and holds one {offset, size}
+ * pair per block, both relative to the start of the frame, so a reader can
+ * decode block k without walking blocks 0..k-1. */
+#define ZPSE_INDEX_MAGIC        UINT32_C(0x31584950) /* "PXI1" LE */
+#define ZPSE_INDEX_HEADER_SIZE  16u
+#define ZPSE_INDEX_ENTRY_SIZE   8u
 #define ZPSE_SEGMENT_HEADER_SIZE 16u
 #define ZPSE_TILE_HEADER_SIZE    8u
 #define ZPSE_SEG_DIR_ENTRY_SIZE  8u
@@ -40,7 +49,11 @@
 #define ZPSE_B_CRC              (UINT8_C(1) << 2)
 #define ZPSE_B_RESET            (UINT8_C(1) << 3)
 #define ZPSE_B_HAS_META         (UINT8_C(1) << 4)
-#define ZPSE_B_RESERVED_MASK    (UINT8_C(0xE0))
+/* The block payload is the intra-block LZ form (include/zpse/lz.h)
+ * rather than transform + segments + tiles. Mutually exclusive with
+ * ZPSE_B_RAW; transform_id 0, segment_count 1, no transform metadata. */
+#define ZPSE_B_LZ               (UINT8_C(1) << 5)
+#define ZPSE_B_RESERVED_MASK    (UINT8_C(0xC0))
 
 /* Encoder options (API): which optional fields a stream carries. The
  * payload CRC32-C is optional in the format (block flag ZPSE_B_CRC,
@@ -69,6 +82,17 @@
  *                            single shape it likes best: one trial per
  *                            block, no second opinion.
  *
+ *   ZPSE_ENC_MAX             everything the default level does, plus one
+ *                            more candidate: the intra-block LZ form. The
+ *                            match finder is a full pass over the block,
+ *                            so this level costs more encode time than any
+ *                            other; it never costs compressed size, since
+ *                            the LZ stream is only written when it is
+ *                            smaller than the best tile stream. What it
+ *                            buys is decode speed on repetitive blocks:
+ *                            a block that LZ wins is a copy loop, not a
+ *                            tile reconstruction.
+ *
  * An unsupported level is rejected with PSE_BAD_ARG rather than rounded to
  * one of these. */
 #define ZPSE_ENC_SPEED_SHIFT    1
@@ -76,6 +100,7 @@
 #define ZPSE_ENC_SPEED_BALANCED (UINT32_C(0) << ZPSE_ENC_SPEED_SHIFT)
 #define ZPSE_ENC_FASTER         (UINT32_C(1) << ZPSE_ENC_SPEED_SHIFT)
 #define ZPSE_ENC_FASTEST        (UINT32_C(2) << ZPSE_ENC_SPEED_SHIFT)
+#define ZPSE_ENC_MAX            (UINT32_C(3) << ZPSE_ENC_SPEED_SHIFT)
 
 /* Segment flags (Sec. 6.1). Only 0x01 is legal in v1. */
 #define ZPSE_S_LEN_PREFIX       (UINT8_C(1) << 0)

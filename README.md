@@ -197,6 +197,38 @@ schema that would make such a codec possible to ship. The `var_string` row
 is the honest limit: no column codec helps there either, and the answer is a
 block codec with a match finder.
 
+### Effort levels
+
+`ZPSE_ENC_*` in the `enc_flags` word chooses how much encode time a block is
+worth. No level changes the format: every level's stream is read by the same
+decoder, and a level only decides which shape gets written. The levels are
+adjacent rungs, not aliases -- each one costs encode time and returns ratio,
+and the levels on both sides of the default were measured in one binary
+over the columnar corpus (25 cases, 4 MiB each, 64 KiB blocks):
+
+| level | mean ratio | mean encode | mean decode | what changes |
+| --- | ---: | ---: | ---: | --- |
+| `ZPSE_ENC_MAX` | 4.49:1 | 348 MB/s | 10.7 GB/s | the default sweep, plus intra-block LZ as one more candidate |
+| `ZPSE_ENC_SPEED_BALANCED` (default) | 4.01:1 | 720 MB/s | 23.1 GB/s | every candidate priced on a tile of every plane; survivors encoded in full |
+| `ZPSE_ENC_FASTER` | 4.01:1 | 916 MB/s | 22.8 GB/s | one tile per plane, then at most two full trials |
+| `ZPSE_ENC_FASTEST` | 4.00:1 | 1.19 GB/s | 22.1 GB/s | the cheap price, then one trial: the shape it likes best |
+
+The deepest level is the one to reach for when bytes matter more than the
+clock. It never writes a larger block than the default level -- the LZ stream
+is kept only when it is smaller -- and it roughly doubles encode time because
+the match finder is a full pass over the block. Where the tile model has
+nothing to predict, it is the difference between raw and compression:
+`text_en` 1.00:1 -> 1.33:1, `json_rows` 1.00:1 -> 2.05:1, `utf8_multi`
+1.00:1 -> 1.95:1, `log_lines` 1.00:1 -> 2.63:1, `var_string` 1.00:1 ->
+2.52:1, and on data the tiles do compress it still adds a little:
+`float_sparse` 2.50:1 -> 3.10:1, `geo_point` 13.06:1 -> 15.54:1,
+`zeros_burst` 9.29:1 -> 12.23:1. A block it wins decodes as an LZ stream
+instead of a tile reconstruction, which is slower than the tile path on
+columnar data (hence the lower mean decode above) and much faster than it on
+a long run: 5.8 GB/s on 1 KiB runs, 27 GB/s on a ramp, measured over 64 KiB
+blocks. The cheap levels are the other side of the same trade: they write
+the same shapes in less encode time.
+
 ## What it does
 
 A **frame** is a 32-byte header (magic `PSE1`, version, content size, block
@@ -216,6 +248,27 @@ The transforms are identity, delta-8, xor-8, byte-transpose of width 2/4/8/16,
 delta-plus-transpose at the same widths, and a stride variant for interleaved
 data. A plane that is one value throughout has a dense form that codes 4 KiB
 in twelve bytes.
+
+A block may instead be coded as **intra-block LZ** (block flag `ZPSE_B_LZ`).
+That form is a literal stream, a command stream and nothing else: every
+reference is a 16-bit distance inside the same block, so a block is still
+independent and still decodes on its own. A command is one 32-bit word --
+offset, literal count, match length minus four -- and there are no escape
+words, so the decoder's inner loop is a copy loop with no length parsing. Long
+runs are written as repeated commands (4 bytes per 259 bytes of run).
+
+The encoder's deepest level, `ZPSE_ENC_MAX`, tries that form as one more
+candidate and keeps it only when it is smaller than the best tile stream. On
+the columnar corpus that is worth +12% ratio over the default level, and on
+high-cardinality text it is the difference between falling back to raw and
+compressing at all -- the case the tile model cannot see, because nothing in
+it repeats four bytes apart, only further back.
+
+A block is written in one of three forms, and the block flags say which: the
+tile form above (`ZPSE_B_RAW` and `ZPSE_B_LZ` clear), a verbatim copy
+(`ZPSE_B_RAW`), or intra-block LZ (`ZPSE_B_LZ`). All three carry the same
+32-byte header, and all three decode on their own, which is what makes a
+block the unit of random access.
 
 Everything is bounds-checked on the way in, and the checks are the interesting
 half of the decoder: every length, count, mode and rank is validated before
@@ -285,16 +338,18 @@ costs nothing however slow its classify is.
 
 ## Known limitations
 
-* **No entropy coder and no match finder.** Ratio loses badly to zstd on
-  redundant data, as shown above. This is a design choice, not a to-do. The
-  columnar section shows the sharpest version of it: on high-cardinality text
-  zpse falls back to raw and zstd gets 4.7x.
+* **No entropy coder.** The default level has no match finder either: ratio
+  loses to zstd on redundant data, as shown above, and that is a design
+  choice. `ZPSE_ENC_MAX` adds one (a single-probe hash match finder, LZ4's
+  shape, not zstd's search), which is what makes the ratio table's text rows
+  compress at all; the default level still does not run it.
+  The columnar section shows the sharpest version: on high-cardinality text
+  the default level falls back to raw and zstd gets 4.7x, while the deepest
+  level gets 2.5x.
 * **No column semantics.** A nullable column costs 1.5x what null suppression
   would give it, and nothing in the format knows what a record boundary is.
   The byte transpose recovers the split for fixed-width records by accident;
   it cannot recover the *meaning* of a null.
-* **Frame index is not implemented.** The `ZPSE_F_FRAME_INDEX` flag is
-  refused rather than emitted with a wrong offset.
 * **64 KiB blocks, no cross-block state.** Each block is independent, which is
   what makes the transform and predictor code branch-light and allows random
   access, but it caps ratio on long-range redundancy.

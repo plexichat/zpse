@@ -5,6 +5,7 @@
 #include "zpse/constants.h"
 #include "zpse/crc32c.h"
 #include "zpse/dense.h"
+#include "zpse/lz.h"
 #include "zpse/predictor.h"
 #include "zpse/segment.h"
 #include "zpse/status.h"
@@ -275,6 +276,36 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             }
         } else {
             memcpy(output, in + ZPSE_BLOCK_HEADER_SIZE, n);
+        }
+        if (out_len_out != 0) {
+            *out_len_out = n;
+        }
+        return (int)n;
+    }
+
+    /* Intra-block LZ form: one literal stream, one command stream, no
+     * transform and no tiles. The block keeps the shape the raw fallback
+     * uses (transform 0, one segment, no metadata) so a reader can tell
+     * the two apart by flag alone, and every reference it carries is a
+     * distance inside this block. */
+    if ((h.block_flags & ZPSE_B_LZ) != 0) {
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u) {
+            return PSE_BAD_HEADER;
+        }
+        if (c <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+            return PSE_BAD_BLOCK_SIZE;
+        }
+        rc = zpse_lz_decode(in + ZPSE_BLOCK_HEADER_SIZE,
+                            c - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, output, n);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+        if ((h.block_flags & ZPSE_B_CRC) != 0) {
+            uint32_t calc = zpse_crc32c(output, n);
+
+            if (calc != h.decoded_crc32c) {
+                return PSE_BAD_PAYLOAD_CRC;
+            }
         }
         if (out_len_out != 0) {
             *out_len_out = n;
@@ -1327,6 +1358,45 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
     }
 }
 
+/* Encode the block as the intra-block LZ form into dst[0..cap). Returns
+ * PSE_OK with *total_out set, or a negative status when the payload does
+ * not fit (which the caller reads as "this candidate lost", not as an
+ * error). The block header is written last-to-first: the payload at
+ * dst + 32, then the envelope around it. */
+static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                             uint32_t in_crc, int is_last, uint32_t seq,
+                             uint8_t *dst, uint32_t cap, uint32_t *total_out)
+{
+    ZpseBlockHeader h;
+    uint8_t flags;
+    uint32_t payload;
+    uint32_t total;
+
+    if (e->lz == 0 || dst == 0 || total_out == 0) {
+        return PSE_BAD_ARG;
+    }
+    if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ_MIN_PAYLOAD) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz);
+    if (payload == 0u) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
+    flags = (uint8_t)(ZPSE_B_LZ | ZPSE_B_RESET |
+                      (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+                           ? ZPSE_B_CRC : 0u));
+    if (is_last) {
+        flags |= ZPSE_B_LAST;
+    }
+    zpse_block_fill_header(&h, flags, n, total, 0u, 1u, 0u, seq, in_crc);
+    zpse_block_header_serialize(dst, &h);
+    zpse_block_fix_header_crc(dst);
+    *total_out = total;
+    return PSE_OK;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -2075,6 +2145,29 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     break;
                 }
             }
+        }
+    }
+
+    /* The deepest level tries one more candidate: the intra-block LZ form.
+     * It competes on size alone, so the level can never write a block
+     * larger than the default level would -- but a block it does win is a
+     * copy loop to decode instead of a tile reconstruction, and a block of
+     * long repeats is exactly where that matters. The match finder is a
+     * full pass over the block, which is why only this level pays for it. */
+    if ((e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
+            (uint32_t)ZPSE_ENC_MAX &&
+        e->lz != 0) {
+        uint32_t lz_total = 0u;
+
+        rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
+                               (uint32_t)ZPSE_E_SZ_CAND, &lz_total);
+        if (rc == PSE_OK && (!have_best || lz_total < best_total)) {
+            memcpy(e->best, e->cand, lz_total);
+            best_total = lz_total;
+            /* 15 is the slot the statistics code gives the raw fallback:
+             * neighbours with no transform id, like the LZ form. */
+            best_idx = 15u;
+            have_best = 1;
         }
     }
 

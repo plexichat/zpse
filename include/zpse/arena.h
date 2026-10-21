@@ -52,7 +52,8 @@
 #define ZPSE_E_OFF_COMB     0x61800u
 #define ZPSE_E_OFF_HIST     0x63800u
 #define ZPSE_E_OFF_SHUF     0x64800u
-#define ZPSE_E_OFF_GUARD    0x65800u
+#define ZPSE_E_OFF_LZ       0x65800u
+#define ZPSE_E_OFF_GUARD    0x69800u
 
 #define ZPSE_E_SZ_CTRL      0x01000u
 #define ZPSE_E_SZ_INPUT     0x10000u
@@ -64,7 +65,12 @@
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
 #define ZPSE_E_SZ_SHUF      0x01000u
-#define ZPSE_E_SZ_GUARD     0x0A800u
+/* The intra-block LZ match finder's direct-mapped table: 8192 16-bit
+ * block positions, ZPSE_LZ_TABLE_ENTRIES entries. Only the deepest
+ * effort level touches it, so it is the encoder arena that pays for it
+ * and the decoder never carries it. */
+#define ZPSE_E_SZ_LZ        0x04000u
+#define ZPSE_E_SZ_GUARD     0x06800u
 
 typedef struct ZpseDecoder {
     uint8_t *arena;       /* base, 64-B aligned, 320 KiB */
@@ -95,6 +101,7 @@ typedef struct ZpseEncoder {
     uint8_t *comb;        /* 8 KiB */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
+    uint8_t *lz;          /* 16 KiB LZ match-finder table */
     /* Which optional fields this encoder emits (ZPSE_ENC_* in
      * constants.h). The one-shot API leaves it 0, i.e. no payload
      * checksum; zpse_compress_block_ex / zpse_compress_frame_ex set it
