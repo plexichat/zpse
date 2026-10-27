@@ -1,4 +1,5 @@
 #include "zpse/predictor.h"
+#include "zpse/hot.h"
 
 #include "zpse/status.h"
 
@@ -83,7 +84,7 @@ void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal)
     zpse_lane_seed_table(s, initial_literal, (uint8_t)ZPSE_P_ORDER2);
 }
 
-void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
+ZPSE_HOT void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
                            uint8_t predictor_id)
 {
     zpse_lane_reset_hist(s, initial_literal);
@@ -222,7 +223,7 @@ int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
     return PSE_OK;
 }
 
-void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,
+ZPSE_HOT void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,
                          const uint8_t *actual, const uint8_t *pred,
                          uint16_t nt)
 {

@@ -9,6 +9,7 @@
 #endif
 
 #include "zpse/bits.h"
+#include "zpse/hot.h"
 #include "zpse/mask.h"
 #include "zpse/predictor.h"
 #include "zpse/residual.h"
@@ -248,7 +249,7 @@ static int dense_check_mask(uint8_t mask_mode, const uint8_t *mask,
 /* One record at payload[base..], coding exactly nt (<= ZPSE_DENSE_MAX_LEN)
  * bytes into out. `literal` is the segment's initial literal, which the
  * record's entry state and STRIDE fallbacks use. */
-static int dense_record(uint32_t nt, const uint8_t *payload,
+ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
                         uint32_t payload_len, uint32_t base, uint8_t *out,
                         uint8_t *scratch, uint8_t literal, int *is_const,
                         uint8_t *fill_out)

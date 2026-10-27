@@ -489,6 +489,44 @@ Portable C11, no compiler-specific code outside `#if defined(__GNUC__)`
 guards; AVX2 paths are selected at runtime (`zpse_cpu_caps()`), and the scalar
 fallbacks are bit-identical, which is what the parity suite exists to prove.
 
+### What the compiler adds, and what the tags are worth
+
+Every number in this README is an `-O2` number: the CI matrix,
+`tests/runners/run.sh` and the release CLI all build at `-O2`. The compiler
+still has something to add at `-O3`, and the two ways to ask for it are not
+interchangeable. Both were measured on the level corpus (`bench_levels.c`, 25
+cases x 4 MiB in 64 KiB blocks; before/after runs interleaved A/B/A/B with the
+order swapped every round, median of the per-case throughput ratios, one
+pinned core):
+
+| build | encode | notes |
+| --- | ---: | --- |
+| `-O2` | 1.000 | everything in this tree |
+| `ZPSE_HOT` on the 22 hot functions (`include/zpse/hot.h`, gcc only) | 1.034 | +21 KB of text; decode and every compressed size unchanged |
+| the amalgamation at `-O3` | 1.071 | same as `#pragma GCC optimize("O3")` at the top of `src/zpse_unity.c` (1.066) |
+| that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
+| `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
+
+Rows three to five are the same request made at three scopes, and why they
+differ is worth knowing before adding a tag. At `-O3` the text of the
+amalgamation grows from 167 KB to 265 KB: most of what `-O3` buys here is not
+inside the loops -- those are hand-written SIMD already tuned at `-O2` -- it
+is the inliner and the interprocedural passes deciding more, and those run at
+the level the compilation was given, which a per-function attribute cannot
+raise. The scope-every-module row confirms it: same object size as `-O2`,
+same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
+that function with its `-O2` neighbours, which is why the last row is slower
+than leaving the function untagged.
+
+`ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 22 functions it
+marks were measured together, and a tag put on a function whose callees are
+untagged reproduces that last row. On clang and MSVC the macro is empty --
+clang does not implement `optimize` and diagnoses it as an unknown attribute,
+which `-Werror` would turn into a failed build, and MSVC has no per-function
+optimization level at all -- so those builds compile the same sources with no
+tag, and the 7% is theirs to take with `-O3` and above on the command line
+rather than with this header.
+
 ```sh
 bash tests/runners/run.sh          # POSIX / Git Bash / WSL
 powershell -File tests/runners/run.ps1   # Windows

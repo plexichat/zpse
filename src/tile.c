@@ -14,6 +14,7 @@ struct ZpseTileHeader;
 
 #include "zpse/bits.h"
 #include "zpse/constants.h"
+#include "zpse/hot.h"
 #include "zpse/mask.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
@@ -662,7 +663,7 @@ static uint32_t tile_stride_of(uint8_t predictor_id)
  * history update for every lane in one O(8) pass. `src` holds
  * the Nt actual bytes (encoder input plane or decoder output plane);
  * ent_last/ent_second are the histories captured before the tile ran. */
-static void tile_history_fixup(ZpseLaneState *lanes, const uint8_t *src,
+ZPSE_HOT static void tile_history_fixup(ZpseLaneState *lanes, const uint8_t *src,
                                uint16_t nt, const uint8_t ent_last[8],
                                const uint8_t ent_second[8])
 {
@@ -708,7 +709,7 @@ static void tile_capture_hist(const ZpseLaneState *lanes, uint8_t last[8],
  * payload whose length was validated against exactly those fields, so a
  * field spans at most one byte boundary and the byte it reaches is
  * always inside the payload: two shifts and an AND, no loop. */
-static unsigned tile_get_bits(const uint8_t *s, uint32_t bitpos, unsigned w)
+ZPSE_HOT static unsigned tile_get_bits(const uint8_t *s, uint32_t bitpos, unsigned w)
 {
     uint32_t byte = bitpos >> 3u;
     unsigned off = (unsigned)(bitpos & 7u);
@@ -1395,7 +1396,7 @@ static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
 
 /* Fold the 256-byte residual-presence array into `seen`, returning how
  * many distinct values it holds. */
-static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
+ZPSE_HOT static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
                                                uint32_t seen[8])
 {
     const __m256i z = _mm256_setzero_si256();
@@ -2606,7 +2607,7 @@ static uint32_t tile_mask_runs_len(const uint32_t words[8], uint16_t nt,
  * each side is minimised on its own -- no encode-and-measure search.
  * Ties prefer the lower mode id, matching the historical exhaustive
  * search's first-wins rule. */
-void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
+ZPSE_HOT void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
                             uint8_t *mask_mode_out, uint8_t *res_mode_out)
 {
     uint16_t k = cl->k;
@@ -2711,7 +2712,7 @@ static ZPSE_TILE_AVX2P void tile_gather_act_avx2(const uint8_t *actual,
 }
 #endif
 
-int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
+ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
                    uint16_t nt, const uint8_t *actual,
                    uint8_t mask_mode, uint8_t res_mode,
                    int tile_reset, uint8_t *record_out,
@@ -3650,7 +3651,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         p += 16u;                                                              \
     } while (0)
 
-static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
+ZPSE_HOT static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
     uint8_t *out, uint16_t nt, uint32_t s, const uint8_t *seg_base,
     uint32_t seg_pos, uint8_t init, const uint32_t words[8],
     const uint8_t *units, uint8_t res_mode)
@@ -4255,7 +4256,7 @@ static ZPSE_TILE_AVX2 __m256i tile_unit_index32(__m256i v1)
  * whole 32-byte chunks go through the vector loop, the remaining
  * nt % 32 positions are finished positionally below so the units keep
  * their order. */
-static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
+ZPSE_HOT static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
                                                      uint8_t constant_C,
                                                      const uint32_t words[8],
                                                      const uint8_t *units,

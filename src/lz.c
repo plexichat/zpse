@@ -1,6 +1,7 @@
 #include "zpse/lz.h"
 
 #include "zpse/bits.h"
+#include "zpse/hot.h"
 #include "zpse/status.h"
 #include "zpse/vector.h"
 
@@ -147,7 +148,7 @@ static void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
     lz_put_cmd(o, off, run, len);
 }
 
-uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
+ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                         uint32_t cap, void *table, uint32_t hash_bits)
 {
     uint16_t *tab = (uint16_t *)table;
@@ -333,7 +334,7 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
  * branch -- and on the text corpora that shape is the common one (four
  * fifths of the matches are under sixteen bytes at a distance over
  * thirty-two), so the tail is most of the copy. */
-static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
+ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
                           const uint8_t *oend)
 {
     if (len <= 32u) {
@@ -404,7 +405,7 @@ static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
     }
 }
 
-int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
+ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                    uint32_t n)
 {
     uint32_t lit_bytes, cmd_off, cmd_len;

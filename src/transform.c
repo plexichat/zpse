@@ -1,5 +1,6 @@
 #include "zpse/transform.h"
 #include "zpse/constants.h"
+#include "zpse/hot.h"
 #include "zpse/status.h"
 #include "zpse/vector.h"
 
@@ -651,7 +652,7 @@ static ZPSE_T_AVX2 void zpse_t16x16_inverse_direct(const uint8_t *const in[16],
  * plane t at t*64, so its sixteen-byte chunks map to set t and the
  * transpose itself reads from sixteen different sets: 16 GB/s, and the
  * copy is one full line per plane instead of four partial ones. */
-static ZPSE_T_AVX2 void zpse_t16x16_inverse_blocked(const uint8_t *const in[16],
+ZPSE_HOT static ZPSE_T_AVX2 void zpse_t16x16_inverse_blocked(const uint8_t *const in[16],
                                                     uint8_t *const out[16],
                                                     uint32_t rows)
 {
@@ -777,7 +778,7 @@ static __m128i zpse_parity_odds(__m128i a, __m128i b)
  * and the byte that crosses the chunk is the chunk's own last byte --
  * exactly the value the byte-at-a-time chain carries, so the result is
  * byte-identical to it. `carry` is threaded through the chunk. */
-static __m128i zpse_chain_undo(__m128i x, uint8_t *carry, int delta)
+ZPSE_HOT static __m128i zpse_chain_undo(__m128i x, uint8_t *carry, int delta)
 {
     uint8_t add;
 
@@ -1192,7 +1193,7 @@ int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
     return PSE_OK;
 }
 
-int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
+ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
                            const uint8_t *in, uint32_t n,
                            uint8_t *segs[16], const uint32_t seg_lens[16])
 {
@@ -1415,7 +1416,7 @@ int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
     return PSE_OK;
 }
 
-int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
+ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
                            const uint8_t *segs[16], const uint32_t seg_lens[16],
                            uint8_t *out, uint32_t n)
 {

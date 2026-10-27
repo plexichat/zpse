@@ -1,5 +1,6 @@
 #include "zpse/residual.h"
 #include "zpse/bits.h"
+#include "zpse/hot.h"
 #include "zpse/status.h"
 #include "zpse/vector.h"
 
@@ -345,7 +346,7 @@ static ZPSE_RES_BMI2_SSSE3 uint16_t residual_mode2_b3_bmi2(
 }
 #endif
 
-static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
+ZPSE_HOT static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     const uint8_t *palette, const uint8_t *src, uint16_t k, unsigned b,
     unsigned m, uint8_t *exc_out)
 {
@@ -1814,7 +1815,7 @@ static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_b2(
  * every remaining value is known to be a palette entry. Anything else
  * falls back to the exhaustive scan, so a wrong certificate costs time,
  * never bytes. */
-static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
+ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
                                  uint8_t *out, uint16_t cap,
                                  uint16_t nu_hint, const uint32_t *seen_hint)
 {
@@ -2022,7 +2023,7 @@ static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
     return (int)total;
 }
 
-static int residual_encode_mode3(const uint8_t *exc_in, uint16_t k,
+ZPSE_HOT static int residual_encode_mode3(const uint8_t *exc_in, uint16_t k,
                                  uint8_t *out, uint16_t cap)
 {
     uint8_t m;
@@ -2141,7 +2142,7 @@ static int residual_encode_mode3(const uint8_t *exc_in, uint16_t k,
     return (int)total;
 }
 
-static int residual_encode_mode4(const uint8_t *actual_in,
+ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
                                  const uint8_t *pred_at_exc, uint16_t k,
                                  uint8_t *out, uint16_t cap)
 {
@@ -2278,7 +2279,7 @@ static int residual_encode_mode4(const uint8_t *actual_in,
     return (int)total;
 }
 
-int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
+ZPSE_HOT int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
                               const uint8_t *actual_in,
                               const uint8_t *pred_at_exc, uint16_t k,
                               uint8_t *payload_out, uint16_t payload_cap,
