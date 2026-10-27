@@ -2711,20 +2711,25 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 zpse_block_lz_wins(n, lz_cmds, lz_total, have_best,
                                    best_total, lz_speed)) {
                 if (direct_out) {
-                    /* The gated block has already written its tile stream
-                     * into the caller's buffer (see the trial loop), so the
-                     * smaller LZ stream replaces it there. No capacity check
-                     * is needed: lz_total is smaller than what `out` now
-                     * holds. */
-                    memcpy(out, e->cand, lz_total);
+                    /* In direct_out mode, `out` is the caller's buffer with
+                     * capacity `tcap` (= out_cap). `lz_total` can be up to
+                     * `lz_cap` (ZPSE_E_SZ_CAND = 64 KiB when !have_best),
+                     * which may exceed `tcap`. Guard the copy so we never
+                     * write past the caller's buffer; if LZ doesn't fit,
+                     * skip it and fall through to RAW (which checks out_cap
+                     * itself at line 2744). */
+                    if (lz_total <= tcap) {
+                        memcpy(out, e->cand, lz_total);
+                        best_total = lz_total;
+                        best_idx = 15u;
+                        have_best = 1;
+                    }
                 } else {
                     memcpy(e->best, e->cand, lz_total);
+                    best_total = lz_total;
+                    best_idx = 15u;
+                    have_best = 1;
                 }
-                best_total = lz_total;
-                /* 15 is the slot the statistics code gives the raw fallback:
-                 * neighbours with no transform id, like the LZ form. */
-                best_idx = 15u;
-                have_best = 1;
             }
         }
     }
