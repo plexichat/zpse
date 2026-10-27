@@ -8,6 +8,10 @@ struct ZpseTileHeader;
 #include <stdint.h>
 #include <string.h>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
+
 #include "zpse/bits.h"
 #include "zpse/constants.h"
 #include "zpse/mask.h"
@@ -240,6 +244,31 @@ uint32_t zpse_ascii_len(uint32_t n)
     return n - (n >> 3);
 }
 
+#if ZPSE_TILE_HAVE_AVX2
+/* The same predicate as the scalar form below, 32 bytes an iteration, with
+ * the offending byte reported as soon as it is seen: cmpgt against zero
+ * turns a byte with its high bit set into 0xFF, movemask gathers the sign
+ * bits, and a nonzero mask settles the run without reading the rest. */
+static ZPSE_TILE_AVX2 int zpse_ascii_scan_avx2(const uint8_t *p, uint32_t n)
+{
+    const __m256i zero = _mm256_setzero_si256();
+    uint32_t i = 0u;
+
+    for (; i + 32u <= n; i += 32u) {
+        const __m256i w =
+            _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+
+        if (_mm256_movemask_epi8(_mm256_cmpgt_epi8(zero, w)) != 0)
+            return 0;
+    }
+    for (; i < n; i++) {
+        if (p[i] > 0x7Fu)
+            return 0;
+    }
+    return 1;
+}
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
 int zpse_ascii_scan(const uint8_t *p, uint32_t n)
 {
     uint64_t acc = 0u;
@@ -248,11 +277,23 @@ int zpse_ascii_scan(const uint8_t *p, uint32_t n)
     if (p == 0) {
         return 0;
     }
+#if ZPSE_TILE_HAVE_AVX2
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u)
+        return zpse_ascii_scan_avx2(p, n);
+#endif
     /* Thirty-two bytes an iteration, as four independent accumulators: the
      * scan runs over a whole block (64 KiB) before every gated encode, so on
      * a text block it is one of the two or three things the gate costs. Four
-     * chains let the compiler keep four loads in flight; the OR is
-     * associative, so the result is the same byte test as the scalar form. */
+     * chains let the compiler keep four loads in flight.
+     *
+     * Each group is tested as it is folded in rather than only at the end.
+     * The scan is a single predicate over the whole run, so the first group
+     * holding a high byte settles it, and on the data the gate is asked
+     * about most -- binary blocks, where such a byte is a few bytes in --
+     * the whole-block pass the accumulating form paid was the entire cost
+     * of the call (measured: 1250 ns for 64 KiB of random, 3 ns once the
+     * first group decides it). A block that really is ASCII still walks
+     * every byte, which is where the four chains pay. */
     for (; i + 32u <= n; i += 32u) {
         uint64_t w0, w1, w2, w3;
 
@@ -260,18 +301,22 @@ int zpse_ascii_scan(const uint8_t *p, uint32_t n)
         memcpy(&w1, p + i + 8u, sizeof w1);
         memcpy(&w2, p + i + 16u, sizeof w2);
         memcpy(&w3, p + i + 24u, sizeof w3);
-        acc |= (w0 | w1) | (w2 | w3);
+        acc = (w0 | w1) | (w2 | w3);
+        if ((acc & UINT64_C(0x8080808080808080)) != 0u)
+            return 0;
     }
     for (; i + 8u <= n; i += 8u) {
         uint64_t w;
 
         memcpy(&w, p + i, sizeof w);
-        acc |= w;
+        if ((w & UINT64_C(0x8080808080808080)) != 0u)
+            return 0;
     }
     for (; i < n; i++) {
-        acc |= p[i];
+        if (p[i] > 0x7Fu)
+            return 0;
     }
-    return (acc & UINT64_C(0x8080808080808080)) == 0u;
+    return 1;
 }
 
 static uint32_t tile_ascii_group_out(unsigned r)
@@ -2004,11 +2049,65 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     case TILE_FAM_CONST:
         if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
             uint8_t c = cl->constant_C;
+#if defined(__SSE2__)
+            if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
+                nt >= 16u) {
+                uint32_t p = 0u;
+                __m128i cvec = _mm_set1_epi8((char)c);
+                for (; p + 16u <= (uint32_t)nt; p += 16u) {
+                    __m128i v = _mm_loadu_si128(
+                        (const __m128i *)(const void *)(actual + p));
+                    __m128i eq = _mm_cmpeq_epi8(v, cvec);
+                    unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
+                    unsigned b = 0u;
+                    while (mm != 0u) {
+                        if ((mm & 1u) != 0u)
+                            TILE_TAKE_EXC((uint16_t)(p + b), c,
+                                          actual[p + b]);
+                        mm >>= 1u;
+                        b++;
+                    }
+                }
+                for (; p < (uint32_t)nt; p++) {
+                    if (actual[p] != c)
+                        TILE_TAKE_EXC(p, c, actual[p]);
+                }
+                tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
+                break;
+            }
+#endif
             for (p = 0; p < nt; p++) {
                 if (actual[p] != c)
                     TILE_TAKE_EXC(p, c, actual[p]);
             }
         } else {
+#if defined(__SSE2__)
+            if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
+                nt >= 16u) {
+                uint32_t p = 0u;
+                __m128i zero = _mm_setzero_si128();
+                for (; p + 16u <= (uint32_t)nt; p += 16u) {
+                    __m128i v = _mm_loadu_si128(
+                        (const __m128i *)(const void *)(actual + p));
+                    __m128i eq = _mm_cmpeq_epi8(v, zero);
+                    unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
+                    unsigned b = 0u;
+                    while (mm != 0u) {
+                        if ((mm & 1u) != 0u)
+                            TILE_TAKE_EXC((uint16_t)(p + b), 0u,
+                                          actual[p + b]);
+                        mm >>= 1u;
+                        b++;
+                    }
+                }
+                for (; p < (uint32_t)nt; p++) {
+                    if (actual[p] != 0u)
+                        TILE_TAKE_EXC(p, 0u, actual[p]);
+                }
+                tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
+                break;
+            }
+#endif
             for (p = 0; p < nt; p++) {
                 if (actual[p] != 0u)
                     TILE_TAKE_EXC(p, 0u, actual[p]);
@@ -2019,6 +2118,36 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
 
     case TILE_FAM_STRIDE: {
         uint32_t s = tile_stride_of(predictor_id);
+#if defined(__SSE2__)
+        if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
+            seg_pos >= s && nt >= 16u) {
+            uint32_t p = 0u;
+            const uint8_t *base = seg_base + seg_pos - s;
+            for (; p + 16u <= (uint32_t)nt; p += 16u) {
+                __m128i v = _mm_loadu_si128(
+                    (const __m128i *)(const void *)(actual + p));
+                __m128i xh = _mm_loadu_si128(
+                    (const __m128i *)(const void *)(base + p));
+                __m128i eq = _mm_cmpeq_epi8(v, xh);
+                unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
+                unsigned b = 0u;
+                while (mm != 0u) {
+                    if ((mm & 1u) != 0u)
+                        TILE_TAKE_EXC((uint16_t)(p + b), base[p + b],
+                                      actual[p + b]);
+                    mm >>= 1u;
+                    b++;
+                }
+            }
+            for (; p < (uint32_t)nt; p++) {
+                uint8_t xhat = base[p];
+                if (actual[p] != xhat)
+                    TILE_TAKE_EXC(p, xhat, actual[p]);
+            }
+            tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
+            break;
+        }
+#endif
         for (p = 0; p < nt; p++) {
             uint32_t abs_pos = seg_pos + (uint32_t)p;
             uint8_t xhat = (abs_pos < s) ? initial_literal

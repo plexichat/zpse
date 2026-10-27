@@ -1,0 +1,11 @@
+homepage: "https://github.com/plexichat/zpse"
+description: "Columnar reference compressor with SIMD-optimized tile codecs and a 9-level encoder effort ladder."
+main_repo: "https://github.com/plexichat/zpse.git"
+primary_contact: "https://github.com/plexichat/zpse/issues"
+fuzzing_engines:
+  - libfuzzer
+  - afl
+  - honggfuzz
+sanitizers:
+  - address
+  - undefined

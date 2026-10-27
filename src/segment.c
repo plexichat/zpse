@@ -3262,6 +3262,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                            zpse_enc_speed(e->enc_flags) <= 2u, have_avx2,
                            &zero_cheap, ks);
         best_p = seg_scan_best(ks, 0xFFu);
+        uint8_t second_p = 0xFFu;
+        uint16_t sk = 0xFFFFu;
         {
             uint16_t bk = ks[best_p];
 
@@ -3270,9 +3272,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
 
             /* Second trial only when it is genuinely competitive. */
             {
-                uint8_t second_p = seg_scan_best(ks, best_p);
-                uint16_t sk = (second_p != 0xFFu) ? ks[second_p]
-                                                  : (uint16_t)0xFFFFu;
+                second_p = seg_scan_best(ks, best_p);
+                sk = (second_p != 0xFFu) ? ks[second_p]
+                                          : (uint16_t)0xFFFFu;
                 /* Second trial only on an exact tie in the prescreen's
                  * miss count, and never when the best candidate is
                  * already perfect: bk == 0 selects mask ALL_HIT with
@@ -3469,6 +3471,16 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
 
         for (ci = 0; ci < ncand; ci++) {
             uint8_t pred = cand[ci];
+            /* Lower-bound prune for the second candidate: a record with sk
+             * exceptions costs at least 10 bytes (8 header + ≥1 mask +
+             * ≥1 residual). If that lower bound already meets or exceeds
+             * best_len from the first candidate, the second candidate
+             * cannot win (strictly smaller required), so skip its
+             * classify + pack entirely. Output is unchanged either way. */
+            if (ci == 1u && second_p != 0xFFu &&
+                10u + sk >= (uint32_t)best_len) {
+                continue;
+            }
             ZpseTileClass cl;
             uint8_t mm;
             uint8_t rr;
