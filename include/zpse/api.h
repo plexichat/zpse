@@ -14,7 +14,9 @@
 extern "C" {
 #endif
 
-const char *zpse_version_string(void); /* "1.0.0" */
+/* The library version, exactly ZPSE_VERSION_STRING (include/zpse/zpse.h is
+ * the one place it is written down). */
+const char *zpse_version_string(void);
 
 /* One-shot block calls.
  *

@@ -29,6 +29,13 @@ int main(void) {
     /* CRC32-C. */
     {
         const uint8_t v[] = "123456789";
+        /* The version has one definition (include/zpse/zpse.h) and the
+         * accessor has to hand back that one, not a literal of its own. */
+        CHECK(strcmp(zpse_version_string(), ZPSE_VERSION_STRING) == 0,
+              "version: accessor %s, macro %s", zpse_version_string(),
+              ZPSE_VERSION_STRING);
+        CHECK(strcmp(ZPSE_VERSION_STRING, "a.1.0-1") == 0,
+              "version: %s", ZPSE_VERSION_STRING);
         CHECK(zpse_crc32c(v, 9) == 0xE3069283u, "crc check value");
         CHECK(zpse_crc32c(v, 0) == 0u, "crc empty == 0");
         CHECK(zpse_crc32c_init() == 0xFFFFFFFFu, "crc init");
@@ -475,8 +482,8 @@ int main(void) {
                 int ok = 0, tried = 0;
                 const uint8_t mmodes[] = {1, 2, 3, 4, 5, 0, 6};
                 for (mm = 0; mm < 7; mm++) {
-                    ZpseLaneState le = {{0},{0},o1,o2,0};
-                    ZpseLaneState ld = {{0},{0},o1,o2,0};
+                    ZpseLaneState le = {{0},{0},o1,o2,0,0};
+                    ZpseLaneState ld = {{0},{0},o1,o2,0,0};
                     int wlen, got;
                     zpse_lane_reset(&le, data[0]);
                     wlen = zpse_tile_encode(&le, data, 256, (uint8_t)pid,
@@ -498,8 +505,8 @@ int main(void) {
         }
         /* Constant tile: K=0 / K=Nt paths. */
         {
-            ZpseLaneState le = {{0},{0},o1,o2,0};
-            ZpseLaneState ld = {{0},{0},o1,o2,0};
+            ZpseLaneState le = {{0},{0},o1,o2,0,0};
+            ZpseLaneState ld = {{0},{0},o1,o2,0,0};
             int wlen, got;
             memcpy(seg + 64, cdata, 256);
             zpse_lane_reset(&le, 0x41);

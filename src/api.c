@@ -1,3 +1,5 @@
+#include "zpse/zpse.h" /* the version macros: the string is built from them */
+
 #include "zpse/api.h"
 
 #include "zpse/arena.h"
@@ -10,7 +12,7 @@
 
 const char *zpse_version_string(void)
 {
-    return "1.0.0";
+    return ZPSE_VERSION_STRING;
 }
 
 /* Encoder options are ZPSE_ENC_CHECKSUM plus one of the nine levels in bits
