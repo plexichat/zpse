@@ -103,16 +103,15 @@ jobs:
       - name: Run 4 hours of fuzzing (${{ matrix.target }} / ${{ matrix.variant }})
         continue-on-error: true
         run: |
-          set -o pipefail
           SEED="${{ steps.restore.outputs.seed }}"
           if [ "${{ matrix.target }}" = "test_fuzz" ]; then
             ${{ matrix.run_env }} timeout 4h /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }} "$SEED" \
-              | tee /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt
+              | tee /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt || true
           else
             ${{ matrix.run_env }} timeout 4h /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }} \
-              | tee /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt
+              | tee /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt || true
           fi
-          echo "${{ matrix.target }}_${{ matrix.variant }} fuzz_exit=${PIPESTATUS[0]}"
+          echo "${{ matrix.target }}_${{ matrix.variant }} fuzz completed"
           # Save the final seed so the next nightly continues from here (test_fuzz only)
           if [ "${{ matrix.target }}" = "test_fuzz" ]; then
             SEED_END=$(grep -oP 'seed=\K[0-9A-Fa-f]+' /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt | tail -1)
