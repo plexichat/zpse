@@ -1,8 +1,10 @@
 # Aggregate: one combined commit-level report from all benchmark jobs.
 #
-# Triggers when any of bench-columnar, bench-levels, or fuzz completes, but
-# only does real work once ALL three have finished for this SHA — so the
-# aggregate never runs before the jobs it is meant to collect.
+# Triggers when any of bench-columnar, bench-levels, or fuzz completes, then
+# polls for up to 25 minutes until ALL three have finished for this SHA.
+# Only then does it collect their outputs into one summary -- so the
+# aggregate never runs before the jobs it is meant to collect, and it
+# doesn't give up after the first sibling finishes.
 #
 # Informational: never fails the build.
 name: bench-aggregate
@@ -16,6 +18,7 @@ on:
 jobs:
   aggregate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install jq
@@ -26,16 +29,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          ALL_DONE=1
-          for wf in bench-columnar bench-levels fuzz; do
-            STATUS=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs" \
-              --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .status" | head -1)
-            if [ "$STATUS" != "completed" ]; then
-              ALL_DONE=0
-              break
+          ALL_DONE=0
+          ELAPSED=0
+          INTERVAL=30
+          MAX_WAIT=1500   # 25 minutes of polling
+          while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+            ALL_DONE=1
+            for wf in bench-columnar bench-levels fuzz; do
+              STATUS=$(gh api \
+                "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs?per_page=100" \
+                --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .status" \
+                | head -1)
+              if [ "$STATUS" != "completed" ]; then
+                ALL_DONE=0
+                break
+              fi
+            done
+            if [ "$ALL_DONE" -eq 1 ]; then
+              echo "all_done=1" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED + INTERVAL))
           done
-          echo "all_done=$ALL_DONE" >> "$GITHUB_OUTPUT"
+          echo "all_done=0" >> "$GITHUB_OUTPUT"
       - if: steps.gate.outputs.all_done == 1
         name: Collect sibling outputs
         env:
@@ -50,8 +67,10 @@ jobs:
             for wf in bench-columnar bench-levels fuzz; do
               echo "#### $wf"
               echo
-              RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs" \
-                --jq ".workflow_runs[] | select(.head_sha == \"$SHA\" and .status == \"completed\") | .id" | head -1)
+              RUN_ID=$(gh api \
+                "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs?per_page=100" \
+                --jq ".workflow_runs[] | select(.head_sha == \"$SHA\" and .status == \"completed\") | .id" \
+                | head -1)
               if [ -z "$RUN_ID" ]; then
                 echo "No completed run found for $wf"
                 echo
@@ -81,5 +100,14 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
       - if: steps.gate.outputs.all_done != 1
-        name: Skip (siblings still running)
-        run: echo "Not all benchmark workflows have completed for this SHA yet; skipping aggregate."
+        name: Timeout waiting for siblings
+        run: |
+          echo "Timed out waiting for all benchmark workflows to complete for this SHA."
+          echo "Collecting whatever finished:"
+          for wf in bench-columnar bench-levels fuzz; do
+            STATUS=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs?per_page=100" \
+              --jq ".workflow_runs[] | select(.head_sha == \"${{ github.event.workflow_run.head_sha }}\") | .status" \
+              | head -1)
+            echo "$wf: $STATUS"
+          done
