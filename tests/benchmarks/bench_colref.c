@@ -19,9 +19,10 @@
  * adding, and it is worth having before anyone argues for one.
  *
  * The reference codecs are not competitors and are not a proposal to
- * put a columnar stage inside zpse. They are reference points, and
- * tests/suites/test_colref.c proves each one round-trips, so a size
- * here is a size a real codec reached.
+ * put a columnar stage inside zpse. They are reference points, SIMD-
+ * optimized (AVX2/SSE2 except geo_point which has non-contiguous 16-byte
+ * records), and tests/suites/test_colref.c proves each one round-trips,
+ * so a size here is a size a real codec reached.
  *
  * Framing: both sides see the same 64 KiB chunks. zpse compresses a
  * 64 KiB block; the reference codec encodes a 64 KiB chunk of the

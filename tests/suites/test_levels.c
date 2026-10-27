@@ -142,6 +142,33 @@ int main(void)
               "%.0f ns", zpse_col_names[kind], times[0], times[4]);
     }
 
+    /* The level field is four bits, so 10-15 are representable and must be
+     * refused rather than treated as the deepest level: a caller asking for
+     * a setting that does not exist should hear PSE_BAD_ARG, not get the
+     * slowest encoder in the library. The empty field, which is how every
+     * caller gets the default, has to stay legal. */
+    {
+        uint32_t lvl;
+
+        for (lvl = 10u; lvl <= 15u; lvl++) {
+            uint32_t cl = 0u;
+            int rc = zpse_compress_block_ex(in, 4096u, comp,
+                                            (uint32_t)sizeof comp, &cl, 0, 1,
+                                            lvl << ZPSE_ENC_SPEED_SHIFT, E);
+
+            CHECK(rc == PSE_BAD_ARG, "level %u was not refused (rc=%d)",
+                  lvl, rc);
+        }
+        {
+            uint32_t cl = 0u;
+            int rc = zpse_compress_block_ex(in, 4096u, comp,
+                                            (uint32_t)sizeof comp, &cl, 0, 1,
+                                            0u, E);
+
+            CHECK(rc == PSE_OK, "the default level (empty field) was refused");
+        }
+    }
+
     if (failures != 0) {
         printf("LEVELS: %ld failures of %ld checks\n", failures, checks);
         return 1;

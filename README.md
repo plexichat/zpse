@@ -203,28 +203,37 @@ block codec with a match finder.
 ### Effort levels
 
 `ZPSE_ENC_*` in the `enc_flags` word chooses how much encode time a block is
-worth. No level changes the format: every level's stream is read by the same
-decoder, and a level only decides which shape gets written. The levels are
-adjacent rungs, not aliases -- each one costs encode time and returns ratio,
-and the levels on both sides of the default were measured in one binary
-over the columnar corpus (25 cases, 4 MiB each, 64 KiB blocks):
+worth. There are nine levels, 1 = FASTEST to 9 = MAX, stored in bits 1-4 as
+`level << 1`; a field with no level bits is the default, BALANCED at level 5,
+and an unsupported level is rejected with `PSE_BAD_ARG` rather than rounded to
+a neighbour. No level changes the format: every level's stream is read by the
+same decoder, and a level only decides which shape gets written. The levels
+are adjacent rungs, not aliases -- each one costs encode time and returns
+ratio -- and all nine were measured in one binary over the columnar corpus
+(25 cases, 4 MiB each, 64 KiB blocks):
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| `ZPSE_ENC_MAX` | 4.51:1 | 557 MB/s | 10.6 GB/s | the default sweep, with the LZ form's sample screen at its loosest |
-| `ZPSE_ENC_SPEED_BALANCED` (default) | 4.45:1 | 682 MB/s | 13.8 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and LZ screened on every block |
-| `ZPSE_ENC_FASTER` | 4.06:1 | 1.12 GB/s | 14.4 GB/s | the same sweep with at most two full trials; no match finder |
-| `ZPSE_ENC_FASTEST` | 4.05:1 | 1.26 GB/s | 13.7 GB/s | the cheap price, then one trial: the shape it likes best; no match finder |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.50 GB/s | 14.4 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
+| 2 | 3.99:1 | 1.50 GB/s | 14.5 GB/s | same as level 1 |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.15 GB/s | 14.8 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
+| 4 | 4.06:1 | 1.16 GB/s | 14.9 GB/s | same as level 3 |
+| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.45:1 | 720 MB/s | 14.2 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
+| 6 | 4.45:1 | 716 MB/s | 14.3 GB/s | same as level 5 |
+| 7 | 4.50:1 | 640 MB/s | 11.9 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
+| 8 | 4.50:1 | 634 MB/s | 11.9 GB/s | same as level 7 |
+| 9 `ZPSE_ENC_SPEED_MAX` | 4.51:1 | 581 MB/s | 11.4 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
 
-The two deepest levels are the ones to reach for when bytes matter more than
-the clock, and the intra-block LZ form is what they buy. Its match finder is
-a full pass over the block at roughly a quarter of the tile encoder's rate on
-text, so neither level pays for it blind: a sample of the block's head is
-screened first, and the pass runs only when that sample shows LZ winning by
-the level's margin. MAX's margin is the smallest, so it is the level that
-finds the form on prose; the default level finds it on everything that wins
-by 25% or more on the sample. Where the tile model has nothing to predict it
-is the difference between raw and compression:
+Levels 5 to 9 are the ones to reach for when bytes matter more than the
+clock, and the intra-block LZ form is what they buy. Its match finder is a
+full pass over the block at roughly a quarter of the tile encoder's rate on
+text, so no level pays for it blind: a sample of the block's head is coded
+first, and the pass runs only when that sample shows LZ winning by the level's
+margin. The margin is what separates the levels: at 1.25x the default takes
+the form on JSON, logs and variable strings, at 1.125x it also reaches beyond
+those, and at 1.0625x MAX is the only level whose screen is loose enough to
+find it on prose. Where the tile model has nothing to predict it is the
+difference between raw and compression:
 
 | case | `ZPSE_ENC_SPEED_BALANCED` | `ZPSE_ENC_MAX` |
 | --- | --- | --- |
@@ -244,26 +253,26 @@ command: 5.6 -> 1.6 GB/s (prose), 9 -> 2.2 (JSON), 17 -> 4.1 (var strings),
 The match copy described below is what keeps the short end of that range from
 costing more than one command per match.
 
-Both levels ship a factor of 12, i.e. a command every 8 output bytes (about
-1 GB/s and up, which is the JSON and log cases above). MAX is the only level
-whose screen is loose enough to reach prose at all, so a factor of 24 there is
-what puts `text_en` at 1.33:1 in the table above -- at 16 (6 bytes per
-command) prose sits just under the bar and nothing changes; at 8 the JSON and
-log cases are given up (`var_string` alone keeps its 2.52). Each level's
-factor and each level's sample margin are one constant each in `src/block.c`,
-and lowering the default level's factor to 4 gives back its ~14 GB/s decode at
-the cost of the whole text column -- the knob to turn if the default level is
-being used for its decode rate rather than its ratio.
+The acceleration factor belongs to the level: 12 at levels 1-6, i.e. a command
+every 8 output bytes (a floor of about 1 GB/s at the command loop's cost per
+command), 16 at levels 7-8 (every 6 bytes) and 24 at level 9 (every 4). That
+is what lets `text_en` reach 1.33:1 at MAX while the default level, at its
+1.25x screen and a factor of 12, leaves prose alone -- at a factor of 8 the
+JSON and log cases would be given up as well and `var_string` alone would keep
+its 2.52. Each level's factor and each level's sample margin are one constant
+each in `src/block.c`, and lowering the default level's factor to 4 gives back
+its ~14 GB/s decode at the cost of the whole text column -- the knob to turn
+if the default level is being used for its decode rate rather than its ratio.
 
 A block the form wins decodes as a copy loop instead of a tile
 reconstruction, which is slower than the tile path on columnar data (hence
 the lower mean decode above, and it is the default level that pays it) and
 much faster than it on a long run: 5.8 GB/s on 1 KiB runs, 27 GB/s on a ramp,
-measured over 64 KiB blocks. The cheap levels are the other side of the same
-trade: they write the same tile shapes in less encode time, and they do not
-run the match finder at all, so the factor above is theirs only if
+measured over 64 KiB blocks. Levels 1-4 are the other side of the same trade:
+they write the same tile shapes in less encode time, and they do not run the
+match finder at all, so the factor above is theirs only if
 `ZPSE_LZ_CHEAP_LEVELS` is turned on -- which the measurements argue against,
-because FASTEST's text encode would fall from 2.3 GB/s to 390 MB/s, slower
+because FASTEST's text encode would fall from 2.2 GB/s to 390 MB/s, slower
 than the default level it is supposed to be faster than.
 
 ### What a match costs
@@ -395,12 +404,12 @@ offset, literal count, match length minus four -- and there are no escape
 words, so the decoder's inner loop is a copy loop with no length parsing. Long
 runs are written as repeated commands (4 bytes per 259 bytes of run).
 
-The two deepest levels, `ZPSE_ENC_MAX` and the default, try that form as one
-more candidate and keep it only when it is smaller than the best tile stream.
-Both screen it on a sample of the block first, because the match finder is a
-full pass at a quarter of the tile encoder's rate; what separates the levels
-is how small a sample win is worth that pass, so the default level takes it on
-JSON, logs and variable strings and the deepest level also takes it on prose.
+Levels 5 to 9 try that form as one more candidate and keep it only when it is
+smaller than the best tile stream. All of them screen it on a sample of the
+block first, because the match finder is a full pass at a quarter of the tile
+encoder's rate; what separates the levels is how small a sample win is worth
+that pass, so the default level takes it on JSON, logs and variable strings
+and the deepest level also takes it on prose.
 On high-cardinality text it is the difference between falling back to raw and
 compressing at all -- the case the tile model cannot see, because nothing in
 it repeats four bytes apart, only further back.
@@ -461,9 +470,10 @@ bash tests/runners/run.sh          # POSIX / Git Bash / WSL
 powershell -File tests/runners/run.ps1   # Windows
 ```
 
-The runner builds and runs the suites (`roundtrip`, `combinadic`, `hostile`,
-`units`, `stride3`, `dense`, `decide`, `fillpred`, `sizes`, `colref`,
-`colcorpus`), then builds `parity`, `fuzz` and `lseed` three times — default,
+The runner builds and runs the suites (`roundtrip`, `transforms`, `combinadic`,
+`hostile`, `units`, `stride3`, `dense`, `decide`, `fillpred`, `lz`, `ascii`,
+`levels`, `frame`, `sizes`, `colref`, `colcorpus`), then builds `parity`, `fuzz`
+and `lseed` three times — default,
 `-DZPSE_FORCE_SCALAR` and `-DZPSE_FORCE_TRIAL_SWAP` — and requires identical
 digests and per-case output across all three. The first two prove the SIMD
 paths are bit-exact; the third permutes the encoder's candidate order and
@@ -501,19 +511,17 @@ costs nothing however slow its classify is.
 
 * **No entropy coder.** The match finder is a single-probe hash one -- LZ4's
   shape, not zstd's search -- and it is screened on a sample before it runs,
-  so ratio still loses to zstd on redundant data. Before the screen it was
-the deepest level's candidate alone; now the default level offers it too and
-the difference between the two levels is how small a sample win is worth a
-full pass. The columnar section shows the sharpest version: on
-  high-cardinality text the cheap levels fall back to raw and zstd gets 4.7x,
-  while the default and deepest levels get 2.5-3.4x.
+  so ratio still loses to zstd on redundant data. Levels 1-4 do not run it at
+  all and levels 5-9 differ only in how small a sample win is worth a full
+  pass. The columnar section shows the sharpest version: on high-cardinality
+  text the cheap levels fall back to raw and zstd gets 4.7x, while levels 5-9
+  get 2.5-3.4x.
 * **The default level trades some decode speed for that ratio.** A block the
   LZ form wins decodes at 1.6-4.1 GB/s instead of the tile stream's 5-13, so
-  the default level's mean decode over the corpus sits at about 13.8 GB/s
-  rather than the 14.7 it would be with the form refused (the deepest level's
-  is lower still, because it also takes the form on prose). If a caller is
-  decoding-bound, the acceleration factor in `src/block.c` is the one constant
-  to change.
+  the default level's mean decode over the corpus is about 14.2 GB/s rather
+  than the 14.9 of level 4, which refuses the form (level 9's is 11.4, because
+  it also takes the form on prose). If a caller is decoding-bound, the
+  acceleration factor in `src/block.c` is the one constant to change.
 * **No column semantics.** A nullable column costs 1.5x what null suppression
   would give it, and nothing in the format knows what a record boundary is.
   The byte transpose recovers the split for fixed-width records by accident;

@@ -24,7 +24,9 @@
  * framing zpse uses, so the sizes are comparable: a reference that
  * could see the whole column would be measuring something else.
  *
- * The formats are deliberately plain -- varint, bit packing, a bitmap.
+ * The formats are deliberately simple -- varint, bit packing, a bitmap --
+ * but every encoder except geo_point is SIMD-optimized (AVX2/SSE2) for
+ * speed while keeping bit-identical output to a scalar reference.
  * They are reference points, not a proposal. */
 #ifndef ZPSE_COL_REF_H
 #define ZPSE_COL_REF_H

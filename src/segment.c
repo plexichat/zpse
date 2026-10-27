@@ -1399,9 +1399,9 @@ static ZPSE_PS_AVX2 uint16_t seg_zero_misses_avx2(const uint8_t *a, uint16_t nt)
 /* Prescreen with one shortcut: a tile that CONST_ZERO misses at most
  * ZPSE_PS_ZERO_ONLY positions is classified against CONST_ZERO alone.
  *
- * CONST_ZERO is the first predictor in seg_screen_pred[], so it wins every
- * tie -- which means the other eight can only beat it by a strictly lower
- * miss count. At <= 3 misses a lower count is at most 2, and the record it
+ * CONST_ZERO has the lowest priority of the screened predictors
+ * (seg_pred_rank), so it wins every tie -- which means the other eight can
+ * only beat it by a strictly lower miss count. At <= 3 misses a lower count is at most 2, and the record it
  * would buy differs by a couple of bytes, while the nine-predictor pass is
  * ~30 ns of a tile that costs ~170 ns to encode (`sparse`: nearly every
  * tile is zeroes plus a spike or two, and that row is the slowest encoder).
@@ -1463,9 +1463,10 @@ static void seg_prescreen_tile(const uint8_t *a, uint16_t nt,
  * cases below that follows from the tile's own bytes plus the segment
  * literal, so a single broadcast compare can replace the whole
  * nine-predictor pass (~30 ns per tile, the dominant cost of encoding a
- * constant or periodic stream). The winner of the prescreen's scan is the
- * FIRST predictor of seg_screen_pred[] whose miss count is 0, so each
- * case also has to exclude every predictor that precedes it:
+ * constant or periodic stream). The winner of the prescreen is the screened
+ * predictor with the smallest miss count, ties to the lowest priority (see
+ * seg_pred_rank), so each case also has to exclude every predictor of lower
+ * priority:
  *
  *   CONST_ZERO     (first of all) all bytes are 0.
  *   LANE_PREVIOUS  all bytes equal the tile's entry lane value, which for
@@ -1597,12 +1598,13 @@ static int seg_all_hit_cheap_ok(const uint8_t *a, uint16_t nt, uint8_t pred,
  *
  * A run may continue only when the prescreen would name the same predictor
  * with k == 0, because that is what the general path would otherwise have
- * chosen. The prescreen's winner is the FIRST predictor of
- * seg_screen_pred[] with the strictly smallest miss count, so keeping the
- * run needs two facts:
+ * chosen. The prescreen's winner is the screened predictor with the smallest
+ * miss count, ties to the lowest priority (seg_pred_rank) -- priority, not
+ * scan position, so a permuted scan cannot change the answer -- and keeping
+ * the run needs two facts:
  *
  *   (a) the run's predictor misses nothing in this tile, and
- *   (b) every predictor BEFORE it in scan order misses somewhere.
+ *   (b) every predictor of lower priority misses somewhere.
  *
  * (a) is one prediction pass over the tile (a shifted compare for the
  * families below), (b) is a witness search: one miss each is enough, and

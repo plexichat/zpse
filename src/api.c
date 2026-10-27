@@ -13,6 +13,24 @@ const char *zpse_version_string(void)
     return "1.0.0";
 }
 
+/* Encoder options are ZPSE_ENC_CHECKSUM plus one of the nine levels in bits
+ * 1-4, and an empty level field means the default level. Anything else is a
+ * bad argument rather than a silent round to a neighbour: the level is the
+ * caller's own speed/size trade, so a codec that cannot honour it must say
+ * so. Bits outside the two fields are refused for the same reason. */
+static int enc_flags_ok(uint32_t enc_flags)
+{
+    uint32_t lvl;
+
+    if ((enc_flags & ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK)) !=
+        0u) {
+        return 0;
+    }
+    lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
+                     ZPSE_ENC_SPEED_SHIFT);
+    return lvl <= 9u;
+}
+
 int zpse_compress_block(const uint8_t *in, uint32_t n,
                         uint8_t *out, uint32_t out_cap,
                         uint32_t *out_len_out,
@@ -39,8 +57,7 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
     if (n == 0 || n > 65536u) {
         return PSE_BAD_BLOCK_SIZE;
     }
-    if ((enc_flags & ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK)) !=
-        0u) {
+    if (!enc_flags_ok(enc_flags)) {
         return PSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
@@ -110,8 +127,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     if (nominal_block_size == 0 || nominal_block_size > 65536u) {
         return PSE_BAD_ARG;
     }
-    if ((enc_flags & ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK)) !=
-        0u) {
+    if (!enc_flags_ok(enc_flags)) {
         return PSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
@@ -146,8 +162,7 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
     if (nominal_block_size == 0 || nominal_block_size > 65536u) {
         return PSE_BAD_ARG;
     }
-    if ((enc_flags & ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK)) !=
-        0u) {
+    if (!enc_flags_ok(enc_flags)) {
         return PSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
