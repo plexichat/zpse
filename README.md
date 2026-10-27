@@ -58,10 +58,10 @@ that fast only because the ASCII gate's whole-block scan is skipped when the
 block's first two kilobytes are one value -- a constant sample cannot convict
 the gate, and the scan is a third of such a block's encode. That scan stops at
 the first byte with its high bit set, so a binary block pays almost nothing
-for it: it was 1.25 us of `alt00FF`'s 7.6 us encode, which is why that row is
-10 950 MB/s here and not the 8 960 the accumulating form gave it; a block that
-really is ASCII still reads every byte, 1.19 us against 1.56 for the scalar
-form, because that path is 32 bytes an iteration in AVX2. Decode is the same
+for it: it was 1.25 us of the 7.3 us `alt00FF` takes to encode, which is why
+that row is 10 950 MB/s here and not the 8 960 the accumulating form gave it;
+a block that really is ASCII still reads every byte, 1.19 us against 1.56 for
+the scalar form, because that path is 32 bytes an iteration in AVX2. Decode is the same
 at every level, because the shapes written are.
 
 What the rows are: `zeros`/`const5A` are one-byte-value blocks (coded in
