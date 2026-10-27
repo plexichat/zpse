@@ -1386,23 +1386,32 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * on text and pays for it in decode rate, which is what the fastest and
  * default levels are being asked for now.
  *
- * Measured end to end on the four text cases and two repetitive ones, with
- * the tile stream's own 1.09:1 at 12 GB/s as the reference (encode is
- * ~100 MB/s whenever the match finder runs -- it is a full pass):
+ * Measured with every level set to each value in turn, on the four text
+ * cases and a repetitive one, against the tile stream's own 1.09:1 at
+ * ~14 GB/s (encode falls to ~100 MB/s on the cases that take the form,
+ * because the match finder is a full pass):
  *
- *   A=2  (48 B/cmd)  nothing on the text cases (they never reach 48)
- *   A=4  (24 B/cmd)  var_string 1.09 -> 2.52, 2.7 GB/s; the rest unchanged
- *   A=8  (12 B/cmd)  + log_lines 1.09 -> 2.63, 1.45 GB/s; json 1.09 -> 2.05,
- *                    1.12 GB/s
- *   A=16 (6 B/cmd)   unchanged from A=8 (prose sits at 5.6, just under)
- *   A=24 (4 B/cmd)   + text_en 1.09 -> 1.33 at 0.57 GB/s
+ *   A=2  (48 B/cmd)  no text case moves; the shipped rule before this knob.
+ *   A=4  (24 B/cmd)  no text case moves either: var_string, the longest-run
+ *                    text shape here, sits just under 24 bytes per command.
+ *   A=8  (12 B/cmd)  var_string 1.09 -> 2.52 at 2.6 GB/s, and log_lines
+ *                    1.09 -> 1.68 at 2.0 (part of its blocks clear the bar).
+ *   A=12 (8 B/cmd)   + json_rows 1.09 -> 2.05 at 1.1 GB/s and log_lines the
+ *                    rest of the way to 2.63 at 1.5. This is the value the
+ *                    two deepest levels ship.
+ *   A=16 (6 B/cmd)   unchanged from A=12: prose sits at 5.6 bytes per
+ *                    command, just under the bar.
+ *   A=24 (4 B/cmd)   + prose, at MAX only: text_en 1.09 -> 1.33 at 0.6 GB/s.
+ *                    The default level does not take it because its sample
+ *                    margin (1.25) rejects prose before this rule is asked;
+ *                    MAX's (1.0625) does not. That is the whole difference
+ *                    between the two levels' LZ behaviour.
  *
- * So the useful settings are A=4 (text that still decodes at GB/s rates),
- * A=8 (adds the structured-text cases at ~1.2 GB/s) and A=24 (prose too,
- * at a command-loop 0.57 GB/s). Each level names its own; the levels must
- * stay ordered by permissiveness -- a deeper level that accepted LESS than
- * the level before it would write a larger block than that level, which
- * tests/suites/test_levels.c fails on. */
+ * So A=12 is the setting that buys the structured-text cases while keeping a
+ * GB/s decoder, and A=24 buys prose at a command-loop 0.6 GB/s. Each level
+ * names its own; the levels must stay ordered by permissiveness -- a deeper
+ * level that accepted LESS than the level before it would write a larger
+ * block than that level, which tests/suites/test_levels.c fails on. */
 #ifndef ZPSE_LZ_BPC_CROSS
 #define ZPSE_LZ_BPC_CROSS 96u
 #endif
@@ -1491,10 +1500,18 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  * margin (ZPSE_LZ_SCREEN_*, in sixteenths). The screen is a lower bound on
  * the win, so it can only cost a block the ratio a full pass would have
  * bought on a sample that lies -- and it is what makes the candidate
- * affordable outside MAX: the JSON, log and variable-string shapes win
- * their sample by 1.8-2.4x and keep their 2.0-2.6:1, prose wins by 1.22x
- * and pays the pass only at the levels asking for that little, and a block
- * with nothing to find never reaches the match finder at all.
+ * affordable outside MAX: a block with nothing to find never reaches the
+ * match finder at all, and the shapes that do reach it keep their 2.0-2.6:1
+ * (see the acceleration table above).
+ *
+ * The sample is 1 KiB, and that is a measurement rather than a default: at
+ * MAX, zeros_burst's LZ form is taken at 12.23:1 with a 1 KiB sample, 11.55
+ * with 2 KiB, 10.22 with 4 and 10.18 with 8, because a sample bigger than
+ * the burst spacing describes the block no better while giving the tile side
+ * a bigger span to win on. Prose's win on the sample lies between MAX's
+ * margin (accepted) and the default level's (rejected), which is exactly
+ * where a threshold should sit: the level that exists to buy ratio pays the
+ * pass for it, the balanced level does not.
  *
  * The margins differ per level because they are the encode side of the same
  * trade the acceleration factor makes on the decode side: the deeper the

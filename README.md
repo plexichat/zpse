@@ -241,19 +241,27 @@ speed of its command loop, one 4-byte command per output run, so its rate
 follows the average run length. Measured over 64 KiB blocks, in bytes per
 command: 5.6 -> 0.6 GB/s (prose), 9 -> 1.2 (JSON), 17 -> 2.9 (var strings),
 64 -> 8.8 (sparse), 246 -> 24 (zeros), against 5-13 GB/s for a tile stream.
-MAX and the default level accept a command every 8 output bytes (~1 GB/s and
-up, which is the JSON and log cases above); the two cheap levels accept one
-every 6. The factor is one constant per level in `src/block.c` -- turning the
-default level's down to 4 bytes per command adds only `var_string` and keeps
-its 14 GB/s decode, which is the knob to turn if the default level is being
-used for its decode rate.
+Both levels ship a factor of 12, i.e. a command every 8 output bytes (about
+1 GB/s and up, which is the JSON and log cases above). MAX is the only level
+whose screen is loose enough to reach prose at all, so a factor of 24 there is
+what puts `text_en` at 1.33:1 in the table above -- at 16 (6 bytes per
+command) prose sits just under the bar and nothing changes; at 8 the JSON and
+log cases are given up (`var_string` alone keeps its 2.52). Each level's
+factor and each level's sample margin are one constant each in `src/block.c`,
+and lowering the default level's factor to 4 gives back its ~14 GB/s decode at
+the cost of the whole text column -- the knob to turn if the default level is
+being used for its decode rate rather than its ratio.
 
 A block the form wins decodes as a copy loop instead of a tile
 reconstruction, which is slower than the tile path on columnar data (hence
 the lower mean decode above, and it is the default level that pays it) and
 much faster than it on a long run: 5.8 GB/s on 1 KiB runs, 27 GB/s on a ramp,
 measured over 64 KiB blocks. The cheap levels are the other side of the same
-trade: they write the same tile shapes in less encode time.
+trade: they write the same tile shapes in less encode time, and they do not
+run the match finder at all, so the factor above is theirs only if
+`ZPSE_LZ_CHEAP_LEVELS` is turned on -- which the measurements argue against,
+because FASTEST's text encode would fall from 2.3 GB/s to 390 MB/s, slower
+than the default level it is supposed to be faster than.
 
 ### A block that does not compress
 
