@@ -411,9 +411,12 @@ typedef struct {
 
 static size_t z_cbound(size_t n) { (void)n; return g_blk + 1024u; }
 /* Encoder options for the zpse rows (ZPSE_ENC_*), set from the last
- * command-line argument so the same binary measures the speed settings:
- *   5 (default) = ZPSE_ENC_SPEED_BALANCED, 3 = FASTER, 1 = FASTEST,
- *   9 = MAX; intermediate levels 2, 4, 6, 7, 8 sit between them
+ * command-line argument so the same binary measures the effort levels. The
+ * level is stored in bits 1-4 as `level << 1`, so it is passed doubled:
+ * 0 = the default level (BALANCED, 5), 2 = FASTEST (1), 6 = FASTER (3),
+ * 10 = BALANCED, 18 = MAX (9), and 11 = BALANCED + CHECKSUM. Levels 2, 4,
+ * 6, 7 and 8 are the intermediate rungs; any other value is rejected with
+ * PSE_BAD_ARG, which the harness reports as FAILED. */
 static uint32_t g_enc_flags = 0u;
 static size_t z_comp(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
 {
