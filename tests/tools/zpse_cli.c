@@ -152,14 +152,24 @@ static int write_file(const char *path, const uint8_t *buf, size_t len)
 
 static int parse_level(const char *s, uint32_t *flags)
 {
-    if (strcmp(s, "balanced") == 0 || strcmp(s, "0") == 0) {
+    if (strcmp(s, "fastest") == 0 || strcmp(s, "1") == 0) {
+        *flags |= ZPSE_ENC_SPEED_FASTEST;
+    } else if (strcmp(s, "2") == 0) {
+        *flags |= ZPSE_ENC_SPEED_L2;
+    } else if (strcmp(s, "faster") == 0 || strcmp(s, "3") == 0) {
+        *flags |= ZPSE_ENC_SPEED_FASTER;
+    } else if (strcmp(s, "4") == 0) {
+        *flags |= ZPSE_ENC_SPEED_L4;
+    } else if (strcmp(s, "balanced") == 0 || strcmp(s, "5") == 0) {
         *flags |= ZPSE_ENC_SPEED_BALANCED;
-    } else if (strcmp(s, "faster") == 0 || strcmp(s, "1") == 0) {
-        *flags |= ZPSE_ENC_FASTER;
-    } else if (strcmp(s, "fastest") == 0 || strcmp(s, "2") == 0) {
-        *flags |= ZPSE_ENC_FASTEST;
-    } else if (strcmp(s, "max") == 0 || strcmp(s, "3") == 0) {
-        *flags |= ZPSE_ENC_MAX;
+    } else if (strcmp(s, "6") == 0) {
+        *flags |= ZPSE_ENC_SPEED_L6;
+    } else if (strcmp(s, "7") == 0) {
+        *flags |= ZPSE_ENC_SPEED_L7;
+    } else if (strcmp(s, "8") == 0) {
+        *flags |= ZPSE_ENC_SPEED_L8;
+    } else if (strcmp(s, "max") == 0 || strcmp(s, "9") == 0) {
+        *flags |= ZPSE_ENC_SPEED_MAX;
     } else {
         fprintf(stderr, "zpse_cli: unknown level '%s'\n", s);
         return 0;
@@ -169,15 +179,27 @@ static int parse_level(const char *s, uint32_t *flags)
 
 static const char *level_name(uint32_t flags)
 {
-    switch (flags & ZPSE_ENC_SPEED_MASK) {
-    case ZPSE_ENC_FASTER:
-        return "faster";
-    case ZPSE_ENC_FASTEST:
+    switch (zpse_enc_speed(flags)) {
+    case 1u:
         return "fastest";
-    case ZPSE_ENC_MAX:
+    case 2u:
+        return "2";
+    case 3u:
+        return "faster";
+    case 4u:
+        return "4";
+    case 5u:
+        return "balanced";
+    case 6u:
+        return "6";
+    case 7u:
+        return "7";
+    case 8u:
+        return "8";
+    case 9u:
         return "max";
     default:
-        return "balanced";
+        return "?";
     }
 }
 

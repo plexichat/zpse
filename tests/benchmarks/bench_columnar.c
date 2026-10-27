@@ -412,8 +412,8 @@ typedef struct {
 static size_t z_cbound(size_t n) { (void)n; return g_blk + 1024u; }
 /* Encoder options for the zpse rows (ZPSE_ENC_*), set from the last
  * command-line argument so the same binary measures the speed settings:
- *   0 (default) = ZPSE_ENC_SPEED_BALANCED, 2 = FASTER, 4 = FASTEST,
- *   1 = BALANCED + CHECKSUM, ... */
+ *   5 (default) = ZPSE_ENC_SPEED_BALANCED, 3 = FASTER, 1 = FASTEST,
+ *   9 = MAX; intermediate levels 2, 4, 6, 7, 8 sit between them
 static uint32_t g_enc_flags = 0u;
 static size_t z_comp(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
 {
@@ -885,15 +885,10 @@ int main(int argc, char **argv)
            "identical bytes per codec, every decode verified\n");
     printf("zpse encoder: enc_flags=0x%lx speed=%s%s\n",
            (unsigned long)g_enc_flags,
-           (g_enc_flags & ZPSE_ENC_SPEED_MASK) == (uint32_t)ZPSE_ENC_FASTER
-               ? "FASTER"
-               : (g_enc_flags & ZPSE_ENC_SPEED_MASK) ==
-                         (uint32_t)ZPSE_ENC_FASTEST
-                     ? "FASTEST"
-                     : (g_enc_flags & ZPSE_ENC_SPEED_MASK) ==
-                               (uint32_t)ZPSE_ENC_MAX
-                           ? "MAX"
-                           : "BALANCED",
+           zpse_enc_speed(g_enc_flags) == 9u    ? "MAX"
+         : zpse_enc_speed(g_enc_flags) == 3u    ? "FASTER"
+         : zpse_enc_speed(g_enc_flags) == 1u    ? "FASTEST"
+                                                : "BALANCED",
            (g_enc_flags & ZPSE_ENC_CHECKSUM) ? " +CHECKSUM" : "");
     printf("versions: zpse %s | zstd %s | lz4 %s | zlib %s | brotli %u.%u.%u\n",
            zpse_version_string(),

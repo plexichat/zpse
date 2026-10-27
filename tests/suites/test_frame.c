@@ -259,8 +259,8 @@ int main(void)
 
     seek_all(FRAME_N, 65536u, 0u, 0);
     seek_all(FRAME_N, 16384u, 0u, 1);
-    seek_all(FRAME_N, 65536u, (uint32_t)ZPSE_ENC_MAX, 2);
-    seek_all(FRAME_N, 16384u, (uint32_t)ZPSE_ENC_FASTEST, 0);
+    seek_all(FRAME_N, 65536u, (uint32_t)ZPSE_ENC_SPEED_MAX, 2);
+    seek_all(FRAME_N, 16384u, (uint32_t)ZPSE_ENC_SPEED_FASTEST, 0);
     seek_all(65536u, 65536u, 0u, 1); /* one block */
     corrupt_cases();
 

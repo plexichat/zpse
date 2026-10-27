@@ -255,7 +255,7 @@ static void block_cases(void)
                                      ea) == PSE_OK,
               "shape %d: balanced encode", shapes[k]);
         rc = zpse_compress_block_ex(plain, 65536u, comp, sizeof comp, &deep,
-                                    0u, 1, (uint32_t)ZPSE_ENC_MAX, ea);
+                                    0u, 1, (uint32_t)ZPSE_ENC_SPEED_MAX, ea);
         CHECK(rc == PSE_OK, "shape %d: deepest encode", shapes[k]);
         if (rc != PSE_OK) {
             continue;
@@ -277,7 +277,7 @@ static void block_cases(void)
 
         make_shape(5, 65536u);
         CHECK(zpse_compress_block_ex(plain, 65536u, comp, sizeof comp, &deep,
-                                     0u, 1, (uint32_t)ZPSE_ENC_MAX, ea) ==
+                                     0u, 1, (uint32_t)ZPSE_ENC_SPEED_MAX, ea) ==
                   PSE_OK,
               "dual-form source block");
         CHECK(zpse_block_header_parse(&h, comp, ZPSE_BLOCK_HEADER_SIZE) ==

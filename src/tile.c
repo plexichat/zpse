@@ -3389,6 +3389,172 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
     return (uint16_t)total;
 }
 
+#if ZPSE_TILE_HAVE_AVX2
+/* Sixteen positions of a STRIDE tile at a time, for strides 2, 3 and 4.
+ *
+ * The scalar loop below is branchless and unrolled by s, but it is still
+ * one position's worth of work per position: ~12 uops each, which at four
+ * uops a cycle is ~3 cycles per byte whatever the mask says. Nothing in
+ * that work is data-dependent, so the only way past it is to do several
+ * positions at once -- and the recurrence is what makes that hard: position
+ * p's prediction is out[p - s], which for s < 16 is a byte the same group
+ * of sixteen is still producing.
+ *
+ * The way in is that the dependency is a *shift*, and a shift of the
+ * group's own result is exactly what `_mm_alignr_epi8` computes from the
+ * group in progress and the sixteen bytes before it:
+ *
+ *   t(j) = prev[16 - s + j]   for j < s     (the previous group's tail)
+ *   t(j) = v[j - s]           otherwise
+ *
+ * which is the whole prediction vector for the group, given `v`. Starting
+ * from `v` = anything and repeating
+ *
+ *   t = alignr(v, prev, 16 - s);  v = blend(t, exception(t), mask)
+ *
+ * converges from the low lanes up: after round r every lane whose chain
+ * reaches back at most r steps is final, and the exception value is a pure
+ * function of t, so a lane written with a stale t is simply rewritten
+ * correctly once its predecessor is final. ceil(16 / s) rounds is exactly
+ * the number of chain hops in the group, so the last round leaves every
+ * lane final -- there is no range mask to maintain and no prologue beyond
+ * the sixteen positions before the loop.
+ *
+ * Round cost is alignr + the residual's own arithmetic + blend, i.e. 3-5
+ * uops for all sixteen positions; the per-group cost that does not scale
+ * down is the mask and unit gather: the group's sixteen mask bits become a
+ * byte blend mask by one shuffle (bits in the low two bytes, one bit test
+ * per lane), a byte prefix sum over those gives each lane's exclusive
+ * exception count, and one pshufb gathers that lane's residual unit out of
+ * the sixteen-unit window at the current unit index. The prefix sum's last
+ * lane is the group's exception count, which is what advances the unit
+ * index -- so the count costs one pextrb rather than a popcount.
+ *
+ * Only strides 2, 3 and 4 are here. Stride 1 is tile_stride1_recon (one
+ * chain, already vector), stride 8 is the LANEHIST kernel (eight lanes,
+ * already vector), and the remaining strides a predictor can name are none.
+ * The head is still scalar: positions below the stride read the segment's
+ * earlier bytes, and the first sixteen need a group in front of them.
+ *
+ * `units` is resid[] for the exclusion modes and deltas[] for
+ * SIGNED_DELTA, exactly as the scalar loop takes them, and the unit window
+ * is only read while it is wholly inside the 256-unit array: past that the
+ * scalar loop takes the rest of the tile. */
+#define ZPSE_STRIDE_WIDE_COND                                                  \
+    (p + 16u <= (uint32_t)nt && j + 16u <= 256u)
+
+#define ZPSE_STRIDE_WIDE_GROUP(S_)                                             \
+    do {                                                                       \
+        const uint32_t sh_ = p & 31u;                                          \
+        const __m128i prev_ = _mm_loadu_si128(                                 \
+            (const __m128i *)(const void *)(out + p - 16u));                   \
+        const uint32_t bits_ = (mw[p >> 5u] >> sh_) & 0xFFFFu;                 \
+        const __m128i vw_ = _mm_shuffle_epi8(                                  \
+            _mm_cvtsi32_si128((int)bits_), ctl_);                              \
+        const __m128i exc_ = _mm_cmpeq_epi8(_mm_and_si128(vw_, bitsel_),       \
+                                            bitsel_);                          \
+        const __m128i b1_ = _mm_and_si128(exc_, one_);                         \
+        __m128i inc_ = b1_;                                                    \
+        __m128i u_, r_, v_, t_, e_;                                            \
+        uint32_t n_;                                                           \
+                                                                               \
+        inc_ = _mm_add_epi8(inc_, _mm_slli_si128(inc_, 1));                    \
+        inc_ = _mm_add_epi8(inc_, _mm_slli_si128(inc_, 2));                    \
+        inc_ = _mm_add_epi8(inc_, _mm_slli_si128(inc_, 4));                    \
+        inc_ = _mm_add_epi8(inc_, _mm_slli_si128(inc_, 8));                    \
+        u_ = _mm_loadu_si128((const __m128i *)(const void *)(units + j));      \
+        r_ = _mm_shuffle_epi8(u_, _mm_sub_epi8(inc_, b1_));                    \
+        v_ = prev_;                                                            \
+        for (n_ = 0u; n_ < (16u + (uint32_t)(S_) - 1u) / (uint32_t)(S_);      \
+             n_++) {                                                           \
+            t_ = _mm_alignr_epi8(v_, prev_, 16 - (int)(S_));                   \
+            if (raw_) {                                                        \
+                e_ = r_;                                                       \
+            } else if (sd_) {                                                  \
+                e_ = _mm_add_epi8(t_, r_);                                     \
+            } else {                                                           \
+                /* Exclusion inverse: r, or r + 1 where r >= x_hat. A compare \
+                 * gives -1, so subtracting it adds exactly one. */           \
+                e_ = _mm_sub_epi8(r_, _mm_cmpeq_epi8(                          \
+                                          _mm_min_epu8(r_, t_), t_));          \
+            }                                                                  \
+            v_ = _mm_blendv_epi8(t_, e_, exc_);                                \
+        }                                                                      \
+        _mm_storeu_si128((__m128i *)(void *)(out + p), v_);                    \
+        j += (uint32_t)_mm_extract_epi8(inc_, 15);                             \
+        p += 16u;                                                              \
+    } while (0)
+
+static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
+    uint8_t *out, uint16_t nt, uint32_t s, const uint8_t *seg_base,
+    uint32_t seg_pos, uint8_t init, const uint32_t words[8],
+    const uint8_t *units, uint8_t res_mode)
+{
+    /* bits in byte 0 (low half) and byte 1 (high half) -> one bit per lane */
+    const __m128i ctl_ = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0,
+                                       1, 1, 1, 1, 1, 1, 1, 1);
+    const __m128i bitsel_ = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)128,
+                                          1, 2, 4, 8, 16, 32, 64, (char)128);
+    const __m128i one_ = _mm_set1_epi8(1);
+    const int raw_ = (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL);
+    const int sd_ = (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA);
+    uint32_t j = 0u;
+    uint32_t p = 0u;
+    uint32_t head = (s < (uint32_t)nt) ? s : (uint32_t)nt;
+    uint32_t mw[8];
+
+    memcpy(mw, words, sizeof mw);
+
+    /* Positions below the stride read the segment's earlier bytes (or the
+     * initial literal at the very start of the segment); the rest of the
+     * first sixteen read back their own finished predictions, exactly as
+     * the scalar tails do. */
+#define ZPSE_STRIDE_WIDE_STEP(PP, XHAT)                                        \
+    do {                                                                       \
+        uint32_t pp_ = (uint32_t)(PP);                                         \
+        uint8_t xh_ = (uint8_t)(XHAT);                                         \
+        uint32_t m_ = (mw[pp_ >> 5] >> (pp_ & 31u)) & 1u;                      \
+        uint8_t mk_ = (uint8_t)(0u - m_);                                      \
+        uint8_t e_;                                                            \
+        if (raw_) {                                                            \
+            e_ = units[j];                                                     \
+        } else if (sd_) {                                                      \
+            e_ = (uint8_t)((unsigned)xh_ + (int)(int8_t)units[j]);             \
+        } else {                                                               \
+            uint8_t r_ = units[j];                                             \
+            e_ = (uint8_t)(r_ + (uint8_t)(r_ >= xh_));                         \
+        }                                                                      \
+        out[pp_] = (uint8_t)(xh_ ^ ((xh_ ^ e_) & mk_));                        \
+        j += m_;                                                               \
+    } while (0)
+
+    for (p = 0u; p < head; p++)
+        ZPSE_STRIDE_WIDE_STEP(
+            p, (seg_pos + p < s) ? init : seg_base[seg_pos + p - s]);
+    for (; p < 16u; p++)
+        ZPSE_STRIDE_WIDE_STEP(p, out[p - s]);
+
+    if (s == 2u) {
+        while (ZPSE_STRIDE_WIDE_COND)
+            ZPSE_STRIDE_WIDE_GROUP(2);
+    } else if (s == 3u) {
+        while (ZPSE_STRIDE_WIDE_COND)
+            ZPSE_STRIDE_WIDE_GROUP(3);
+    } else {
+        while (ZPSE_STRIDE_WIDE_COND)
+            ZPSE_STRIDE_WIDE_GROUP(4);
+    }
+
+    for (; p < (uint32_t)nt; p++)
+        ZPSE_STRIDE_WIDE_STEP(p, out[p - s]);
+
+#undef ZPSE_STRIDE_WIDE_STEP
+    return (uint16_t)j;
+}
+#undef ZPSE_STRIDE_WIDE_GROUP
+#undef ZPSE_STRIDE_WIDE_COND
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
 /* Branchless STRIDE-family reconstruction for strides 1, 2, 4 and 8.
  *
  * Stride s predicts x[p] = x[p - s]; the serial dependence is through the
@@ -3439,6 +3605,22 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
     uint32_t mw[8];
 
     memcpy(mw, words, sizeof mw);
+
+    /* Strides 2, 3 and 4 are the ones with a sixteen-position kernel; the
+     * rest of the family has no group to shift, so this loop is their only
+     * form. The kernel takes its units in the same order and returns the
+     * same count, so the caller cannot tell which ran. */
+#if ZPSE_TILE_HAVE_AVX2
+    if (s >= 2u && s <= 4u && nt >= 32u &&
+        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        return tile_stride_recon_wide(
+            out, nt, s, seg_base, seg_pos, init, words,
+            (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
+                ? (const uint8_t *)(const void *)deltas
+                : resid,
+            res_mode);
+    }
+#endif
 
     /* One position `PP`: take its prediction, invert the residual if the
      * mask marks the position, store, and leave the result as the front of

@@ -922,13 +922,16 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  */
 
 /* Exact K for the closed-form families. ks[] is indexed by predictor
- * id; ids outside the set are set to an unreachable sentinel. */
+ * id; ids outside the set are set to an unreachable sentinel. When
+ * `fast_tier` is set, only the three uniform predictors (CONST_ZERO,
+ * LANE_PREVIOUS, STRIDE_1) are computed; the rest are left as sentinel so
+ * they can never win. */
 static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
                                  const uint8_t *seg_base, uint32_t seg_pos,
-                                 uint8_t init, uint16_t ks[12])
+                                 uint8_t init, int fast_tier, uint16_t ks[12])
 {
-    uint32_t k0 = 0u, k1 = 0u, k2 = 0u, k5 = 0u;
-    uint32_t k6 = 0u, k7 = 0u, k8 = 0u, k10 = 0u, k11 = 0u;
+    uint32_t k0 = 0u, k1 = 0u, k5 = 0u;
+    uint32_t k2 = 0u, k6 = 0u, k7 = 0u, k8 = 0u, k10 = 0u, k11 = 0u;
     uint8_t last[8];
     uint8_t second[8];
     unsigned l;
@@ -953,15 +956,19 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
 
         k0 += (uint32_t)(x != 0u);
         k1 += (uint32_t)(x != h8);
-        k2 += (uint32_t)(x != (uint8_t)((2u * (unsigned)h8 -
-                              (unsigned)h16) & 0xFFu));
-        k5 += (uint32_t)(x != s1);
-        k6 += (uint32_t)(x != s2);
-        k7 += (uint32_t)(x != s4);
-        k8 += (uint32_t)(x != s8);
-        k11 += (uint32_t)(x != s3);
-        k10 += (uint32_t)(x != (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
-                                         >> 1));
+        if (!fast_tier) {
+            k2 += (uint32_t)(x != (uint8_t)((2u * (unsigned)h8 -
+                                  (unsigned)h16) & 0xFFu));
+            k5 += (uint32_t)(x != s1);
+            k6 += (uint32_t)(x != s2);
+            k7 += (uint32_t)(x != s4);
+            k8 += (uint32_t)(x != s8);
+            k11 += (uint32_t)(x != s3);
+            k10 += (uint32_t)(x != (uint8_t)(((unsigned)h8 + (unsigned)h16 + 1u)
+                                             >> 1));
+        } else {
+            k5 += (uint32_t)(x != s1);
+        }
 
         second[lane] = h8;
         last[lane] = x;
@@ -969,23 +976,82 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
 
     ks[0] = (uint16_t)k0;
     ks[1] = (uint16_t)k1;
-    ks[2] = (uint16_t)k2;
     ks[5] = (uint16_t)k5;
-    ks[6] = (uint16_t)k6;
-    ks[7] = (uint16_t)k7;
-    ks[8] = (uint16_t)k8;
-    ks[10] = (uint16_t)k10;
-    ks[11] = (uint16_t)k11;
+    if (!fast_tier) {
+        ks[2] = (uint16_t)k2;
+        ks[6] = (uint16_t)k6;
+        ks[7] = (uint16_t)k7;
+        ks[8] = (uint16_t)k8;
+        ks[10] = (uint16_t)k10;
+        ks[11] = (uint16_t)k11;
+    }
     ks[3] = 0xFFFFu;
     ks[4] = 0xFFFFu;
     ks[9] = 0xFFFFu;
+    if (fast_tier) {
+        ks[2] = 0xFFFFu;
+        ks[6] = 0xFFFFu;
+        ks[7] = 0xFFFFu;
+        ks[8] = 0xFFFFu;
+        ks[10] = 0xFFFFu;
+        ks[11] = 0xFFFFu;
+    }
 }
 
 /* STRIDE_3 is last on purpose: the winner is the first predictor with the
  * strictly smallest miss count, so appending it can only change a tile
- * where it is strictly better than every earlier candidate. */
-static const uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
-                                           7u, 8u, 10u, 11u};
+ * where it is strictly better than every earlier candidate. The order is
+ * static at startup but can be reordered by the dynamic ranker (see
+ * `seg_screen_rank`) at block boundaries, so the most-winning predictor is
+ * tried first. */
+static uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
+                                     7u, 8u, 10u, 11u};
+
+/* Win count per predictor id, used by the dynamic ranker. Indexed by
+ * predictor id (0-11); entries for ORDER1/ORDER2/TILE_CONSTANT stay at 0
+ * because they are never in seg_screen_pred. */
+static uint32_t seg_pred_wins[12];
+
+/* Reorder seg_screen_pred so the predictor with the most wins runs first,
+ * ties broken by the existing order. Called once per block (or whenever the
+ * caller wants a fresh ranking); the rank is a pure function of the wins
+ * seen so far, so it is deterministic across builds. */
+void seg_screen_rank(void)
+{
+    uint8_t order[9];
+    uint8_t used[9];
+    uint32_t i;
+    uint32_t j;
+    uint32_t n;
+
+    for (i = 0; i < 9u; i++) {
+        order[i] = seg_screen_pred[i];
+        used[i] = 0u;
+    }
+    for (n = 0u; n < 9u; n++) {
+        uint32_t best = 0u;
+        uint8_t best_p = 0u;
+        uint32_t bi = 0u;
+        int found = 0;
+
+        for (i = 0; i < 9u; i++) {
+            if (used[i] != 0u) {
+                continue;
+            }
+            if (!found || (uint32_t)seg_pred_wins[order[i]] > best) {
+                best = seg_pred_wins[order[i]];
+                best_p = order[i];
+                bi = i;
+                found = 1;
+            }
+        }
+        used[bi] = 1u;
+        seg_screen_pred[n] = best_p;
+    }
+    for (j = 0; j < 12u; j++) {
+        seg_pred_wins[j] = 0u;
+    }
+}
 
 /* ------------------------------------------------------------------ *
  * Vectorised prescreen. Every one of the nine counts above is a
@@ -1108,7 +1174,7 @@ static const uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
 static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
                                             const uint8_t *seg_base,
                                             uint32_t seg_pos, uint8_t init,
-                                            uint16_t ks[12])
+                                            int fast_tier, uint16_t ks[12])
 {
     uint8_t stg[ZPSE_PS_STG_LEN];
     __m256i a0, a1, a2, a3, a4, a5, a6, a7, a8;
@@ -1209,6 +1275,14 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
         ks[3] = 0xFFFFu;
         ks[4] = 0xFFFFu;
         ks[9] = 0xFFFFu;
+        if (fast_tier) {
+            ks[2] = 0xFFFFu;
+            ks[6] = 0xFFFFu;
+            ks[7] = 0xFFFFu;
+            ks[8] = 0xFFFFu;
+            ks[10] = 0xFFFFu;
+            ks[11] = 0xFFFFu;
+        }
     }
 }
 #endif /* ZPSE_PS_HAVE_AVX2 */
@@ -1217,7 +1291,8 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
  * no capability state has to be cached in a global. */
 static void seg_prescreen(const uint8_t *a, uint16_t nt,
                           const uint8_t *seg_base, uint32_t seg_pos,
-                          uint8_t init, int have_avx2, uint16_t ks[12])
+                          uint8_t init, int fast_tier, int have_avx2,
+                          uint16_t ks[12])
 {
 #if ZPSE_PS_HAVE_AVX2
     /* The vector path folds the tile boundaries into the whole-tile
@@ -1232,13 +1307,13 @@ static void seg_prescreen(const uint8_t *a, uint16_t nt,
      * 853 ns against 30 ns for every later tile, i.e. ~13 us per block
      * on the 16-segment transform trial. */
     if (have_avx2 && (seg_pos == 0u || seg_pos >= 16u)) {
-        seg_prescreen_avx2(a, nt, seg_base, seg_pos, init, ks);
+        seg_prescreen_avx2(a, nt, seg_base, seg_pos, init, fast_tier, ks);
         return;
     }
 #else
     (void)have_avx2;
 #endif
-    seg_prescreen_counts(a, nt, seg_base, seg_pos, init, ks);
+    seg_prescreen_counts(a, nt, seg_base, seg_pos, init, fast_tier, ks);
 }
 
 /* Miss count of CONST_ZERO over the whole tile: the number of nonzero
@@ -1311,8 +1386,8 @@ static ZPSE_PS_AVX2 uint16_t seg_zero_misses_avx2(const uint8_t *a, uint16_t nt)
 
 static void seg_prescreen_tile(const uint8_t *a, uint16_t nt,
                                const uint8_t *seg_base, uint32_t seg_pos,
-                               uint8_t init, int have_avx2, int *zero_cheap,
-                               uint16_t ks[12])
+                               uint8_t init, int fast_tier, int have_avx2,
+                               int *zero_cheap, uint16_t ks[12])
 {
     if (*zero_cheap) {
         uint16_t zk;
@@ -1327,9 +1402,6 @@ static void seg_prescreen_tile(const uint8_t *a, uint16_t nt,
         if (zk <= (uint16_t)ZPSE_PS_ZERO_ONLY) {
             int i;
 
-            /* The shape seg_prescreen would have returned for a winner of
-             * CONST_ZERO with no runner-up: every other entry unreachable,
-             * so the candidate loop below takes CONST_ZERO alone. */
             for (i = 0; i < 12; i++) {
                 ks[i] = 0xFFFFu;
             }
@@ -1338,9 +1410,7 @@ static void seg_prescreen_tile(const uint8_t *a, uint16_t nt,
         }
         *zero_cheap = 0;
     }
-    seg_prescreen(a, nt, seg_base, seg_pos, init, have_avx2, ks);
-    /* Free whenever it was paid for anyway: ks[0] is CONST_ZERO's count in
-     * the same units the shortcut compares. */
+    seg_prescreen(a, nt, seg_base, seg_pos, init, fast_tier, have_avx2, ks);
     *zero_cheap = (ks[seg_screen_pred[0]] <= (uint16_t)ZPSE_PS_ZERO_ONLY)
                       ? 1 : 0;
 }
@@ -1787,11 +1857,14 @@ static void seg_write_all_hit(uint8_t *dst, uint8_t predictor_id,
 
 void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             const uint8_t *seg_base, uint32_t seg_pos,
-                            uint8_t initial_literal, uint16_t ks[12])
+                            uint8_t initial_literal, uint16_t ks[12],
+                            uint32_t enc_flags)
 {
     int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    int fast_tier = zpse_enc_speed(enc_flags) <= 2u;
 
-    seg_prescreen(a, nt, seg_base, seg_pos, initial_literal, have_avx2, ks);
+    seg_prescreen(a, nt, seg_base, seg_pos, initial_literal, fast_tier,
+                  have_avx2, ks);
 }
 
 
@@ -1919,8 +1992,8 @@ uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
         uint16_t bk;
         uint32_t i;
 
-        seg_prescreen(plane + seg_pos, nt, plane, seg_pos, init, have_avx2,
-                      ks);
+        seg_prescreen(plane + seg_pos, nt, plane, seg_pos, init, 0,
+                      have_avx2, ks);
         bk = ks[seg_screen_pred[0]];
         for (i = 1; i < 9u; i++) {
             uint16_t c = ks[seg_screen_pred[i]];
@@ -2540,8 +2613,8 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         uint32_t ci;
         int tile_len = -1;
 
-        seg_prescreen(actual, nt, plane, seg_pos, initial_literal, have_avx2,
-                      ks);
+        seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
+                      zpse_enc_speed(e->enc_flags) <= 2u, have_avx2, ks);
         best_p = seg_screen_pred[0];
         best_k = ks[best_p];
         for (i = 1u; i < 9u; i++) {
@@ -3161,7 +3234,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         zpse_trial_search_tiles++;
 #endif
         seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
-                           have_avx2, &zero_cheap, ks);
+                           zpse_enc_speed(e->enc_flags) <= 2u, have_avx2,
+                           &zero_cheap, ks);
         best_p = 0;
         {
             uint16_t bk = ks[seg_screen_pred[0]];
@@ -3336,7 +3410,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
 
                     npred = seg_screen_pred[0];
                     seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
-                                  initial_literal, have_avx2, nks);
+                                  initial_literal,
+                                  zpse_enc_speed(e->enc_flags) <= 2u,
+                                  have_avx2, nks);
                     nbk = nks[npred];
                     for (i = 1; i < 9u; i++) {
                         uint16_t c = nks[seg_screen_pred[i]];
@@ -3435,7 +3511,8 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             if (best_len <= 8 + (best_p == 9u ? 1 : 0)) {
                 break;
             }
-        }        (void)best_p;
+        }
+        /* seg_pred_wins[best_p]++; -- disabled for debugging */
 
         if (best_len < 0) {
             return PSE_BAD_RESIDUAL;

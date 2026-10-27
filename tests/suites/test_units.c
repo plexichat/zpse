@@ -129,8 +129,8 @@ int main(void) {
         static uint8_t in[65536], comp[200000], out[65536];
         static const uint32_t levels[3] = {
             (uint32_t)ZPSE_ENC_SPEED_BALANCED,
-            (uint32_t)ZPSE_ENC_FASTER,
-            (uint32_t)ZPSE_ENC_FASTEST
+            (uint32_t)ZPSE_ENC_SPEED_FASTER,
+            (uint32_t)ZPSE_ENC_SPEED_FASTEST
         };
         uint32_t cl_bal = 0u;
         uint32_t i;
@@ -164,16 +164,16 @@ int main(void) {
          * the width-16 shape rather than fall back to the identity. */
         CHECK(cl_bal > 0u && cl_bal < 3000u, "balanced ramp is 2619 (got %u)",
               cl_bal);
-        /* ZPSE_ENC_MAX is the deepest level: it may cost encode time but
+        /* ZPSE_ENC_SPEED_MAX is the deepest level: it may cost encode time but
          * never compressed size, so its stream cannot be larger than the
          * default level's on the same block. */
         {
             uint32_t cl_max = 0u;
 
-            CHECK(zpse_compress_block_ex(in, sizeof in, comp, sizeof comp,
-                                         &cl_max, 0, 1,
-                                         (uint32_t)ZPSE_ENC_MAX, ea) == PSE_OK,
-                  "deepest level accepted");
+             CHECK(zpse_compress_block_ex(in, sizeof in, comp, sizeof comp,
+                                          &cl_max, 0, 1,
+                                          (uint32_t)ZPSE_ENC_SPEED_MAX, ea) == PSE_OK,
+                   "deepest level accepted");
             CHECK(cl_max > 0u && cl_max <= cl_bal,
                   "deepest level is no larger (%u vs %u)", cl_max, cl_bal);
         }

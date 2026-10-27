@@ -94,6 +94,12 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
  * table's first tile, whose preceding plane bytes do not exist). */
 void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             const uint8_t *seg_base, uint32_t seg_pos,
-                            uint8_t initial_literal, uint16_t ks[12]);
+                            uint8_t initial_literal, uint16_t ks[12],
+                            uint32_t enc_flags);
+
+/* Reorder the prescreen scan order by predictor win count. Call once per
+ * block, at the start of the first segment encode. Resets the win counters
+ * after ranking. */
+void seg_screen_rank(void);
 
 #endif /* ZPSE_SEGMENT_H */

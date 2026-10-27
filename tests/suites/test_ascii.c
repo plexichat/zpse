@@ -218,13 +218,18 @@ static void test_rejects(void)
  * must not. */
 static void test_blocks(void)
 {
-    static const uint32_t levels[4] = {
-        ZPSE_ENC_FASTEST, ZPSE_ENC_FASTER,
-        ZPSE_ENC_SPEED_BALANCED, ZPSE_ENC_MAX};
-    static const char *names[4] = {"fastest", "faster", "balanced", "max"};
+    static const uint32_t levels[9] = {
+        ZPSE_ENC_SPEED_FASTEST, ZPSE_ENC_SPEED_L2,
+        ZPSE_ENC_SPEED_FASTER, ZPSE_ENC_SPEED_L4,
+        ZPSE_ENC_SPEED_BALANCED, ZPSE_ENC_SPEED_L6,
+        ZPSE_ENC_SPEED_L7, ZPSE_ENC_SPEED_L8,
+        ZPSE_ENC_SPEED_MAX
+    };
+    static const char *names[9] = {"fastest", "2", "faster", "4",
+                                   "balanced", "6", "7", "8", "max"};
     uint32_t li;
 
-    for (li = 0; li < 4u; li++) {
+    for (li = 0; li < 9u; li++) {
         uint32_t cl, ol;
         uint32_t i;
         int rc;

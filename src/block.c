@@ -599,7 +599,7 @@ static int zpse_block_is_noise(const uint8_t *const planes[16], uint8_t sc,
         nt = (uint16_t)((len - off > 256u) ? 256u : (len - off));
         if (nt < 64u)
             continue;
-        zpse_segment_prescreen(pl + off, nt, pl, off, pl[0], ks);
+        zpse_segment_prescreen(pl + off, nt, pl, off, pl[0], ks, 0u);
         best = ks[zpse_block_screen[0]];
         for (j = 1u; j < 9u; j++) {
             if (ks[zpse_block_screen[j]] < best)
@@ -645,6 +645,9 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (budget_hit != 0) {
         *budget_hit = 0;
     }
+    /* Reorder the prescreen scan order by win count at every block start,
+     * so the predictor that wins most tiles runs first. */
+    seg_screen_rank();
     /* The flat abort's coverage counter and the flag that ends its run span
      * this trial's segments, so they are reset here rather than inside
      * zpse_segment_encode. */
@@ -970,7 +973,7 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
         memcpy(loc, in + p - 16u, 16u);
         memcpy(loc + 16u, in + p, (size_t)ZPSE_TILE_SIZE);
         zpse_segment_prescreen(loc + 16u, (uint16_t)ZPSE_TILE_SIZE, loc, 16u,
-                               in[0], ks);
+                               in[0], ks, 0u);
         kmin = ks[0];
         for (c = 1u; c < 11u; c++) {
             if (ks[c] < kmin) {
@@ -997,7 +1000,7 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
             loc[j] = (uint8_t)(in[q] - in[q - 1u]);
         }
         zpse_segment_prescreen(loc + 16u, (uint16_t)ZPSE_TILE_SIZE, loc, 16u,
-                               0u, ks);
+                               0u, ks, 0u);
         kmin = ks[0];
         for (c = 1u; c < 11u; c++) {
             if (ks[c] < kmin) {
@@ -1126,12 +1129,13 @@ static uint32_t zpse_block_cand_floor(uint32_t len)
 /* Exact price of one candidate, summed the same way the prescreen proxy sums
  * its planes.
  *
- * `every_plane` is the default (ZPSE_ENC_SPEED_BALANCED) and prices one tile
+ * `every_plane` is BALANCED and deeper (level 5+) and prices one tile
  * in every plane, which is the only way to rank a transpose correctly (see
- * the comment below). The cheap levels price `tiles` planes instead and
- * charge the rest their average, or nothing at all when they are constant:
- * that is the estimate this code used to make everywhere, and it is wrong by
- * design in exactly one direction -- it under-prices the wide transposes,
+ * the comment below). The cheap levels (1-4) price `tiles` planes instead
+ * and charge the rest their average, or nothing at all when they are
+ * constant: that is the estimate this code used to make everywhere, and it
+ * is wrong by design in exactly one direction -- it under-prices the wide
+ * transposes,
  * whose planes differ most from each other. */
 static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
                                       const uint32_t lens[16], uint8_t sc,
@@ -1170,12 +1174,12 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
      * the pass is what buys decimal8 4.62:1 -> 5.82:1 (3.96:1 -> 4.01:1 over
      * the corpus).
      *
-     * The cheap levels (ZPSE_ENC_FASTER and _FASTEST) used to price only a
-     * stride of the planes and charge the rest their average -- which under-
-     * prices wide transposes whose planes differ (DT8 on 2-byte records came
-     * out 49% larger than BALANCED's pick). They now price every plane, one
-     * tile each; a single tile per plane is enough to rank a transpose, and
-     * single-segment candidates still pay fewer tiles than BALANCED's four,
+     * The cheap levels (1-4) used to price only a stride of the planes and
+     * charge the rest their average -- which under-prices wide transposes
+     * whose planes differ (DT8 on 2-byte records came out 49% larger than
+     * BALANCED's pick). They now price every plane, one tile each; a single
+     * tile per plane is enough to rank a transpose, and single-segment
+     * candidates still pay fewer tiles than BALANCED's four,
      * which is where the cheap levels' speed comes from. */
     if (!every_plane) {
         step = 1u;
@@ -1435,14 +1439,23 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
 #define ZPSE_LZ_MIN_WIN_DIV 32u
 #endif
 
-/* Minimum output bytes per LZ command at this level's acceleration factor. */
+/* Minimum output bytes per LZ command at this level's acceleration factor.
+ * Levels 1-4 use the cheap factor, 5-6 the balanced one, 7-8 denser, 9 the
+ * deepest (most commands per byte = best ratio, slowest decode). */
 static uint32_t zpse_lz_min_bpc(uint32_t speed)
 {
-    uint32_t accel = (speed == (uint32_t)ZPSE_ENC_MAX)
-                         ? (uint32_t)ZPSE_LZ_ACCEL_MAX
-                         : (speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED)
-                               ? (uint32_t)ZPSE_LZ_ACCEL_BALANCED
-                               : (uint32_t)ZPSE_LZ_ACCEL_CHEAP;
+    uint32_t lvl = zpse_enc_speed(speed);
+    uint32_t accel;
+
+    if (lvl >= 9u) {
+        accel = (uint32_t)ZPSE_LZ_ACCEL_MAX;
+    } else if (lvl >= 7u) {
+        accel = 16u;
+    } else if (lvl >= 5u) {
+        accel = (uint32_t)ZPSE_LZ_ACCEL_BALANCED;
+    } else {
+        accel = (uint32_t)ZPSE_LZ_ACCEL_CHEAP;
+    }
     uint32_t bpc;
 
     if (accel == 0u) {
@@ -1467,20 +1480,19 @@ static uint32_t zpse_lz_min_bpc(uint32_t speed)
 #define ZPSE_LZ_CHEAP_LEVELS 0
 #endif
 
-/* Which levels run the match finder at all: MAX and the default level price
+/* Which levels run the match finder at all: BALANCED and deeper price
  * every block -- the pass is what those levels are for -- and, when
- * ZPSE_LZ_CHEAP_LEVELS is on, the two cheap levels price only the blocks the
+ * ZPSE_LZ_CHEAP_LEVELS is on, the cheap levels price only the blocks the
  * ASCII gate has already convicted of being text, which is the one piece of
  * evidence about the tile family the gate hands back for free. */
 static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
 {
+    uint32_t lvl = zpse_enc_speed(speed);
     (void)ascii_gate;
 #if ZPSE_LZ_CHEAP_LEVELS
-    return speed == (uint32_t)ZPSE_ENC_MAX ||
-           speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED || ascii_gate != 0u;
+    return lvl >= ZPSE_ENC_SPEED_LZ_MIN || ascii_gate != 0u;
 #else
-    return speed == (uint32_t)ZPSE_ENC_MAX ||
-           speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED;
+    return lvl >= ZPSE_ENC_SPEED_LZ_MIN;
 #endif
 }
 
@@ -1546,14 +1558,17 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                 uint8_t tid, uint8_t sc, const uint8_t *mb,
                                 uint16_t meta_len, uint32_t speed)
 {
+    uint32_t lvl = zpse_enc_speed(speed);
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
                       ? n
                       : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
-    uint32_t num = (speed == (uint32_t)ZPSE_ENC_MAX)
+    uint32_t num = (lvl >= 9u)
                        ? (uint32_t)ZPSE_LZ_SCREEN_NUM_MAX
-                       : (speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED)
-                             ? (uint32_t)ZPSE_LZ_SCREEN_NUM_BALANCED
-                             : (uint32_t)ZPSE_LZ_SCREEN_NUM_CHEAP;
+                       : (lvl >= 7u)
+                             ? (uint32_t)ZPSE_LZ_SCREEN_NUM_MAX + 1u
+                             : (lvl >= 5u)
+                                   ? (uint32_t)ZPSE_LZ_SCREEN_NUM_BALANCED
+                                   : (uint32_t)ZPSE_LZ_SCREEN_NUM_CHEAP;
     uint32_t lz_s;
     uint32_t tile_s;
 
@@ -1561,7 +1576,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return 1;
     }
     lz_s = zpse_lz_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                          (speed == (uint32_t)ZPSE_ENC_FASTEST)
+                          lvl == 1u
                               ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
                               : (uint32_t)ZPSE_LZ_HASH_BITS);
     if (lz_s == 0u) {
@@ -1616,8 +1631,7 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
                              cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
-                             (e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
-                                     (uint32_t)ZPSE_ENC_FASTEST
+                             zpse_enc_speed(e->enc_flags) == 1u
                                  ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
                                  : (uint32_t)ZPSE_LZ_HASH_BITS);
     if (payload == 0u) {
@@ -1912,8 +1926,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * seven bits on prose (1.26-5.07:1 on the Silesia text files), and
      * that trial is the point of the level. */
     e->ascii_gate = 0u;
-    if ((e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) !=
-            (uint32_t)ZPSE_ENC_MAX &&
+    if (zpse_enc_speed(e->enc_flags) <= ZPSE_ENC_SPEED_ASCII_GATE_MAX &&
         n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK && zpse_ascii_scan(in, n) &&
         zpse_block_ascii_gate(e, in, n)) {
         e->ascii_gate = 1u;
@@ -2052,11 +2065,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t pn = n < (uint32_t)ZPSE_PROBE_WINDOW
                           ? n
                           : (uint32_t)ZPSE_PROBE_WINDOW;
-        /* ZPSE_ENC_SPEED_BALANCED prices every plane of a candidate, which is
+        /* BALANCED and deeper price every plane of a candidate, which is
          * what ranks a transpose correctly; the cheap levels price a stride
          * of them and fill the rest in (see zpse_block_exact_sum). */
-        int every_plane = (speed != (uint32_t)ZPSE_ENC_FASTER &&
-                           speed != (uint32_t)ZPSE_ENC_FASTEST);
+        int every_plane = zpse_enc_speed(speed) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN;
         int pick = -1;
         int ci;
         int k;
@@ -2333,17 +2345,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             for (m = 0; m < ZPSE_MAX_CAND_META; m++)
                 meta_bufs[pick][m] = tb[m];
         }
-        /* The trials each cheap level is willing to spend. The cheap ranking
-         * is biased (it under-prices the wide transposes), so its runner-up
-         * is worth one trial at FASTER; below that the second opinion is what
-         * costs the time the level exists to save. FASTEST keeps the winner
-         * only -- the setting to reach for when the encoder is the bottleneck
-         * and the stream is not. */
-        if (pick >= 0 && speed == (uint32_t)ZPSE_ENC_FASTEST) {
-            ncand = 1;
-        } else if (pick >= 0 && speed == (uint32_t)ZPSE_ENC_FASTER &&
-                   ncand > 2) {
-            ncand = 2;
+        /* The trials each cheap level is willing to spend. Levels 1-2 keep
+         * the winner only; levels 3-4 allow one runner-up trial; below that
+         * the second opinion is what costs the time the level exists to save.
+         * Level 5+ price every survivor in full. */
+        {
+            uint32_t lvl = zpse_enc_speed(speed);
+            if (pick >= 0 && lvl <= 2u) {
+                ncand = 1;
+            } else if (pick >= 0 && lvl <= 4u && ncand > 2) {
+                ncand = 2;
+            }
         }
     }
 #endif /* !ZPSE_KEEP_EXACT_SWEEP */

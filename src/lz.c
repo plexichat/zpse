@@ -266,8 +266,42 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
  * match repeats the bytes it just wrote. Loads and stores are wider than
  * one byte only when the distance is at least as wide, so no load ever
  * reads a byte the store in front of it has not written yet. */
-static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len)
+/* A short match at a long distance is ONE store.
+ *
+ * Three things have to hold at once for a wide store to replace the copy
+ * plus its byte tail: the width may be no larger than the distance, so the
+ * load cannot read a byte this store has not written; it must be at least
+ * the match length, so one store covers the match; and it must fit in the
+ * output, so the bytes it writes past the match are ones a later command
+ * overwrites instead of ones past the end of the block. The decoder fills
+ * the block from zero upward, so every byte it has not reached yet is
+ * written by a later command: the slack is always reclaimed. (Same slack
+ * argument as lz_copy_literals, which writes past its literal run.)
+ *
+ * What it replaces is the tail: today a ten-byte match at distance 300 is
+ * an eight-byte copy and then two byte moves, each with its own loop
+ * branch -- and on the text corpora that shape is the common one (four
+ * fifths of the matches are under sixteen bytes at a distance over
+ * thirty-two), so the tail is most of the copy. */
+static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
+                          const uint8_t *oend)
 {
+    if (len <= 32u) {
+        uint32_t room = (uint32_t)(oend - dst);
+
+        if (off >= 32u && room >= 32u) {
+            memcpy(dst, dst - off, 32u);
+            return;
+        }
+        if (len <= 16u && off >= 16u && room >= 16u) {
+            memcpy(dst, dst - off, 16u);
+            return;
+        }
+        if (len <= 8u && off >= 8u && room >= 8u) {
+            memcpy(dst, dst - off, 8u);
+            return;
+        }
+    }
     /* A short offset is a repeating pattern, not a slow copy. Copy it once
      * at its own width, which doubles the distance, and repeat: after one
      * pass the last `off` bytes hold two periods, so a copy at twice the
@@ -395,7 +429,7 @@ int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         if (mlen > (uint32_t)(oend - op)) {
             return PSE_BAD_LZ;
         }
-        lz_copy_match(op, off, mlen);
+        lz_copy_match(op, off, mlen, oend);
         op += mlen;
     }
     /* Every literal and every command has to be accounted for: a stream

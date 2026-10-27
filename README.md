@@ -239,8 +239,11 @@ level pays for it in size. What it costs is decode speed, and that is what
 the level's **acceleration factor** decides: an LZ stream decodes at the
 speed of its command loop, one 4-byte command per output run, so its rate
 follows the average run length. Measured over 64 KiB blocks, in bytes per
-command: 5.6 -> 0.6 GB/s (prose), 9 -> 1.2 (JSON), 17 -> 2.9 (var strings),
+command: 5.6 -> 1.6 GB/s (prose), 9 -> 2.2 (JSON), 17 -> 4.1 (var strings),
 64 -> 8.8 (sparse), 246 -> 24 (zeros), against 5-13 GB/s for a tile stream.
+The match copy described below is what keeps the short end of that range from
+costing more than one command per match.
+
 Both levels ship a factor of 12, i.e. a command every 8 output bytes (about
 1 GB/s and up, which is the JSON and log cases above). MAX is the only level
 whose screen is loose enough to reach prose at all, so a factor of 24 there is
@@ -262,6 +265,71 @@ run the match finder at all, so the factor above is theirs only if
 `ZPSE_LZ_CHEAP_LEVELS` is turned on -- which the measurements argue against,
 because FASTEST's text encode would fall from 2.3 GB/s to 390 MB/s, slower
 than the default level it is supposed to be faster than.
+
+### What a match costs
+
+On the text corpora four fifths of the matches are under sixteen bytes at a
+distance over thirty-two, so the copy a match is written with, not the match
+length, sets the rate of the command loop. A ten-byte match at distance 300
+has to cost one store, not a wide copy followed by two byte moves.
+
+A decoder fills its block strictly forward, which is what allows a match to be
+written with **one store**, as long as the store
+covers the match, its width does not exceed the distance (so its load cannot
+reach bytes it has not itself written), and the store stays inside the output.
+The bytes it writes past the match are ones a later command overwrites, so the
+slack is reclaimed rather than leaked -- the same argument `lz_copy_literals`
+already made for literals, applied to the other half of the command.
+
+That is what the run lengths above report: a command costs about the same
+whatever its match length, so prose at 5.6 bytes per command decodes at
+1.6 GB/s, JSON at 2.2, variable strings at 4.1, and the long-run cases at 8.8
+and 24 GB/s, where a match is several stores wide and the copy width, not the
+command, is the cost.
+
+### Sixteen positions at a time
+
+The stride predictors reconstruct a tile by replaying a recurrence: a position
+is its prediction -- the byte one stride back -- unless the mask marks it an
+exception, in which case its residual inverts against that prediction. The
+scalar loop is branchless and unrolled by the stride, but it is still one
+position's work per position -- about twelve uops, three cycles per byte --
+and it is most of the decode cost of every columnar row that depends on it:
+`ts_gapped`, `float_sparse`, `ts_us`, `sorted_near`. Those rows are why the
+decoder reconstructs sixteen positions at a time.
+
+For a stride of two or more, the recurrence is a **shift** of the group's own
+result, and a shift by s bytes of the group in progress concatenated with the
+the sixteen bytes before it is exactly what `alignr` computes. So sixteen
+positions go through one round of
+`v = blend(alignr(v, prev, 16 - s), exception(alignr(v, prev, 16 - s)), mask)`
+repeated `ceil(16 / s)` times: each round finalises one more hop of every
+chain, and since the exception value is a pure function of the prediction, a
+lane written early with a stale prediction is simply rewritten correctly once
+the lane it reads is final. The group's fixed cost is the mask and unit
+gather -- one shuffle turns the sixteen mask bits into a byte blend mask, a
+byte prefix sum over those gives each lane its exclusive exception count, one
+`pshufb` pulls that lane's residual unit out of the sixteen-unit window, and
+the prefix sum's last lane is the exception count that advances the unit
+index, so no popcount is needed.
+
+Stride 1 and stride 8 have vector kernels of their own (one chain, and the
+eight-lane recurrence respectively); strides 2, 3 and 4 take this one. The
+head before the first sixteen positions stays scalar, as does the rest of the
+tile when the unit window would read past the 256-unit array. On the rows that
+depend on it, decode over 64 KiB blocks:
+
+| column | ratio | decode |
+| --- | ---: | ---: |
+| `ts_gapped` (timestamp with gaps) | 2.06:1 | 1.6 GB/s |
+| `float_sparse` (f32 readings) | 2.72:1 | 2.4 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.11:1 | 2.4 GB/s |
+| `sorted_near` | 3.82:1 | 2.9 GB/s |
+| `ts_seq` (i64 µs timestamps) | 5.38:1 | 3.4 GB/s |
+
+The parity, fuzz and least-effort suites report identical digests in the
+default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
+kernel writes exactly the bytes the scalar loop writes.
 
 ### A block that does not compress
 
@@ -440,11 +508,12 @@ full pass. The columnar section shows the sharpest version: on
   high-cardinality text the cheap levels fall back to raw and zstd gets 4.7x,
   while the default and deepest levels get 2.5-3.4x.
 * **The default level trades some decode speed for that ratio.** A block the
-  LZ form wins decodes at 1.0-2.6 GB/s instead of the tile stream's 5-13, so
-  the default level's mean decode over the corpus falls from 14.7 GB/s to
-  13.8 (the deepest level's from 14.9 to 10.6, because it also takes the
-  form on prose). If a caller is decoding-bound, the acceleration factor in
-  `src/block.c` is the one constant to change.
+  LZ form wins decodes at 1.6-4.1 GB/s instead of the tile stream's 5-13, so
+  the default level's mean decode over the corpus sits at about 13.8 GB/s
+  rather than the 14.7 it would be with the form refused (the deepest level's
+  is lower still, because it also takes the form on prose). If a caller is
+  decoding-bound, the acceleration factor in `src/block.c` is the one constant
+  to change.
 * **No column semantics.** A nullable column costs 1.5x what null suppression
   would give it, and nothing in the format knows what a record boundary is.
   The byte transpose recovers the split for fixed-width records by accident;

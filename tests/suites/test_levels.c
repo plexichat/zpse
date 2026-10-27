@@ -52,11 +52,15 @@ static long checks = 0;
     }                                               \
 } while (0)
 
-static const uint32_t levels[4] = {
-    ZPSE_ENC_FASTEST, ZPSE_ENC_FASTER,
-    ZPSE_ENC_SPEED_BALANCED, ZPSE_ENC_MAX
+static const uint32_t levels[9] = {
+    ZPSE_ENC_SPEED_FASTEST, ZPSE_ENC_SPEED_L2,
+    ZPSE_ENC_SPEED_FASTER, ZPSE_ENC_SPEED_L4,
+    ZPSE_ENC_SPEED_BALANCED, ZPSE_ENC_SPEED_L6,
+    ZPSE_ENC_SPEED_L7, ZPSE_ENC_SPEED_L8,
+    ZPSE_ENC_SPEED_MAX
 };
-static const char *const names[4] = {"fastest", "faster", "balanced", "max"};
+static const char *const names[9] = {"fastest", "2", "faster", "4",
+                                     "balanced", "6", "7", "8", "max"};
 
 static double now_ns(void)
 {
@@ -71,14 +75,14 @@ int main(void)
     unsigned li;
 
     for (kind = 0; kind < (int)ZPSE_COL_KINDS; kind++) {
-        uint32_t sizes[4];
-        double times[4];
+        uint32_t sizes[9];
+        double times[9];
         ZpseColGen g;
 
         zpse_col_gen_init(&g, kind);
         zpse_col_gen_fill(&g, in, sizeof in);
 
-        for (li = 0; li < 4u; li++) {
+            for (li = 0; li < 9u; li++) {
             uint32_t cl = 0u;
             uint32_t ol = 0u;
             double best = 1e18;
@@ -119,7 +123,7 @@ int main(void)
 
         /* The sizes do not increase from the fastest level to the
          * deepest. */
-        for (li = 1u; li < 4u; li++) {
+        for (li = 1u; li < 9u; li++) {
             CHECK(sizes[li] <= sizes[li - 1u],
                   "%s: the %s level writes %u bytes, the %s level %u",
                   zpse_col_names[kind], names[li], sizes[li], names[li - 1u],
@@ -127,14 +131,14 @@ int main(void)
         }
         /* The deepest level never writes a block larger than the
          * balanced one. */
-        CHECK(sizes[3] <= sizes[2], "%s: the deepest level writes %u bytes, "
-              "the balanced level %u", zpse_col_names[kind], sizes[3],
-              sizes[2]);
+        CHECK(sizes[8] <= sizes[4], "%s: the deepest level writes %u bytes, "
+              "the balanced level %u", zpse_col_names[kind], sizes[8],
+              sizes[4]);
         /* And the levels are ordered in time the same way they are in
          * size. The fastest level is not allowed to be the slowest. */
-        CHECK(times[0] <= times[2] * 4.0,
+        CHECK(times[0] <= times[4] * 4.0,
               "%s: the fastest level takes %.0f ns, the balanced level "
-              "%.0f ns", zpse_col_names[kind], times[0], times[2]);
+              "%.0f ns", zpse_col_names[kind], times[0], times[4]);
     }
 
     if (failures != 0) {
