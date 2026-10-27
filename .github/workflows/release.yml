@@ -1,0 +1,39 @@
+name: Automated Release Creator
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip
+
+      - name: Build binaries
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+            tests/tools/zpse_cli.c src/zpse_unity.c -o zpse_cli_linux
+          cc -std=c11 -O2 -DNDEBUG -Iinclude tests/tools/zpse_cli.c src/zpse_unity.c \
+            -o zpse_cli_linux_fast
+
+      - name: Generate GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            zpse_cli_linux
+            zpse_cli_linux_fast

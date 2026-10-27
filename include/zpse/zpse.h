@@ -1,12 +1,17 @@
 #ifndef ZPSE_H
 #define ZPSE_H
 
-/* zpse umbrella header — PSE Block Format v1.0.0. */
+/* zpse umbrella header — public API, status codes, version.
 
-#define ZPSE_VERSION_MAJOR 1
-#define ZPSE_VERSION_MINOR 0
-#define ZPSE_VERSION_PATCH 0
-#define ZPSE_VERSION_STRING "1.0.0"
+ * Library version: [stage].[major].[minor]-[build]
+ * stage: a = alpha, b = beta, c = candidate, r = release
+ * Current: a.1.0-1 (alpha, major 1, minor 0, build 1). */
+#define ZPSE_VERSION_STAGE      'a'
+#define ZPSE_VERSION_MAJOR      1
+#define ZPSE_VERSION_MINOR      0
+#define ZPSE_VERSION_PATCH      0
+#define ZPSE_VERSION_BUILD      1
+#define ZPSE_VERSION_STRING     "a.1.0-1"
 
 #include "status.h"
 #include "constants.h"

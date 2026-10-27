@@ -34,21 +34,28 @@ and is tested that way.
 ## Performance
 
 One core, 64 KiB blocks, the library linked directly into the benchmark
-(`tests/benchmarks/bench.c`), best of six runs. This is a Ryzen 5 5600X under
+(`tests/benchmarks/bench.c`), best of five runs. This is a Ryzen 5 5600X under
 WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 
 | pattern | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| `zeros` | 0.004 | 43 900 | **74 600** |
-| `const5A` | 0.004 | 44 100 | **74 600** |
-| `random` | 1.000 | 4 650 | **66 400** |
-| `lowentropy` (4-bit alphabet) | 0.508 | 2 500 | 47 300 |
-| `incr` (0..255 ramp) | 0.040 | 8 200 | 17 100 |
-| `strided` | 0.040 | 4 360 | 16 400 |
-| `alt00FF` | 0.009 | 9 420 | 19 300 |
-| `sparse2` | 0.019 | 5 820 | 16 000 |
-| `sparse` (1 byte per 97) | 0.060 | 2 350 | 15 100 |
-| `sawtooth` | 0.116 | 3 840 | 11 200 |
+| `zeros` | 0.004 | 19 800 | **74 500** |
+| `const5A` | 0.004 | 19 800 | **74 000** |
+| `random` | 1.000 | 1 020 | **65 900** |
+| `lowentropy` (4-bit alphabet) | 0.508 | 210 | 45 900 |
+| `incr` (0..255 ramp) | 0.040 | 2 020 | 16 800 |
+| `strided` | 0.040 | 840 | 16 800 |
+| `alt00FF` | 0.004 | 8 960 | 22 700 |
+| `sparse2` | 0.018 | 1 090 | 12 500 |
+| `sparse` (1 byte per 97) | 0.030 | 240 | 21 200 |
+| `sawtooth` | 0.041 | 720 | 7 900 |
+
+The encode column is the default level (5), which prices every plane of every
+candidate and also offers the intra-block LZ form. On these patterns the price
+buys the ratios and the finder finds nothing, so the sweep is most of the
+encode: the one-value rows encode at 20 GB/s here and 37 at level 9, which
+skips the ASCII gate, against 74 GB/s to decode them. Decode is the same at
+every level, because the shapes written are.
 
 What the rows are: `zeros`/`const5A` are one-byte-value blocks (coded in
 248 bytes), `random` is incompressible (coded as a raw block, so decode is
@@ -68,7 +75,7 @@ ceiling. Everything else is transform- and tile-bound, not memory-bound.
 * In-process only. `tests/benchmarks/bench_vs.sh` measures other tools by
   running their command-line programs; those numbers include process startup
   and file I/O, so none of them appear here. The table above is a library call
-  over the same buffer, best of six, single thread.
+  over the same buffer, best of five, single thread.
 * The host has two performance states — its `memcpy` ceiling wanders between
   57 000 and 66 000 MB/s depending on thermal state — so run-to-run spread on
   a busy row is around ±10%. Any comparison worth trusting here was done as
@@ -214,15 +221,15 @@ ratio -- and all nine were measured in one binary over the columnar corpus
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.50 GB/s | 14.4 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
-| 2 | 3.99:1 | 1.50 GB/s | 14.5 GB/s | same as level 1 |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.15 GB/s | 14.8 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
-| 4 | 4.06:1 | 1.16 GB/s | 14.9 GB/s | same as level 3 |
-| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.45:1 | 720 MB/s | 14.2 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
-| 6 | 4.45:1 | 716 MB/s | 14.3 GB/s | same as level 5 |
-| 7 | 4.50:1 | 640 MB/s | 11.9 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
-| 8 | 4.50:1 | 634 MB/s | 11.9 GB/s | same as level 7 |
-| 9 `ZPSE_ENC_SPEED_MAX` | 4.51:1 | 581 MB/s | 11.4 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.54 GB/s | 16.0 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
+| 2 | 3.99:1 | 1.53 GB/s | 16.0 GB/s | same as level 1 |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.18 GB/s | 16.8 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
+| 4 | 4.06:1 | 1.18 GB/s | 16.8 GB/s | same as level 3 |
+| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.45:1 | 729 MB/s | 15.8 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
+| 6 | 4.45:1 | 729 MB/s | 15.7 GB/s | same as level 5 |
+| 7 | 4.50:1 | 641 MB/s | 13.2 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
+| 8 | 4.50:1 | 643 MB/s | 13.3 GB/s | same as level 7 |
+| 9 `ZPSE_ENC_SPEED_MAX` | 4.51:1 | 589 MB/s | 12.6 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
 
 Levels 5 to 9 are the ones to reach for when bytes matter more than the
 clock, and the intra-block LZ form is what they buy. Its match finder is a
@@ -248,7 +255,7 @@ level pays for it in size. What it costs is decode speed, and that is what
 the level's **acceleration factor** decides: an LZ stream decodes at the
 speed of its command loop, one 4-byte command per output run, so its rate
 follows the average run length. Measured over 64 KiB blocks, in bytes per
-command: 5.6 -> 1.6 GB/s (prose), 9 -> 2.2 (JSON), 17 -> 4.1 (var strings),
+command: 5.6 -> 1.6 GB/s (prose), 9 -> 2.2 (JSON), 17 -> 4.0 (var strings),
 64 -> 8.8 (sparse), 246 -> 24 (zeros), against 5-13 GB/s for a tile stream.
 The match copy described below is what keeps the short end of that range from
 costing more than one command per match.
@@ -292,7 +299,7 @@ already made for literals, applied to the other half of the command.
 
 That is what the run lengths above report: a command costs about the same
 whatever its match length, so prose at 5.6 bytes per command decodes at
-1.6 GB/s, JSON at 2.2, variable strings at 4.1, and the long-run cases at 8.8
+1.6 GB/s, JSON at 2.2, variable strings at 4.0, and the long-run cases at 8.8
 and 24 GB/s, where a match is several stores wide and the copy width, not the
 command, is the cost.
 
@@ -330,11 +337,11 @@ depend on it, decode over 64 KiB blocks:
 
 | column | ratio | decode |
 | --- | ---: | ---: |
-| `ts_gapped` (timestamp with gaps) | 2.06:1 | 1.6 GB/s |
-| `float_sparse` (f32 readings) | 2.72:1 | 2.4 GB/s |
-| `ts_us` (i64 µs timestamps) | 5.11:1 | 2.4 GB/s |
-| `sorted_near` | 3.82:1 | 2.9 GB/s |
-| `ts_seq` (i64 µs timestamps) | 5.38:1 | 3.4 GB/s |
+| `ts_gapped` (timestamp with gaps) | 2.06:1 | 1.7 GB/s |
+| `float_sparse` (f32 readings) | 2.72:1 | 2.6 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.11:1 | 2.5 GB/s |
+| `sorted_near` | 3.82:1 | 3.2 GB/s |
+| `ts_seq` (i64 µs timestamps) | 5.38:1 | 3.6 GB/s |
 
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
@@ -517,9 +524,9 @@ costs nothing however slow its classify is.
   text the cheap levels fall back to raw and zstd gets 4.7x, while levels 5-9
   get 2.5-3.4x.
 * **The default level trades some decode speed for that ratio.** A block the
-  LZ form wins decodes at 1.6-4.1 GB/s instead of the tile stream's 5-13, so
-  the default level's mean decode over the corpus is about 14.2 GB/s rather
-  than the 14.9 of level 4, which refuses the form (level 9's is 11.4, because
+  LZ form wins decodes at 1.6-4.0 GB/s instead of the tile stream's 5-13, so
+  the default level's mean decode over the corpus is about 15.8 GB/s rather
+  than the 16.8 of level 4, which refuses the form (level 9's is 12.6, because
   it also takes the form on prose). If a caller is decoding-bound, the
   acceleration factor in `src/block.c` is the one constant to change.
 * **No column semantics.** A nullable column costs 1.5x what null suppression

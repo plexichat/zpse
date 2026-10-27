@@ -2054,7 +2054,10 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     }
 
     default: { /* TILE_FAM_ORDER2 */
-        uint8_t *tab = lanes->o2;
+        uint8_t *tab;
+
+        zpse_lane_o2_use(lanes);
+        tab = lanes->o2;
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint8_t last = lanes->last[lane];
@@ -4722,7 +4725,10 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
             o1[lane * 256u + (size_t)last] = x;
         }
     } else {
-        uint8_t *tab = lanes->o2;
+        uint8_t *tab;
+
+        zpse_lane_o2_use(lanes);
+        tab = lanes->o2;
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint8_t last = lanes->last[lane];

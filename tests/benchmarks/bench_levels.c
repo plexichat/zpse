@@ -33,6 +33,11 @@
 
 #include "../corpus/columnar_gen.h"
 
+#if defined(__linux__)
+#include <sys/utsname.h>
+#include <unistd.h>
+#endif
+
 #define CHUNK (65536u)
 #define CORPUS_BYTES ((size_t)CHUNK * 64u) /* 4 MiB per case, fixed */
 #define NCHUNK (CORPUS_BYTES / CHUNK)
@@ -67,6 +72,56 @@ static void fmt_rate(char *b, size_t n, double mb_s)
 {
     if (mb_s >= 1000.0) snprintf(b, n, "%.2f GB/s", mb_s / 1000.0);
     else snprintf(b, n, "%.0f MB/s", mb_s);
+}
+
+static void print_host(void)
+{
+#if defined(__linux__)
+    FILE *f;
+    char line[512], model[256] = "n/a", mhz[64] = "n/a";
+    char flags[256] = "n/a";
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGESIZE);
+    struct utsname u;
+    char os[512] = "n/a";
+
+    if (uname(&u) == 0)
+        snprintf(os, sizeof os, "%s %s %s %s", u.sysname, u.release, u.version, u.machine);
+    f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "model name", 10) && model[0] == 'n') {
+                char *p = strchr(line, ':');
+                if (p) { snprintf(model, sizeof model, "%s", p + 2); model[strcspn(model, "\n")] = 0; }
+            } else if (!strncmp(line, "cpu MHz", 7) && mhz[0] == 'n') {
+                char *p = strchr(line, ':');
+                if (p) { snprintf(mhz, sizeof mhz, "%s MHz", p + 2); mhz[strcspn(mhz, "\n")] = 0; }
+            } else if (!strncmp(line, "flags", 5) && flags[0] == 'n') {
+                char *p = strchr(line, ':');
+                if (p) { snprintf(flags, sizeof flags, "%.200s...", p + 2); flags[strcspn(flags, "\n")] = 0; }
+            }
+            if (model[0] != 'n' && mhz[0] != 'n' && flags[0] != 'n')
+                break;
+        }
+        fclose(f);
+    }
+    printf("host: os=%s\n", os);
+    printf("host: cpu=%s\n", model);
+    printf("host: cpus=%ld\n", ncpu > 0 ? ncpu : -1L);
+    if (pages > 0 && psize > 0)
+        printf("host: ram=%.1f GiB\n", (double)pages * (double)psize / 1073741824.0);
+    else
+        printf("host: ram=n/a\n");
+    printf("host: mhz=%s\n", mhz);
+    printf("host: flags=%s\n", flags);
+#if defined(__VERSION__)
+    printf("host: cc=%s\n", __VERSION__);
+#else
+    printf("host: cc=n/a\n");
+#endif
+#else
+    printf("host: n/a (non-Linux)\n");
+#endif
 }
 
 /* Total encoded size of the corpus under zpse at one level, block by
@@ -571,6 +626,7 @@ int main(int argc, char **argv)
            "blocks, single core, best-of-%d reps\n",
            (unsigned)NCHUNK, reps);
     printf("levels: 1=FASTEST 2 3=FASTER 4 5=BALANCED 6 7=TIGHTER 8 9=MAX\n");
+    print_host();
 
     for (ci = 0; ci < (int)(sizeof cases / sizeof cases[0]); ci++)
         report_levels(ci, iters, reps);

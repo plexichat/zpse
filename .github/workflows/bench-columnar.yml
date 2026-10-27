@@ -104,14 +104,3 @@ jobs:
             echo
             cat /tmp/colref.txt
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bench-columnar
-          path: |
-            /tmp/benchcol.txt
-            /tmp/benchcol-16k.txt
-            /tmp/benchcol-stats.txt
-            /tmp/benchcol-levels.txt
-            /tmp/colref.txt
-          if-no-files-found: error
-          retention-days: 90

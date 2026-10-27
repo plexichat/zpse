@@ -1,0 +1,56 @@
+# Differential fuzzing: 10 minutes per commit, every push.
+#
+# Builds tests/suites/test_fuzz.c (randomized differential corpus over
+# thousands of shapes and sizes, three build variants: default, scalar,
+# and trial-swap) and runs it for up to 10 minutes. The fuzzer prints a
+# deterministic FNV-1a digest -- identical on every run and platform --
+# so a run that reports the same digest as the previous one proves no
+# regression; a different digest with zero failures means the encoder
+# still round-trips every input but the bit layout changed (expected
+# only when the format intentionally changed).
+#
+# Informational: a timeout or a non-zero exit does not fail the build.
+name: fuzz
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the fuzzer (three variants)
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude \
+            tests/suites/test_fuzz.c src/zpse_unity.c -o /tmp/fuzz_default
+          cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_SCALAR \
+            -Iinclude tests/suites/test_fuzz.c src/zpse_unity.c \
+            -o /tmp/fuzz_scalar
+          cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_TRIAL_SWAP \
+            -Iinclude tests/suites/test_fuzz.c src/zpse_unity.c \
+            -o /tmp/fuzz_trialswap
+      - name: Run 10 minutes of fuzzing
+        run: |
+          timeout 10m /tmp/fuzz_default | tee /tmp/fuzz_default.txt
+          timeout 10m /tmp/fuzz_scalar | tee /tmp/fuzz_scalar.txt
+          timeout 10m /tmp/fuzz_trialswap | tee /tmp/fuzz_trialswap.txt
+          {
+            echo '### fuzz: 10 minutes per variant, every commit'
+            echo
+            echo 'test_fuzz.c attacks the encoder round-trip invariant over'
+            echo 'thousands of shapes and sizes instead of dozens. Each'
+            echo 'variant prints a deterministic FNV-1a digest -- identical'
+            echo 'digest across runs proves no bit-layout regression; zero'
+            echo 'failures proves every input round-trips.'
+            echo
+            echo '#### default (runtime SIMD dispatch)'
+            echo '```'; cat /tmp/fuzz_default.txt; echo '```'
+            echo
+            echo '#### scalar (-DZPSE_FORCE_SCALAR)'
+            echo '```'; cat /tmp/fuzz_scalar.txt; echo '```'
+            echo
+            echo '#### trial-swap (-DZPSE_FORCE_TRIAL_SWAP)'
+            echo '```'; cat /tmp/fuzz_trialswap.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

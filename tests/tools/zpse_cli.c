@@ -611,8 +611,13 @@ int main(int argc, char **argv)
     if (argc < 2) {
         fprintf(stderr, "usage: zpse_cli c [opts] IN OUT\n"
                         "       zpse_cli d IN OUT\n"
-                        "       zpse_cli bench [opts] FILE...\n");
+                        "       zpse_cli bench [opts] FILE...\n"
+                        "       zpse_cli --version\n");
         return 2;
+    }
+    if (strcmp(argv[1], "--version") == 0) {
+        printf("zpse %s\n", ZPSE_VERSION_STRING);
+        return 0;
     }
     if (strcmp(argv[1], "bench") == 0) {
         return cmd_bench(argc, argv);

@@ -1,0 +1,67 @@
+# Nightly fuzzing: 4 hours, does not restart from scratch each time.
+#
+# Runs tests/suites/test_fuzz.c for up to 4 hours on a nightly schedule.
+# The fuzzer's final PRNG seed is saved as an artifact; the next nightly
+# run downloads it and passes it as the starting seed, so fuzzing
+# continues from where the previous night left off instead of repeating
+# the same cases.
+#
+# Informational: does not fail the build. Results land in the job
+# summary and as an artifact for the aggregate job.
+name: bench-nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC every day
+  workflow_dispatch:
+
+jobs:
+  fuzz-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore previous seed (continue, don't restart)
+        id: restore
+        run: |
+          if [ -f /tmp/fuzz_seed.txt ]; then
+            echo "seed=$(cat /tmp/fuzz_seed.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "seed=0x2468ACE0" >> "$GITHUB_OUTPUT"
+          fi
+        continue-on-error: true
+      - name: Download previous seed artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fuzz-nightly-seed
+          path: /tmp
+        continue-on-error: true
+      - name: Build the fuzzer
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude \
+            tests/suites/test_fuzz.c src/zpse_unity.c -o /tmp/fuzz_nightly
+      - name: Run 4 hours of fuzzing
+        run: |
+          SEED="${{ steps.restore.outputs.seed }}"
+          timeout 4h /tmp/fuzz_nightly "$SEED" | tee /tmp/fuzz_nightly.txt
+          # Save the final seed so the next nightly continues from here
+          SEED_END=$(grep -oP 'seed=\K[0-9A-Fa-f]+' /tmp/fuzz_nightly.txt | tail -1)
+          echo -n "$SEED_END" > /tmp/fuzz_seed.txt
+          cat /tmp/fuzz_seed.txt
+      - name: Save seed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-nightly-seed
+          path: /tmp/fuzz_seed.txt
+          retention-days: 30
+      - name: Report
+        run: |
+          {
+            echo '### nightly fuzz: 4 hours, stateful (continues from previous seed)'
+            echo
+            echo 'test_fuzz.c differential fuzzer runs for 4 hours every night.'
+            echo 'The PRNG seed is saved after each run and passed as the'
+            echo 'starting seed on the next night, so coverage accumulates'
+            echo 'instead of repeating the same cases.'
+            echo
+            echo '```'; cat /tmp/fuzz_nightly.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

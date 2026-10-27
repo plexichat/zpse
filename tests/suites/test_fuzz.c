@@ -23,6 +23,7 @@
  * sizeof-derived counts. Exit 0 = every round trip passed.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "zpse/zpse.h"
 
@@ -276,8 +277,14 @@ static void fill(uint32_t shape, uint32_t n)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* Optional starting PRNG seed, for the nightly job that must not
+     * restart from scratch each time. Pass the seed saved by the previous
+     * nightly run and fuzzing continues from where it left off. */
+    if (argc > 1) {
+        rs = (uint32_t)strtoul(argv[1], NULL, 0);
+    }
     /* Size spread: every size up to 64, the tile/segment boundaries, a
      * spread of larger powers of two with their neighbours, and
      * pseudorandom sizes across the whole legal range. */
@@ -400,8 +407,8 @@ int main(void)
         }
     }
 
-    printf("FUZZ cases=%u frames=%u digest=%016llX\n", (unsigned)cases,
-           (unsigned)frames, (unsigned long long)dig);
+    printf("FUZZ cases=%u frames=%u digest=%016llX seed=%08X\n",
+           (unsigned)cases, (unsigned)frames, (unsigned long long)dig, rs);
     if (fails == 0) {
         printf("FUZZ: ALL OK\n");
     } else {

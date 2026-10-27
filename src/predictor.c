@@ -69,10 +69,10 @@ void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
     } else if (predictor_id == (uint8_t)ZPSE_P_ORDER2) {
         /* Nothing to seed. An entry is learned only if its generation is
          * the tile's, and the tile's generation advances every tile, so
-         * no entry can be mistaken for one this tile wrote. The wipe
-         * that used to be here -- 64 KiB of memset, a third of the
-         * classify -- is gone; the table is wiped once per trial
-         * instead, where the generation restarts. */
+         * no entry can be mistaken for one this tile wrote. The table is
+         * wiped once per block or trial, where the generation restarts,
+         * and only if that block or trial reaches ORDER2 at all -- see
+         * zpse_lane_o2_use. */
     }
 }
 
@@ -158,7 +158,10 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
         if (s->o2 == NULL) {
             return PSE_BAD_ARG;
         }
-        zpse_lane_o2_use(s);
+        /* The table is prepared here, not mutated: predicting never changes
+         * the histories, which is what the const says, but the table has to
+         * be clean before it is read. */
+        zpse_lane_o2_use((ZpseLaneState *)(void *)s);
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint16_t idx = zpse_order2_index(s->second_last[lane],
