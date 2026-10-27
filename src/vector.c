@@ -1,6 +1,7 @@
 #include "zpse/vector.h"
 #include "zpse/status.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 /* Unity-build safe: no globals, no allocation, helpers are `static`.
@@ -79,13 +80,14 @@ uint32_t zpse_cpu_caps(void)
      * question than on the code it selects -- the AVX2 classify path was
      * 17x slower than the scalar one for exactly this reason. The answer
      * cannot change while the process runs, so compute it once and cache
-     * it; the computation is idempotent and a racing thread can at worst
-     * repeat it. */
-    static uint32_t cached = 0xFFFFFFFFu; /* sentinel: not yet computed */
+     * it; the computation is idempotent. Atomic cache makes concurrent
+     * first-call safe (all threads compute the same value). */
+    static _Atomic uint32_t cached = 0xFFFFFFFFu; /* sentinel: not yet computed */
     uint32_t caps;
 
-    if (cached != 0xFFFFFFFFu) {
-        return cached;
+    caps = (uint32_t)atomic_load_explicit(&cached, memory_order_relaxed);
+    if (caps != 0xFFFFFFFFu) {
+        return caps;
     }
     caps = 0;
 
@@ -168,7 +170,7 @@ uint32_t zpse_cpu_caps(void)
 #endif
 #endif
 
-    cached = caps;
+    atomic_store_explicit(&cached, caps, memory_order_relaxed);
     return caps;
 #endif /* ZPSE_FORCE_SCALAR */
 }

@@ -9,6 +9,9 @@
 
 static void zpse_mask_set_at(uint32_t words[8], uint16_t pos)
 {
+    if (pos >= 256u) {
+        return; /* words[] has 8 entries = 256 bits; pos must be < nt <= 256 */
+    }
     words[pos >> 5] |= (uint32_t)1u << (pos & 31u);
 }
 

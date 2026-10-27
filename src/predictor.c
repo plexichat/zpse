@@ -106,7 +106,7 @@ static uint32_t zpse_stride_of(uint8_t predictor_id)
     }
 }
 
-int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
+int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
                        uint8_t constant_C, const uint8_t *seg_base,
                        uint32_t seg_pos, uint8_t initial_literal,
                        uint8_t *pred_out, uint16_t nt)
@@ -158,10 +158,10 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
         if (s->o2 == NULL) {
             return PSE_BAD_ARG;
         }
-        /* The table is prepared here, not mutated: predicting never changes
-         * the histories, which is what the const says, but the table has to
-         * be clean before it is read. */
-        zpse_lane_o2_use((ZpseLaneState *)(void *)s);
+        /* Predicting O2 prepares the table (memset + generation bump) so
+         * the lane state must be mutable. The caller passes a non-const
+         * lane for this predictor family. */
+        zpse_lane_o2_use(s);
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint16_t idx = zpse_order2_index(s->second_last[lane],

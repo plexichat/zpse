@@ -3464,8 +3464,15 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * for `tmp`; the overflow decision stays where it was, on the
          * final record size below. With two candidates the second one
          * still needs somewhere to be packed before the sizes are
-         * compared, so that case keeps the staging buffer. */
-        direct = (ncand == 1u && payload_cap - pos - 2u >= tmp_cap) ? 1 : 0;
+         * compared, so that case keeps the staging buffer.
+         *
+         * `payload_cap - pos` must be >= 2u before subtracting the 2-byte
+         * length prefix; otherwise `payload_cap - pos - 2u` underflows
+         * and hands the packer a huge capacity, causing an OOB write. */
+        {
+            uint32_t room = payload_cap - pos;
+            direct = (ncand == 1u && room >= 2u && room - 2u >= tmp_cap) ? 1 : 0;
+        }
         wout = direct ? (payload_out + pos + 2u) : tmp;
         wcap = direct ? (payload_cap - pos - 2u) : tmp_cap;
 

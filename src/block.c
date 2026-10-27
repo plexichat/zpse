@@ -1963,12 +1963,22 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * The gate never fires on data that compresses: a constant or periodic
      * ASCII plane prices at its own floor, far below seven bits a byte, so
      * the sample does not convict and the block keeps the sweep it has
-     * always had. Only MAX opts out -- it has the LZ form, which beats
-     * seven bits on prose (1.26-5.07:1 on the Silesia text files), and
-     * that trial is the point of the level. */
+     * always had.
+     *
+     * Every level gates, MAX included. MAX used to opt out on the argument
+     * that it has the LZ form, which beats seven bits on prose, and that
+     * the trial is the point of the level -- but the gate does not compete
+     * with that trial: it decides only what the TILE side of a block costs
+     * (one pack of the seven-bit form instead of a priced sweep), and
+     * zpse_block_lz_level reads the level, not e->ascii_gate, so MAX still
+     * runs the match finder and its stream still replaces the gated one
+     * when it is smaller (see the candidate below). Opting out therefore
+     * bought no ratio and cost the sweep on every convicted block: measured
+     * at MAX, text_en 88 -> 294 MB/s, json_rows 101 -> 407, var_string 91 ->
+     * 410 on 4 MiB blocks, with the streams identical -- and identical too
+     * over the 779-case size corpus at levels 5, 7, 8 and 9. */
     e->ascii_gate = 0u;
-    if (zpse_enc_speed(e->enc_flags) <= ZPSE_ENC_SPEED_ASCII_GATE_MAX &&
-        n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK &&
+    if (n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK &&
         !zpse_block_head_one_value(
             in, (n < (uint32_t)ZPSE_ASCII_SAMPLE) ? n
                                                   : (uint32_t)ZPSE_ASCII_SAMPLE) &&
@@ -2668,9 +2678,29 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             uint32_t lz_cmds = 0u;
             uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
 
+            /* Cap the pass at the size it could still win at. `lz_wins`
+             * keeps the form only when its total is smaller than the
+             * winner's by ZPSE_LZ_MIN_WIN_DIV, so a payload that reaches
+             * that cap is one the sweep would reject anyway -- and a stream
+             * only grows as it is written, so stopping there cannot change
+             * the verdict, only the time spent reaching it. This is the
+             * whole of the win on the blocks where the form LOSES after
+             * its screen accepted it (the screen samples 1 KiB and can be
+             * wrong about the block): measured on the level-5 corpus,
+             * uuid_mix 254 -> 289 MB/s (+13.7%) and json_rows +1.1%, every
+             * stream unchanged. */
+            uint32_t lz_cap = (uint32_t)ZPSE_E_SZ_CAND;
+
+            if (have_best && best_total < (uint32_t)ZPSE_E_SZ_CAND) {
+                uint32_t win = best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV +
+                               1u;
+
+                if (best_total > win) {
+                    lz_cap = best_total - win;
+                }
+            }
             rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                   (uint32_t)ZPSE_E_SZ_CAND, &lz_total,
-                                   &lz_cmds);
+                                   lz_cap, &lz_total, &lz_cmds);
             /* Smaller is not enough: the two forms decode at speeds that
              * have nothing to do with their ratio, so the win also has to be
              * big enough to pay for the decode it gives up and the command

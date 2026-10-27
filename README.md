@@ -231,19 +231,20 @@ a neighbour. No level changes the format: every level's stream is read by the
 same decoder, and a level only decides which shape gets written. The levels
 are adjacent rungs, not aliases -- each one costs encode time and returns
 ratio -- and all nine were measured in one binary over the columnar corpus
-(25 cases, 4 MiB each, 64 KiB blocks):
+(25 cases, 4 MiB each, 64 KiB blocks, best of three runs of the whole matrix
+on one host, `tests/benchmarks/bench_levels.c`):
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.54 GB/s | 16.0 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
-| 2 | 3.99:1 | 1.53 GB/s | 16.0 GB/s | same as level 1 |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.18 GB/s | 16.8 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
-| 4 | 4.06:1 | 1.18 GB/s | 16.8 GB/s | same as level 3 |
-| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.45:1 | 729 MB/s | 15.8 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
-| 6 | 4.45:1 | 729 MB/s | 15.7 GB/s | same as level 5 |
-| 7 | 4.50:1 | 641 MB/s | 13.2 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
-| 8 | 4.50:1 | 643 MB/s | 13.3 GB/s | same as level 7 |
-| 9 `ZPSE_ENC_SPEED_MAX` | 4.51:1 | 589 MB/s | 12.6 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.43 GB/s | 14.1 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
+| 2 | 3.99:1 | 1.44 GB/s | 14.1 GB/s | same as level 1 |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.09 GB/s | 14.3 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
+| 4 | 4.06:1 | 1.11 GB/s | 14.8 GB/s | same as level 3 |
+| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.49:1 | 669 MB/s | 12.1 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
+| 6 | 4.49:1 | 661 MB/s | 12.4 GB/s | same as level 5 |
+| 7 | 4.51:1 | 600 MB/s | 11.9 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
+| 8 | 4.51:1 | 600 MB/s | 12.5 GB/s | same as level 7 |
+| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 586 MB/s | 10.9 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
 
 Levels 5 to 9 are the ones to reach for when bytes matter more than the
 clock, and the intra-block LZ form is what they buy. Its match finder is a
@@ -261,12 +262,14 @@ difference between raw and compression:
 | `json_rows` | 1.09:1 -> 2.05:1 | 1.09:1 -> 2.05:1 |
 | `log_lines` | 1.09:1 -> 2.63:1 | 1.09:1 -> 2.63:1 |
 | `var_string` | 1.09:1 -> 2.52:1 | 1.09:1 -> 2.52:1 |
-| `utf8_multi` | 1.00:1 | 1.00:1 -> 1.95:1 |
+| `utf8_multi` | 1.00:1 -> 1.64:1 | 1.00:1 -> 2.00:1 |
 | `text_en` | 1.09:1 | 1.09:1 -> 1.33:1 |
 
 The form is kept only when it is smaller than the best tile stream, so no
-level pays for it in size. What it costs is decode speed, and that is what
-the level's **acceleration factor** decides: an LZ stream decodes at the
+level pays for it in size, and no level gives up the trial to save time: the
+ASCII gate below replaces the tile-side sweep, not the match finder, which is
+offered afterwards whatever the gate decided. What the form costs is decode
+speed, and that is what the level's **acceleration factor** decides: an LZ stream decodes at the
 speed of its command loop, one 4-byte command per output run, so its rate
 follows the average run length. Measured over 64 KiB blocks, in bytes per
 command: 5.6 -> 1.6 GB/s (prose), 9 -> 2.2 (JSON), 17 -> 4.0 (var strings),
@@ -539,8 +542,8 @@ costs nothing however slow its classify is.
   get 2.5-3.4x.
 * **The default level trades some decode speed for that ratio.** A block the
   LZ form wins decodes at 1.6-4.0 GB/s instead of the tile stream's 5-13, so
-  the default level's mean decode over the corpus is about 15.8 GB/s rather
-  than the 16.8 of level 4, which refuses the form (level 9's is 12.6, because
+  the default level's mean decode over the corpus is about 12.1 GB/s rather
+  than the 14.8 of level 4, which refuses the form (level 9's is 10.9, because
   it also takes the form on prose). If a caller is decoding-bound, the
   acceleration factor in `src/block.c` is the one constant to change.
 * **No column semantics.** A nullable column costs 1.5x what null suppression

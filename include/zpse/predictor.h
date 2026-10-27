@@ -102,7 +102,7 @@ static inline uint16_t zpse_order2_index(uint8_t second_last, uint8_t last) {
  * bytes are already final). Stateful predictors (1-4, 10) require the
  * online predict/update loop in tile.c for tile reconstruction; do NOT
  * use this as a tile reference generator for those IDs. */
-int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
+int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
                        uint8_t constant_C, const uint8_t *seg_base,
                        uint32_t seg_pos, uint8_t initial_literal,
                        uint8_t *pred_out, uint16_t nt);

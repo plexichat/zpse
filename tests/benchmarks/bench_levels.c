@@ -10,6 +10,15 @@
  * block than a mid level on structured data -- sizes are not guaranteed
  * to descend from 1 to 9; that is a feature of the fast tier.
  *
+ * The level is an encoder option, not a plain number: it lives in bits
+ * 1-4 of the ZPSE_ENC_* word, so level N is passed as N <<
+ * ZPSE_ENC_SPEED_SHIFT (2, 4, ... 18). Passing N itself would set the
+ * CHECKSUM bit on every odd row and shift every level down by one --
+ * levels 5-8 would never be measured, and the deepest row would be a
+ * repeat of level 4. The flag word is built once per column below and the
+ * row's name is read back through zpse_enc_speed, so a row cannot print a
+ * name its flags do not encode.
+ *
  * Portable: no dlopen, no POSIX-only calls. Links zpse_unity.c.
  *
  * Usage: bench_levels [iters] [reps]
@@ -126,6 +135,12 @@ static void print_host(void)
 
 /* Total encoded size of the corpus under zpse at one level, block by
  * block, with every decode verified. */
+/* The ZPSE_ENC_* word for level 1..9: see the header comment. */
+static uint32_t level_flags(uint32_t level)
+{
+    return level << ZPSE_ENC_SPEED_SHIFT;
+}
+
 static int zpse_size_at(uint32_t level, size_t *out_len)
 {
     size_t total = 0;
@@ -137,7 +152,7 @@ static int zpse_size_at(uint32_t level, size_t *out_len)
         const uint8_t *src = g_in + c * CHUNK;
         if (zpse_compress_block_ex(src, CHUNK, g_comp,
                                    (uint32_t)(CHUNK + 1024u), &clen, 0, 1,
-                                   level, g_ea) != 0)
+                                   level_flags(level), g_ea) != 0)
             return -1;
         if (zpse_decompress_block(g_comp, clen, g_dec, CHUNK, &olen, g_da) != 0)
             return -1;
@@ -163,7 +178,7 @@ static double zpse_enc_mbps(uint32_t level, int iters, int reps)
             uint32_t l = 0;
             (void)zpse_compress_block_ex(g_in + c * CHUNK, CHUNK, g_comp,
                                          (uint32_t)(CHUNK + 1024u), &l, 0, 1,
-                                         level, g_ea);
+                                         level_flags(level), g_ea);
         }
         t1 = now_ns();
         {
@@ -196,7 +211,7 @@ static double zpse_dec_mbps(uint32_t level, int iters, int reps)
             zpse_compress_block_ex(g_in + c2 * CHUNK, CHUNK,
                                    comps + c2 * (CHUNK + 1024u),
                                    (uint32_t)(CHUNK + 1024u), &l, 0, 1,
-                                   level, g_ea);
+                                   level_flags(level), g_ea);
             lens[c2] = l;
         }
         prepared_level = level;
@@ -575,7 +590,11 @@ static void report_levels(int ci, int iters, int reps)
         uint32_t level = (uint32_t)(li + 1u);
         const char *name;
 
-        switch (level) {
+        /* Read back what the flags actually encode rather than trusting
+         * the loop counter: the printout is the harness's only output, so
+         * a mismatch between the row label and the level it measured
+         * would be invisible in every number below it. */
+        switch (zpse_enc_speed(level_flags(level))) {
         case 1u: name = "FASTEST"; break;
         case 2u: name = "2"; break;
         case 3u: name = "FASTER"; break;
@@ -584,7 +603,8 @@ static void report_levels(int ci, int iters, int reps)
         case 6u: name = "6"; break;
         case 7u: name = "TIGHTER"; break;
         case 8u: name = "8"; break;
-        default: name = "MAX"; break;
+        case 9u: name = "MAX"; break;
+        default: name = "BAD"; break;
         }
         fmt_ratio(rb, sizeof rb, CORPUS_BYTES, lens[li]);
         fmt_rate(eb, sizeof eb, encs[li]);
@@ -625,7 +645,9 @@ int main(int argc, char **argv)
     printf("zpse levels on 25-column corpus: 4 MiB per case as %u x 64 KiB "
            "blocks, single core, best-of-%d reps\n",
            (unsigned)NCHUNK, reps);
-    printf("levels: 1=FASTEST 2 3=FASTER 4 5=BALANCED 6 7=TIGHTER 8 9=MAX\n");
+    printf("levels: 1=FASTEST 2 3=FASTER 4 5=BALANCED 6 7=TIGHTER 8 9=MAX"
+           ", passed as enc_flags = level << %u\n",
+           (unsigned)ZPSE_ENC_SPEED_SHIFT);
     print_host();
 
     for (ci = 0; ci < (int)(sizeof cases / sizeof cases[0]); ci++)

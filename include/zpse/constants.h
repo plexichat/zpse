@@ -144,8 +144,10 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
 #define ZPSE_ENC_SPEED_EVERY_PLANE_MIN 5u
 /* Levels that run the match finder at all (5-9). */
 #define ZPSE_ENC_SPEED_LZ_MIN 5u
-/* The deepest level that still uses the ASCII gate (8; MAX opts out). */
-#define ZPSE_ENC_SPEED_ASCII_GATE_MAX 8u
+/* Every level uses the ASCII gate, MAX included: it decides only what the
+ * tile side of a convicted block costs, and the LZ candidate is offered
+ * afterwards whatever it decided, so no level can lose its LZ trial to it.
+ * (MAX used to opt out of it, for nothing; see src/block.c.) */
 
 /* Segment flags (Sec. 6.1). Only 0x01 is legal in v1. */
 #define ZPSE_S_LEN_PREFIX       (UINT8_C(1) << 0)
