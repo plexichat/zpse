@@ -126,6 +126,7 @@ jobs:
           retention-days: 30
       - name: Report (${{ matrix.target }} / ${{ matrix.variant }})
         if: always()
+        continue-on-error: true
         run: |
           {
             echo '### nightly fuzz: ${{ matrix.target }} / ${{ matrix.variant }} (4 hours, stateful)'
@@ -144,5 +145,11 @@ jobs:
               echo 'and corrupt-stream paths.'
             fi
             echo
-            echo '```'; cat /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt; echo '```'
+            echo '```'
+            if [ -f /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt ]; then
+              cat /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt
+            else
+              echo "(no output captured)"
+            fi
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

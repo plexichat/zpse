@@ -105,6 +105,7 @@ jobs:
           echo "${{ matrix.target }}_${{ matrix.variant }} fuzz completed"
       - name: Report (${{ matrix.target }} / ${{ matrix.variant }})
         if: always()
+        continue-on-error: true
         run: |
           {
             echo '### fuzz: ${{ matrix.target }} / ${{ matrix.variant }}'
@@ -130,5 +131,11 @@ jobs:
               echo 'rejects malformed input safely.'
             fi
             echo
-            echo '```'; cat /tmp/fuzz_${{ matrix.target }}_${{ matrix.variant }}.txt; echo '```'
+            echo '```'
+            if [ -f /tmp/fuzz_${{ matrix.target }}_${{ matrix.variant }}.txt ]; then
+              cat /tmp/fuzz_${{ matrix.target }}_${{ matrix.variant }}.txt
+            else
+              echo "(no output captured)"
+            fi
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
