@@ -1,13 +1,14 @@
-# Nightly fuzzing: 4 hours, stateful, parallel across build variants.
+# Nightly fuzzing: 4 hours, stateful, parallel across build variants and targets.
 #
-# Runs tests/suites/test_fuzz.c for up to 4 hours per variant on a
-# nightly schedule. Each variant runs in its own matrix job (parallel,
-# ~4h wall time instead of ~12h sequential). The fuzzer's final PRNG seed
-# is saved per-variant; the next nightly downloads it and continues from
-# where that variant left off instead of repeating the same cases.
+# Runs tests/suites/test_fuzz.c (round-trip), fuzz_target.c (libFuzzer
+# round-trip across 9 effort levels), and fuzz_decode.c (libFuzzer decoder-only
+# corrupt-stream fuzzing) for up to 4 hours per variant. Each matrix job runs
+# in parallel (~4h wall time instead of ~36h sequential). The fuzzer's final
+# PRNG seed is saved per-variant; the next nightly downloads it and continues
+# from where that variant left off instead of repeating the same cases.
 #
-# Informational: does not fail the build. Results land in each job's
-# summary and as per-variant seed artifacts for the aggregate job.
+# Informational: does not fail the build. Results land in each job's summary
+# and as per-variant seed artifacts for the aggregate job.
 name: fuzz-nightly
 
 on:
@@ -21,13 +22,58 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [default, scalar, asan]
+        include:
+          # --- test_fuzz.c variants (gcc, continuous mode) ---
+          - target: test_fuzz
+            variant: default
+            cc: cc
+            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude"
+            run_env: "ZPSE_FUZZ_CONTINUE=1"
+            run_args: ""
+          - target: test_fuzz
+            variant: scalar
+            cc: cc
+            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_SCALAR -Iinclude"
+            run_env: "ZPSE_FUZZ_CONTINUE=1"
+            run_args: ""
+          - target: test_fuzz
+            variant: asan
+            cc: cc
+            cflags: "-std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -DNDEBUG -Iinclude"
+            run_env: "ZPSE_FUZZ_CONTINUE=1"
+            run_args: ""
+          # --- fuzz_target.c variants (clang libFuzzer) ---
+          - target: fuzz_target
+            variant: default
+            cc: clang
+            cflags: "-std=c11 -O2 -fsanitize=fuzzer -fno-omit-frame-pointer -Iinclude"
+            run_env: ""
+            run_args: ""
+          - target: fuzz_target
+            variant: asan
+            cc: clang
+            cflags: "-std=c11 -O2 -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -Iinclude"
+            run_env: ""
+            run_args: ""
+          # --- fuzz_decode.c variants (clang libFuzzer) ---
+          - target: fuzz_decode
+            variant: default
+            cc: clang
+            cflags: "-std=c11 -O2 -fsanitize=fuzzer -fno-omit-frame-pointer -Iinclude"
+            run_env: ""
+            run_args: ""
+          - target: fuzz_decode
+            variant: asan
+            cc: clang
+            cflags: "-std=c11 -O2 -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -Iinclude"
+            run_env: ""
+            run_args: ""
     steps:
       - uses: actions/checkout@v4
       - name: Download previous seed (continue, don't restart)
         id: restore
         run: |
-          SEED_FILE=/tmp/fuzz_seed_${{ matrix.variant }}.txt
+          SEED_FILE=/tmp/fuzz_seed_${{ matrix.target }}_${{ matrix.variant }}.txt
           if [ -f "$SEED_FILE" ]; then
             echo "seed=$(cat "$SEED_FILE")" >> "$GITHUB_OUTPUT"
           else
@@ -37,55 +83,66 @@ jobs:
       - name: Download previous seed artifact
         uses: actions/download-artifact@v4
         with:
-          name: fuzz-nightly-seed-${{ matrix.variant }}
+          name: fuzz-nightly-seed-${{ matrix.target }}-${{ matrix.variant }}
           path: /tmp
         continue-on-error: true
-      - name: Build the fuzzer (${{ matrix.variant }})
+      - name: Build the fuzzer (${{ matrix.target }} / ${{ matrix.variant }})
         run: |
-          case "${{ matrix.variant }}" in
-            default)
-              cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude \
-                tests/suites/test_fuzz.c src/zpse_unity.c -o /tmp/fuzz_nightly_${{ matrix.variant }}
-              ;;
-            scalar)
-              cc -std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_SCALAR \
-                -Iinclude tests/suites/test_fuzz.c src/zpse_unity.c \
-                -o /tmp/fuzz_nightly_${{ matrix.variant }}
-              ;;
-            asan)
-              cc -std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined \
-                -fno-omit-frame-pointer -DNDEBUG -Iinclude \
+          case "${{ matrix.target }}" in
+            test_fuzz)
+              ${{ matrix.cc }} ${{ matrix.cflags }} \
                 tests/suites/test_fuzz.c src/zpse_unity.c \
-                -o /tmp/fuzz_nightly_${{ matrix.variant }}
+                -o /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}
+              ;;
+            fuzz_target|fuzz_decode)
+              ${{ matrix.cc }} ${{ matrix.cflags }} \
+                tests/suites/${{ matrix.target }}.c src/zpse_unity.c \
+                -o /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}
               ;;
           esac
-      - name: Run 4 hours of fuzzing (${{ matrix.variant }})
+      - name: Run 4 hours of fuzzing (${{ matrix.target }} / ${{ matrix.variant }})
         run: |
           set -o pipefail
           SEED="${{ steps.restore.outputs.seed }}"
-          ZPSE_FUZZ_CONTINUE=1 timeout 4h /tmp/fuzz_nightly_${{ matrix.variant }} "$SEED" \
-            | tee /tmp/fuzz_nightly_${{ matrix.variant }}.txt
-          echo "${{ matrix.variant }} fuzz_exit=${PIPESTATUS[0]}"
-          # Save the final seed so the next nightly continues from here
-          SEED_END=$(grep -oP 'seed=\K[0-9A-Fa-f]+' /tmp/fuzz_nightly_${{ matrix.variant }}.txt | tail -1)
-          echo -n "$SEED_END" > /tmp/fuzz_seed_${{ matrix.variant }}.txt
-          cat /tmp/fuzz_seed_${{ matrix.variant }}.txt
+          if [ "${{ matrix.target }}" = "test_fuzz" ]; then
+            ${{ matrix.run_env }} timeout 4h /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }} "$SEED" \
+              | tee /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt
+          else
+            ${{ matrix.run_env }} timeout 4h /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }} \
+              | tee /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt
+          fi
+          echo "${{ matrix.target }}_${{ matrix.variant }} fuzz_exit=${PIPESTATUS[0]}"
+          # Save the final seed so the next nightly continues from here (test_fuzz only)
+          if [ "${{ matrix.target }}" = "test_fuzz" ]; then
+            SEED_END=$(grep -oP 'seed=\K[0-9A-Fa-f]+' /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt | tail -1)
+            echo -n "$SEED_END" > /tmp/fuzz_seed_${{ matrix.target }}_${{ matrix.variant }}.txt
+            cat /tmp/fuzz_seed_${{ matrix.target }}_${{ matrix.variant }}.txt
+          fi
       - name: Save seed artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-nightly-seed-${{ matrix.variant }}
-          path: /tmp/fuzz_seed_${{ matrix.variant }}.txt
+          name: fuzz-nightly-seed-${{ matrix.target }}-${{ matrix.variant }}
+          path: /tmp/fuzz_seed_${{ matrix.target }}_${{ matrix.variant }}.txt
           retention-days: 30
-      - name: Report (${{ matrix.variant }})
+      - name: Report (${{ matrix.target }} / ${{ matrix.variant }})
         if: always()
         run: |
           {
-            echo '### nightly fuzz: ${{ matrix.variant }} (4 hours, stateful)'
+            echo '### nightly fuzz: ${{ matrix.target }} / ${{ matrix.variant }} (4 hours, stateful)'
             echo
-            echo 'test_fuzz.c differential fuzzer runs for 4 hours every night.'
-            echo 'The PRNG seed is saved after each run and passed as the'
-            echo 'starting seed on the next night, so coverage accumulates'
-            echo 'instead of repeating the same cases.'
+            if [ "${{ matrix.target }}" = "test_fuzz" ]; then
+              echo 'test_fuzz.c runs in continuous mode (ZPSE_FUZZ_CONTINUE=1),'
+              echo 'generating random blocks until timeout 4h kills it. The'
+              echo 'PRNG seed is saved after each run and passed as the'
+              echo 'starting seed on the next night.'
+            elif [ "${{ matrix.target }}" = "fuzz_target" ]; then
+              echo 'fuzz_target.c is a libFuzzer target that compresses and'
+              echo 'decompresses each fuzz input across all 9 effort levels.'
+            else
+              echo 'fuzz_decode.c is a libFuzzer target that feeds arbitrary'
+              echo 'bytes directly to the decoder, attacking error-handling'
+              echo 'and corrupt-stream paths.'
+            fi
             echo
-            echo '```'; cat /tmp/fuzz_nightly_${{ matrix.variant }}.txt; echo '```'
+            echo '```'; cat /tmp/fuzz_nightly_${{ matrix.target }}_${{ matrix.variant }}.txt; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
