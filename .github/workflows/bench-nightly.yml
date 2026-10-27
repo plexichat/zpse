@@ -42,7 +42,7 @@ jobs:
       - name: Run 4 hours of fuzzing
         run: |
           SEED="${{ steps.restore.outputs.seed }}"
-          timeout 4h /tmp/fuzz_nightly "$SEED" | tee /tmp/fuzz_nightly.txt
+          ZPSE_FUZZ_CONTINUE=1 timeout 4h /tmp/fuzz_nightly "$SEED" | tee /tmp/fuzz_nightly.txt
           # Save the final seed so the next nightly continues from here
           SEED_END=$(grep -oP 'seed=\K[0-9A-Fa-f]+' /tmp/fuzz_nightly.txt | tail -1)
           echo -n "$SEED_END" > /tmp/fuzz_seed.txt

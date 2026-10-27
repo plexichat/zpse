@@ -33,17 +33,18 @@ jobs:
             -o /tmp/fuzz_trialswap
       - name: Run 10 minutes of fuzzing
         run: |
-          timeout 10m /tmp/fuzz_default | tee /tmp/fuzz_default.txt
-          timeout 10m /tmp/fuzz_scalar | tee /tmp/fuzz_scalar.txt
-          timeout 10m /tmp/fuzz_trialswap | tee /tmp/fuzz_trialswap.txt
+          ZPSE_FUZZ_CONTINUE=1 timeout 10m /tmp/fuzz_default | tee /tmp/fuzz_default.txt
+          ZPSE_FUZZ_CONTINUE=1 timeout 10m /tmp/fuzz_scalar | tee /tmp/fuzz_scalar.txt
+          ZPSE_FUZZ_CONTINUE=1 timeout 10m /tmp/fuzz_trialswap | tee /tmp/fuzz_trialswap.txt
           {
             echo '### fuzz: 10 minutes per variant, every commit'
             echo
-            echo 'test_fuzz.c attacks the encoder round-trip invariant over'
-            echo 'thousands of shapes and sizes instead of dozens. Each'
-            echo 'variant prints a deterministic FNV-1a digest -- identical'
-            echo 'digest across runs proves no bit-layout regression; zero'
-            echo 'failures proves every input round-trips.'
+            echo 'test_fuzz.c runs in continuous mode (ZPSE_FUZZ_CONTINUE=1),'
+            echo 'generating random blocks until timeout 10m kills it. Each'
+            echo 'variant prints a deterministic FNV-1a digest every 2048 cases'
+            echo 'with the running PRNG seed -- identical digest across runs'
+            echo 'proves no bit-layout regression; zero FAIL lines proves every'
+            echo 'input round-trips.'
             echo
             echo '#### default (runtime SIMD dispatch)'
             echo '```'; cat /tmp/fuzz_default.txt; echo '```'

@@ -407,6 +407,50 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Continuous fuzzing mode: run until killed by timeout. Gated by
+     * ZPSE_FUZZ_CONTINUE so the unit-test runner (run.sh/run.ps1) still
+     * executes the finite corpus once and exits with a stable digest; CI
+     * sets the env var and bounds the run with timeout 10m / 4h. */
+    if (getenv("ZPSE_FUZZ_CONTINUE") != 0) {
+        uint64_t cont_cases = 0u;
+        for (;;) {
+            uint32_t n = 1u + (nr32() % ZPSE_MAX_BLOCK_SIZE);
+            uint32_t shape = nr32() % SHAPE_N;
+            uint32_t clen = 0u;
+            uint32_t olen = 0u;
+            int rc;
+
+            fill(shape, n);
+            rc = zpse_compress_block(in, n, comp, sizeof comp, &clen, seq,
+                                     1, enc_arena);
+            if (rc == 0 && clen <= n + (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+                memset(out, 0xA5, n);
+                rc = zpse_decompress_block(comp, clen, out, n, &olen,
+                                           dec_arena);
+            }
+            if (rc < 0 || olen != n || memcmp(in, out, n) != 0) {
+                printf("FAIL cont_case=%llu shape=%u n=%u rc=%d\n",
+                       (unsigned long long)cont_cases, shape, n, rc);
+                fflush(stdout);
+                fails++;
+            } else {
+                mix_u32(n);
+                mix_u32(clen);
+                mix(comp, clen);
+                cont_cases++;
+            }
+            seq++;
+
+            if ((cont_cases & 2047u) == 0u) {
+                printf("FUZZ cont cases=%llu frames=%llu digest=%016llX seed=%08X\n",
+                       (unsigned long long)(cases + cont_cases),
+                       (unsigned long long)frames,
+                       (unsigned long long)dig, rs);
+                fflush(stdout);
+            }
+        }
+    }
+
     printf("FUZZ cases=%u frames=%u digest=%016llX seed=%08X\n",
            (unsigned)cases, (unsigned)frames, (unsigned long long)dig, rs);
     if (fails == 0) {

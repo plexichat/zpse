@@ -109,13 +109,18 @@ change.
 | `lowentropy` | 0.5079 | 0.5196 | **zpse 2% smaller** |
 | `random` | 1.0005 | 1.0000 | tie |
 
-That is the honest picture. zpse has no block matching and no entropy stage:
-its whole model is "one of ten predictors over 256-byte tiles, code the
-exceptions enumeratively". On the ramp/sparse patterns zstd's match finder
-turns almost the entire file into a handful of copies and beats it by two
-orders of magnitude. Where the data has no redundancy to match but does have a
-small alphabet, zpse's tile model is competitive, and on truly random data
-both are at 1.000.
+That is the honest picture, and read the table as the shape of the comparison
+rather than as the default level's numbers: the intra-block LZ form below moves
+`var_string` from 1.0005 to about 0.40 at level 5. zpse has no entropy stage
+and no cross-block window -- a match distance is 16 bits inside the block, so a
+block stays independent -- and its tile model is "one of ten predictors over
+256-byte tiles, code the exceptions enumeratively", with a single-probe hash
+match finder (LZ4's shape, not a search) offered as one more candidate at
+levels 5-9. On the ramp/sparse patterns zstd's finder still turns almost the
+entire file into a handful of copies and beats zpse by two orders of
+magnitude. Where the data has no redundancy to match but does have a small
+alphabet, zpse's tile model is competitive, and on truly random data both are
+at 1.000.
 
 So: pick zpse when decode latency, allocation behaviour and output
 determinism matter more than ratio, and pick zstd when the bytes matter more
@@ -148,19 +153,20 @@ Three of those rows are worth reading twice.
 `struct_offsets` is a strictly increasing array of byte offsets — nothing in
 it repeats, so zstd's match finder has nothing to match and lands at 0.78,
 worse than storing the raw column. zpse's stride and lane-delta predictors
-read the monotone sequence directly and get 0.30. *A block codec with no
-match finder is not simply a worse match finder; on data with no redundancy
-to match, it is a different codec, and it can win.*
+read the monotone sequence directly and get 0.30. *A block codec that predicts
+instead of matching is not simply a worse match finder; on data with no
+redundancy to match, it is a different codec, and it can win.*
 
 `var_string` is the other end: high-cardinality JSON-ish text, where every
-value is unique. zpse falls back to raw (1.0005) because none of its ten
-predictors help, and zstd's match finder finds the repeated keys and gets
-0.21. This is the "no match finder" limitation showing up on realistic text
-rather than on a synthetic ramp, and it is the row that decides against zpse
-for this data. It is the row the screened match finder changes: `var_string`
-at the default level is about 0.40 (2.5:1) now rather than 1.0005, which is
-what the effort-level table above shows, so treat this table as the shape of
-the comparison rather than as the current default level's numbers.
+value is unique. The cheap levels fall back to raw (1.0005) because none of the
+ten tile predictors help, and zstd's match finder finds the repeated keys and
+gets 0.21. This is the tile model's own limit showing up on realistic text
+rather than on a synthetic ramp, and without the LZ form it is the row that
+decides against zpse for this data. It is the row the screened match finder
+changes: `var_string` at the default level is about 0.40 (2.5:1) now rather
+than 1.0005, which is what the effort-level table above shows -- so treat the
+table above as the shape of the comparison rather than as the current default
+level's numbers.
 
 The timestamp rows are the interesting middle: zstd is 2–3% ahead of zpse on
 both, which is to say they are within noise of each other on data a
@@ -207,7 +213,8 @@ column is worth 10.44:1 to a codec that knows the nulls are whole records.
 The other four are within 20% of a purpose-built codec, without any of the
 schema that would make such a codec possible to ship. The `var_string` row
 is the honest limit: no column codec helps there either, and the answer is a
-block codec with a match finder.
+match finder -- which is what the intra-block LZ form gives it at levels 5-9,
+inside the block and nowhere else.
 
 ### Effort levels
 
