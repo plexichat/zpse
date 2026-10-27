@@ -61,9 +61,11 @@ jobs:
           esac
       - name: Run 4 hours of fuzzing (${{ matrix.variant }})
         run: |
+          set -o pipefail
           SEED="${{ steps.restore.outputs.seed }}"
           ZPSE_FUZZ_CONTINUE=1 timeout 4h /tmp/fuzz_nightly_${{ matrix.variant }} "$SEED" \
             | tee /tmp/fuzz_nightly_${{ matrix.variant }}.txt
+          echo "${{ matrix.variant }} fuzz_exit=${PIPESTATUS[0]}"
           # Save the final seed so the next nightly continues from here
           SEED_END=$(grep -oP 'seed=\K[0-9A-Fa-f]+' /tmp/fuzz_nightly_${{ matrix.variant }}.txt | tail -1)
           echo -n "$SEED_END" > /tmp/fuzz_seed_${{ matrix.variant }}.txt

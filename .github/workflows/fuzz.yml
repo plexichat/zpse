@@ -58,9 +58,10 @@ jobs:
           esac
       - name: Run 10 minutes of fuzzing (${{ matrix.variant }})
         run: |
+          set -o pipefail
           ZPSE_FUZZ_CONTINUE=1 timeout 10m /tmp/fuzz_${{ matrix.variant }} \
             | tee /tmp/fuzz_${{ matrix.variant }}.txt
-          echo "${{ matrix.variant }} exit=$?"
+          echo "${{ matrix.variant }} fuzz_exit=${PIPESTATUS[0]}"
       - name: Report (${{ matrix.variant }})
         if: always()
         run: |
