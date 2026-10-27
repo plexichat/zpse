@@ -60,10 +60,13 @@
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
  * 2,4,6,...,18. This trades compressed size for encode time and never
- * changes the format: every level writes a stream any decoder reads, and
- * every level's stream decodes at the same speed, because the shapes
- * themselves are the same. What a level changes is how the sweep decides
- * which shape to write.
+ * changes the format: every level writes a stream any decoder reads, and a
+ * tile stream decodes at the same speed whichever level chose it, because
+ * the shapes themselves are the same. What a level changes is how the sweep
+ * decides which shape to write. The one exception is the intra-block LZ
+ * form, which levels 5-9 may also pick: it decodes at the speed of its
+ * command loop rather than the tile reconstruction, which is why the level
+ * caps how many commands per output byte it will accept.
  *
  *   1  ZPSE_ENC_SPEED_FASTEST   one trial per block, no match finder, the
  *                               prescreen only tries the three uniform
@@ -115,13 +118,26 @@
 #define ZPSE_ENC_SPEED_L4       (UINT32_C(4) << ZPSE_ENC_SPEED_SHIFT)  /* level 4 */
 #define ZPSE_ENC_SPEED_BALANCED (UINT32_C(5) << ZPSE_ENC_SPEED_SHIFT)  /* level 5 */
 #define ZPSE_ENC_SPEED_L6       (UINT32_C(6) << ZPSE_ENC_SPEED_SHIFT)  /* level 6 */
-#define ZPSE_ENC_SPEED_TIGHTER  (UINT32_C(7) << ZPSE_ENC_SPEED_SHIFT)  /* level 7 */
+#define ZPSE_ENC_SPEED_L7       (UINT32_C(7) << ZPSE_ENC_SPEED_SHIFT)  /* level 7 */
 #define ZPSE_ENC_SPEED_L8       (UINT32_C(8) << ZPSE_ENC_SPEED_SHIFT)  /* level 8 */
 #define ZPSE_ENC_SPEED_MAX      (UINT32_C(9) << ZPSE_ENC_SPEED_SHIFT)  /* level 9 */
 
-/* Extract the level number (1-9) from the options field. */
+/* The level an options field with no level bits encodes at: the default is
+ * BALANCED, level 5. */
+#define ZPSE_ENC_SPEED_DEFAULT  (ZPSE_ENC_SPEED_BALANCED >> ZPSE_ENC_SPEED_SHIFT)
+
+/* Extract the level number (1-9) from the options field, normalising the
+ * empty field to the default level. Every level test in the encoder is a
+ * threshold ("at least 5 prices every plane", "at most 2 screens three
+ * predictors"), so a raw zero would put the default encoder on the cheap
+ * side of all of them -- which is how the default level silently became the
+ * most expensive-quality regression the size gate has ever caught. The
+ * normalisation is here, in the one accessor, rather than at each test. */
 static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
-    return (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >> ZPSE_ENC_SPEED_SHIFT);
+    uint32_t lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
+                              ZPSE_ENC_SPEED_SHIFT);
+
+    return (lvl != 0u) ? lvl : (uint32_t)ZPSE_ENC_SPEED_DEFAULT;
 }
 
 /* Levels whose sweep prices every plane of every candidate (5-9). */

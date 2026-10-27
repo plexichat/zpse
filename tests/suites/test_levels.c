@@ -1,6 +1,7 @@
 /* The encoder's effort levels, as a contract.
  *
- * The four levels trade size for time in one direction: the fastest
+ * The nine levels (1 = FASTEST ... 9 = MAX, with the default at 5) trade
+ * size for time in one direction: the fastest
  * writes the biggest block and the deepest writes the smallest. That is
  * the promise the levels make, and nothing pins it -- a level that
  * quietly wrote a bigger block than the one before it would not fail

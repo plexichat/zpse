@@ -1007,6 +1007,43 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
 static uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
                                      7u, 8u, 10u, 11u};
 
+/* Priority of each predictor id, i.e. the order the winner rule is DEFINED
+ * in. This is a constant and seg_screen_pred is not: the scan order may be
+ * permuted for speed (seg_screen_rank), but every decision that depends on
+ * which predictor comes first -- the tie between equal miss counts, and
+ * which predictors a run continuation has to rule out -- reads this table
+ * instead of the scan position. That is what keeps a permuted scan from
+ * writing a different stream: the winner is the smallest count, ties to the
+ * lowest priority, whatever order the scan happened to visit them in. An
+ * id that is not screened at all has no priority. */
+static const uint8_t seg_pred_rank[12] = {
+    0u, 1u, 2u, 0xFFu, 0xFFu, 3u, 4u, 5u, 6u, 0xFFu, 7u, 8u
+};
+
+/* The best screened predictor in `ks` (skipping `skip`, which is how the
+ * runner-up is found): smallest miss count, and on a tie the lowest
+ * priority. Independent of seg_screen_pred's current order by
+ * construction, so the candidate list is the same list the static order
+ * produced. Returns 0xFF when every screened id was skipped. */
+static uint8_t seg_scan_best(const uint16_t ks[12], uint8_t skip)
+{
+    uint8_t best = 0xFFu;
+    uint32_t i;
+
+    for (i = 0u; i < 9u; i++) {
+        uint8_t p = seg_screen_pred[i];
+
+        if (p == skip) {
+            continue;
+        }
+        if (best == 0xFFu || ks[p] < ks[best] ||
+            (ks[p] == ks[best] && seg_pred_rank[p] < seg_pred_rank[best])) {
+            best = p;
+        }
+    }
+    return best;
+}
+
 /* Win count per predictor id, used by the dynamic ranker. Indexed by
  * predictor id (0-11); entries for ORDER1/ORDER2/TILE_CONSTANT stay at 0
  * because they are never in seg_screen_pred. */
@@ -1411,7 +1448,9 @@ static void seg_prescreen_tile(const uint8_t *a, uint16_t nt,
         *zero_cheap = 0;
     }
     seg_prescreen(a, nt, seg_base, seg_pos, init, fast_tier, have_avx2, ks);
-    *zero_cheap = (ks[seg_screen_pred[0]] <= (uint16_t)ZPSE_PS_ZERO_ONLY)
+    /* CONST_ZERO by id, not by scan position: the shortcut is only sound
+     * while CONST_ZERO is the predictor it names. */
+    *zero_cheap = (ks[(uint8_t)ZPSE_P_CONST_ZERO] <= (uint16_t)ZPSE_PS_ZERO_ONLY)
                       ? 1 : 0;
 }
 
@@ -1802,8 +1841,6 @@ static int seg_run_stays(const uint8_t *a, uint16_t nt, uint8_t pred,
                          uint8_t literal, uint32_t seg_pos,
                          const uint8_t *plane, int have_avx2)
 {
-    int i;
-
     /* The uniform three carry their own ordering proof. */
     if (pred == (uint8_t)ZPSE_P_CONST_ZERO ||
         pred == (uint8_t)ZPSE_P_LANE_PREVIOUS ||
@@ -1811,22 +1848,24 @@ static int seg_run_stays(const uint8_t *a, uint16_t nt, uint8_t pred,
         return seg_all_hit_cheap_ok(a, nt, pred, literal, seg_pos, plane,
                                     have_avx2);
     }
-    for (i = 0; i < 9; i++) {
-        if (seg_screen_pred[i] == pred) {
-            break;
-        }
-    }
-    if (i == 9) {
+    if (seg_pred_rank[pred] == 0xFFu) {
         return 0; /* not a screened predictor: let the prescreen decide */
     }
-    /* Every predictor earlier in the scan must miss somewhere, or it would
-     * win the tile instead (first minimum). One miss each is a proof. */
+    /* Every predictor of lower priority must miss somewhere, or it would win
+     * the tile instead (smallest count, ties to the lower priority). One
+     * miss each is a proof. Priority, not scan position: the scan order is
+     * a speed decision and this one decides bytes. */
     {
         int j;
 
-        for (j = 0; j < i; j++) {
-            if (!seg_pred_miss_within(a, nt, seg_screen_pred[j], literal,
-                                      seg_pos, plane, SEG_WITNESS)) {
+        for (j = 0; j < 9; j++) {
+            uint8_t q = seg_screen_pred[j];
+
+            if (q == pred || seg_pred_rank[q] >= seg_pred_rank[pred]) {
+                continue;
+            }
+            if (!seg_pred_miss_within(a, nt, q, literal, seg_pos, plane,
+                                      SEG_WITNESS)) {
                 return 0;
             }
         }
@@ -2609,22 +2648,13 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         uint8_t best_p;
         uint8_t cand[2];
         uint32_t ncand = 0u;
-        uint32_t i;
         uint32_t ci;
         int tile_len = -1;
 
         seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
                       zpse_enc_speed(e->enc_flags) <= 2u, have_avx2, ks);
-        best_p = seg_screen_pred[0];
+        best_p = seg_scan_best(ks, 0xFFu);
         best_k = ks[best_p];
-        for (i = 1u; i < 9u; i++) {
-            uint16_t c = ks[seg_screen_pred[i]];
-
-            if (c < best_k) {
-                best_k = c;
-                best_p = seg_screen_pred[i];
-            }
-        }
         if (best_k == 0u) {
             /* The all-hit run writes these directly: a 2-byte length prefix
              * and the 8-byte record. */
@@ -2634,20 +2664,10 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         cand[ncand++] = best_p;
         {
-            uint8_t second_p = 0xFFu;
-            uint16_t sk = 0xFFFFu;
+            uint8_t second_p = seg_scan_best(ks, best_p);
+            uint16_t sk = (second_p != 0xFFu) ? ks[second_p]
+                                              : (uint16_t)0xFFFFu;
 
-            for (i = 0u; i < 9u; i++) {
-                uint16_t c = ks[seg_screen_pred[i]];
-
-                if (seg_screen_pred[i] == best_p) {
-                    continue;
-                }
-                if (c < sk) {
-                    sk = c;
-                    second_p = seg_screen_pred[i];
-                }
-            }
             if (second_p != 0xFFu && sk == best_k &&
                 (uint32_t)best_k * 8u < (uint32_t)nt * 7u) {
                 cand[ncand++] = second_p;
@@ -3236,34 +3256,18 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
                            zpse_enc_speed(e->enc_flags) <= 2u, have_avx2,
                            &zero_cheap, ks);
-        best_p = 0;
+        best_p = seg_scan_best(ks, 0xFFu);
         {
-            uint16_t bk = ks[seg_screen_pred[0]];
-            uint32_t i;
-            for (i = 1; i < 9u; i++) {
-                uint16_t c = ks[seg_screen_pred[i]];
-                if (c < bk) {
-                    bk = c;
-                    best_p = seg_screen_pred[i];
-                }
-            }
+            uint16_t bk = ks[best_p];
+
             best_k = bk;
             cand[ncand++] = best_p;
 
             /* Second trial only when it is genuinely competitive. */
             {
-                uint8_t second_p = 0xFFu;
-                uint16_t sk = 0xFFFFu;
-                for (i = 0; i < 9u; i++) {
-                    uint16_t c = ks[seg_screen_pred[i]];
-                    if (seg_screen_pred[i] == best_p) {
-                        continue;
-                    }
-                    if (c < sk) {
-                        sk = c;
-                        second_p = seg_screen_pred[i];
-                    }
-                }
+                uint8_t second_p = seg_scan_best(ks, best_p);
+                uint16_t sk = (second_p != 0xFFu) ? ks[second_p]
+                                                  : (uint16_t)0xFFFFu;
                 /* Second trial only on an exact tie in the prescreen's
                  * miss count, and never when the best candidate is
                  * already perfect: bk == 0 selects mask ALL_HIT with
