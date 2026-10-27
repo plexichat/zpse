@@ -2,6 +2,7 @@
 
 #include "zpse/bits.h"
 #include "zpse/status.h"
+#include "zpse/vector.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -30,6 +31,47 @@ static uint64_t lz_load64(const uint8_t *p)
     memcpy(&v, p, 8u);
     return v;
 }
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_LZ_AVX2 __attribute__((target("avx2")))
+#define ZPSE_LZ_HAVE_AVX2 1
+#elif defined(__AVX2__)
+#define ZPSE_LZ_AVX2
+#define ZPSE_LZ_HAVE_AVX2 1
+#else
+#define ZPSE_LZ_HAVE_AVX2 0
+#endif
+#else
+#define ZPSE_LZ_HAVE_AVX2 0
+#endif
+
+#if ZPSE_LZ_HAVE_AVX2
+#include <immintrin.h>
+
+static ZPSE_LZ_AVX2 uint32_t
+lz_extend_avx2(const uint8_t *in, uint32_t pos, uint32_t cand, uint32_t len,
+               uint32_t n)
+{
+    while (pos + len + 32u <= n && cand + len + 32u <= n) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(in + pos + len));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(in + cand + len));
+
+        if ((uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) !=
+            0xFFFFFFFFu) {
+            uint32_t k = 0u;
+
+            while (in[pos + len + k] == in[cand + len + k]) {
+                k++;
+            }
+            return len + k;
+        }
+        len += 32u;
+    }
+    return len;
+}
+#endif /* ZPSE_LZ_HAVE_AVX2 */
 
 /* Output under construction. Literals grow forward from dst + 4; commands
  * grow backward from the end of the buffer, and are compacted behind the
@@ -158,10 +200,18 @@ uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             pos--;
             cand--;
         }
+        int have_avx2 = 0;
+#if ZPSE_LZ_HAVE_AVX2
+        have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+#endif
         len = ZPSE_LZ_MIN_MATCH;
-        while (pos + len + 8u <= n && cand + len + 8u <= n &&
-               lz_load64(in + pos + len) == lz_load64(in + cand + len)) {
-            len += 8u;
+        if (have_avx2) {
+            len = lz_extend_avx2(in, pos, cand, len, n);
+        } else {
+            while (pos + len + 8u <= n && cand + len + 8u <= n &&
+                   lz_load64(in + pos + len) == lz_load64(in + cand + len)) {
+                len += 8u;
+            }
         }
         while (pos + len < n && in[pos + len] == in[cand + len]) {
             len++;

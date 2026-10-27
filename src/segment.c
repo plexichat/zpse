@@ -2823,7 +2823,8 @@ uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
         return UINT32_MAX;
     }
     if (tiles == 0u) {
-        tiles = ZPSE_EST_TILES;
+        uint32_t speed = zpse_enc_speed(e->enc_flags);
+        tiles = (speed <= 2u) ? 2u : (speed <= 4u) ? 4u : 8u;
     }
     tc = (plane_len + 255u) / 256u;
     best = seg_tile_price(e, lanes, plane, plane_len, tc, tiles,

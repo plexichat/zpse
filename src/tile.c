@@ -172,6 +172,35 @@ uint32_t zpse_tile_ascii_len(uint16_t nt)
     return (uint32_t)ZPSE_TILE_HEADER_SIZE + (uint32_t)nt - (uint32_t)(nt >> 3);
 }
 
+#if ZPSE_TILE_HAVE_AVX2
+#include <immintrin.h>
+
+/* 32 bytes per iteration: any byte with the high bit set (>= 0x80 unsigned,
+ * i.e. < 0 as int8) turns its element to 0xFF; movemask gathers the sign
+ * bits, so a nonzero mask means the tile is not ASCII. Bit-exact to the
+ * scalar OR form. */
+static ZPSE_TILE_AVX2 int zpse_tile_is_ascii_avx2(const uint8_t *actual,
+                                                  uint16_t nt)
+{
+    const __m256i zero = _mm256_setzero_si256();
+    uint16_t i = 0u;
+
+    for (; (uint32_t)i + 32u <= (uint32_t)nt;
+         i = (uint16_t)(i + 32u)) {
+        const __m256i w = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(actual + i));
+        const __m256i gt = _mm256_cmpgt_epi8(zero, w);
+
+        if (_mm256_movemask_epi8(gt) != 0)
+            return 0;
+    }
+    for (; i < nt; i++)
+        if (actual[i] > 0x7Fu)
+            return 0;
+    return 1;
+}
+#endif /* ZPSE_TILE_HAVE_AVX2 */
+
 int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt)
 {
     uint64_t acc = 0u;
@@ -179,6 +208,10 @@ int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt)
 
     if (actual == 0)
         return 0;
+#if ZPSE_TILE_HAVE_AVX2
+    if (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2)
+        return zpse_tile_is_ascii_avx2(actual, nt);
+#endif
     for (; (uint32_t)i + 8u <= (uint32_t)nt; i = (uint16_t)(i + 8u)) {
         uint64_t w;
 
