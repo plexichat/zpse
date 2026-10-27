@@ -1,0 +1,52 @@
+# zpse across all 9 effort levels (1=FASTEST ... 9=MAX) on the seven
+# typed columnar corpora (ts_seq, ts_ns, float_sparse, var_string,
+# sparse_mix, geo_point, struct_offsets). Same 4 MiB corpus, same 64 KiB
+# blocks, same pinned single core as bench-columnar.
+#
+# Informational: a slower number than the last run must not fail the
+# build. The table lands in the job summary; raw output is kept as an
+# artifact for diffing between runs.
+name: bench-levels
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  levels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compiler
+        run: |
+          cc --version | head -1
+      - name: Build the harness
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+            tests/benchmarks/bench_levels.c src/zpse_unity.c \
+            -o /tmp/bench_levels
+      - name: Run the matrix (7 columns x 9 levels, single core)
+        run: |
+          taskset -c 0 /tmp/bench_levels 12 3 | tee /tmp/bench_levels.txt
+          {
+            echo '### zpse effort levels on columnar corpora, single core'
+            echo
+            echo '4 MiB per column as 64 x 64 KiB blocks, one level per row:'
+            echo '1=FASTEST 2 3=FASTER 4 5=BALANCED 6 7=TIGHTER 8 9=MAX.'
+            echo 'Ratio is input:output; encode/decode are MB/s of uncompressed'
+            echo 'bytes; best(med/max)-of-N. Every decode verified before timing.'
+            echo 'A sizes-monotonic check runs per column: because level 1'
+            echo 'screens only the three uniform predictors, it can write a'
+            echo 'smaller block than a mid level on structured data, so sizes'
+            echo 'are not guaranteed to descend from 1 to 9; that is a feature'
+            echo 'of the fast tier, not a regression.'
+            echo
+            cat /tmp/bench_levels.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-levels
+          path: |
+            /tmp/bench_levels.txt
+          if-no-files-found: error
+          retention-days: 90
