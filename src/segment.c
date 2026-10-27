@@ -1052,7 +1052,9 @@ static uint32_t seg_pred_wins[12];
 /* Reorder seg_screen_pred so the predictor with the most wins runs first,
  * ties broken by the existing order. Called once per block (or whenever the
  * caller wants a fresh ranking); the rank is a pure function of the wins
- * seen so far, so it is deterministic across builds. */
+ * seen so far, so it is deterministic across builds, and it cannot change a
+ * byte of output because nothing reads scan position as a priority: the
+ * winner rule and the run continuation both use seg_pred_rank. */
 void seg_screen_rank(void)
 {
     uint8_t order[9];
