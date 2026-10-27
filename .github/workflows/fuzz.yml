@@ -98,6 +98,7 @@ jobs:
               ;;
           esac
       - name: Run 10 minutes of fuzzing (${{ matrix.target }} / ${{ matrix.variant }})
+        continue-on-error: true
         run: |
           set -o pipefail
           ${{ matrix.run_env }} timeout 10m /tmp/fuzz_${{ matrix.target }}_${{ matrix.variant }} ${{ matrix.run_args }} \

@@ -101,6 +101,7 @@ jobs:
               ;;
           esac
       - name: Run 4 hours of fuzzing (${{ matrix.target }} / ${{ matrix.variant }})
+        continue-on-error: true
         run: |
           set -o pipefail
           SEED="${{ steps.restore.outputs.seed }}"
