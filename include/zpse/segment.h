@@ -97,9 +97,12 @@ void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             uint8_t initial_literal, uint16_t ks[12],
                             uint32_t enc_flags);
 
-/* Reorder the prescreen scan order by predictor win count. Call once per
- * block, at the start of the first segment encode. Resets the win counters
- * after ranking. */
+/* Reorder the prescreen's scan by predictor win count. Call once per block,
+ * at the start of the first segment encode; the win counters are reset after
+ * ranking. A pure speed decision: every rule that reads "which predictor
+ * comes first" (the tie between equal miss counts, and what a run
+ * continuation has to rule out) goes through the fixed seg_pred_rank table,
+ * so any permutation of the scan writes the same bytes. */
 void seg_screen_rank(void);
 
 #endif /* ZPSE_SEGMENT_H */
