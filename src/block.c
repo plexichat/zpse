@@ -1055,6 +1055,7 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_WINDOW 12288u
 #endif
 
+
 #ifndef ZPSE_FLAT_TRIALS
 #define ZPSE_FLAT_TRIALS 3
 #endif
@@ -1363,11 +1364,222 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * not fit (which the caller reads as "this candidate lost", not as an
  * error). The block header is written last-to-first: the payload at
  * dst + 32, then the envelope around it. */
-/* A block's LZ stream is only worth taking when its commands average this
- * many output bytes or more: below it the decoder is a command loop rather
- * than a copy, and it loses to the tile stream it would replace (see the
- * measurements at the call site). */
-#define ZPSE_LZ_MIN_BYTES_PER_CMD 48u
+/* ---- The LZ form's decode bill, as a per-level acceleration factor ---- *
+ *
+ * An LZ stream decodes at the speed of its own command loop, one 4-byte
+ * command per output run, so its rate follows the AVERAGE RUN LENGTH.
+ * Measured on this corpus, in bytes of output per command: 5.6 -> 0.6 GB/s
+ * (prose), 9 -> 1.2 (json), 17 -> 2.9 (var strings), 64 -> 8.8 (sparse),
+ * 128 -> 8.4 (geo), 246 -> 24 (zeros). A tile stream decodes at 5-13 GB/s
+ * whatever it holds (~12 GB/s on the shapes this encoder picks), so the two
+ * cross at about ZPSE_LZ_BPC_CROSS output bytes per command and the only
+ * question a block has to answer is how much decode speed it will trade for
+ * size.
+ *
+ * That trade is the level's ACCELERATION FACTOR A -- the same idea as
+ * zstd's -1/-2/-4, moved to the decode side: the form is taken when its
+ * commands average at least ZPSE_LZ_BPC_CROSS / A output bytes, i.e. when
+ * the LZ stream is expected to decode at least A times SLOWER than the tile
+ * stream it replaces. A = 2 is the 48 bytes per command this rule used to
+ * be hard-coded to (and it is nearly inert: it keeps LZ only for blocks
+ * whose runs are long enough to out-decode the tiles); a large A buys ratio
+ * on text and pays for it in decode rate, which is what the fastest and
+ * default levels are being asked for now.
+ *
+ * Measured end to end on the four text cases and two repetitive ones, with
+ * the tile stream's own 1.09:1 at 12 GB/s as the reference (encode is
+ * ~100 MB/s whenever the match finder runs -- it is a full pass):
+ *
+ *   A=2  (48 B/cmd)  nothing on the text cases (they never reach 48)
+ *   A=4  (24 B/cmd)  var_string 1.09 -> 2.52, 2.7 GB/s; the rest unchanged
+ *   A=8  (12 B/cmd)  + log_lines 1.09 -> 2.63, 1.45 GB/s; json 1.09 -> 2.05,
+ *                    1.12 GB/s
+ *   A=16 (6 B/cmd)   unchanged from A=8 (prose sits at 5.6, just under)
+ *   A=24 (4 B/cmd)   + text_en 1.09 -> 1.33 at 0.57 GB/s
+ *
+ * So the useful settings are A=4 (text that still decodes at GB/s rates),
+ * A=8 (adds the structured-text cases at ~1.2 GB/s) and A=24 (prose too,
+ * at a command-loop 0.57 GB/s). Each level names its own; the levels must
+ * stay ordered by permissiveness -- a deeper level that accepted LESS than
+ * the level before it would write a larger block than that level, which
+ * tests/suites/test_levels.c fails on. */
+#ifndef ZPSE_LZ_BPC_CROSS
+#define ZPSE_LZ_BPC_CROSS 96u
+#endif
+#ifndef ZPSE_LZ_ACCEL_MAX
+#define ZPSE_LZ_ACCEL_MAX 24u
+#endif
+#ifndef ZPSE_LZ_ACCEL_BALANCED
+#define ZPSE_LZ_ACCEL_BALANCED 12u
+#endif
+#ifndef ZPSE_LZ_ACCEL_CHEAP
+#define ZPSE_LZ_ACCEL_CHEAP 12u
+#endif
+
+/* The smallest win that pays for the LZ form's slower decode. A stream one
+ * byte smaller is not worth trading a 12 GB/s decoder for a command loop,
+ * and the rule is deliberately coarse: the LZ form's own size is estimated
+ * well (the sweep compares real totals), the win test only has to stop the
+ * one-byte "wins", which are noise on the sampling and cost 20x the decode.
+ * 1/32 is the same margin the candidate sweep keeps. */
+#ifndef ZPSE_LZ_MIN_WIN_DIV
+#define ZPSE_LZ_MIN_WIN_DIV 32u
+#endif
+
+/* Minimum output bytes per LZ command at this level's acceleration factor. */
+static uint32_t zpse_lz_min_bpc(uint32_t speed)
+{
+    uint32_t accel = (speed == (uint32_t)ZPSE_ENC_MAX)
+                         ? (uint32_t)ZPSE_LZ_ACCEL_MAX
+                         : (speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED)
+                               ? (uint32_t)ZPSE_LZ_ACCEL_BALANCED
+                               : (uint32_t)ZPSE_LZ_ACCEL_CHEAP;
+    uint32_t bpc;
+
+    if (accel == 0u) {
+        accel = 1u;
+    }
+    bpc = (uint32_t)ZPSE_LZ_BPC_CROSS / accel;
+    return bpc == 0u ? 1u : bpc;
+}
+
+/* Do the two cheap levels run the match finder too? Off by default, and the
+ * measurement is why. On the three structured-text corpora the form wins
+ * 1.09 -> 2.03/2.63/2.52, but the pass that finds it runs at ~600 MB/s while
+ * the tile encoder runs at 2.4 GB/s on the same blocks, so FASTEST's encode
+ * on those cases falls from 2320 MB/s to 391 -- slower than the DEFAULT
+ * level, which is the one thing an effort ladder must not do: the levels
+ * would no longer be ordered in time, and a caller asking for the fastest
+ * setting would get a five-times-slower encoder. The default and the deepest
+ * level pay that pass for the ratio (BALANCED 1900 -> 426 MB/s on JSON for
+ * 1.09 -> 2.05, and prose at MAX 1.09 -> 1.33); FASTEST and FASTER keep the
+ * tile stream and their own 2.4 GB/s. */
+#ifndef ZPSE_LZ_CHEAP_LEVELS
+#define ZPSE_LZ_CHEAP_LEVELS 0
+#endif
+
+/* Which levels run the match finder at all: MAX and the default level price
+ * every block -- the pass is what those levels are for -- and, when
+ * ZPSE_LZ_CHEAP_LEVELS is on, the two cheap levels price only the blocks the
+ * ASCII gate has already convicted of being text, which is the one piece of
+ * evidence about the tile family the gate hands back for free. */
+static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
+{
+    (void)ascii_gate;
+#if ZPSE_LZ_CHEAP_LEVELS
+    return speed == (uint32_t)ZPSE_ENC_MAX ||
+           speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED || ascii_gate != 0u;
+#else
+    return speed == (uint32_t)ZPSE_ENC_MAX ||
+           speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED;
+#endif
+}
+
+/* ---- The sample screen the LZ candidate passes first ---------------- *
+ *
+ * The match finder is the most expensive candidate in the sweep: measured
+ * with tests/tools on 64 KiB blocks it runs at 5.4-10.9 GB/s on the
+ * repetitive corpora but 575-610 MB/s on the text-shaped ones, against
+ * 2.3-2.5 GB/s for the tile encoder on the same blocks. So a level that
+ * offers the candidate on every block pays several trials' worth of time
+ * for a form that usually loses -- which is why only MAX used to offer it.
+ *
+ * Before the full pass, the same question is asked on the head of the
+ * block: the match finder encodes ZPSE_LZ_SCREEN_BYTES of it, the shape the
+ * sweep wants prices the same span with the probe's own machinery, and the
+ * pass only goes ahead when the LZ form wins that sample by the level's
+ * margin (ZPSE_LZ_SCREEN_*, in sixteenths). The screen is a lower bound on
+ * the win, so it can only cost a block the ratio a full pass would have
+ * bought on a sample that lies -- and it is what makes the candidate
+ * affordable outside MAX: the JSON, log and variable-string shapes win
+ * their sample by 1.8-2.4x and keep their 2.0-2.6:1, prose wins by 1.22x
+ * and pays the pass only at the levels asking for that little, and a block
+ * with nothing to find never reaches the match finder at all.
+ *
+ * The margins differ per level because they are the encode side of the same
+ * trade the acceleration factor makes on the decode side: the deeper the
+ * level, the smaller the sample win it will pay a pass for. MAX's margin is
+ * the smallest of the four (it is the level that exists to buy ratio) and it
+ * must be, since a deeper level that accepted LESS than the one before it
+ * would write a larger block than that level -- which is what
+ * tests/suites/test_levels.c pins. */
+#ifndef ZPSE_LZ_SCREEN_BYTES
+#define ZPSE_LZ_SCREEN_BYTES 1024u
+#endif
+#ifndef ZPSE_LZ_SCREEN_DEN
+#define ZPSE_LZ_SCREEN_DEN 16u
+#endif
+#ifndef ZPSE_LZ_SCREEN_NUM_MAX
+#define ZPSE_LZ_SCREEN_NUM_MAX 17u /* 1.0625x */
+#endif
+#ifndef ZPSE_LZ_SCREEN_NUM_BALANCED
+#define ZPSE_LZ_SCREEN_NUM_BALANCED 20u /* 1.25x */
+#endif
+#ifndef ZPSE_LZ_SCREEN_NUM_CHEAP
+#define ZPSE_LZ_SCREEN_NUM_CHEAP 20u /* 1.25x */
+#endif
+
+/* Should the full match-finder pass be paid for? `tid`, `sc` and the
+ * metadata describe the shape the sweep wants for this block, which is what
+ * the sample's tile price is measured with; the sample itself is the head of
+ * the block. Returns 1 (go ahead) when the sample cannot be coded or priced
+ * -- the screen is an optimisation on the sweep, never a new way to drop a
+ * candidate the sweep could not judge. */
+static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                                uint8_t tid, uint8_t sc, const uint8_t *mb,
+                                uint16_t meta_len, uint32_t speed)
+{
+    uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
+                      ? n
+                      : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
+    uint32_t num = (speed == (uint32_t)ZPSE_ENC_MAX)
+                       ? (uint32_t)ZPSE_LZ_SCREEN_NUM_MAX
+                       : (speed == (uint32_t)ZPSE_ENC_SPEED_BALANCED)
+                             ? (uint32_t)ZPSE_LZ_SCREEN_NUM_BALANCED
+                             : (uint32_t)ZPSE_LZ_SCREEN_NUM_CHEAP;
+    uint32_t lz_s;
+    uint32_t tile_s;
+
+    if (sn < ZPSE_LZ_MIN_MATCH + 1u) {
+        return 1;
+    }
+    lz_s = zpse_lz_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                          (speed == (uint32_t)ZPSE_ENC_FASTEST)
+                              ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                              : (uint32_t)ZPSE_LZ_HASH_BITS);
+    if (lz_s == 0u) {
+        return 1;
+    }
+    tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
+                                    ZPSE_DECIDE_TILES, UINT32_MAX, 1);
+    if (tile_s == UINT32_MAX) {
+        return 1;
+    }
+    return (uint64_t)tile_s * (uint64_t)ZPSE_LZ_SCREEN_DEN >=
+           (uint64_t)lz_s * (uint64_t)num;
+}
+
+/* Is this LZ stream worth taking? Smaller than the tile winner (or the
+ * sweep found nothing at all, in which case there is no tile stream to
+ * compare against), inside the level's acceleration factor, and smaller by
+ * enough to pay for the decode it gives up. `lz_cmds == 0` cannot happen
+ * from zpse_lz_encode (its stream always ends in a command) but is kept as
+ * "no evidence either way" rather than a division by zero. */
+static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
+                              int have_best, uint32_t best_total,
+                              uint32_t speed)
+{
+    if (have_best &&
+        (lz_total >= best_total ||
+         best_total - lz_total < best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV +
+                                     1u)) {
+        return 0;
+    }
+    if (lz_cmds != 0u && n / lz_cmds < zpse_lz_min_bpc(speed)) {
+        return 0;
+    }
+    return 1;
+}
 
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
@@ -1811,11 +2023,21 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * unchanged). The window has to be big enough for the price to
      * mean something: the sizes corpus is what catches a window that
      * mis-ranks, and it did not move. */
-        uint32_t pn = n < ZPSE_PROBE_WINDOW ? n : ZPSE_PROBE_WINDOW;
+        uint32_t speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
+        /* One window for every level. FASTEST was given its own, 8 KiB
+         * against the others' 12 (the window is paid once per candidate, and
+         * FASTEST acts on a single candidate), and it is not worth it: on the
+         * geo_point corpus the shorter window picks a shape that is 13%
+         * larger AND decodes at 1.9 GB/s against the 5.1 the 12 KiB window
+         * picks (13.06:1), because 8 KiB is not enough of a burst-heavy
+         * columnar block to see the repeats that rank it. The speed it bought
+         * was ~4%, inside the run-to-run noise of this machine. */
+        uint32_t pn = n < (uint32_t)ZPSE_PROBE_WINDOW
+                          ? n
+                          : (uint32_t)ZPSE_PROBE_WINDOW;
         /* ZPSE_ENC_SPEED_BALANCED prices every plane of a candidate, which is
          * what ranks a transpose correctly; the cheap levels price a stride
          * of them and fill the rest in (see zpse_block_exact_sum). */
-        uint32_t speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
         int every_plane = (speed != (uint32_t)ZPSE_ENC_FASTER &&
                            speed != (uint32_t)ZPSE_ENC_FASTEST);
         int pick = -1;
@@ -1863,6 +2085,28 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * unpriced. */
             if (pick >= 0 && ex[pick] != UINT32_MAX) {
                 lim = ex[pick] + (ex[pick] >> 4);
+            }
+            /* Arithmetic floor before any staging: a shape's smallest
+             * possible total over the window is a function of its plane
+             * lengths alone (ten bytes per 256-byte tile, twelve per 4 KiB
+             * dense record), so a candidate already past the limit cannot
+             * be a survivor and the transform staging plus the plane prices
+             * that would prove it are pure cost. The probe's own early exit
+             * cannot see this: it stops a candidate only after its first
+             * plane has been staged and priced, which is most of the price
+             * of a width-16 shape. Reported as a finite price above `lim`
+             * -- like a candidate the probe convicted -- so the compaction
+             * below drops it rather than treating it as unpriced (UINT32_MAX
+             * is kept on purpose: the sweep must never drop something it
+             * could not price). */
+            if (lim != UINT32_MAX) {
+                uint32_t fl = zpse_block_floor(pn, tids[ci], scounts[ci],
+                                               meta_lens[ci]);
+
+                if (fl != UINT32_MAX && fl > lim) {
+                    ex[ci] = fl;
+                    continue;
+                }
             }
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
@@ -2317,14 +2561,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
 
-    /* The deepest level tries one more candidate: the intra-block LZ form.
-     * It competes on size alone, so the level can never write a block
-     * larger than the default level would -- but a block it does win is a
-     * copy loop to decode instead of a tile reconstruction, and a block of
-     * long repeats is exactly where that matters. The match finder is a
-     * full pass over the block, which is why only this level pays for it. */
-    if ((e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) ==
-            (uint32_t)ZPSE_ENC_MAX &&
+    /* One more candidate, competing on size alone: the intra-block LZ form.
+     * A level that takes it can never write a block larger than the same
+     * level without it, and a block it wins is a copy loop to decode instead
+     * of a tile reconstruction. Which levels run the match finder at all is
+     * zpse_block_lz_level (MAX and the default level price every block, the
+     * two cheap levels only the blocks the ASCII gate convicted of being
+     * text), and what they will trade for it is the level's acceleration
+     * factor (see ZPSE_LZ_ACCEL_*): the match finder is a full pass over the
+     * block, so it is the most expensive candidate in the sweep. */
+    if (zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+                            e->ascii_gate) &&
         e->lz != 0) {
         /* Exact floor first: one command codes at most 259 bytes, so an
          * LZ payload can never be smaller than its 8-byte header plus one
@@ -2338,29 +2585,38 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                             4u * ((n + ZPSE_LZ_MAX_MATCH - 1u) /
                                   ZPSE_LZ_MAX_MATCH);
 
-        if (!have_best || best_total > lz_floor) {
+        if ((!have_best || best_total > lz_floor) &&
+            zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
+                                 meta_lens[0] > 0 ? meta_bufs[0] : in,
+                                 meta_lens[0],
+                                 e->enc_flags &
+                                     (uint32_t)ZPSE_ENC_SPEED_MASK)) {
             uint32_t lz_total = 0u;
             uint32_t lz_cmds = 0u;
+            uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
 
             rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                    (uint32_t)ZPSE_E_SZ_CAND, &lz_total,
                                    &lz_cmds);
             /* Smaller is not enough: the two forms decode at speeds that
-             * have nothing to do with their ratio. A tile stream decodes at
-             * 5-13 GB/s whatever it holds; an LZ stream decodes at the speed
-             * of its own command loop, one 4-byte command per output run, so
-             * its rate follows the AVERAGE RUN LENGTH. Measured on this
-             * corpus, in bytes of output per command: 5.6 -> 0.6 GB/s
-             * (prose), 9 -> 1.2 (json), 17 -> 2.9 (var strings), 64 -> 8.8
-             * (sparse), 128 -> 8.4 (geo), 246 -> 24 (zeros). So the level
-             * takes LZ only when its commands average a run long enough to
-             * beat the tile stream's own decode, which is the copy loop this
-             * level exists for; a prose block whose LZ stream is 20% smaller
-             * keeps the tiles, because 0.6 GB/s is not a win over 12. */
-            if (rc == PSE_OK && (!have_best || lz_total < best_total) &&
-                (lz_cmds == 0u ||
-                 n / lz_cmds >= (uint32_t)ZPSE_LZ_MIN_BYTES_PER_CMD)) {
-                memcpy(e->best, e->cand, lz_total);
+             * have nothing to do with their ratio, so the win also has to be
+             * big enough to pay for the decode it gives up and the command
+             * loop has to be inside this level's acceleration factor. Both
+             * tests are in zpse_block_lz_wins, with the measurements they
+             * came from. */
+            if (rc == PSE_OK &&
+                zpse_block_lz_wins(n, lz_cmds, lz_total, have_best,
+                                   best_total, lz_speed)) {
+                if (direct_out) {
+                    /* The gated block has already written its tile stream
+                     * into the caller's buffer (see the trial loop), so the
+                     * smaller LZ stream replaces it there. No capacity check
+                     * is needed: lz_total is smaller than what `out` now
+                     * holds. */
+                    memcpy(out, e->cand, lz_total);
+                } else {
+                    memcpy(e->best, e->cand, lz_total);
+                }
                 best_total = lz_total;
                 /* 15 is the slot the statistics code gives the raw fallback:
                  * neighbours with no transform id, like the LZ form. */

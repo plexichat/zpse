@@ -861,14 +861,29 @@ static void emitter_block(uint32_t n, uint8_t v)
     if (rc != PSE_OK) {
         return;
     }
-    /* One segment, no metadata: 32-byte block header, 8-byte directory
-     * entry, 16-byte segment header, then the first record. */
-    CHECK((((comp[32 + 8 + 16 + 2] & ZPSE_DENSE_MARKER) != 0) ? 1 : 0) ==
-              want,
-          "block: dense marker iff smaller");
-    if (want) {
-        CHECK(clen == 32u + 8u + 16u + 12u * ((n + 4095u) / 4096u),
-              "block: dense constant size");
+    /* A constant block used to be the dense form's showcase, and it still is
+     * wherever the dense form is the cheapest thing the encoder has. The
+     * default level now also offers the intra-block LZ form, and on a run of
+     * one byte that form beats BOTH tile forms once the block is long enough
+     * to pay for its command words (n = 1024: 56 bytes against the dense
+     * form's 68, and 44 against it at n = 100), which is why the shape pinned
+     * here is "dense, or the LZ form when it won". A block that went RAW, or
+     * dense when RAW was smaller, still fails: the LZ branch's bound is the
+     * all-hit tile form's own cost, and the dense branch pins the exact
+     * arithmetic as before. */
+    if ((comp[3] & (uint8_t)ZPSE_B_LZ) != 0) {
+        CHECK(clen < 32u + 8u + 16u + 10u * ((n + 255u) / 256u),
+              "block: LZ form beats the tiles on a constant block");
+    } else {
+        /* One segment, no metadata: 32-byte block header, 8-byte directory
+         * entry, 16-byte segment header, then the first record. */
+        CHECK((((comp[32 + 8 + 16 + 2] & ZPSE_DENSE_MARKER) != 0) ? 1 : 0) ==
+                  want,
+              "block: dense marker iff smaller");
+        if (want) {
+            CHECK(clen == 32u + 8u + 16u + 12u * ((n + 4095u) / 4096u),
+                  "block: dense constant size");
+        }
     }
     rc = zpse_decompress_block(comp, clen, back, (uint32_t)sizeof back, &dlen,
                                DARENA);

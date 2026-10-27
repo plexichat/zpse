@@ -70,28 +70,38 @@
  * the shapes themselves are the same. What a level changes is how the sweep
  * decides which shape to write.
  *
- *   ZPSE_ENC_SPEED_BALANCED  the default: price one tile in every plane of
- *                            every candidate, keep those within a margin of
- *                            the best, encode each in full.
- *   ZPSE_ENC_FASTER          price a quarter of the planes and estimate the
- *                            rest, keeping the same survivor rule. The
- *                            estimate under-prices the wide transposes, so
- *                            a block whose best shape is one of those can
- *                            come out larger than at the default.
+ *   ZPSE_ENC_SPEED_BALANCED  the default: price the planes of every
+ *                            candidate, keep those within a margin of the
+ *                            best, encode each in full -- and offer the
+ *                            intra-block LZ form as one more candidate on
+ *                            every block. The match finder is a full pass
+ *                            at roughly a quarter of the tile encoder's
+ *                            rate, so a sample of the block is coded first
+ *                            and the pass is paid for only when that sample
+ *                            shows the form winning by a margin (see
+ *                            ZPSE_LZ_SCREEN_* in block.c).
+ *   ZPSE_ENC_FASTER          the same sweep with at most two full trials,
+ *                            and no match finder at all.
  *   ZPSE_ENC_FASTEST         the same cheap price, then encode only the
  *                            single shape it likes best: one trial per
- *                            block, no second opinion.
+ *                            block, no second opinion, no match finder.
+ *                            This is the level to reach for when the
+ *                            encoder is the bottleneck.
  *
- *   ZPSE_ENC_MAX             everything the default level does, plus one
- *                            more candidate: the intra-block LZ form. The
- *                            match finder is a full pass over the block,
- *                            so this level costs more encode time than any
- *                            other; it never costs compressed size, since
- *                            the LZ stream is only written when it is
- *                            smaller than the best tile stream. What it
- *                            buys is decode speed on repetitive blocks:
- *                            a block that LZ wins is a copy loop, not a
- *                            tile reconstruction.
+ *   ZPSE_ENC_MAX             everything the default level does, with the
+ *                            match finder's sample screen at its loosest
+ *                            (see ZPSE_LZ_SCREEN_NUM_*). The two deepest
+ *                            levels therefore differ mostly in how small a
+ *                            win on that sample is worth a full pass, which
+ *                            is what puts prose's LZ form at MAX and not at
+ *                            the default level. No level's LZ candidate can
+ *                            cost it size -- the form is kept only when it
+ *                            is smaller than the best tile stream -- and
+ *                            the trade it makes is decode speed: an LZ
+ *                            stream decodes at the speed of its command
+ *                            loop, so the level's acceleration factor (see
+ *                            ZPSE_LZ_ACCEL_* in block.c) decides how slow
+ *                            than the tile stream it is allowed to be.
  *
  * An unsupported level is rejected with PSE_BAD_ARG rather than rounded to
  * one of these. */
