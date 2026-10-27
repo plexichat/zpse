@@ -45,7 +45,22 @@ typedef struct ZpseLaneState {
      * tile by both sides, over the same tiles in the same order, so the
      * two agree on which entries are current. */
     uint16_t gen;
+    /* Set once the ORDER2 table has been wiped for the block or trial this
+     * lane state belongs to; cleared where the wipe used to be done. See
+     * zpse_lane_o2_use. */
+    int o2_ready;
 } ZpseLaneState;
+
+/* Wipe the ORDER2 table if this block or trial has not needed it yet.
+ *
+ * Entries carry a generation stamp and the stamp restarts with every block,
+ * so a table left over from the previous block could make its first tiles
+ * read entries they never wrote. Wiping at every block start is correct but
+ * unconditional: 128 KiB of memset for a block whose tiles may never name
+ * ORDER2, which on a one-value or stride block was the largest fixed cost
+ * in the whole path. Every caller that is about to touch the table calls
+ * this first, so the wipe happens exactly when it is needed and once. */
+void zpse_lane_o2_use(ZpseLaneState *s);
 
 void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal);
 

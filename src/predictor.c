@@ -6,6 +6,17 @@
 #include <stdint.h>
 #include <string.h>
 
+void zpse_lane_o2_use(ZpseLaneState *s)
+{
+    if (s->o2_ready != 0) {
+        return;
+    }
+    if (s->o2 != 0) {
+        memset(s->o2, 0, (size_t)8u * 4096u * 4u);
+    }
+    s->o2_ready = 1;
+}
+
 /* Histories only: 16 bytes, and the part of the entry state that every
  * tile's classify and decode depend on. Split out of zpse_lane_reset so
  * a caller can establish the entry state without paying the 66 KiB of
@@ -147,6 +158,7 @@ int zpse_predict_block(const ZpseLaneState *s, uint8_t predictor_id,
         if (s->o2 == NULL) {
             return PSE_BAD_ARG;
         }
+        zpse_lane_o2_use(s);
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
             uint16_t idx = zpse_order2_index(s->second_last[lane],
@@ -232,7 +244,10 @@ void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,
                 s->order1[lane * 256u + (size_t)old_last] = x;
             }
         } else if (predictor_id == ZPSE_P_ORDER2) { /* 4 */
-            uint16_t idx = zpse_order2_index(old_second, old_last);
+            uint16_t idx;
+
+            zpse_lane_o2_use(s);
+            idx = zpse_order2_index(old_second, old_last);
             size_t off = (lane * 4096u + (size_t)idx) * 4u;
             uint8_t *val;
             uint8_t *conf;
