@@ -1691,6 +1691,47 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * identity, DELTA8 (digits and numbers), and a width-4 transpose (tabular
  * text). Widths 2, 8 and 16 price within a few percent of width 4 on the
  * data this fires on, and they cost the same samples again. */
+/* 1 iff the first `n` bytes are all one value.
+ *
+ * The gate compares three shapes' exact price against what the seven-bit
+ * form would cost over the same span, and a plane that is one value prices
+ * at its own floor -- far below seven bits a byte -- so a constant sample
+ * cannot convict. Testing for it on the two kilobytes the gate would have
+ * sampled anyway is what keeps a one-value block from paying a whole-block
+ * scan and six priced planes to learn nothing: that scan is ~1.3 us of a
+ * ~3 us encode (measured: `zeros` encodes at 20 GB/s through the gate and
+ * 37 at MAX, which does not run it).
+ *
+ * Skipping the gate can only send the block down the ordinary sweep, which
+ * is the path every non-ASCII and every non-gated block takes, so the bytes
+ * written are decided by the sweep either way. */
+static int zpse_block_head_one_value(const uint8_t *in, uint32_t n)
+{
+    uint64_t rep;
+    uint32_t i;
+    uint8_t v;
+
+    if (in == 0 || n < 64u) {
+        return 0;
+    }
+    v = in[0];
+    rep = UINT64_C(0x0101010101010101) * (uint64_t)v;
+    for (i = 0u; i + 8u <= n; i += 8u) {
+        uint64_t w;
+
+        memcpy(&w, in + i, sizeof w);
+        if (w != rep) {
+            return 0;
+        }
+    }
+    for (; i < n; i++) {
+        if (in[i] != v) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
                                  uint32_t n)
 {
@@ -1927,8 +1968,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * that trial is the point of the level. */
     e->ascii_gate = 0u;
     if (zpse_enc_speed(e->enc_flags) <= ZPSE_ENC_SPEED_ASCII_GATE_MAX &&
-        n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK && zpse_ascii_scan(in, n) &&
-        zpse_block_ascii_gate(e, in, n)) {
+        n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK &&
+        !zpse_block_head_one_value(
+            in, (n < (uint32_t)ZPSE_ASCII_SAMPLE) ? n
+                                                  : (uint32_t)ZPSE_ASCII_SAMPLE) &&
+        zpse_ascii_scan(in, n) && zpse_block_ascii_gate(e, in, n)) {
         e->ascii_gate = 1u;
         /* Identity only: one trial, which now packs instead of searching,
          * and no pricing pass or second opinion to pay for first. */

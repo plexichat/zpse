@@ -39,8 +39,8 @@ WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 
 | pattern | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| `zeros` | 0.004 | 19 800 | **74 500** |
-| `const5A` | 0.004 | 19 800 | **74 000** |
+| `zeros` | 0.004 | 35 600 | **74 000** |
+| `const5A` | 0.004 | 35 500 | **74 000** |
 | `random` | 1.000 | 1 020 | **65 900** |
 | `lowentropy` (4-bit alphabet) | 0.508 | 210 | 45 900 |
 | `incr` (0..255 ramp) | 0.040 | 2 020 | 16 800 |
@@ -53,9 +53,11 @@ WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 The encode column is the default level (5), which prices every plane of every
 candidate and also offers the intra-block LZ form. On these patterns the price
 buys the ratios and the finder finds nothing, so the sweep is most of the
-encode: the one-value rows encode at 20 GB/s here and 37 at level 9, which
-skips the ASCII gate, against 74 GB/s to decode them. Decode is the same at
-every level, because the shapes written are.
+encode: the one-value rows are 35 GB/s against 74 to decode them, and they are
+that fast only because the ASCII gate's whole-block scan is skipped when the
+block's first two kilobytes are one value -- a constant sample cannot convict
+the gate, and the scan is a third of such a block's encode. Decode is the same
+at every level, because the shapes written are.
 
 What the rows are: `zeros`/`const5A` are one-byte-value blocks (coded in
 248 bytes), `random` is incompressible (coded as a raw block, so decode is
