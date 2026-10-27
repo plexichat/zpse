@@ -32,6 +32,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 /* ---- bit writer / reader (LSB first within a byte) ----------------- */
 
@@ -202,22 +208,154 @@ static inline void zpse_ref_put64le(uint8_t *p, uint64_t v)
 /* The first value is stored absolute, the rest as the difference to
  * the previous one. A sorted microsecond column has a step of about a
  * millisecond, so a difference is a varint of two bytes and the whole
- * column shrinks by a factor of four. */
+ * column shrinks by a factor of four.
+ *
+ * Delta computation is vectorized with SSE2/AVX2: a chunk of values is
+ * loaded, shifted so every element sits next to its predecessor, and
+ * subtracted in parallel. Varint emission stays scalar, and the vector
+ * path emits exactly the values the scalar loop below emits, so the byte
+ * stream is bit-identical either way.
+ *
+ * The shift is the whole trick. A 64-bit element shift on either ISA
+ * moves bytes WITHIN each 128-bit lane (VPSLLDQ/PSLLDQ), so a plain
+ * `_mm256_srli_si256(vals, 8)` gives [v1, 0, v3, 0] -- the odd elements
+ * read zero and the even ones lose the predecessor that lives in the
+ * other lane. The predecessor vector is therefore built per half: the
+ * even half's predecessor is the previous chunk's last value, the odd
+ * half's is the even half's last value, and both are shifted in with a
+ * lane-exchanging permute. No special case is needed for the first
+ * value: `prev` starts at zero, so the first delta IS the value.
+
+ */
+
+/* [prev, v0, v1, ...] for a chunk of 128-bit registers holding 64-bit
+ * values, `prev` being the value before the chunk. */
+#if defined(__AVX2__)
+static inline __m256i zpse_colref_prev256(__m256i vals, uint64_t prev)
+{
+    __m256i carry = _mm256_castsi128_si256(_mm_cvtsi64_si128((long long)prev));
+
+    /* Low lane: 0 for the value that is first, `prev` in front of it. High
+     * lane: the low lane's last value in front of it, which is the only
+     * place it can come from -- hence the lane exchange. */
+    return _mm256_or_si256(_mm256_slli_si256(vals, 8),
+                           _mm256_permute2x128_si256(
+                               carry, _mm256_srli_si256(vals, 8), 0x20));
+}
+
+/* The 32-bit version. The high lane's first slot wants the low lane's
+ * LAST element, and a byte shift cannot reach across the lane boundary,
+ * so the second term shifts the chunk right by three elements: its low
+ * lane then holds exactly [v3, 0, 0, 0], and the byte-wise permute moves
+ * that whole lane up into the high lane's first slot. */
+static inline __m256i zpse_colref_prev256_32(__m256i vals, uint32_t prev)
+{
+    __m256i carry = _mm256_castsi128_si256(_mm_cvtsi32_si128((int)prev));
+
+    return _mm256_or_si256(_mm256_slli_si256(vals, 4),
+                           _mm256_permute2x128_si256(
+                               carry, _mm256_srli_si256(vals, 12), 0x20));
+}
+#endif
+#if defined(__SSE2__)
+static inline __m128i zpse_colref_prev128(__m128i vals, uint64_t prev)
+{
+    return _mm_or_si128(_mm_slli_si128(vals, 8),
+                        _mm_cvtsi64_si128((long long)prev));
+}
+
+/* The same predecessor vector for a chunk of 32-bit lanes (the float
+ * codec). `prev` is what the element before the chunk holds. */
+static inline __m128i zpse_colref_prev128_32(__m128i vals, uint32_t prev)
+{
+    return _mm_or_si128(_mm_slli_si128(vals, 4), _mm_cvtsi32_si128((int)prev));
+}
+
+/* Three instructions SSE2 does not have, rebuilt out of ones it does.
+ * _mm_cmpeq_epi64 and _mm_max_epi32 arrive with SSE4.1, and a bare
+ * -std=c11 -O2 build on x86-64 is SSE2 only (which is how
+ * tests/suites/test_colref.c compiles this header), so a block guarded
+ * by __SSE2__ may not name them. */
+
+/* Per-64-bit-lane equality: two elements are equal exactly when both of
+ * their 32-bit halves are. Shuffling adjacent 32-bit lanes and ANDing
+ * leaves that conjunction in every half of each lane, so movemask's bit
+ * 0 (first lane) and bit 8 (second lane) are this element's equality. */
+static inline __m128i zpse_colref_eq64(__m128i a, __m128i b)
+{
+    __m128i c = _mm_cmpeq_epi32(a, b);
+
+    return _mm_and_si128(c, _mm_shuffle_epi32(c, 0xB1));
+}
+
+static inline __m128i zpse_colref_ne64(__m128i a, __m128i b)
+{
+    return _mm_xor_si128(zpse_colref_eq64(a, b), _mm_set1_epi32(-1));
+}
+
+/* Signed 32-bit lane max: the compare's mask selects the larger half. */
+static inline __m128i zpse_colref_max_epi32(__m128i a, __m128i b)
+{
+    __m128i gt = _mm_cmpgt_epi32(a, b);
+
+    return _mm_or_si128(_mm_and_si128(gt, a), _mm_andnot_si128(gt, b));
+}
+#endif
+
 static inline int zpse_colref_ts_seq_encode(const uint8_t *in, size_t n,
                                              uint8_t *out, size_t cap,
                                              size_t *out_len)
 {
     size_t pos = 0;
-    size_t r;
+    size_t r = 0;
+    size_t nvals = n / 8u;
     uint64_t prev = 0;
 
-    for (r = 0; (r + 1u) * 8u <= n; r++) {
+#if defined(__AVX2__)
+    for (; r + 4u <= nvals; r += 4u) {
+        __m256i vals = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(in + r * 8u));
+        __m256i deltas = _mm256_sub_epi64(vals,
+                                          zpse_colref_prev256(vals, prev));
+        uint64_t dv[4], vv[4];
+        size_t k;
+
+        _mm256_storeu_si256((__m256i *)(void *)dv, deltas);
+        _mm256_storeu_si256((__m256i *)(void *)vv, vals);
+        prev = vv[3];
+        for (k = 0u; k < 4u; k++) {
+            pos = zpse_varint_put(out, cap, pos, dv[k]);
+            if (pos >= cap) return -1;
+        }
+    }
+#elif defined(__SSE2__)
+    for (; r + 2u <= nvals; r += 2u) {
+        __m128i vals = _mm_loadu_si128(
+            (const __m128i *)(const void *)(in + r * 8u));
+        __m128i deltas = _mm_sub_epi64(vals,
+                                       zpse_colref_prev128(vals, prev));
+        uint64_t dv[2], vv[2];
+        size_t k;
+
+        _mm_storeu_si128((__m128i *)(void *)dv, deltas);
+        _mm_storeu_si128((__m128i *)(void *)vv, vals);
+        prev = vv[1];
+        for (k = 0u; k < 2u; k++) {
+            pos = zpse_varint_put(out, cap, pos, dv[k]);
+            if (pos >= cap) return -1;
+        }
+    }
+#endif
+
+    for (; r < nvals; r++) {
         uint64_t v = zpse_ref_get64le(in + r * 8u);
         uint64_t d = (r == 0u) ? v : (v - prev);
+
         pos = zpse_varint_put(out, cap, pos, d);
         if (pos >= cap) return -1;
         prev = v;
     }
+
     *out_len = pos;
     return 0;
 }
@@ -246,25 +384,98 @@ static inline int zpse_colref_ts_seq_decode(const uint8_t *in, size_t n,
 /* The difference between two differences. A nanosecond feed's step is
  * nearly constant, so the second difference is a small signed number
  * -- usually zero -- and the column becomes a stream of one-byte
- * varints. */
+ * varints.
+ *
+ * First and second deltas are both vectorized with SSE2/AVX2, using the
+ * same predecessor vector as ts_seq above (so the shift crosses the
+ * 128-bit lane boundary). Zigzag is vectorized on AVX2; on SSE2 it is
+ * scalar, because a 64-bit compare -- which is what the sign mask needs
+ * -- first appears in SSE4.2. Varint emission stays scalar, and the
+ * vector path emits exactly the values the scalar loop below emits.
+ *
+ * The first two outputs bypass the recurrence: position 0's second
+ * difference is its first difference (there is no earlier one) and
+ * position 1's likewise, which is why the first chunk patches element 1
+ * back to its first difference before the zigzag. */
 static inline int zpse_colref_ts_ns_encode(const uint8_t *in, size_t n,
                                             uint8_t *out, size_t cap,
                                             size_t *out_len)
 {
     size_t pos = 0;
-    size_t r;
-    int64_t prev = 0;
+    size_t r = 0;
+    size_t nvals = n / 8u;
+    int64_t prev_v = 0;
     int64_t prev_d = 0;
 
-    for (r = 0; (r + 1u) * 8u <= n; r++) {
+#if defined(__AVX2__)
+    for (; r + 4u <= nvals; r += 4u) {
+        __m256i vals = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(in + r * 8u));
+        __m256i d = _mm256_sub_epi64(
+            vals, zpse_colref_prev256(vals, (uint64_t)prev_v));
+        __m256i dd = _mm256_sub_epi64(
+            d, zpse_colref_prev256(d, (uint64_t)prev_d));
+        __m256i zz;
+        uint64_t vv[4], dv[4], zzv[4];
+        size_t k;
+
+        if (r == 0u) {
+            /* Element 1 is the second 64-bit element: 32-bit lanes 2 and
+             * 3, which is blend mask 0x0C. */
+            dd = _mm256_blend_epi32(dd, d, 0x0Cu);
+        }
+        /* (dd << 1) ^ (dd >> 63): the arithmetic shift is the sign mask of
+         * a 64-bit compare, since AVX2 has no 64-bit vector shift. */
+        zz = _mm256_xor_si256(_mm256_slli_epi64(dd, 1),
+                              _mm256_cmpgt_epi64(_mm256_setzero_si256(), dd));
+        _mm256_storeu_si256((__m256i *)(void *)vv, vals);
+        _mm256_storeu_si256((__m256i *)(void *)dv, d);
+        _mm256_storeu_si256((__m256i *)(void *)zzv, zz);
+        prev_v = (int64_t)vv[3];
+        prev_d = (int64_t)dv[3];
+        for (k = 0u; k < 4u; k++) {
+            pos = zpse_varint_put(out, cap, pos, zzv[k]);
+            if (pos >= cap) return -1;
+        }
+    }
+#elif defined(__SSE2__)
+    for (; r + 2u <= nvals; r += 2u) {
+        __m128i vals = _mm_loadu_si128(
+            (const __m128i *)(const void *)(in + r * 8u));
+        __m128i d = _mm_sub_epi64(vals,
+                                  zpse_colref_prev128(vals, (uint64_t)prev_v));
+        __m128i dd = _mm_sub_epi64(d,
+                                   zpse_colref_prev128(d, (uint64_t)prev_d));
+        uint64_t vv[2], dv[2], ddv[2];
+        size_t k;
+
+        _mm_storeu_si128((__m128i *)(void *)vv, vals);
+        _mm_storeu_si128((__m128i *)(void *)dv, d);
+        _mm_storeu_si128((__m128i *)(void *)ddv, dd);
+        if (r == 0u) {
+            ddv[1] = dv[1];
+        }
+        prev_v = (int64_t)vv[1];
+        prev_d = (int64_t)dv[1];
+        for (k = 0u; k < 2u; k++) {
+            pos = zpse_varint_put(out, cap, pos,
+                                  zpse_zigzag((int64_t)ddv[k]));
+            if (pos >= cap) return -1;
+        }
+    }
+#endif
+
+    for (; r < nvals; r++) {
         int64_t v = (int64_t)zpse_ref_get64le(in + r * 8u);
-        int64_t d = (r == 0u) ? v : (v - prev);
+        int64_t d = v - prev_v;
         int64_t dd = (r < 2u) ? d : (d - prev_d);
+
         pos = zpse_varint_put(out, cap, pos, zpse_zigzag(dd));
         if (pos >= cap) return -1;
-        prev = v;
+        prev_v = v;
         prev_d = d;
     }
+
     *out_len = pos;
     return 0;
 }
@@ -298,17 +509,98 @@ static inline int zpse_colref_ts_ns_decode(const uint8_t *in, size_t n,
  * then store the leading zeros, the length of the meaningful part and
  * the meaningful bits themselves. A value equal to its predecessor
  * costs a single bit, which is the whole point on a column of
- * readings that mostly repeat. */
+ * readings that mostly repeat.
+ *
+ * The XOR chain and zero test are vectorized (SSE2 = 4 lanes,
+ * AVX2 = 8 lanes): a whole chunk is XORed with its shifted self in one
+ * instruction, and all lanes are compared to zero at once. The bit
+ * stream itself stays serial -- variable-length output per value means
+ * the chunk is then walked lane-by-lane calling the same bit writer as
+ * the scalar version, so the emitted bytes are bit-identical. `prev`
+ * carries from the last lane of each chunk. */
 static inline int zpse_colref_float_encode(const uint8_t *in, size_t n,
                                             uint8_t *out, size_t cap,
                                             size_t *out_len)
 {
     ZpseBitWriter w;
-    size_t r;
+    size_t r = 0;
+    size_t nvals = n / 4u;
     uint32_t prev = 0;
 
     zpse_bw_init(&w, out, cap);
-    for (r = 0; (r + 1u) * 4u <= n; r++) {
+
+#if defined(__AVX2__)
+    for (; r + 8u <= nvals; r += 8u) {
+        __m256i vals = _mm256_loadu_si256((const __m256i *)(in + r * 4u));
+        __m256i x = _mm256_xor_si256(vals,
+                                     zpse_colref_prev256_32(vals, prev));
+        uint32_t vv[8], xx[8];
+        _mm256_storeu_si256((__m256i *)vv, vals);
+        _mm256_storeu_si256((__m256i *)xx, x);
+        int zmask = _mm256_movemask_ps(
+            _mm256_castsi256_ps(_mm256_cmpeq_epi32(x, _mm256_setzero_si256())));
+
+        for (unsigned k = 0; k < 8u; k++) {
+            uint32_t v = vv[k];
+            uint32_t xv = xx[k];
+            unsigned lead;
+            unsigned trail;
+            unsigned len;
+
+            if (((zmask >> k) & 1u) != 0u) {
+                zpse_bw_put(&w, 0, 1);
+                prev = v;
+                continue;
+            }
+            lead = 0;
+            while (lead < 32u && ((xv >> (31u - lead)) & 1u) == 0u) lead++;
+            trail = 0;
+            while (trail < 32u && ((xv >> trail) & 1u) == 0u) trail++;
+            len = 32u - lead - trail;
+            zpse_bw_put(&w, 1, 1);
+            zpse_bw_put(&w, lead, 5);
+            zpse_bw_put(&w, len, 6);
+            zpse_bw_put(&w, (uint64_t)(xv >> trail), len);
+            prev = v;
+        }
+    }
+#elif defined(__SSE2__)
+    for (; r + 4u <= nvals; r += 4u) {
+        __m128i vals = _mm_loadu_si128((const __m128i *)(in + r * 4u));
+        __m128i x = _mm_xor_si128(vals, zpse_colref_prev128_32(vals, prev));
+        uint32_t vv[4], xx[4];
+        _mm_storeu_si128((__m128i *)vv, vals);
+        _mm_storeu_si128((__m128i *)xx, x);
+        int zmask = _mm_movemask_ps(
+            _mm_castsi128_ps(_mm_cmpeq_epi32(x, _mm_setzero_si128())));
+
+        for (unsigned k = 0; k < 4u; k++) {
+            uint32_t v = vv[k];
+            uint32_t xv = xx[k];
+            unsigned lead;
+            unsigned trail;
+            unsigned len;
+
+            if (((zmask >> k) & 1u) != 0u) {
+                zpse_bw_put(&w, 0, 1);
+                prev = v;
+                continue;
+            }
+            lead = 0;
+            while (lead < 32u && ((xv >> (31u - lead)) & 1u) == 0u) lead++;
+            trail = 0;
+            while (trail < 32u && ((xv >> trail) & 1u) == 0u) trail++;
+            len = 32u - lead - trail;
+            zpse_bw_put(&w, 1, 1);
+            zpse_bw_put(&w, lead, 5);
+            zpse_bw_put(&w, len, 6);
+            zpse_bw_put(&w, (uint64_t)(xv >> trail), len);
+            prev = v;
+        }
+    }
+#endif
+
+    for (; r < nvals; r++) {
         uint32_t v = zpse_ref_get32le(in + r * 4u);
         uint32_t x = v ^ prev;
         unsigned lead;
@@ -337,6 +629,10 @@ static inline int zpse_colref_float_encode(const uint8_t *in, size_t n,
     return 0;
 }
 
+/* Decode is inherently serial: each value is prev ^ reconstructed x, so
+ * prev is a loop-carried dependency with no chunk-level parallelism.
+ * Kept scalar; the bit reader is unchanged, so output is trivially
+ * bit-identical. */
 static inline int zpse_colref_float_decode(const uint8_t *in, size_t n,
                                             uint8_t *out, size_t n_out)
 {
@@ -368,9 +664,10 @@ static inline int zpse_colref_float_decode(const uint8_t *in, size_t n,
 /* ---- sparse_mix: null bitmap + values ----------------------------- */
 
 /* One bit per value saying whether it is null, then the non-null
- * values. A column that is 92% null costs a bit per value and nothing
- * for the rest -- which is the whole point of null suppression, and
- * the reason a wide analytics table compresses to almost nothing. */
+ * values. SIMD (AVX2: 4 i64 per load, SSE2: 2 i64 per load) detects
+ * all-zero lanes and packs the null flags into the bitmap LSB-first;
+ * non-null values are still copied one memcpy at a time, so output is
+ * bit-identical to the scalar version. */
 static inline int zpse_colref_sparse_encode(const uint8_t *in, size_t n,
                                             uint8_t *out, size_t cap,
                                             size_t *out_len)
@@ -383,7 +680,66 @@ static inline int zpse_colref_sparse_encode(const uint8_t *in, size_t n,
     if (cap < nbytes) return -1;
     memset(out, 0, nbytes);
     pos = nbytes;
-    for (i = 0; i < nvals; i++) {
+    i = 0;
+
+#if defined(__AVX2__)
+    for (; i + 8u <= nvals; i += 8u) {
+        __m256i zero = _mm256_setzero_si256();
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(in + (i + 0u) * 8u));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(in + (i + 4u) * 8u));
+        uint32_t m0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi64(v0, zero));
+        uint32_t m1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi64(v1, zero));
+        uint8_t byte = 0;
+
+        /* movemask bit == 1 means null; bitmap bit == 1 means non-null. */
+        byte |= (uint8_t)((((m0 >> 0u) & 1u) ^ 1u) << 0u);
+        byte |= (uint8_t)((((m0 >> 8u) & 1u) ^ 1u) << 1u);
+        byte |= (uint8_t)((((m0 >> 16u) & 1u) ^ 1u) << 2u);
+        byte |= (uint8_t)((((m0 >> 24u) & 1u) ^ 1u) << 3u);
+        byte |= (uint8_t)((((m1 >> 0u) & 1u) ^ 1u) << 4u);
+        byte |= (uint8_t)((((m1 >> 8u) & 1u) ^ 1u) << 5u);
+        byte |= (uint8_t)((((m1 >> 16u) & 1u) ^ 1u) << 6u);
+        byte |= (uint8_t)((((m1 >> 24u) & 1u) ^ 1u) << 7u);
+
+        out[i / 8u] = byte;
+        /* Copy non-null values after the bitmap byte */
+        for (size_t k = 0; k < 8u; k++) {
+            if (((byte >> k) & 1u) != 0u) {
+                if (pos + 8u > cap) return -1;
+                memcpy(out + pos, in + (i + k) * 8u, 8);
+                pos += 8u;
+            }
+        }
+    }
+#elif defined(__SSE2__)
+    for (; i + 8u <= nvals; i += 8u) {
+        uint8_t byte = 0;
+        int j;
+
+        for (j = 0; j < 4; j++) {
+            int m = _mm_movemask_epi8(zpse_colref_eq64(
+                _mm_loadu_si128(
+                    (const __m128i *)(in + (i + (size_t)2u * j) * 8u)),
+                _mm_setzero_si128()));
+            /* lane 0 -> bit 2j, lane 1 -> bit 2j+1; movemask bit==1 means null,
+             * so invert: bitmap bit==1 means non-null. */
+            byte |= (uint8_t)((((m >> 0) & 1) ^ 1) << (2u * j));
+            byte |= (uint8_t)((((m >> 8) & 1) ^ 1) << (2u * j + 1u));
+        }
+
+        out[i / 8u] = byte;
+        /* Copy non-null values after the bitmap byte */
+        for (int k = 0; k < 8; k++) {
+            if (((byte >> k) & 1) != 0) {
+                if (pos + 8u > cap) return -1;
+                memcpy(out + pos, in + (i + (size_t)k) * 8u, 8);
+                pos += 8u;
+            }
+        }
+    }
+#endif
+
+    for (; i < nvals; i++) {
         const uint8_t *v = in + i * 8u;
         int null = (v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6] | v[7]) == 0;
         if (!null) {
@@ -540,11 +896,55 @@ static inline int zpse_colref_offsets_encode(const uint8_t *in, size_t n,
 
         if (cnt > ZPSE_COLREF_FOR_GROUP) cnt = ZPSE_COLREF_FOR_GROUP;
         base = zpse_ref_get32le(in + g * 4u);
-        for (k = 1; k < cnt; k++) {
+
+#if defined(__AVX2__)
+        {
+            __m256i base_vec = _mm256_set1_epi32((int)base);
+            __m256i max_vec = _mm256_setzero_si256();
+            for (k = 1u; k + 7u < cnt; k += 8u) {
+                __m256i vals = _mm256_loadu_si256((const __m256i *)(in + (g + k) * 4u));
+                __m256i res = _mm256_sub_epi32(vals, base_vec);
+                res = _mm256_max_epi32(res, _mm256_setzero_si256());   /* clamp v<base to 0 */
+                max_vec = _mm256_max_epi32(max_vec, res);
+            }
+            uint32_t max_arr[8];
+            _mm256_storeu_si256((__m256i *)max_arr, max_vec);
+            for (int i = 0; i < 8; i++)
+                if (max_arr[i] > maxres) maxres = max_arr[i];
+        }
+        for (; k < cnt; k++) {
             uint32_t v = zpse_ref_get32le(in + (g + k) * 4u);
             uint32_t res = (v >= base) ? (v - base) : 0u;
             if (res > maxres) maxres = res;
         }
+#elif defined(__SSE2__)
+        {
+            __m128i base_vec = _mm_set1_epi32((int)base);
+            __m128i max_vec = _mm_setzero_si128();
+            for (k = 1u; k + 3u < cnt; k += 4u) {
+                __m128i vals = _mm_loadu_si128((const __m128i *)(in + (g + k) * 4u));
+                __m128i res = _mm_sub_epi32(vals, base_vec);
+                res = zpse_colref_max_epi32(res, _mm_setzero_si128());   /* clamp v<base to 0 */
+                max_vec = zpse_colref_max_epi32(max_vec, res);
+            }
+            uint32_t max_arr[4];
+            _mm_storeu_si128((__m128i *)max_arr, max_vec);
+            for (int i = 0; i < 4; i++)
+                if (max_arr[i] > maxres) maxres = max_arr[i];
+        }
+        for (; k < cnt; k++) {
+            uint32_t v = zpse_ref_get32le(in + (g + k) * 4u);
+            uint32_t res = (v >= base) ? (v - base) : 0u;
+            if (res > maxres) maxres = res;
+        }
+#else
+        for (k = 1u; k < cnt; k++) {
+            uint32_t v = zpse_ref_get32le(in + (g + k) * 4u);
+            uint32_t res = (v >= base) ? (v - base) : 0u;
+            if (res > maxres) maxres = res;
+        }
+#endif
+
         width = 0;
         while (width < 32u && (maxres >> width) != 0u) width++;
         pos = zpse_varint_put(out, cap, pos, base);
@@ -552,7 +952,7 @@ static inline int zpse_colref_offsets_encode(const uint8_t *in, size_t n,
         pos = zpse_varint_put(out, cap, pos, width);
         if (pos >= cap) return -1;
         zpse_bw_init(&w, out + pos, cap - pos);
-        for (k = 1; k < cnt; k++) {
+        for (k = 1u; k < cnt; k++) {
             uint32_t v = zpse_ref_get32le(in + (g + k) * 4u);
             uint32_t res = (v >= base) ? (v - base) : 0u;
             zpse_bw_put(&w, res, width);
