@@ -1,9 +1,8 @@
 # Aggregate: one combined commit-level report from all benchmark jobs.
 #
-# Triggers when any benchmark workflow finishes (bench-columnar,
-# bench-levels, fuzz). Uses the GitHub API to fetch the latest outputs
-# from the sibling workflows for the same commit and writes a single
-# aggregated summary so the commit page has one place to read everything.
+# Triggers when any of bench-columnar, bench-levels, or fuzz completes, but
+# only does real work once ALL three have finished for this SHA — so the
+# aggregate never runs before the jobs it is meant to collect.
 #
 # Informational: never fails the build.
 name: bench-aggregate
@@ -19,18 +18,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install gh
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+      - name: Wait until all sibling workflows are done for this SHA
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
-      - name: Collect sibling workflow outputs
-        id: collect
+          ALL_DONE=1
+          for wf in bench-columnar bench-levels fuzz; do
+            STATUS=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs" \
+              --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .status" | head -1)
+            if [ "$STATUS" != "completed" ]; then
+              ALL_DONE=0
+              break
+            fi
+          done
+          echo "all_done=$ALL_DONE" >> "$GITHUB_OUTPUT"
+      - if: steps.gate.outputs.all_done == 1
+        name: Collect sibling outputs
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           {
-            echo '### benchmark aggregate: ${{ github.event.workflow_run.name }}'
+            echo '### benchmark aggregate'
             echo
             echo "Commit: \`$SHA\`"
             echo
@@ -39,29 +52,34 @@ jobs:
               echo
               RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf.yml/runs" \
                 --jq ".workflow_runs[] | select(.head_sha == \"$SHA\" and .status == \"completed\") | .id" | head -1)
-              if [ -n "$RUN_ID" ]; then
-                ART=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
-                  --jq ".artifacts[0].archive_download_url" 2>/dev/null || true)
-                if [ -n "$ART" ]; then
-                  gh api "$ART" -H "Accept: application/zip" > /tmp/$wf.zip 2>/dev/null || true
-                  if [ -f /tmp/$wf.zip ] && unzip -l /tmp/$wf.zip >/dev/null 2>&1; then
-                    echo "Artifact available: $wf (see workflow run $RUN_ID)"
-                    unzip -o /tmp/$wf.zip -d /tmp/$wf-out >/dev/null 2>&1 || true
-                    for f in /tmp/$wf-out/*.txt; do
-                      [ -f "$f" ] || continue
-                      echo
-                      echo "##### \`$(basename "$f")\`"
-                      echo '```'
-                      cat "$f" | head -80
-                      echo '```'
-                    done
-                  fi
+              if [ -z "$RUN_ID" ]; then
+                echo "No completed run found for $wf"
+                echo
+                continue
+              fi
+              ART_URL=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
+                --jq ".artifacts[0].archive_download_url" 2>/dev/null || true)
+              if [ -n "$ART_URL" ]; then
+                gh api "$ART_URL" -H "Accept: application/zip" > /tmp/$wf.zip 2>/dev/null || true
+                if [ -f /tmp/$wf.zip ] && unzip -t /tmp/$wf.zip >/dev/null 2>&1; then
+                  unzip -o /tmp/$wf.zip -d /tmp/$wf-out >/dev/null 2>&1 || true
+                  for f in /tmp/$wf-out/*.txt; do
+                    [ -f "$f" ] || continue
+                    echo
+                    echo "##### \`$(basename "$f")\`"
+                    echo '```'
+                    cat "$f" | head -80
+                    echo '```'
+                  done
                 else
-                  echo "No artifact; summary only (workflow run $RUN_ID)"
+                  echo "No readable artifact for $wf (run $RUN_ID)"
                 fi
               else
-                echo "No completed run for $wf on this commit yet"
+                echo "No artifact for $wf (run $RUN_ID)"
               fi
               echo
             done
           } >> "$GITHUB_STEP_SUMMARY"
+      - if: steps.gate.outputs.all_done != 1
+        name: Skip (siblings still running)
+        run: echo "Not all benchmark workflows have completed for this SHA yet; skipping aggregate."
