@@ -8,7 +8,7 @@
 #
 # Informational: does not fail the build. Results land in the job
 # summary and as an artifact for the aggregate job.
-name: bench-nightly
+name: fuzz-nightly
 
 on:
   schedule:
