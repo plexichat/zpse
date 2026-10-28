@@ -431,10 +431,10 @@ depend on it, decode over 64 KiB blocks:
 | column | ratio | decode |
 | --- | ---: | ---: |
 | `ts_gapped` (timestamp with gaps) | 2.06:1 | 2.4 GB/s |
-| `float_sparse` (f32 readings) | 2.72:1 | 3.4 GB/s |
-| `ts_us` (i64 µs timestamps) | 5.11:1 | 3.1 GB/s |
-| `sorted_near` | 3.82:1 | 4.2 GB/s |
-| `ts_seq` (i64 µs timestamps) | 5.38:1 | 4.7 GB/s |
+| `float_sparse` (f32 readings) | 2.72:1 | 3.3 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.11:1 | 3.3 GB/s |
+| `sorted_near` | 3.82:1 | 4.1 GB/s |
+| `ts_seq` (i64 µs timestamps) | 5.38:1 | 4.9 GB/s |
 
 Two of the group's costs are the same lesson: a value the loop has already
 produced should not be read back out of memory. A group's `prev` -- the sixteen
