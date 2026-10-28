@@ -432,11 +432,28 @@ depend on it, decode over 64 KiB blocks:
 
 | column | ratio | decode |
 | --- | ---: | ---: |
-| `ts_gapped` (timestamp with gaps) | 2.06:1 | 1.7 GB/s |
-| `float_sparse` (f32 readings) | 2.72:1 | 2.6 GB/s |
-| `ts_us` (i64 µs timestamps) | 5.11:1 | 2.5 GB/s |
-| `sorted_near` | 3.82:1 | 3.2 GB/s |
-| `ts_seq` (i64 µs timestamps) | 5.38:1 | 3.6 GB/s |
+| `ts_gapped` (timestamp with gaps) | 2.06:1 | 2.4 GB/s |
+| `float_sparse` (f32 readings) | 2.72:1 | 3.4 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.11:1 | 3.3 GB/s |
+| `sorted_near` | 3.82:1 | 4.2 GB/s |
+| `ts_seq` (i64 µs timestamps) | 5.38:1 | 4.7 GB/s |
+
+**The group vector stays in a register.** A group's `prev` -- the sixteen
+bytes it shifts against -- is the vector the group before it stored, so
+loading it back from `out` is a store-to-load forward of a store one
+iteration old, and on `ts_gapped` that single load was the busiest
+instruction in the whole decoder (19% of its samples, 93 of ~500). Both
+branches of the step already produce that vector, so they hand it forward
+instead, and the loop reads `out` only once, after the scalar head. Alternate
+binaries over the 25-case corpus, best of twelve interleaved rounds: **decode
++5.2% time-weighted, +2.7% geomean**, with every stride-dependent column
+moving -- `ts_gapped` 1.93 -> 2.35 GB/s, `float_sparse` 2.89 -> 3.37,
+`sorted_near` 3.97 -> 4.15, `struct_offsets` 10.1 -> 10.4 -- and no size on
+any case of the level sweep changed. Encode, which shares none of this code,
+read -1.1% in the same run against a **0.5% floor** measured by running the
+harness on two copies of the same tree (per-case swings up to 2%): a unity
+build has one text section, so a decode-side edit moves every later
+function's alignment. Read that -1.1% as the floor plus layout, not as work.
 
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this

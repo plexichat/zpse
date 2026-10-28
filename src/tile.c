@@ -3660,11 +3660,16 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
 #define ZPSE_STRIDE_WIDE_COND                                                  \
     (p + 16u <= (uint32_t)nt && j + 16u <= 256u)
 
+/* `prev_` is the sixteen bytes before the group, which is exactly the vector
+ * the previous group stored, so it lives in a register across the loop
+ * instead of being loaded back from `out`: that load is a store-to-load
+ * forward of the store one iteration ago, a ~5 cycle stall the loop can
+ * simply not have. On the regular columns this kernel exists for, the load
+ * was the single busiest instruction in the whole decoder (measured: 19% of
+ * ts_gapped's decode samples on it). */
 #define ZPSE_STRIDE_WIDE_GROUP(S_)                                             \
     do {                                                                       \
         const uint32_t sh_ = p & 31u;                                          \
-        const __m128i prev_ = _mm_loadu_si128(                                 \
-            (const __m128i *)(const void *)(out + p - 16u));                   \
         const uint32_t bits_ = (mw[p >> 5u] >> sh_) & 0xFFFFu;                 \
         __m128i v_;                                                            \
         uint32_t n_;                                                           \
@@ -3684,6 +3689,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
                 v_ = _mm_alignr_epi8(v_, prev_, 16 - (int)(S_));            \
             }                                                                  \
             _mm_storeu_si128((__m128i *)(void *)(out + p), v_);                \
+            prev_ = v_;                                                        \
             p += 16u;                                                          \
         } else {                                                               \
         const __m128i vw_ = _mm_shuffle_epi8(                                  \
@@ -3718,6 +3724,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         }                                                                      \
         _mm_storeu_si128((__m128i *)(void *)(out + p), v_);                    \
         j += (uint32_t)_mm_extract_epi8(inc_, 15);                             \
+        prev_ = v_;                                                            \
         p += 16u;                                                              \
         }                                                                      \
     } while (0)
@@ -3739,6 +3746,8 @@ static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
     uint32_t p = 0u;
     uint32_t head = (s < (uint32_t)nt) ? s : (uint32_t)nt;
     uint32_t mw[8];
+    /* The sixteen bytes the next group shifts out of (see the macro). */
+    __m128i prev_;
 
     memcpy(mw, words, sizeof mw);
 
@@ -3770,6 +3779,10 @@ static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
             p, (seg_pos + p < s) ? init : seg_base[seg_pos + p - s]);
     for (; p < 16u; p++)
         ZPSE_STRIDE_WIDE_STEP(p, out[p - s]);
+
+    /* out[0..15] is final here, so this is the group vector the first
+     * iteration shifts against. */
+    prev_ = _mm_loadu_si128((const __m128i *)(const void *)out);
 
     if (s == 2u) {
         while (ZPSE_STRIDE_WIDE_COND)
