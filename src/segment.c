@@ -8,6 +8,7 @@
 
 #include "zpse/bits.h"
 #include "zpse/dense.h"
+#include "zpse/hot.h"
 #include "zpse/mask.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
@@ -2274,7 +2275,7 @@ static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
  * with more than sixteen values still leaves the gather the first time the
  * test finds one, so the early exit that keeps text and noise cheap is
  * unchanged. */
-static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane_len,
+ZPSE_HOT static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane_len,
                                    uint32_t limit, uint32_t bits[8])
 {
     uint32_t n = 0u;

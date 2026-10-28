@@ -502,14 +502,14 @@ pinned core):
 | build | encode | notes |
 | --- | ---: | --- |
 | `-O2` | 1.000 | everything in this tree |
-| `ZPSE_HOT` on the 22 hot functions (`include/zpse/hot.h`, gcc only) | 1.034 | +21 KB of text; decode and every compressed size unchanged |
+| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.029 | 152 KB -> 166 KB of text; decode and every compressed size unchanged |
 | the amalgamation at `-O3` | 1.071 | same as `#pragma GCC optimize("O3")` at the top of `src/zpse_unity.c` (1.066) |
 | that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
 | `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
 
 Rows three to five are the same request made at three scopes, and why they
 differ is worth knowing before adding a tag. At `-O3` the text of the
-amalgamation grows from 167 KB to 265 KB: most of what `-O3` buys here is not
+amalgamation grows from 152 KB to 249 KB: most of what `-O3` buys here is not
 inside the loops -- those are hand-written SIMD already tuned at `-O2` -- it
 is the inliner and the interprocedural passes deciding more, and those run at
 the level the compilation was given, which a per-function attribute cannot
@@ -518,9 +518,20 @@ same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
 that function with its `-O2` neighbours, which is why the last row is slower
 than leaving the function untagged.
 
-`ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 22 functions it
+`ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 18 functions it
 marks were measured together, and a tag put on a function whose callees are
-untagged reproduces that last row. On clang and MSVC the macro is empty --
+untagged reproduces that last row. The set is measured best of seven
+interleaved rounds with the order swapped every round, against the same tree
+built with the macro defined away; two builds of identical sources read 1.000
+(base readings 0.999 - 1.002), which is the noise floor the row above is
+quoted from. That measurement is also why the functions called from the
+middle of a chain stay untagged: they come back with fewer instructions
+retired and more cycles spent. Nor does a tag combine with a target
+attribute -- gcc re-applies the command line's target to a function it has
+been asked to optimize at another level -- so the AVX2 bodies stay untagged
+however hot they are.
+
+On clang and MSVC the macro is empty --
 clang does not implement `optimize` and diagnoses it as an unknown attribute,
 which `-Werror` would turn into a failed build, and MSVC has no per-function
 optimization level at all -- so those builds compile the same sources with no

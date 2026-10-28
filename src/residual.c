@@ -346,7 +346,7 @@ static ZPSE_RES_BMI2_SSSE3 uint16_t residual_mode2_b3_bmi2(
 }
 #endif
 
-ZPSE_HOT static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
+static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     const uint8_t *palette, const uint8_t *src, uint16_t k, unsigned b,
     unsigned m, uint8_t *exc_out)
 {
@@ -1856,11 +1856,16 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
      * with the index it already had on a repeat, nu advances by is_new, and
      * pal[nu] holds the dead next slot on a repeat -- which is pal[16] once
      * sixteen values are recorded, above every live entry. */
-    memset(idx_of, 0xFF, sizeof idx_of);
     {
         int certified = 0;
 
         if (seen_hint != 0 && nu_hint <= 16u) {
+            /* Cleared inside the branch, not before it: the exhaustive
+             * scan below clears the table itself, so the call without a
+             * hint -- which is most of them -- used to write 256 bytes
+             * that the next memset immediately overwrote. Same table, same
+             * first-appearance order, one clear per call instead of two. */
+            memset(idx_of, 0xFF, sizeof idx_of);
             /* Prefix scan with an early exit: stop as soon as every value
              * the certificate promises has been seen. Positions are
              * visited in the same ascending order as the exhaustive scan,
@@ -1896,8 +1901,9 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
             }
             if (!certified) {
                 /* Not reachable from a valid certificate; rebuild from
-                 * scratch exactly as the exhaustive scan would. */
-                memset(idx_of, 0xFF, sizeof idx_of);
+                 * scratch exactly as the exhaustive scan would. The scan's
+                 * own clear is the one that counts -- clearing here as
+                 * well only moved the cost, never the contents. */
                 nu = 0;
             }
         }

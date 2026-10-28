@@ -119,6 +119,51 @@ static void lz_put_cmd(LzOut *o, uint32_t off, uint32_t lit, uint32_t mlen)
                          (((mlen - ZPSE_LZ_MIN_MATCH) & 0xFFu) << 24));
 }
 
+/* The shape every command takes except a long run or a long match: a
+ * literal run that fits the token's 8-bit field, a match that fits its
+ * length field. Kept apart from lz_emit so the two appends share one
+ * capacity test and neither goes through the out-of-line copy lz_emit
+ * compiles to -- the tokens that follow a short match are mostly a few
+ * bytes long, and a call per token is most of what that path costs on
+ * hex, text and URL blocks, where a match is found every few bytes.
+ *
+ * A run below eight bytes is copied by one overlapping eight-byte store:
+ * the bytes past the run land in the gap between the literal region and
+ * the commands, which the end of the block zero-fills, and the read past
+ * the run stays inside the block -- a run that reaches the end of the
+ * block comes from the trailing-literal path, not from here. */
+static void lz_emit_short(LzOut *o, const uint8_t *lit, uint32_t run,
+                          uint32_t off, uint32_t len, const uint8_t *in_end)
+{
+    uint32_t room;
+    uint8_t *ldst;
+
+    if (o->fail || o->cmd_hi < 4u || o->lit_total > o->cmd_hi - 4u) {
+        o->fail = 1;
+        return;
+    }
+    room = o->cmd_hi - 4u - o->lit_total;
+    /* Room for the run, and the command word behind it. */
+    if (run > room || room - run < 4u) {
+        o->fail = 1;
+        return;
+    }
+    ldst = o->dst + 4u + o->lit_total;
+    if (run < 8u && room - run >= 8u && (uint32_t)(in_end - lit) >= 8u) {
+        uint64_t v;
+
+        memcpy(&v, lit, 8u);
+        memcpy(ldst, &v, 8u);
+    } else if (run != 0u) {
+        memcpy(ldst, lit, run);
+    }
+    o->lit_total += run;
+    o->cmd_hi -= 4u;
+    zpse_store_u32le(o->dst + o->cmd_hi,
+                     (off & 0xFFFFu) | ((run & 0xFFu) << 16) |
+                         (((len - ZPSE_LZ_MIN_MATCH) & 0xFFu) << 24));
+}
+
 /* One match and the literals that precede it. Runs longer than a token
  * can express are split into repeated commands: the literals go in front
  * of the first command and the rest carry zero literals, so the decoder's
@@ -179,13 +224,31 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     pos = 0u;
     anchor = 0u;
     misses = 0u;
+    /* The extension width is a property of the machine, not of the
+     * position: the capability is read once per call rather than once per
+     * match, which is one load and one test less on every match that gets
+     * past the hash compare, and the answer cannot change inside the loop
+     * (nothing here can change what the CPU is). */
+    int have_avx2 = 0;
+#if ZPSE_LZ_HAVE_AVX2
+    have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+#endif
     while (pos + ZPSE_LZ_MIN_MATCH <= n) {
         uint32_t h = lz_hash(in + pos, hash_bits);
         uint32_t cand = tab[h];
         uint32_t len;
 
         tab[h] = (uint16_t)pos;
-        if (cand == LZ_EMPTY || pos - cand > 65535u ||
+        /* No distance test: every entry the table can hold was written by
+         * this call at a position strictly below the cursor, and the
+         * cursor never passes n - 4 <= 65532, so no candidate is more than
+         * 65532 back -- under the 65535 the field can express -- and
+         * LZ_EMPTY (0xFFFF) is a value no position can take, because a
+         * block is at most 64 KiB. That is also why the table is cleared
+         * per call. Dropping the compare takes two operations out of the
+         * loop the match finder spends its time in, and cannot change
+         * which candidate is tested. */
+        if (cand == LZ_EMPTY ||
             zpse_load_u32le(in + cand) != zpse_load_u32le(in + pos)) {
             /* Two misses are a coincidence; a run of them means the data
              * has no match here, so the cursor accelerates. */
@@ -201,23 +264,55 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             pos--;
             cand--;
         }
-        int have_avx2 = 0;
-#if ZPSE_LZ_HAVE_AVX2
-        have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
-#endif
         len = ZPSE_LZ_MIN_MATCH;
-        if (have_avx2) {
-            len = lz_extend_avx2(in, pos, cand, len, n);
-        } else {
-            while (pos + len + 8u <= n && cand + len + 8u <= n &&
-                   lz_load64(in + pos + len) == lz_load64(in + cand + len)) {
-                len += 8u;
+        {
+            /* The head of the match, compared eight bytes at a time. A
+             * short match is the common one, and this is where its cost
+             * is: a mismatch inside a word is located by the lowest set
+             * bit of the xor instead of a byte loop, and all of it is in
+             * the caller, so a match that ends inside the head pays no
+             * call at all. That is most of the matches the LZ path emits
+             * on hex, text and URL blocks. Only a match that runs past
+             * the head reaches the wide loop, which is what long runs
+             * want. `hit` says the length is already final. */
+            uint32_t cap = (n - pos - len) < 24u ? (n - pos - len) : 24u;
+            uint32_t m = 0u;
+            int hit = 0;
+
+            while (m + 8u <= cap) {
+                uint64_t x = lz_load64(in + pos + len + m) ^
+                             lz_load64(in + cand + len + m);
+
+                if (x != 0u) {
+                    m += zpse_ctz64(x) >> 3;
+                    hit = 1;
+                    break;
+                }
+                m += 8u;
+            }
+            len += m;
+            if (!hit) {
+                if (have_avx2) {
+                    len = lz_extend_avx2(in, pos, cand, len, n);
+                } else {
+                    while (pos + len + 8u <= n && cand + len + 8u <= n &&
+                           lz_load64(in + pos + len) ==
+                               lz_load64(in + cand + len)) {
+                        len += 8u;
+                    }
+                }
+                while (pos + len < n && in[pos + len] == in[cand + len]) {
+                    len++;
+                }
             }
         }
-        while (pos + len < n && in[pos + len] == in[cand + len]) {
-            len++;
+        if (pos - anchor <= ZPSE_LZ_MAX_LITERALS &&
+            len <= ZPSE_LZ_MAX_MATCH) {
+            lz_emit_short(&o, in + anchor, pos - anchor, pos - cand, len,
+                          in + n);
+        } else {
+            lz_emit(&o, in + anchor, pos - anchor, pos - cand, len);
         }
-        lz_emit(&o, in + anchor, pos - anchor, pos - cand, len);
         if (o.fail) {
             return 0u;
         }
@@ -225,7 +320,28 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         anchor = pos;
         misses = 0u;
     }
-    /* Trailing literals: no match left to code, so offset 0. */
+    /* Trailing literals: no match left to code, so offset 0. What a run
+     * of `run` literals does to both regions is known before a byte of it
+     * is copied -- literal bytes plus one command per 255 of them -- and a
+     * total that cannot fit cap is refused by the verification below
+     * whether it is copied first or not. Computing it first is what keeps
+     * an aborting call from copying up to 64 KiB of literals and 257
+     * command words in 255-byte steps that the verification then throws
+     * away: on an incompressible block every remaining byte is a literal,
+     * and a capped pass (see zpse_block_try_lz) reaches here with one.
+     * The arithmetic is 64-bit so the comparison cannot wrap. */
+    if (anchor < n && !o.fail) {
+        uint32_t run = n - anchor;
+        uint64_t ncmd = ((uint64_t)run + ZPSE_LZ_MAX_LITERALS - 1u) /
+                        (uint64_t)ZPSE_LZ_MAX_LITERALS;
+        uint64_t lit_end = (uint64_t)o.lit_total + (uint64_t)run;
+        uint64_t off_end = 4u + ((lit_end + 3u) & ~(uint64_t)3u);
+        uint64_t len_end = (uint64_t)(cap - o.cmd_hi) + 4u * ncmd;
+
+        if (off_end + len_end > (uint64_t)cap) {
+            return 0u;
+        }
+    }
     if (anchor < n) {
         uint32_t run = n - anchor;
         const uint8_t *src = in + anchor;

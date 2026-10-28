@@ -1396,7 +1396,7 @@ static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
 
 /* Fold the 256-byte residual-presence array into `seen`, returning how
  * many distinct values it holds. */
-ZPSE_HOT static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
+static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
                                                uint32_t seen[8])
 {
     const __m256i z = _mm256_setzero_si256();
@@ -2120,28 +2120,48 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     case TILE_FAM_STRIDE: {
         uint32_t s = tile_stride_of(predictor_id);
 #if defined(__SSE2__)
-        if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
-            seg_pos >= s && nt >= 16u) {
+        if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u && nt >= 16u) {
+            /* The positions that precede the plane have no byte behind
+             * them and predict the initial literal; there are at most
+             * eight of them. Taking those first is what lets this path
+             * run at all on the FIRST tile of a plane, where seg_pos is 0
+             * and every stride predictor the encoder screens would fall
+             * through to the byte loop below -- and a plane that repeats
+             * itself is searched on its first tile, so that one tile is
+             * where a column of nulls or a run of one value pays for
+             * every stride classify it does. The rest of the tile is the
+             * same 16-byte comparison as before, indexed from the plane
+             * byte the first predicted position sits at (seg_pos + h == s
+             * for a short head, and h == 0 for a tile that already has all
+             * of its head). Same exceptions in the same order. */
             uint32_t p = 0u;
-            const uint8_t *base = seg_base + seg_pos - s;
+            uint32_t h = (s > seg_pos) ? (s - seg_pos) : 0u;
+            const uint8_t *base = seg_base + (seg_pos + h - s);
+
+            if (h > (uint32_t)nt)
+                h = (uint32_t)nt;
+            for (; p < h; p++) {
+                if (actual[p] != initial_literal)
+                    TILE_TAKE_EXC(p, initial_literal, actual[p]);
+            }
             for (; p + 16u <= (uint32_t)nt; p += 16u) {
                 __m128i v = _mm_loadu_si128(
                     (const __m128i *)(const void *)(actual + p));
                 __m128i xh = _mm_loadu_si128(
-                    (const __m128i *)(const void *)(base + p));
+                    (const __m128i *)(const void *)(base + (p - h)));
                 __m128i eq = _mm_cmpeq_epi8(v, xh);
                 unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
                 unsigned b = 0u;
                 while (mm != 0u) {
                     if ((mm & 1u) != 0u)
-                        TILE_TAKE_EXC((uint16_t)(p + b), base[p + b],
-                                      actual[p + b]);
+                        TILE_TAKE_EXC((uint16_t)(p + b),
+                                      base[p + b - h], actual[p + b]);
                     mm >>= 1u;
                     b++;
                 }
             }
             for (; p < (uint32_t)nt; p++) {
-                uint8_t xhat = base[p];
+                uint8_t xhat = base[p - h];
                 if (actual[p] != xhat)
                     TILE_TAKE_EXC(p, xhat, actual[p]);
             }
@@ -3651,7 +3671,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         p += 16u;                                                              \
     } while (0)
 
-ZPSE_HOT static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
+static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
     uint8_t *out, uint16_t nt, uint32_t s, const uint8_t *seg_base,
     uint32_t seg_pos, uint8_t init, const uint32_t words[8],
     const uint8_t *units, uint8_t res_mode)
@@ -4256,7 +4276,7 @@ static ZPSE_TILE_AVX2 __m256i tile_unit_index32(__m256i v1)
  * whole 32-byte chunks go through the vector loop, the remaining
  * nt % 32 positions are finished positionally below so the units keep
  * their order. */
-ZPSE_HOT static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
+static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
                                                      uint8_t constant_C,
                                                      const uint32_t words[8],
                                                      const uint8_t *units,
