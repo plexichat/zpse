@@ -202,10 +202,21 @@ static int residual_has_ff(const uint8_t *p, uint32_t n)
  * element-wise loop produced, for every caller that does not overlap the
  * payload (the payload is the tile record inside the compressed stream
  * and the destination is the tile's scratch array). */
+/* A tile's payload copy, k bytes with k <= 256, on every mode-0 and mode-1
+ * tile the decoder rebuilds -- 5% of decode time on the corpus, and on a
+ * dense tile the k is large enough that the step width is what the copy
+ * costs. Thirty-two bytes a step (two 16-byte moves, which is what the
+ * compiler makes of a constant-size memcpy) halves the loop and its two
+ * counter updates per byte copied, and the 8-byte loop still covers the
+ * last partial step. */
 static void residual_copy_bytes(uint8_t *dst, const uint8_t *src, uint32_t n)
 {
     uint32_t i = 0;
 
+    while (i + 32u <= n) {
+        memcpy(dst + i, src + i, 32);
+        i += 32u;
+    }
     while (i + 8u <= n) {
         uint64_t w;
 

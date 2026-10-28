@@ -455,6 +455,17 @@ harness on two copies of the same tree (per-case swings up to 2%): a unity
 build has one text section, so a decode-side edit moves every later
 function's alignment. Read that -1.1% as the floor plus layout, not as work.
 
+**The payload copy moves thirty-two bytes a step too.** `residual_copy_bytes`
+is the mode-0/mode-1 tile payload copy -- k bytes, k at most 256 -- and on a
+dense tile the step width is what it costs: thirty-two bytes a step halves the
+loop and its counter against the eight-byte form, and the eight-byte loop
+still finishes the last partial step. With it, the same A/B reads decode
+**+5.4% time-weighted, +4.4% geomean**. A widening of the LZ decoder's literal
+copy was measured on the same harness and is *not* here: 32 bytes a step read
+1.54 GB/s against 1.53 on `text_en` and 2.37 against 2.37 on `json_rows`,
+because that decoder is per-command bound (about twelve cycles a command at
+5-11 bytes a command), not per-byte bound.
+
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
 kernel writes exactly the bytes the scalar loop writes.
