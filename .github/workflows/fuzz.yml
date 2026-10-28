@@ -17,7 +17,7 @@ on:
 
 jobs:
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -27,31 +27,31 @@ jobs:
           # --- test_fuzz.c variants (gcc, continuous mode) ---
           - target: test_fuzz
             variant: default
-            cc: cc
-            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude -mavx2"
+            cc: gcc-15
+            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
             variant: scalar
-            cc: cc
+            cc: gcc-15
             cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_SCALAR -Iinclude"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
             variant: swap
-            cc: cc
-            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_TRIAL_SWAP -Iinclude -mavx2"
+            cc: gcc-15
+            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_TRIAL_SWAP -Iinclude"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
             variant: asan
-            cc: cc
-            cflags: "-std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -DNDEBUG -Iinclude -mavx2"
+            cc: gcc-15
+            cflags: "-std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -DNDEBUG -Iinclude"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
             variant: asan_scalar
-            cc: cc
+            cc: gcc-15
             cflags: "-std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -DNDEBUG -DZPSE_FORCE_SCALAR -Iinclude"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
@@ -82,7 +82,7 @@ jobs:
             run_env: ""
             run_args: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build the fuzzer (${{ matrix.target }} / ${{ matrix.variant }})
         run: |
           case "${{ matrix.target }}" in

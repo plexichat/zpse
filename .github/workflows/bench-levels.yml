@@ -14,15 +14,15 @@ on:
 
 jobs:
   levels:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Compiler
         run: |
           cc --version | head -1
       - name: Build the harness
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+          gcc-15 -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/benchmarks/bench_levels.c src/zpse_unity.c \
             -o /tmp/bench_levels
       - name: Run the matrix (25 cases x 9 levels, single core)

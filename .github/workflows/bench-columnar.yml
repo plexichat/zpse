@@ -18,9 +18,9 @@ on:
 
 jobs:
   columnar:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Compiler and competitor runtimes
         run: |
           cc --version | head -1
@@ -29,11 +29,11 @@ jobs:
             zstd lz4 brotli zlib1g
       - name: Build the harness
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+          gcc-15 -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/benchmarks/bench_columnar.c src/zpse_unity.c -ldl -o /tmp/benchcol
           # The stats mode is compiled only with -DZPSE_TRIAL_STATS; building
           # it here keeps that opt-in instrument from rotting away.
-          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -DZPSE_TRIAL_STATS \
+          gcc-15 -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -DZPSE_TRIAL_STATS \
             -Iinclude tests/benchmarks/bench_columnar.c src/zpse_unity.c \
             -ldl -o /tmp/benchcol-stats
       - name: Predictor trial stats (what the encoder really runs)
@@ -90,7 +90,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: What a purpose-built codec for each column achieves
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+          gcc-15 -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/benchmarks/bench_colref.c src/zpse_unity.c -o /tmp/colref
           taskset -c 0 /tmp/colref 12 3 | tee /tmp/colref.txt
           {

@@ -1,7 +1,7 @@
 # Everything the tree can prove about itself, on every push:
 #
 #  - every suite in tests/runners/run.sh (roundtrip, combinadic, hostile, units,
-#    stride3, dense, decide, sizes) under gcc and clang;
+#    stride3, dense, decide, sizes) under gcc 15 and clang;
 #  - the parity/fuzz/lseed corpora in three builds each (runtime SIMD
 #    dispatch, -DZPSE_FORCE_SCALAR, -DZPSE_FORCE_TRIAL_SWAP), whose digests
 #    must match -- that is what proves the SIMD kernels are bit-exact
@@ -21,15 +21,28 @@ on:
 jobs:
   linux:
     name: linux / ${{ matrix.cc }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
-        cc: [gcc, clang]
+        cc: [gcc-15, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Compiler version
         run: ${{ matrix.cc }} --version | head -1
+      - name: Optimize tags stay off target-attributed functions
+        run: |
+          # gcc re-applies the command line's target to a function it is asked
+          # to optimize at a different level, so `optimize` and a target
+          # attribute do not combine: the AVX2/SSSE3/BMI2 body would be
+          # compiled for the baseline ISA and fail to inline its intrinsics.
+          # gcc 15 keeps the target and builds anyway, which is why this is a
+          # grep and not a build: the runner cannot reproduce the failure that
+          # a gcc before 15 has, so the rule is checked directly.
+          if grep -rnE 'ZPSE_HOT[^;]{0,60}(ZPSE_(CRC32C_TARGET|LZ_AVX2|MASK_SIMD|RES_(SSSE3|AVX2|BMI2)|PS_AVX2|ASCII_BMI2|TILE_AVX2P?|T_AVX2)|ZPSE_TARGET_(SSE2|SSSE3))' src/; then
+            echo "::error::ZPSE_HOT must not be combined with a target attribute"
+            exit 1
+          fi
       - name: Suites + SIMD/scalar/order parity
         run: CC=${{ matrix.cc }} bash tests/runners/run.sh
       - name: Strict amalgamation build
@@ -68,7 +81,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
