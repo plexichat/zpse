@@ -390,11 +390,11 @@ The bytes it writes past the match are ones a later command overwrites, so the
 slack is reclaimed rather than leaked -- the same argument `lz_copy_literals`
 already made for literals, applied to the other half of the command.
 
-That is what the run lengths above report: a command costs about the same
-whatever its match length, so prose at six bytes per command decodes at about
-2.5 GB/s, JSON at eleven bytes at 4.0, variable strings at twenty at 3.9, and
-the long-run patterns at a hundred bytes or more at 5 to 6.5, where a match is
-several stores wide and the copy width, not the command, is the cost.
+That is why a command costs about the same whatever its match length, and why
+the stream's rate follows its bytes per command rather than its ratio: the
+command loop is the ceiling on prose, JSON and variable strings, and only on
+the long-run patterns -- where a match spans several stores -- does the copy
+width take over as the cost.
 
 ### Sixteen positions at a time
 
