@@ -652,9 +652,9 @@ static ZPSE_T_AVX2 void zpse_t16x16_inverse_direct(const uint8_t *const in[16],
  * plane t at t*64, so its sixteen-byte chunks map to set t and the
  * transpose itself reads from sixteen different sets: 16 GB/s, and the
  * copy is one full line per plane instead of four partial ones. */
-ZPSE_HOT static ZPSE_T_AVX2 void zpse_t16x16_inverse_blocked(const uint8_t *const in[16],
-                                                    uint8_t *const out[16],
-                                                    uint32_t rows)
+static ZPSE_T_AVX2 void zpse_t16x16_inverse_blocked(const uint8_t *const in[16],
+                                                     uint8_t *const out[16],
+                                                     uint32_t rows)
 {
     /* Aligned: the staging stores are aligned _mm256 stores, and every
      * plane's run inside it starts on a 64-byte boundary -- which is why
@@ -733,7 +733,55 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
     uint32_t q;
 
 #if ZPSE_T_HAVE_SSE2
-    for (q = 0; (size_t)q + 16u <= (size_t)n; q += 16u) {
+    /* Four chunks per iteration. Each chunk's incoming byte is the last
+     * byte of the PREVIOUS chunk's original content, which is a byte of a
+     * load that has already happened, so all four shifts come out of
+     * registers and only the seed for the next group of four crosses the
+     * loop -- one psrldq per 64 bytes. The 16-byte form that still takes
+     * the remainder reads that seed back out of the plane, at a position
+     * the store of the same iteration has just written, so the store queue
+     * can only forward it after the store retires; the wide form above
+     * reads nothing it has just written. The residual 16-byte loop and the
+     * byte tail are unchanged, and every position gets the same byte as
+     * before. */
+    for (q = 0; (size_t)q + 64u <= (size_t)n; q += 64u) {
+        __m128i a = _mm_loadu_si128((const __m128i *)(const void *)(p + q));
+        __m128i b =
+            _mm_loadu_si128((const __m128i *)(const void *)(p + q + 16u));
+        __m128i c =
+            _mm_loadu_si128((const __m128i *)(const void *)(p + q + 32u));
+        __m128i d =
+            _mm_loadu_si128((const __m128i *)(const void *)(p + q + 48u));
+        __m128i pa = _mm_or_si128(_mm_slli_si128(a, 1),
+                                  _mm_cvtsi32_si128((int)prev));
+        __m128i pb =
+            _mm_or_si128(_mm_slli_si128(b, 1), _mm_srli_si128(a, 15));
+        __m128i pc =
+            _mm_or_si128(_mm_slli_si128(c, 1), _mm_srli_si128(b, 15));
+        __m128i pd =
+            _mm_or_si128(_mm_slli_si128(d, 1), _mm_srli_si128(c, 15));
+
+        prev = (uint8_t)_mm_cvtsi128_si32(_mm_srli_si128(d, 15));
+        if (delta) {
+            _mm_storeu_si128((__m128i *)(void *)(p + q), _mm_sub_epi8(a, pa));
+            _mm_storeu_si128((__m128i *)(void *)(p + q + 16u),
+                             _mm_sub_epi8(b, pb));
+            _mm_storeu_si128((__m128i *)(void *)(p + q + 32u),
+                             _mm_sub_epi8(c, pc));
+            _mm_storeu_si128((__m128i *)(void *)(p + q + 48u),
+                             _mm_sub_epi8(d, pd));
+        } else {
+            _mm_storeu_si128((__m128i *)(void *)(p + q),
+                             _mm_xor_si128(a, pa));
+            _mm_storeu_si128((__m128i *)(void *)(p + q + 16u),
+                             _mm_xor_si128(b, pb));
+            _mm_storeu_si128((__m128i *)(void *)(p + q + 32u),
+                             _mm_xor_si128(c, pc));
+            _mm_storeu_si128((__m128i *)(void *)(p + q + 48u),
+                             _mm_xor_si128(d, pd));
+        }
+    }
+    for (; (size_t)q + 16u <= (size_t)n; q += 16u) {
         __m128i cur = _mm_loadu_si128((const __m128i *)(const void *)(p + q));
         __m128i prv = _mm_or_si128(_mm_slli_si128(cur, 1),
                                    _mm_cvtsi32_si128((int)prev));
