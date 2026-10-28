@@ -346,12 +346,12 @@ ASCII gate below replaces the tile-side sweep, not the match finder, which is
 offered afterwards whatever the gate decided. What the form costs is decode
 speed, and that is what the level's **acceleration factor** decides: an LZ stream decodes at the
 speed of its command loop, one 4-byte command per output run, so its rate
-follows the average run length. Over 64 KiB blocks, at 5.6 bytes per command
-prose decodes at about 1.6 GB/s, at 9 bytes JSON at 2.2, at 17 bytes variable
-strings at 4.0, at 64 bytes the sparse patterns at 8.8, and at 246 bytes the
-all-zero patterns at 24 -- against 5-13 GB/s for a tile stream.
-The match copy described below is what keeps the short end of that range from
-costing more than one command per match.
+follows the average run length. Over 64 KiB blocks, at six bytes per command
+prose decodes at about 2.5 GB/s, at eleven bytes JSON at 4.0, at twenty bytes
+variable strings at 3.9, and at a hundred or more the long-run patterns at 5
+to 6.5 -- against 5-13 GB/s for a tile stream. The match copy described below
+is what keeps the short end of that range from costing more than one command
+per match.
 
 The acceleration factor belongs to the level: 12 at levels 1-6, i.e. a command
 every 8 output bytes (a floor of about 1 GB/s at the command loop's cost per
@@ -391,10 +391,10 @@ slack is reclaimed rather than leaked -- the same argument `lz_copy_literals`
 already made for literals, applied to the other half of the command.
 
 That is what the run lengths above report: a command costs about the same
-whatever its match length, so prose at 5.6 bytes per command decodes at
-1.6 GB/s, JSON at 2.2, variable strings at 4.0, and the long-run cases at 8.8
-and 24 GB/s, where a match is several stores wide and the copy width, not the
-command, is the cost.
+whatever its match length, so prose at six bytes per command decodes at about
+2.5 GB/s, JSON at eleven bytes at 4.0, variable strings at twenty at 3.9, and
+the long-run patterns at a hundred bytes or more at 5 to 6.5, where a match is
+several stores wide and the copy width, not the command, is the cost.
 
 ### Sixteen positions at a time
 

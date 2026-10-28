@@ -645,8 +645,15 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * ones the general path writes, and a stream the general path
              * would refuse is refused here too (every test it makes is in
              * this condition, or already made above). */
+            /* The output test is `op_rem >= 40`, not `lit + mlen + 16 <=
+             * op_rem`: with lit <= 8 and mlen <= 16 the two are the same
+             * bound, and a compare is one op where the sum is three. The
+             * distance test is `off <= op_done`, one literal's worth
+             * stricter than the general path's after the literals are
+             * placed -- a match that starts within the first eight bytes of
+             * the block takes the general path instead. */
             if (lit <= 8u && off >= 16u && mlen <= 16u && lit_safe16 != 0 &&
-                off <= op_done + lit && lit + mlen + 16u <= op_rem) {
+                off <= op_done && op_rem >= 40u) {
                 memcpy(op, lp, 8u);
                 memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
                 op += lit + mlen;
