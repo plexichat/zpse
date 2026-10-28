@@ -434,7 +434,7 @@ depend on it, decode over 64 KiB blocks:
 | --- | ---: | ---: |
 | `ts_gapped` (timestamp with gaps) | 2.06:1 | 2.4 GB/s |
 | `float_sparse` (f32 readings) | 2.72:1 | 3.4 GB/s |
-| `ts_us` (i64 µs timestamps) | 5.11:1 | 3.3 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.11:1 | 3.1 GB/s |
 | `sorted_near` | 3.82:1 | 4.2 GB/s |
 | `ts_seq` (i64 µs timestamps) | 5.38:1 | 4.7 GB/s |
 
@@ -444,30 +444,35 @@ loading it back from `out` is a store-to-load forward of a store one
 iteration old, and on `ts_gapped` that single load was the busiest
 instruction in the whole decoder (19% of its samples, 93 of ~500). Both
 branches of the step already produce that vector, so they hand it forward
-instead, and the loop reads `out` only once, after the scalar head. Alternate
-binaries over the 25-case corpus, best of twelve interleaved rounds: **decode
-+5.2% time-weighted, +2.7% geomean**, with every stride-dependent column
-moving -- `ts_gapped` 1.93 -> 2.35 GB/s, `float_sparse` 2.89 -> 3.37,
-`sorted_near` 3.97 -> 4.15, `struct_offsets` 10.1 -> 10.4 -- and no size on
-any case of the level sweep changed. Encode, which shares none of this code,
-read -1.1% in the same run against a **0.5% floor** measured by running the
-harness on two copies of the same tree (per-case swings up to 2%): a unity
-build has one text section, so a decode-side edit moves every later
-function's alignment. Read that -1.1% as the floor plus layout, not as work.
+instead, and the loop reads `out` only once, after the scalar head.
 
 **The payload copy moves thirty-two bytes a step too.** `residual_copy_bytes`
 is the mode-0/mode-1 tile payload copy -- k bytes, k at most 256 -- and on a
 dense tile the step width is what it costs: thirty-two bytes a step halves the
 loop and its counter against the eight-byte form, and the eight-byte loop
-still finishes the last partial step. With it, the same A/B reads decode
-**+5.4% time-weighted, +4.4% geomean**; with the exception-mask walk below it
-in as well, three runs of twelve interleaved rounds read **+6.2% and +4.8%**
-(`ts_gapped` 1.93 -> 2.35 GB/s, `float_sparse` 2.89 -> 3.40, `ts_us` 3.06 ->
-3.26, `struct_offsets` 10.1 -> 10.4). A widening of the LZ decoder's literal
+still finishes the last partial step. A widening of the LZ decoder's literal
 copy was measured on the same harness and is *not* here: 32 bytes a step read
 1.54 GB/s against 1.53 on `text_en` and 2.37 against 2.37 on `json_rows`,
 because that decoder is per-command bound (about twelve cycles a command at
 5-11 bytes a command), not per-byte bound.
+
+**Together**, alternate binaries over the 25-case corpus, best of twelve
+interleaved rounds: **decode +5.9% time-weighted, +5.0% geomean**; encode,
+which shares none of this code, **+0.4%** -- neutral -- and no cell of the
+nine-level size sweep changed. Per case: `ts_gapped` 1.94 -> 2.43 GB/s,
+`float_sparse` 2.91 -> 3.34, `sorted_near` 3.85 -> 4.12, `ts_us` 2.92 -> 3.09,
+`uuid_mix` 13.9 -> 17.5, `dict_u16le` 21.1 -> 27.6, `rle_lens` 20.5 -> 22.9.
+
+The encode column is worth a sentence of its own, because it lied once. An
+earlier run of the same A/B read encode -1.1%, consistent enough over three
+runs to argue about layout for, and it was not layout: the copy of the tree on
+the *right* of that A/B still carried an unshipped experiment in
+`transform.c`, which the unity build had pulled into the same translation unit
+as the encoder. The number above is the same three changes built from the tree
+that is in this repository. The rule this file already gives -- same recipe,
+same host, same configuration -- needs one more clause: **the trees on either
+side have to be the trees you ship**, and rebuilding the right-hand side from
+the working tree is what found it.
 
 **And the mask walk jumps instead of shifting.** The classify takes a tile's
 exceptions from a 16-bit `movemask`, and it used to walk those sixteen
