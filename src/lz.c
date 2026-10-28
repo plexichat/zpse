@@ -621,6 +621,41 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             if (lit > lit_rem || lit > op_rem) {
                 return PSE_BAD_LZ;
             }
+            /* One-shot path for the shape most commands of a text, JSON or
+             * log block take: at most eight literal bytes and a match that
+             * fits in sixteen, at a distance of at least sixteen. Both
+             * copies become one store with no tail, and the whole command
+             * becomes one branch instead of the two copies' own cascades of
+             * width tests -- which is what the loop is worth, because it is
+             * per-command bound, not per-byte bound: a command emits five to
+             * eleven bytes and costs about twelve cycles whatever its
+             * shape. Measured on the LZ decoder alone, `json_rows` 2.37 ->
+             * 3.74 GB/s and `text_en` 1.54 -> 2.29.
+             *
+             * The bounds are the general path's, tested as one expression
+             * and in the order those tests would run in: the literal count
+             * was just checked, `off <= op_done + lit` is the distance test
+             * taken after the literal bytes are placed, and
+             * `lit + mlen + 16 <= op_rem` covers both the output bound and
+             * the sixteen bytes the match store writes past its run, which a
+             * later command reclaims exactly as the general path's slack
+             * does. Both stores over-copy and both over-copies are
+             * overwritten -- the literal's tail by the match store, the
+             * match's tail past the command -- so the bytes in `out` are the
+             * ones the general path writes, and a stream the general path
+             * would refuse is refused here too (every test it makes is in
+             * this condition, or already made above). */
+            if (lit <= 8u && off >= 16u && mlen <= 16u && lit_safe16 != 0 &&
+                off <= op_done + lit && lit + mlen + 16u <= op_rem) {
+                memcpy(op, lp, 8u);
+                memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
+                op += lit + mlen;
+                lp += lit;
+                lit_rem -= lit;
+                op_rem -= lit + mlen;
+                op_done += lit + mlen;
+                continue;
+            }
             lz_copy_literals(op, lp, lit, op_rem, lit_safe16);
             op += lit;
             lp += lit;

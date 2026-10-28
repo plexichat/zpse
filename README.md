@@ -454,14 +454,33 @@ still finishes the last partial step. A widening of the LZ decoder's literal
 copy was measured on the same harness and is *not* here: 32 bytes a step read
 1.54 GB/s against 1.53 on `text_en` and 2.37 against 2.37 on `json_rows`,
 because that decoder is per-command bound (about twelve cycles a command at
-5-11 bytes a command), not per-byte bound.
+5-11 bytes a command), not per-byte bound -- which is also the reason the
+one-shot command path below is what it took to move that decoder at all.
+
+**The LZ decoder gets a one-shot command path.** The loop above is per-command
+bound, not per-byte bound -- a command emits five to eleven bytes and costs
+about twelve cycles whatever its shape -- so the way in is fewer instructions
+per command, not a wider copy. Nine commands in ten on a text, JSON or log
+block share one shape: at most eight literal bytes and a match that fits in
+sixteen, at a distance of at least sixteen. That shape now gets one branch and
+two stores, with no tail and no width cascade in either copy, and falls
+through to the general path unchanged when any of its bounds misses. Every
+bound the general path tests is in the one condition (or already tested above
+it), so a stream it would refuse is refused here too, and both stores
+over-copy into bytes a later command writes -- the same slack argument the
+literal and match copies already make. LZ decode alone: `json_rows` 2.37 ->
+3.74 GB/s, `text_en` 1.54 -> 2.29, `decimal8` 1.06 -> 1.83, `float_mix` 1.75 ->
+2.69.
 
 **Together**, alternate binaries over the 25-case corpus, best of twelve
-interleaved rounds: **decode +5.9% time-weighted, +5.0% geomean**; encode,
-which shares none of this code, **+0.4%** -- neutral -- and no cell of the
-nine-level size sweep changed. Per case: `ts_gapped` 1.94 -> 2.43 GB/s,
-`float_sparse` 2.91 -> 3.34, `sorted_near` 3.85 -> 4.12, `ts_us` 2.92 -> 3.09,
-`uuid_mix` 13.9 -> 17.5, `dict_u16le` 21.1 -> 27.6, `rle_lens` 20.5 -> 22.9.
+interleaved rounds: **decode +12.8% time-weighted, +9.0% geomean**; encode
+**+1.9%**, and no cell of the nine-level size sweep changed. Per case:
+`json_rows` 2.14 -> 3.09 GB/s, `log_lines` 2.64 -> 3.57, `var_string` 3.79 ->
+4.67, `uuid_mix` 12.2 -> 15.1, `dict_u16le` 18.8 -> 25.7, `ts_gapped` 1.71 ->
+2.11, `float_sparse` 2.57 -> 2.82, `sorted_near` 3.36 -> 3.63, `rle_lens`
+18.6 -> 20.1. Without the one-shot path the same measurement read +5.9% and
++5.0%, which is what the three copies and the mask walk are worth on their
+own.
 
 The encode column is worth a sentence of its own, because it lied once. An
 earlier run of the same A/B read encode -1.1%, consistent enough over three
