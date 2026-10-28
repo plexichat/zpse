@@ -2091,13 +2091,22 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                         (const __m128i *)(const void *)(actual + p));
                     __m128i eq = _mm_cmpeq_epi8(v, cvec);
                     unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
-                    unsigned b = 0u;
+
+                    /* Walk the set bits, not the sixteen positions: a
+                     * bit-at-a-time shift is sixteen iterations of shift,
+                     * test and increment per sixteen bytes whatever the
+                     * mask holds, and this is the classify's inner loop on
+                     * every family without a dense kernel (measured: 9% of
+                     * dict_u8's encode, the slowest row of the corpus).
+                     * ctz jumps straight to the next exception and the
+                     * clear-lowest walks it in ascending order, which is
+                     * the order the shift loop produced. */
                     while (mm != 0u) {
-                        if ((mm & 1u) != 0u)
-                            TILE_TAKE_EXC((uint16_t)(p + b), c,
-                                          actual[p + b]);
-                        mm >>= 1u;
-                        b++;
+                        unsigned b = zpse_ctz32(mm);
+
+                        TILE_TAKE_EXC((uint16_t)(p + b), c,
+                                      actual[p + b]);
+                        mm &= mm - 1u;
                     }
                 }
                 for (; p < (uint32_t)nt; p++) {
@@ -2123,13 +2132,13 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                         (const __m128i *)(const void *)(actual + p));
                     __m128i eq = _mm_cmpeq_epi8(v, zero);
                     unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
-                    unsigned b = 0u;
+
                     while (mm != 0u) {
-                        if ((mm & 1u) != 0u)
-                            TILE_TAKE_EXC((uint16_t)(p + b), 0u,
-                                          actual[p + b]);
-                        mm >>= 1u;
-                        b++;
+                        unsigned b = zpse_ctz32(mm);
+
+                        TILE_TAKE_EXC((uint16_t)(p + b), 0u,
+                                      actual[p + b]);
+                        mm &= mm - 1u;
                     }
                 }
                 for (; p < (uint32_t)nt; p++) {
@@ -2182,13 +2191,13 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                     (const __m128i *)(const void *)(base + (p - h)));
                 __m128i eq = _mm_cmpeq_epi8(v, xh);
                 unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
-                unsigned b = 0u;
+
                 while (mm != 0u) {
-                    if ((mm & 1u) != 0u)
-                        TILE_TAKE_EXC((uint16_t)(p + b),
-                                      base[p + b - h], actual[p + b]);
-                    mm >>= 1u;
-                    b++;
+                    unsigned b = zpse_ctz32(mm);
+
+                    TILE_TAKE_EXC((uint16_t)(p + b), base[p + b - h],
+                                  actual[p + b]);
+                    mm &= mm - 1u;
                 }
             }
             for (; p < (uint32_t)nt; p++) {
