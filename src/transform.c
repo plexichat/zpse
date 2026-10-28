@@ -1075,12 +1075,183 @@ static void zpse_merge8(uint8_t *out, const uint8_t *const segs[16],
     }
 }
 
+#if ZPSE_T_HAVE_AVX2
+/* The same parity split at 32 rows per iteration -- the encode side of the
+ * 32-row merges below.
+ *
+ * The tree is the 128-bit one above: `vpackuswb` is a per-lane instruction,
+ * so as long as lane 0 of every input vector holds a chunk of rows 0-15 and
+ * lane 1 holds the matching chunk of rows 16-31, lane 0 of every result is
+ * the first half's plane bytes and lane 1 is the second half's, which is one
+ * 32-byte store per plane. Inputs are built that way by pairing a chunk with
+ * the chunk sixteen rows later (`vinserti128` takes the second load as a
+ * memory operand), so per 32 rows the tree does half the ops of two 16-row
+ * passes and the stores go from sixteen to eight, against eight extra
+ * inserts and eight extra loads.
+ *
+ * A half is 16 rows of w bytes, so the pairing offset is 16*w. */
+static ZPSE_T_AVX2 __m256i zpse_parity_evens256(__m256i a, __m256i b)
+{
+    const __m256i mask = _mm256_set1_epi16(0x00FF);
+
+    return _mm256_packus_epi16(_mm256_and_si256(a, mask),
+                               _mm256_and_si256(b, mask));
+}
+
+static ZPSE_T_AVX2 __m256i zpse_parity_odds256(__m256i a, __m256i b)
+{
+    return _mm256_packus_epi16(_mm256_srli_epi16(a, 8),
+                               _mm256_srli_epi16(b, 8));
+}
+
+/* One 32-row group's worth of chunk k: the first half's chunk in lane 0 and
+ * the chunk 16 rows later in lane 1. */
+#define ZPSE_SPLIT_PAIR(Q, HALF, K)                                           \
+    _mm256_inserti128_si256(                                                  \
+        _mm256_castsi128_si256(_mm_loadu_si128(                               \
+            (const __m128i *)(const void *)((Q) + 16u * (K)))),               \
+        _mm_loadu_si128(                                                      \
+            (const __m128i *)(const void *)((Q) + (HALF) + 16u * (K))), 1)
+
+static ZPSE_T_AVX2 uint32_t
+zpse_split2_avx2(uint8_t *const segs[16], const uint8_t *in, uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        const uint8_t *q = in + (size_t)g * 2u;
+        __m256i a = ZPSE_SPLIT_PAIR(q, 32u, 0u);
+        __m256i b = ZPSE_SPLIT_PAIR(q, 32u, 1u);
+
+        _mm256_storeu_si256((__m256i *)(void *)(segs[0] + g),
+                            zpse_parity_evens256(a, b));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[1] + g),
+                            zpse_parity_odds256(a, b));
+    }
+    return g;
+}
+
+static ZPSE_T_AVX2 uint32_t
+zpse_split4_avx2(uint8_t *const segs[16], const uint8_t *in, uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        const uint8_t *q = in + (size_t)g * 4u;
+        __m256i a = ZPSE_SPLIT_PAIR(q, 64u, 0u);
+        __m256i b = ZPSE_SPLIT_PAIR(q, 64u, 1u);
+        __m256i c = ZPSE_SPLIT_PAIR(q, 64u, 2u);
+        __m256i d = ZPSE_SPLIT_PAIR(q, 64u, 3u);
+        /* Level 1: bytes of class 0|2 (evens) and 1|3 (odds), per half. */
+        __m256i e1 = zpse_parity_evens256(a, b);
+        __m256i o1 = zpse_parity_odds256(a, b);
+        __m256i e2 = zpse_parity_evens256(c, d);
+        __m256i o2 = zpse_parity_odds256(c, d);
+
+        /* Level 2: even and odd positions of each half of those streams. */
+        _mm256_storeu_si256((__m256i *)(void *)(segs[0] + g),
+                            zpse_parity_evens256(e1, e2));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[1] + g),
+                            zpse_parity_evens256(o1, o2));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[2] + g),
+                            zpse_parity_odds256(e1, e2));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[3] + g),
+                            zpse_parity_odds256(o1, o2));
+    }
+    return g;
+}
+
+static ZPSE_T_AVX2 uint32_t
+zpse_split8_avx2(uint8_t *const segs[16], const uint8_t *in, uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        const uint8_t *q = in + (size_t)g * 8u;
+        __m256i a0 = ZPSE_SPLIT_PAIR(q, 128u, 0u);
+        __m256i a1 = ZPSE_SPLIT_PAIR(q, 128u, 1u);
+        __m256i a2 = ZPSE_SPLIT_PAIR(q, 128u, 2u);
+        __m256i a3 = ZPSE_SPLIT_PAIR(q, 128u, 3u);
+        __m256i a4 = ZPSE_SPLIT_PAIR(q, 128u, 4u);
+        __m256i a5 = ZPSE_SPLIT_PAIR(q, 128u, 5u);
+        __m256i a6 = ZPSE_SPLIT_PAIR(q, 128u, 6u);
+        __m256i a7 = ZPSE_SPLIT_PAIR(q, 128u, 7u);
+        /* Level 1: the parity split of each 32-byte span. */
+        __m256i ev01 = zpse_parity_evens256(a0, a1);
+        __m256i od01 = zpse_parity_odds256(a0, a1);
+        __m256i ev23 = zpse_parity_evens256(a2, a3);
+        __m256i od23 = zpse_parity_odds256(a2, a3);
+        __m256i ev45 = zpse_parity_evens256(a4, a5);
+        __m256i od45 = zpse_parity_odds256(a4, a5);
+        __m256i ev67 = zpse_parity_evens256(a6, a7);
+        __m256i od67 = zpse_parity_odds256(a6, a7);
+        /* Level 2: the evens and odds of the two spans of each parity. */
+        __m256i p0 = zpse_parity_evens256(ev01, ev23);
+        __m256i p4 = zpse_parity_odds256(ev01, ev23);
+        __m256i p1 = zpse_parity_evens256(ev45, ev67);
+        __m256i p5 = zpse_parity_odds256(ev45, ev67);
+        __m256i p2 = zpse_parity_evens256(od01, od23);
+        __m256i p6 = zpse_parity_odds256(od01, od23);
+        __m256i p3 = zpse_parity_evens256(od45, od67);
+        __m256i p7 = zpse_parity_odds256(od45, od67);
+
+        /* Level 3: one residue per plane. */
+        _mm256_storeu_si256((__m256i *)(void *)(segs[0] + g),
+                            zpse_parity_evens256(p0, p1));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[1] + g),
+                            zpse_parity_evens256(p2, p3));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[2] + g),
+                            zpse_parity_evens256(p4, p5));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[3] + g),
+                            zpse_parity_evens256(p6, p7));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[4] + g),
+                            zpse_parity_odds256(p0, p1));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[5] + g),
+                            zpse_parity_odds256(p2, p3));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[6] + g),
+                            zpse_parity_odds256(p4, p5));
+        _mm256_storeu_si256((__m256i *)(void *)(segs[7] + g),
+                            zpse_parity_odds256(p6, p7));
+    }
+    return g;
+}
+#endif /* ZPSE_T_HAVE_AVX2 */
+
 /* `rows` interleaved rows in, w contiguous planes out. The caller handles
  * the ragged tail (plane lengths differ by at most one row) and the
  * delta/xor chains, which run on the contiguous planes. */
 static void zpse_split_narrow(uint8_t *const segs[16], const uint8_t *in,
                               uint32_t rows, uint8_t w)
 {
+#if ZPSE_T_HAVE_AVX2
+    if (rows >= 32u && zpse_t_avx2()) {
+        uint8_t *sh[16];
+        uint32_t done;
+        unsigned t;
+
+        if (w == 2u) {
+            done = zpse_split2_avx2(segs, in, rows);
+        } else if (w == 4u) {
+            done = zpse_split4_avx2(segs, in, rows);
+        } else {
+            done = zpse_split8_avx2(segs, in, rows);
+        }
+        /* At most one 16-row group is left over. */
+        if (done < rows) {
+            for (t = 0; t < 16u; t++) {
+                sh[t] = segs[t < (unsigned)w ? t : 0u] + done;
+            }
+            if (w == 2u) {
+                zpse_split2(sh, in + (size_t)done * 2u, rows - done);
+            } else if (w == 4u) {
+                zpse_split4(sh, in + (size_t)done * 4u, rows - done);
+            } else {
+                zpse_split8(sh, in + (size_t)done * 8u, rows - done);
+            }
+        }
+        return;
+    }
+#endif /* ZPSE_T_HAVE_AVX2 */
     if (w == 2u) {
         zpse_split2(segs, in, rows);
     } else if (w == 4u) {
@@ -1090,6 +1261,207 @@ static void zpse_split_narrow(uint8_t *const segs[16], const uint8_t *in,
     }
 }
 
+#if ZPSE_T_HAVE_AVX2
+/* The narrow merges at 32 rows per iteration.
+ *
+ * The network is the 128-bit one above, unchanged: `vpunpck*` is a per-lane
+ * instruction, so one 256-bit unpack runs the whole 16-row tree on both
+ * halves of its inputs at once -- lane 0 for rows 0-15, lane 1 for rows
+ * 16-31. What that leaves is a store-order problem and nothing else: the
+ * output vectors hold their two halves in row order, so the last stage of
+ * each group is one `vperm2i128` per output vector instead of a 16-byte
+ * store. Eight ladders of 32 bytes replace sixteen of 16, the tree op count
+ * is halved, and the stores go from sixteen to eight per 256 bytes of
+ * output, for four permutes per 128 bytes (w == 4) or eight per 256
+ * (w == 8).
+ *
+ * The chain undo is the same inclusive byte prefix the SSE helper computes,
+ * with the two 128-bit halves cross-linked after the four in-lane
+ * shift-adds: the helpers the 32-byte prefix scans above already use, so
+ * the arithmetic is the one those scans are tested against. Byte 31 of the
+ * result is the 32-byte chunk's total, which is what `carry` becomes, in
+ * the same way byte 15 of a 16-byte chunk is in the SSE form. */
+static ZPSE_T_AVX2 __m256i zpse_chain_undo32(__m256i ctl, __m256i x,
+                                             uint8_t *carry, int delta)
+{
+    uint8_t add;
+    uint8_t c = *carry;
+
+    if (delta) {
+        x = _mm256_add_epi8(x, _mm256_slli_si256(x, 1));
+        x = _mm256_add_epi8(x, _mm256_slli_si256(x, 2));
+        x = _mm256_add_epi8(x, _mm256_slli_si256(x, 4));
+        x = _mm256_add_epi8(x, _mm256_slli_si256(x, 8));
+        x = _mm256_add_epi8(x, zpse_avx2_lane_total(ctl, x));
+        add = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);
+        x = _mm256_add_epi8(x, _mm256_set1_epi8((char)c));
+        *carry = (uint8_t)(c + add);
+    } else {
+        x = _mm256_xor_si256(x, _mm256_slli_si256(x, 1));
+        x = _mm256_xor_si256(x, _mm256_slli_si256(x, 2));
+        x = _mm256_xor_si256(x, _mm256_slli_si256(x, 4));
+        x = _mm256_xor_si256(x, _mm256_slli_si256(x, 8));
+        x = _mm256_xor_si256(x, zpse_avx2_lane_total(ctl, x));
+        add = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);
+        x = _mm256_xor_si256(x, _mm256_set1_epi8((char)c));
+        *carry = (uint8_t)(c ^ add);
+    }
+    return x;
+}
+
+/* Whole 32-row groups only: the caller runs the 16-row snake over what is
+ * left, which is at most one group because `rows` arrives a multiple of 16.
+ * These return the number of rows written. */
+static ZPSE_T_AVX2 uint32_t
+zpse_merge2_avx2(uint8_t *out, const uint8_t *const segs[16], uint32_t rows,
+                 uint8_t *carry, int delta)
+{
+    const __m256i ctl = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15);
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        __m256i a = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(segs[0] + g));
+        __m256i b = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(segs[1] + g));
+        __m256i lo, hi;
+        uint8_t *d = out + (size_t)g * 2u;
+
+        if (carry != 0) {
+            a = zpse_chain_undo32(ctl, a, carry, delta);
+            b = zpse_chain_undo32(ctl, b, carry + 1, delta);
+        }
+        lo = _mm256_unpacklo_epi8(a, b);
+        hi = _mm256_unpackhi_epi8(a, b);
+        _mm256_storeu_si256((__m256i *)(void *)d,
+                            _mm256_permute2x128_si256(lo, hi, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),
+                            _mm256_permute2x128_si256(lo, hi, 0x31));
+    }
+    return g;
+}
+
+static ZPSE_T_AVX2 uint32_t
+zpse_merge4_avx2(uint8_t *out, const uint8_t *const segs[16], uint32_t rows,
+                 uint8_t *carry, int delta)
+{
+    const __m256i ctl = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15);
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        __m256i p[4];
+        __m256i lo[2];
+        __m256i hi[2];
+        __m256i r[4];
+        uint8_t *d = out + (size_t)g * 4u;
+        unsigned t;
+
+        for (t = 0; t < 4u; t++) {
+            __m256i x = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(segs[t] + g));
+
+            p[t] = carry != 0 ? zpse_chain_undo32(ctl, x, carry + t, delta)
+                              : x;
+        }
+        /* Classes 0|1 and 2|3 interleave pairwise, then the two halves. */
+        lo[0] = _mm256_unpacklo_epi8(p[0], p[1]);
+        hi[0] = _mm256_unpackhi_epi8(p[0], p[1]);
+        lo[1] = _mm256_unpacklo_epi8(p[2], p[3]);
+        hi[1] = _mm256_unpackhi_epi8(p[2], p[3]);
+        r[0] = _mm256_unpacklo_epi16(lo[0], lo[1]);
+        r[1] = _mm256_unpackhi_epi16(lo[0], lo[1]);
+        r[2] = _mm256_unpacklo_epi16(hi[0], hi[1]);
+        r[3] = _mm256_unpackhi_epi16(hi[0], hi[1]);
+        /* Lane 0 of the four results is rows 0-15, lane 1 rows 16-31, so a
+         * row-ordered 32-byte store pairs the low halves and then the high
+         * ones. */
+        _mm256_storeu_si256((__m256i *)(void *)d,
+                            _mm256_permute2x128_si256(r[0], r[1], 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),
+                            _mm256_permute2x128_si256(r[2], r[3], 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 64u),
+                            _mm256_permute2x128_si256(r[0], r[1], 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 96u),
+                            _mm256_permute2x128_si256(r[2], r[3], 0x31));
+    }
+    return g;
+}
+
+static ZPSE_T_AVX2 uint32_t
+zpse_merge8_avx2(uint8_t *out, const uint8_t *const segs[16], uint32_t rows,
+                 uint8_t *carry, int delta)
+{
+    const __m256i ctl = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15);
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        __m256i c[8];
+        __m256i p0, p1, p2, p3, p4, p5, p6, p7;
+        __m256i ev01, ev23, ev45, ev67, od01, od23, od45, od67;
+        __m256i r0, r1, r2, r3, r4, r5, r6, r7;
+        uint8_t *d = out + (size_t)g * 8u;
+        unsigned t;
+
+        for (t = 0; t < 8u; t++) {
+            __m256i x = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(segs[t] + g));
+
+            c[t] = carry != 0 ? zpse_chain_undo32(ctl, x, carry + t, delta)
+                              : x;
+        }
+        /* Level 3, undone: class t and class t+4 were the evens and odds of
+         * the same pair of streams. */
+        p0 = _mm256_unpacklo_epi8(c[0], c[4]);
+        p1 = _mm256_unpackhi_epi8(c[0], c[4]);
+        p2 = _mm256_unpacklo_epi8(c[1], c[5]);
+        p3 = _mm256_unpackhi_epi8(c[1], c[5]);
+        p4 = _mm256_unpacklo_epi8(c[2], c[6]);
+        p5 = _mm256_unpackhi_epi8(c[2], c[6]);
+        p6 = _mm256_unpacklo_epi8(c[3], c[7]);
+        p7 = _mm256_unpackhi_epi8(c[3], c[7]);
+        /* Level 2, undone: the same pairing one level down. */
+        ev01 = _mm256_unpacklo_epi8(p0, p4);
+        ev23 = _mm256_unpackhi_epi8(p0, p4);
+        ev45 = _mm256_unpacklo_epi8(p1, p5);
+        ev67 = _mm256_unpackhi_epi8(p1, p5);
+        od01 = _mm256_unpacklo_epi8(p2, p6);
+        od23 = _mm256_unpackhi_epi8(p2, p6);
+        od45 = _mm256_unpacklo_epi8(p3, p7);
+        od67 = _mm256_unpackhi_epi8(p3, p7);
+        /* Level 1, undone: the parity-2 spans rebuild the eight 16-byte
+         * pieces of a 16-row half, in input order. */
+        r0 = _mm256_unpacklo_epi8(ev01, od01);
+        r1 = _mm256_unpackhi_epi8(ev01, od01);
+        r2 = _mm256_unpacklo_epi8(ev23, od23);
+        r3 = _mm256_unpackhi_epi8(ev23, od23);
+        r4 = _mm256_unpacklo_epi8(ev45, od45);
+        r5 = _mm256_unpackhi_epi8(ev45, od45);
+        r6 = _mm256_unpacklo_epi8(ev67, od67);
+        r7 = _mm256_unpackhi_epi8(ev67, od67);
+        _mm256_storeu_si256((__m256i *)(void *)d,
+                            _mm256_permute2x128_si256(r0, r1, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),
+                            _mm256_permute2x128_si256(r2, r3, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 64u),
+                            _mm256_permute2x128_si256(r4, r5, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 96u),
+                            _mm256_permute2x128_si256(r6, r7, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 128u),
+                            _mm256_permute2x128_si256(r0, r1, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 160u),
+                            _mm256_permute2x128_si256(r2, r3, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 192u),
+                            _mm256_permute2x128_si256(r4, r5, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 224u),
+                            _mm256_permute2x128_si256(r6, r7, 0x31));
+    }
+    return g;
+}
+#endif /* ZPSE_T_HAVE_AVX2 */
+
 /* The inverse: w contiguous planes in, the interleaved rows out. When
  * `carry` is not NULL each plane's sixteen bytes are first restored from the
  * chain in registers, and `carry[t]` holds the byte that crosses the group. */
@@ -1097,6 +1469,41 @@ static void zpse_merge_narrow(uint8_t *out, const uint8_t *const segs[16],
                               uint32_t rows, uint8_t w, uint8_t *carry,
                               int delta)
 {
+#if ZPSE_T_HAVE_AVX2
+    if (rows >= 32u && zpse_t_avx2()) {
+        const uint8_t *sh[16];
+        uint32_t done;
+        unsigned t;
+
+        if (w == 2u) {
+            done = zpse_merge2_avx2(out, segs, rows, carry, delta);
+        } else if (w == 4u) {
+            done = zpse_merge4_avx2(out, segs, rows, carry, delta);
+        } else {
+            done = zpse_merge8_avx2(out, segs, rows, carry, delta);
+        }
+        /* At most one 16-row group is left: the callers hand over a
+         * multiple of sixteen. The carry the 32-byte ladder left is the
+         * one the 16-byte snake continues from, so the two forms share the
+         * chain exactly where they meet. */
+        if (done < rows) {
+            for (t = 0; t < 16u; t++) {
+                sh[t] = segs[t < (unsigned)w ? t : 0u] + done;
+            }
+            if (w == 2u) {
+                zpse_merge2(out + (size_t)done * 2u, sh, rows - done, carry,
+                            delta);
+            } else if (w == 4u) {
+                zpse_merge4(out + (size_t)done * 4u, sh, rows - done, carry,
+                            delta);
+            } else {
+                zpse_merge8(out + (size_t)done * 8u, sh, rows - done, carry,
+                            delta);
+            }
+        }
+        return;
+    }
+#endif /* ZPSE_T_HAVE_AVX2 */
     if (w == 2u) {
         zpse_merge2(out, segs, rows, carry, delta);
     } else if (w == 4u) {
