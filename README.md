@@ -95,6 +95,84 @@ ceiling. Everything else is transform- and tile-bound, not memory-bound.
 * One machine, one compiler, no confidence intervals. Treat the table as
   "this is roughly what it does" rather than a result.
 
+### Measuring a change
+
+`tests/benchmarks/ab.sh` is the harness behind the alternating-binary numbers
+in this file. It builds `bench_columnar.c` against two source trees, runs them
+back to back in the same round (order swapped every round) and reports the
+per-case encode and decode rate ratio of the second tree to the first, with
+two summaries: the geomean over cases, and the time-weighted total, which is
+the ratio on the whole corpus and the one to quote -- a case running at
+40 GB/s contributes almost no time and cannot outweigh one at 2 GB/s.
+
+```
+tests/benchmarks/ab.sh -e 6 -r 8 /path/to/before /path/to/after
+```
+
+Four checks decide whether a change is worth keeping, in this order:
+
+1. **The output has to be the same bytes.** `bench_levels.c` prints every
+   (case, level, size) cell and memcmp-verifies each block's decode before it
+   prints the row, so diffing its size column between the two trees is the
+   format statement: an encoder-side change has to leave those numbers alone,
+   or it is not a speed change.
+2. **The suites have to pass**, in `tests/runners/run.sh` (roundtrip, fuzz,
+   hostile, sizes, dense, decide, and the `-DZPSE_FORCE_SCALAR` and
+   `-DZPSE_FORCE_TRIAL_SWAP` parity digests). A kernel that changes bytes on
+   an input the corpus never generates is exactly what the parity builds are
+   there to catch.
+3. **A kernel needs a differential test of its own.** The suites pin the
+   frame and block paths; a width-specific kernel needs every length and
+   every row count that reaches it. Calling `zpse_transform_forward` and
+   `zpse_transform_inverse` in a loop over `n = 1..1024`, with the digest of
+   the plane bytes and the status of each call printed, and comparing that
+   digest across the default and `-DZPSE_FORCE_SCALAR` builds, is the form
+   used for the narrow-width kernels.
+4. **The ratio has to reproduce**, twice, with the sign stable per case. A
+   change that moves every case by 1% in a different direction is noise, and
+   the harness will say 1.00 because it is.
+
+Where to look first is decided by a profile, not by taste: `perf record` /
+`perf annotate` over the columnar corpus, with the encoder or the decoder as
+the only thing in the timed region. Which transform each corpus case selects
+is the companion fact, because it says which half of the codec that case
+exercises (this is the `transforms(...)` line `bench_columnar` prints):
+
+| case | transform |
+| --- | --- |
+| `bools_nulls` | RAW |
+| `decimal8` | T8 |
+| `dict_u8` | RAW |
+| `dict_u16le` | T2 |
+| `dna_2bit` | RAW |
+| `float_mix` | DT16 |
+| `float_sparse` | RAW (49/64), T2 |
+| `geo_point` | RAW |
+| `i32_seq` | DT4 |
+| `i64_mixed` | DT8 |
+| `json_rows` | RAW |
+| `log_lines` | RAW |
+| `rle_lens` | T4 |
+| `sorted_near` | DT4 (62/64), DT8 |
+| `sparse_mix` | RAW (61/64), T2 |
+| `struct_offsets` | DT4 |
+| `text_en` | RAW |
+| `ts_gapped` | T4 |
+| `ts_ns` | DT8 |
+| `ts_seq` | DT8 |
+| `ts_us` | DT8 |
+| `utf8_multi` | RAW |
+| `uuid_mix` | T16 |
+| `var_string` | RAW |
+| `zeros_burst` | RAW |
+
+RAW means the block kept its bytes (the intra-block LZ form can still ride on
+top of that at levels 5-9), T* is the plain width-* transpose, DT* the delta
+transpose. The rows that dominate the decode time budget are the DT4/DT8 ones
+-- their inverse is a chain per plane plus a merge -- and the rows that
+dominate the encode budget are the RAW ones, where the sweep and the match
+finder are the cost.
+
 ### Ratios against zstd
 
 Same corpus, 4 MiB per pattern, `zstd -3` on the command line. Only the
@@ -363,6 +441,51 @@ depend on it, decode over 64 KiB blocks:
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
 kernel writes exactly the bytes the scalar loop writes.
+
+### Choosing the predictor
+
+Every tile the encoder searches is asked one question first: of the nine
+cheap predictors, which misses fewest? That is `seg_prescreen`, one vector
+pass that counts all nine miss counts at once, and its answer decides which
+one or two predictors are then classified exactly. A count is not a price --
+two predictors that miss one position each usually pack to the same size --
+so the encoder keeps the runner-up as a second candidate only when the two
+counts tie exactly, and the pair of them is what the tile loop needs.
+
+Getting that pair used to mean walking the nine candidates twice, with a
+data-dependent branch per candidate in each walk: once for the best, once
+more with the best skipped for the runner-up. It is one walk now, over a
+packed key per candidate -- miss count above, priority below -- so the
+comparison is a single `<` whose result is the same decision the two-term
+test made, ties included. The priority table is the winner rule the format
+is defined by; the scan order (`seg_screen_rank`) is free to change and
+changes nothing, because the key never reads it.
+
+Two smaller things came out of the same profile. The repeat cache at the top
+of the tile loop is keyed and zeroed per segment, 1.5 KiB of `memset` that a
+64 KiB plane does not notice and a 4 KiB plane pays 96 bytes a tile for --
+and a 4 KiB plane is exactly what a width-16 transform hands the loop,
+sixteen times a block. Below 32 tiles the cache is not set up at all: its
+hit needs a whole 256-byte tile to recur, sixteen tiles of a transposed
+plane are different records, and a miss costs nothing but the reuse it did
+not find, because the general path writes the record the copy would have
+written. And the dense classify now keeps its own distinct-residual count
+instead of leaving the epilogue to recount the bitmap it was just built
+from, with the presence fold stopping as soon as it has seventeen distinct
+values -- which is the only thing the count is ever compared against.
+
+Measured over the twenty-five-case columnar corpus, alternating binaries,
+best of eight rounds, nothing else changed, and run twice on a host that was
+carrying another workload: **encode +2.8% and +4.0% geomean (+3.4% and +4.3%
+time-weighted)**. Decode is untouched, so the decode column of those two runs
+(+0.7%, -1.2%) is the harness's own spread on that afternoon -- which is the
+size of the error bar to read the encode numbers with.
+
+The streams are unchanged -- same size on every case of the sweep, and the
+parity, fuzz and least-effort suites report identical digests in the default
+and `-DZPSE_FORCE_SCALAR` builds, which is the statement that the
+classification's capped count and its trimmed `seen` set agree between the
+two.
 
 ### A block that does not compress
 

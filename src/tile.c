@@ -1395,18 +1395,32 @@ static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
 }
 
 /* Fold the 256-byte residual-presence array into `seen`, returning how
- * many distinct values it holds. */
+ * many distinct values it holds -- stopping once that count reaches `cap`,
+ * because the only consumer of the count (tile_res_len's palette branch)
+ * rejects the palette above sixteen entries and so can never tell 17 from
+ * 60. The words past the stop are zeroed, which keeps `seen` exactly the
+ * set of values the returned count describes: the caller trims it to `cap`
+ * bits, and every set bit it reports is a residual that was really seen.
+ *
+ * A dense tile of text, code or noise reaches seventeen distinct residuals
+ * within the first handful of them, so this is two of the eight words on
+ * the overwhelming majority of the tiles that get here. */
 static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
-                                               uint32_t seen[8])
+                                               uint32_t seen[8],
+                                               unsigned cap)
 {
     const __m256i z = _mm256_setzero_si256();
     unsigned i;
     unsigned nu = 0u;
 
     for (i = 0; i < 8u; i++) {
-        const __m256i q = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(pres + i * 32u));
+        __m256i q;
 
+        if (nu >= cap) {
+            seen[i] = 0u;
+            continue;
+        }
+        q = _mm256_loadu_si256((const __m256i *)(const void *)(pres + i * 32u));
         seen[i] = (uint32_t)~_mm256_movemask_epi8(_mm256_cmpeq_epi8(q, z));
         nu += (unsigned)_mm_popcnt_u32(seen[i]);
     }
@@ -1446,7 +1460,8 @@ static ZPSE_TILE_AVX2P unsigned tile_bits_count_avx2(const uint32_t w[8])
 static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
     const uint8_t *tile, uint16_t nt, uint8_t predictor_id, int fam,
     uint8_t c, uint32_t s, const uint32_t words[8], ZpseTileClass *cl,
-    uint8_t *rmax_o, uint8_t *dmin_o, uint8_t *dmax_o, int want_at_pred)
+    uint8_t *rmax_o, uint8_t *dmin_o, uint8_t *dmax_o, int want_at_pred,
+    int *nu_ready)
 {
     /* The compacted exception arrays are written straight into the
      * classification: an 8-byte store per 16 lanes lands exactly where the
@@ -1617,6 +1632,7 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
      * stays exact either way. */
     {
         uint8_t pres[256];
+        uint32_t nu;
         const uint32_t lim =
             ((uint32_t)k < (uint32_t)ZPSE_TILE_PROBE) ? (uint32_t)k
                                                       : (uint32_t)ZPSE_TILE_PROBE;
@@ -1630,24 +1646,35 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
         }
         for (; i < lim; i++)
             pres[tr[i]] = 1u;
-        if (tile_pres_fold(pres, cl->seen) < ZPSE_TILE_NU_CAP) {
-            while (i < (uint32_t)k) {
-                uint32_t end = i + (uint32_t)ZPSE_TILE_PROBE;
+        nu = tile_pres_fold(pres, cl->seen, ZPSE_TILE_NU_CAP);
+        while (nu < ZPSE_TILE_NU_CAP && i < (uint32_t)k) {
+            uint32_t end = i + (uint32_t)ZPSE_TILE_PROBE;
 
-                if (end > (uint32_t)k)
-                    end = (uint32_t)k;
-                for (; i + 4u <= end; i += 4u) {
-                    pres[tr[i]] = 1u;
-                    pres[tr[i + 1u]] = 1u;
-                    pres[tr[i + 2u]] = 1u;
-                    pres[tr[i + 3u]] = 1u;
-                }
-                for (; i < end; i++)
-                    pres[tr[i]] = 1u;
-                if (tile_pres_fold(pres, cl->seen) >= ZPSE_TILE_NU_CAP)
-                    break;
+            if (end > (uint32_t)k)
+                end = (uint32_t)k;
+            for (; i + 4u <= end; i += 4u) {
+                pres[tr[i]] = 1u;
+                pres[tr[i + 1u]] = 1u;
+                pres[tr[i + 2u]] = 1u;
+                pres[tr[i + 3u]] = 1u;
             }
+            for (; i < end; i++)
+                pres[tr[i]] = 1u;
+            nu = tile_pres_fold(pres, cl->seen, ZPSE_TILE_NU_CAP);
         }
+        /* The count is final here, so the epilogue does not have to recount
+         * the bitmap it was just built from -- and the trim below is what
+         * keeps popcount(seen) == nu, the invariant the parity suite pins.
+         * Above the cap the set is cut to its lowest `cap` bits, which is
+         * the same shape the walk above produced before it could stop
+         * early; nothing reads it in that case, because a palette of more
+         * than sixteen entries does not exist. */
+        if (nu > (uint32_t)ZPSE_TILE_NU_CAP) {
+            tile_seen_trim(cl->seen, ZPSE_TILE_NU_CAP, nu);
+            nu = (uint32_t)ZPSE_TILE_NU_CAP;
+        }
+        cl->nu = (uint16_t)nu;
+        *nu_ready = 1;
     }
 
     /* Three horizontal folds instead of three 32-iteration byte scans.
@@ -1711,6 +1738,8 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
     uint8_t _rmax = 0;
     uint8_t _dmin = 255u;
     uint8_t _dmax = 0u;
+    /* 1 once the dense pass has produced cl->nu itself. */
+    int nu_ready = 0;
     const __m256i zero = _mm256_setzero_si256();
     const __m256i all = _mm256_cmpeq_epi8(zero, zero);
     /* The bytes this tile is compared against and its exceptions read
@@ -1853,7 +1882,7 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
         if (nexc >= 32u) {
             k = tile_dense_bk_avx2(tile_bytes, nt, predictor_id, fam, c, s,
                                    words, cl, &_rmax, &_dmin, &_dmax,
-                                   want_at_pred);
+                                   want_at_pred, &nu_ready);
         } else if (fam == TILE_FAM_CONST) {
             /* Stop once every set bit of the mask has been consumed:
              * positions ascend across words and the mask holds exactly
@@ -1955,7 +1984,9 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
     cl->rmax = _rmax;
     cl->dmin = _dmin;
     cl->dmax = _dmax;
-    {
+    /* The dense pass above already produced the exact capped count and
+     * trimmed the set, so only the other families pay for the recount. */
+    if (nu_ready == 0) {
         uint16_t nu = (uint16_t)tile_bits_count_avx2(cl->seen);
 
         if (nu > (uint16_t)ZPSE_TILE_NU_CAP) {
@@ -3635,14 +3666,33 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         const __m128i prev_ = _mm_loadu_si128(                                 \
             (const __m128i *)(const void *)(out + p - 16u));                   \
         const uint32_t bits_ = (mw[p >> 5u] >> sh_) & 0xFFFFu;                 \
+        __m128i v_;                                                            \
+        uint32_t n_;                                                           \
+                                                                               \
+        if (bits_ == 0u) {                                                     \
+            /* Every position in the group takes the prediction, which is     \
+             * the common case on the regular columns this kernel exists     \
+             * for. There is no exception value, no unit to gather and no    \
+             * unit index to advance, so the group is the bare recurrence:   \
+             * `ceil(16/s)` shifts of the group in progress, and nothing on  \
+             * the shuffle or gather ports. The recurrence is the same one   \
+             * the full path runs -- blend(t, anything, 0) is t -- so the    \
+             * bytes are identical either way. */                          \
+            v_ = prev_;                                                        \
+            for (n_ = 0u;                                                   \
+                 n_ < (16u + (uint32_t)(S_) - 1u) / (uint32_t)(S_); n_++) { \
+                v_ = _mm_alignr_epi8(v_, prev_, 16 - (int)(S_));            \
+            }                                                                  \
+            _mm_storeu_si128((__m128i *)(void *)(out + p), v_);                \
+            p += 16u;                                                          \
+        } else {                                                               \
         const __m128i vw_ = _mm_shuffle_epi8(                                  \
             _mm_cvtsi32_si128((int)bits_), ctl_);                              \
         const __m128i exc_ = _mm_cmpeq_epi8(_mm_and_si128(vw_, bitsel_),       \
                                             bitsel_);                          \
         const __m128i b1_ = _mm_and_si128(exc_, one_);                         \
         __m128i inc_ = b1_;                                                    \
-        __m128i u_, r_, v_, t_, e_;                                            \
-        uint32_t n_;                                                           \
+        __m128i u_, r_, t_, e_;                                                \
                                                                                \
         inc_ = _mm_add_epi8(inc_, _mm_slli_si128(inc_, 1));                    \
         inc_ = _mm_add_epi8(inc_, _mm_slli_si128(inc_, 2));                    \
@@ -3669,6 +3719,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         _mm_storeu_si128((__m128i *)(void *)(out + p), v_);                    \
         j += (uint32_t)_mm_extract_epi8(inc_, 15);                             \
         p += 16u;                                                              \
+        }                                                                      \
     } while (0)
 
 static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(

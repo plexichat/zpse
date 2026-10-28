@@ -1021,28 +1021,48 @@ static const uint8_t seg_pred_rank[12] = {
     0u, 1u, 2u, 0xFFu, 0xFFu, 3u, 4u, 5u, 6u, 0xFFu, 7u, 8u
 };
 
-/* The best screened predictor in `ks` (skipping `skip`, which is how the
- * runner-up is found): smallest miss count, and on a tie the lowest
- * priority. Independent of seg_screen_pred's current order by
- * construction, so the candidate list is the same list the static order
- * produced. Returns 0xFF when every screened id was skipped. */
-static uint8_t seg_scan_best(const uint16_t ks[12], uint8_t skip)
+/* The best two screened predictors in `ks`, in one pass.
+ *
+ * `best` is the smallest miss count, and on a tie the lowest priority;
+ * `second` is the same rule over the remaining eight, i.e. exactly what a
+ * second scan skipping `best` would return. Both are independent of
+ * seg_screen_pred's current order, so the candidate list is the same list
+ * the static order produced. `second` is 0xFF only when there is no
+ * screened id left, which cannot happen while seg_screen_pred has nine.
+ *
+ * One pass, not two, because the pair is the whole point: every tile the
+ * encoder searches asks for both (the runner-up is the second trial) and
+ * the old form walked the nine candidates twice, with a data-dependent
+ * branch per candidate in each walk. The ordering here is a single
+ * comparison on a packed key -- miss count above, priority below, the
+ * lower key wins -- which is the same decision the two-term test made, and
+ * the three ids the encoder never screens carry rank 0xFF and a 0xFFFF
+ * miss count, so their keys can only lose. */
+static void seg_scan_two(const uint16_t ks[12], uint8_t *best,
+                         uint8_t *second)
 {
-    uint8_t best = 0xFFu;
+    uint32_t k0 = UINT32_MAX;
+    uint32_t k1 = UINT32_MAX;
+    uint8_t p0 = 0xFFu;
+    uint8_t p1 = 0xFFu;
     uint32_t i;
 
     for (i = 0u; i < 9u; i++) {
         uint8_t p = seg_screen_pred[i];
+        uint32_t key = ((uint32_t)ks[p] << 4) | (uint32_t)seg_pred_rank[p];
 
-        if (p == skip) {
-            continue;
-        }
-        if (best == 0xFFu || ks[p] < ks[best] ||
-            (ks[p] == ks[best] && seg_pred_rank[p] < seg_pred_rank[best])) {
-            best = p;
+        if (key < k0) {
+            k1 = k0;
+            p1 = p0;
+            k0 = key;
+            p0 = p;
+        } else if (key < k1) {
+            k1 = key;
+            p1 = p;
         }
     }
-    return best;
+    *best = p0;
+    *second = p1;
 }
 
 /* Win count per predictor id, used by the dynamic ranker. Indexed by
@@ -2655,10 +2675,11 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         uint32_t ncand = 0u;
         uint32_t ci;
         int tile_len = -1;
+        uint8_t second_p;
 
         seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
                       zpse_enc_speed(e->enc_flags) <= 2u, have_avx2, ks);
-        best_p = seg_scan_best(ks, 0xFFu);
+        seg_scan_two(ks, &best_p, &second_p);
         best_k = ks[best_p];
         if (best_k == 0u) {
             /* The all-hit run writes these directly: a 2-byte length prefix
@@ -2668,15 +2689,9 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
             continue;
         }
         cand[ncand++] = best_p;
-        {
-            uint8_t second_p = seg_scan_best(ks, best_p);
-            uint16_t sk = (second_p != 0xFFu) ? ks[second_p]
-                                              : (uint16_t)0xFFFFu;
-
-            if (second_p != 0xFFu && sk == best_k &&
-                (uint32_t)best_k * 8u < (uint32_t)nt * 7u) {
-                cand[ncand++] = second_p;
-            }
+        if (second_p != 0xFFu && ks[second_p] == best_k &&
+            (uint32_t)best_k * 8u < (uint32_t)nt * 7u) {
+            cand[ncand++] = second_p;
         }
         /* A generation no real tile uses, so the entries this pass
          * leaves behind read as unlearned to the tile that follows. The
@@ -2871,6 +2886,21 @@ static int seg_no_room(ZpseSegmentHeader *h, uint8_t *payload_out,
 #define ZPSE_REP_SLOTS 128u
 #define ZPSE_REP_SHIFT (64u - 7u)
 
+/* Tiles a plane needs before the repeat cache is worth its setup.
+ *
+ * The cache is 128 slots and only two of its five arrays have to start
+ * zeroed (the offset and the key; the rest are gated on a non-zero offset),
+ * so entering a segment costs 1.5 KiB of memset. That is nothing against a
+ * 64 KiB plane's 256 tiles and it is 96 bytes a tile against a 4 KiB
+ * plane's sixteen -- and a 4 KiB plane is what a width-16 transform or a
+ * 16-segment split hands the tile loop, thirteen times a block. Below this
+ * many tiles the cache also has almost nothing to find: a repeat needs a
+ * whole 256-byte tile to recur, and sixteen tiles of a transposed plane are
+ * different records. Skipping the cache costs nothing but the reuse it
+ * would have found -- a miss leaves the general path to write the record it
+ * would have written anyway, so the stream is unchanged. */
+#define ZPSE_REP_MIN_TILES 32u
+
 int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                         const uint8_t *plane, uint32_t plane_len,
                         uint8_t initial_literal,
@@ -2908,6 +2938,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     /* Whether the previous tile armed the CONST_ZERO shortcut in
      * seg_prescreen_tile (see there). */
     int zero_cheap = 0;
+    /* 1 iff this plane is long enough to pay the repeat cache's setup (see
+     * ZPSE_REP_MIN_TILES). */
+    int rep_on;
     uint32_t pal_bits[8];
     /* Repeat cache: source tile offset in the plane, where its record
      * starts in the payload, its length (with the u16 prefix) and its tile
@@ -3053,8 +3086,11 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     lit_try = 1;
     lit_proj_at = 2u;
     lit_proj_shift = 1u;
-    memset(rep_off, 0, sizeof rep_off);
-    memset(rep_key, 0, sizeof rep_key);
+    rep_on = (tc >= (uint32_t)ZPSE_REP_MIN_TILES) ? 1u : 0u;
+    if (rep_on != 0u) {
+        memset(rep_off, 0, sizeof rep_off);
+        memset(rep_key, 0, sizeof rep_key);
+    }
 
     /* The projection is evaluated after 4, 8, 16, ... tiles coded, so the
      * extrapolation is a shift of a product rather than a 64-bit division
@@ -3159,7 +3195,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * as at the tile this record came from -- and never while the form
          * is still in play (pal_len != 0), which is the one state where the
          * payload written so far may be rewritten in place. */
-        if (t != 0u && nt == (uint16_t)256u) {
+        if (rep_on != 0u && t != 0u && nt == (uint16_t)256u) {
             uint64_t w0;
             uint64_t w1;
             uint64_t w2;
@@ -3262,9 +3298,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
                            zpse_enc_speed(e->enc_flags) <= 2u, have_avx2,
                            &zero_cheap, ks);
-        best_p = seg_scan_best(ks, 0xFFu);
         uint8_t second_p = 0xFFu;
         uint16_t sk = 0xFFFFu;
+        seg_scan_two(ks, &best_p, &second_p);
         {
             uint16_t bk = ks[best_p];
 
@@ -3273,7 +3309,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
 
             /* Second trial only when it is genuinely competitive. */
             {
-                second_p = seg_scan_best(ks, best_p);
                 sk = (second_p != 0xFFu) ? ks[second_p]
                                           : (uint16_t)0xFFFFu;
                 /* Second trial only on an exact tie in the prescreen's
