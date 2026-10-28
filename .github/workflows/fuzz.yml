@@ -28,7 +28,7 @@ jobs:
           - target: test_fuzz
             variant: default
             cc: cc
-            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude"
+            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -Iinclude -mavx2"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
@@ -40,13 +40,13 @@ jobs:
           - target: test_fuzz
             variant: swap
             cc: cc
-            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_TRIAL_SWAP -Iinclude"
+            cflags: "-std=c11 -O2 -Wall -Wextra -DNDEBUG -DZPSE_FORCE_TRIAL_SWAP -Iinclude -mavx2"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
             variant: asan
             cc: cc
-            cflags: "-std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -DNDEBUG -Iinclude"
+            cflags: "-std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -DNDEBUG -Iinclude -mavx2"
             run_env: "ZPSE_FUZZ_CONTINUE=1"
             run_args: ""
           - target: test_fuzz
