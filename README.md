@@ -460,11 +460,26 @@ is the mode-0/mode-1 tile payload copy -- k bytes, k at most 256 -- and on a
 dense tile the step width is what it costs: thirty-two bytes a step halves the
 loop and its counter against the eight-byte form, and the eight-byte loop
 still finishes the last partial step. With it, the same A/B reads decode
-**+5.4% time-weighted, +4.4% geomean**. A widening of the LZ decoder's literal
+**+5.4% time-weighted, +4.4% geomean**; with the exception-mask walk below it
+in as well, three runs of twelve interleaved rounds read **+6.2% and +4.8%**
+(`ts_gapped` 1.93 -> 2.35 GB/s, `float_sparse` 2.89 -> 3.40, `ts_us` 3.06 ->
+3.26, `struct_offsets` 10.1 -> 10.4). A widening of the LZ decoder's literal
 copy was measured on the same harness and is *not* here: 32 bytes a step read
 1.54 GB/s against 1.53 on `text_en` and 2.37 against 2.37 on `json_rows`,
 because that decoder is per-command bound (about twelve cycles a command at
 5-11 bytes a command), not per-byte bound.
+
+**And the mask walk jumps instead of shifting.** The classify takes a tile's
+exceptions from a 16-bit `movemask`, and it used to walk those sixteen
+positions one at a time to find the set bits: sixteen iterations of shift,
+test and increment per sixteen bytes whatever the mask held. `ctz` jumps to
+the next exception, so a sparse tile pays one iteration per exception instead
+of sixteen per vector, and the exceptions still come out in ascending
+position, which is the only thing the record depends on. That one is kept on
+the instruction count rather than on the harness: on this machine the encode
+column of the A/B swings about as much as the change could plausibly be worth
+-- which is the honest reason it is written down this way and not with a
+number.
 
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
