@@ -58,11 +58,10 @@ that fast only because the ASCII gate's whole-block scan is skipped when the
 block's first two kilobytes are one value -- a constant sample cannot convict
 the gate, and the scan is a third of such a block's encode. That scan stops at
 the first byte with its high bit set, so a binary block pays almost nothing
-for it: it was 1.25 us of the 7.3 us `alt00FF` takes to encode, which is why
-that row is 10 950 MB/s here and not the 8 960 the accumulating form gave it;
-a block that really is ASCII still reads every byte, 1.19 us against 1.56 for
-the scalar form, because that path is 32 bytes an iteration in AVX2. Decode is the same
-at every level, because the shapes written are.
+for it -- 1.25 us of the 7.3 us `alt00FF` takes to encode -- while a block that
+really is ASCII reads every byte at 32 bytes an iteration in AVX2, 1.19 us for
+a 64 KiB block. Decode is the same at every level, because the shapes written
+are.
 
 What the rows are: `zeros`/`const5A` are one-byte-value blocks (coded in
 248 bytes), `random` is incompressible (coded as a raw block, so decode is
@@ -245,11 +244,9 @@ value is unique. The cheap levels fall back to raw (1.0005) because none of the
 ten tile predictors help, and zstd's match finder finds the repeated keys and
 gets 0.21. This is the tile model's own limit showing up on realistic text
 rather than on a synthetic ramp, and without the LZ form it is the row that
-decides against zpse for this data. It is the row the screened match finder
-changes: `var_string` at the default level is about 0.40 (2.5:1) now rather
-than 1.0005, which is what the effort-level table above shows -- so treat the
-table above as the shape of the comparison rather than as the current default
-level's numbers.
+decides against zpse for this data. With the LZ form it is a different row:
+`var_string` at the default level is about 0.40 (2.5:1), which is the effort
+level table's number rather than the 1.0005 a tile-only sweep reaches.
 
 The timestamp rows are the interesting middle: zstd is 2–3% ahead of zpse on
 both, which is to say they are within noise of each other on data a
@@ -335,13 +332,13 @@ those, and at 1.0625x MAX is the only level whose screen is loose enough to
 find it on prose. Where the tile model has nothing to predict it is the
 difference between raw and compression:
 
-| case | `ZPSE_ENC_SPEED_BALANCED` | `ZPSE_ENC_MAX` |
-| --- | --- | --- |
-| `json_rows` | 1.09:1 -> 2.05:1 | 1.09:1 -> 2.05:1 |
-| `log_lines` | 1.09:1 -> 2.63:1 | 1.09:1 -> 2.63:1 |
-| `var_string` | 1.09:1 -> 2.52:1 | 1.09:1 -> 2.52:1 |
-| `utf8_multi` | 1.00:1 -> 1.64:1 | 1.00:1 -> 2.00:1 |
-| `text_en` | 1.09:1 | 1.09:1 -> 1.33:1 |
+| case | `ZPSE_ENC_SPEED_BALANCED` | `ZPSE_ENC_MAX` | tile stream alone |
+| --- | ---: | ---: | ---: |
+| `json_rows` | 2.05:1 | 2.05:1 | 1.09:1 |
+| `log_lines` | 2.63:1 | 2.63:1 | 1.09:1 |
+| `var_string` | 2.52:1 | 2.52:1 | 1.09:1 |
+| `utf8_multi` | 1.64:1 | 2.00:1 | 1.00:1 |
+| `text_en` | 1.09:1 | 1.33:1 | 1.09:1 |
 
 The form is kept only when it is smaller than the best tile stream, so no
 level pays for it in size, and no level gives up the trial to save time: the
@@ -349,9 +346,10 @@ ASCII gate below replaces the tile-side sweep, not the match finder, which is
 offered afterwards whatever the gate decided. What the form costs is decode
 speed, and that is what the level's **acceleration factor** decides: an LZ stream decodes at the
 speed of its command loop, one 4-byte command per output run, so its rate
-follows the average run length. Measured over 64 KiB blocks, in bytes per
-command: 5.6 -> 1.6 GB/s (prose), 9 -> 2.2 (JSON), 17 -> 4.0 (var strings),
-64 -> 8.8 (sparse), 246 -> 24 (zeros), against 5-13 GB/s for a tile stream.
+follows the average run length. Over 64 KiB blocks, at 5.6 bytes per command
+prose decodes at about 1.6 GB/s, at 9 bytes JSON at 2.2, at 17 bytes variable
+strings at 4.0, at 64 bytes the sparse patterns at 8.8, and at 246 bytes the
+all-zero patterns at 24 -- against 5-13 GB/s for a tile stream.
 The match copy described below is what keeps the short end of that range from
 costing more than one command per match.
 
@@ -438,72 +436,29 @@ depend on it, decode over 64 KiB blocks:
 | `sorted_near` | 3.82:1 | 4.2 GB/s |
 | `ts_seq` (i64 µs timestamps) | 5.38:1 | 4.7 GB/s |
 
-**The group vector stays in a register.** A group's `prev` -- the sixteen
-bytes it shifts against -- is the vector the group before it stored, so
-loading it back from `out` is a store-to-load forward of a store one
-iteration old, and on `ts_gapped` that single load was the busiest
-instruction in the whole decoder (19% of its samples, 93 of ~500). Both
-branches of the step already produce that vector, so they hand it forward
-instead, and the loop reads `out` only once, after the scalar head.
+Two of the group's costs are the same lesson: a value the loop has already
+produced should not be read back out of memory. A group's `prev` -- the sixteen
+bytes it shifts against -- is the vector the group before it stored, so it
+lives in a register and both branches of the step hand it forward; `out` is read
+once, after the scalar head. The classify's mask walk has the same shape:
+exceptions are walked with `ctz` and a clear-lowest-bit, so a sparse tile costs
+one iteration per exception rather than sixteen per vector, and they still
+arrive in ascending position, which is the only thing the record depends on.
 
-**The payload copy moves thirty-two bytes a step too.** `residual_copy_bytes`
-is the mode-0/mode-1 tile payload copy -- k bytes, k at most 256 -- and on a
-dense tile the step width is what it costs: thirty-two bytes a step halves the
-loop and its counter against the eight-byte form, and the eight-byte loop
-still finishes the last partial step. A widening of the LZ decoder's literal
-copy was measured on the same harness and is *not* here: 32 bytes a step read
-1.54 GB/s against 1.53 on `text_en` and 2.37 against 2.37 on `json_rows`,
-because that decoder is per-command bound (about twelve cycles a command at
-5-11 bytes a command), not per-byte bound -- which is also the reason the
-one-shot command path below is what it took to move that decoder at all.
+`residual_copy_bytes` -- the mode-0/mode-1 payload copy, k bytes with k at most
+256 -- moves thirty-two bytes a step, which is two 16-byte moves and the half
+loop that implies, with the eight-byte loop finishing the last partial step.
 
-**The LZ decoder gets a one-shot command path.** The loop above is per-command
-bound, not per-byte bound -- a command emits five to eleven bytes and costs
-about twelve cycles whatever its shape -- so the way in is fewer instructions
-per command, not a wider copy. Nine commands in ten on a text, JSON or log
-block share one shape: at most eight literal bytes and a match that fits in
-sixteen, at a distance of at least sixteen. That shape now gets one branch and
-two stores, with no tail and no width cascade in either copy, and falls
-through to the general path unchanged when any of its bounds misses. Every
-bound the general path tests is in the one condition (or already tested above
-it), so a stream it would refuse is refused here too, and both stores
-over-copy into bytes a later command writes -- the same slack argument the
-literal and match copies already make. LZ decode alone: `json_rows` 2.37 ->
-3.74 GB/s, `text_en` 1.54 -> 2.29, `decimal8` 1.06 -> 1.83, `float_mix` 1.75 ->
-2.69.
-
-**Together**, alternate binaries over the 25-case corpus, best of twelve
-interleaved rounds: **decode +12.8% time-weighted, +9.0% geomean**; encode
-**+1.9%**, and no cell of the nine-level size sweep changed. Per case:
-`json_rows` 2.14 -> 3.09 GB/s, `log_lines` 2.64 -> 3.57, `var_string` 3.79 ->
-4.67, `uuid_mix` 12.2 -> 15.1, `dict_u16le` 18.8 -> 25.7, `ts_gapped` 1.71 ->
-2.11, `float_sparse` 2.57 -> 2.82, `sorted_near` 3.36 -> 3.63, `rle_lens`
-18.6 -> 20.1. Without the one-shot path the same measurement read +5.9% and
-+5.0%, which is what the three copies and the mask walk are worth on their
-own.
-
-The encode column is worth a sentence of its own, because it lied once. An
-earlier run of the same A/B read encode -1.1%, consistent enough over three
-runs to argue about layout for, and it was not layout: the copy of the tree on
-the *right* of that A/B still carried an unshipped experiment in
-`transform.c`, which the unity build had pulled into the same translation unit
-as the encoder. The number above is the same three changes built from the tree
-that is in this repository. The rule this file already gives -- same recipe,
-same host, same configuration -- needs one more clause: **the trees on either
-side have to be the trees you ship**, and rebuilding the right-hand side from
-the working tree is what found it.
-
-**And the mask walk jumps instead of shifting.** The classify takes a tile's
-exceptions from a 16-bit `movemask`, and it used to walk those sixteen
-positions one at a time to find the set bits: sixteen iterations of shift,
-test and increment per sixteen bytes whatever the mask held. `ctz` jumps to
-the next exception, so a sparse tile pays one iteration per exception instead
-of sixteen per vector, and the exceptions still come out in ascending
-position, which is the only thing the record depends on. That one is kept on
-the instruction count rather than on the harness: on this machine the encode
-column of the A/B swings about as much as the change could plausibly be worth
--- which is the honest reason it is written down this way and not with a
-number.
+The LZ command loop is bound per command, not per byte: a command emits five to
+eleven bytes and costs about twelve cycles whatever its shape, so the copy
+widths are not where its time is. Its shape is. Nine commands in ten on a text,
+JSON or log block are at most eight literal bytes and a match that fits in
+sixteen, at a distance of at least sixteen; those take one branch and two
+unconditional stores, with no tail and no width cascade in either copy, and
+fall through to the general path when a bound misses. Every bound the general
+path tests is in that one condition, so a stream it refuses is refused there
+too, and both stores over-copy into bytes a later command writes -- the slack
+argument the literal and match copies already make.
 
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
@@ -519,40 +474,25 @@ two predictors that miss one position each usually pack to the same size --
 so the encoder keeps the runner-up as a second candidate only when the two
 counts tie exactly, and the pair of them is what the tile loop needs.
 
-Getting that pair used to mean walking the nine candidates twice, with a
-data-dependent branch per candidate in each walk: once for the best, once
-more with the best skipped for the runner-up. It is one walk now, over a
-packed key per candidate -- miss count above, priority below -- so the
-comparison is a single `<` whose result is the same decision the two-term
-test made, ties included. The priority table is the winner rule the format
-is defined by; the scan order (`seg_screen_rank`) is free to change and
-changes nothing, because the key never reads it.
+The pair comes out of one walk over a packed key per candidate -- miss count
+above, priority below -- so the comparison is a single `<` whose result is the
+decision a two-term test makes, ties included. The priority table is the winner
+rule the format is defined by; the scan order (`seg_screen_rank`) is free to
+change and changes nothing, because the key never reads it.
 
-Two smaller things came out of the same profile. The repeat cache at the top
-of the tile loop is keyed and zeroed per segment, 1.5 KiB of `memset` that a
-64 KiB plane does not notice and a 4 KiB plane pays 96 bytes a tile for --
-and a 4 KiB plane is exactly what a width-16 transform hands the loop,
-sixteen times a block. Below 32 tiles the cache is not set up at all: its
-hit needs a whole 256-byte tile to recur, sixteen tiles of a transposed
-plane are different records, and a miss costs nothing but the reuse it did
-not find, because the general path writes the record the copy would have
-written. And the dense classify now keeps its own distinct-residual count
-instead of leaving the epilogue to recount the bitmap it was just built
-from, with the presence fold stopping as soon as it has seventeen distinct
-values -- which is the only thing the count is ever compared against.
-
-Measured over the twenty-five-case columnar corpus, alternating binaries,
-best of eight rounds, nothing else changed, and run twice on a host that was
-carrying another workload: **encode +2.8% and +4.0% geomean (+3.4% and +4.3%
-time-weighted)**. Decode is untouched, so the decode column of those two runs
-(+0.7%, -1.2%) is the harness's own spread on that afternoon -- which is the
-size of the error bar to read the encode numbers with.
-
-The streams are unchanged -- same size on every case of the sweep, and the
-parity, fuzz and least-effort suites report identical digests in the default
-and `-DZPSE_FORCE_SCALAR` builds, which is the statement that the
-classification's capped count and its trimmed `seen` set agree between the
-two.
+Two things in the tile loop follow from the fact that a plane is not always a
+block. The repeat cache is keyed and zeroed per segment, 1.5 KiB of `memset`
+that a 64 KiB plane does not notice and a 4 KiB plane pays 96 bytes a tile
+for -- and a 4 KiB plane is what a width-16 transform hands the loop, sixteen
+times a block. Below 32 tiles the cache is therefore not set up at all: a hit
+needs a whole 256-byte tile to recur, sixteen tiles of a transposed plane are
+different records, and a miss costs nothing but the reuse it did not find,
+because the general path writes the record the copy would have written. And
+the dense classify counts its distinct residuals as it folds, stopping at
+seventeen -- the only value the count is ever compared against -- so the
+bitmap it was just built from is never recounted. The
+classification's capped count and its trimmed `seen` set agree with the
+scalar path, which is what the parity and least-effort digests state.
 
 ### A block that does not compress
 
@@ -575,20 +515,20 @@ block whose head and tail are noise but whose middle is not -- the "noise then
 constant" shape of the size corpus -- has a price that says flat and a trial
 that says otherwise, and the trial wins because it encodes the whole block. A
 block that compresses still gets its compression; only a block that really is
-noise stops after one trial. The size corpus (768 cases) grows by nothing, and
-the corpus mean encode rate goes from about 830 MB/s to about 900 MB/s.
+noise stops after one trial. No case of the size corpus (768 cases) grows a
+byte for it, and the corpus mean encode rate is about 900 MB/s.
 
-What it buys is the rows that were slowest for the wrong reason:
+The rows it is worth most on are the ones whose head and tail are noise:
 
-| case | before | after | |
-| --- | ---: | ---: | --- |
-| `utf8_multi` | 230 MB/s | 590 MB/s | **2.5x** |
-| `bools_nulls` | 380 MB/s | 900 MB/s | **2.4x** |
-| `dna_2bit` | 460 MB/s | 920 MB/s | **2.0x** |
+| case | encode |
+| --- | ---: |
+| `utf8_multi` | 590 MB/s |
+| `bools_nulls` | 900 MB/s |
+| `dna_2bit` | 920 MB/s |
 
 At the deepest level, where the match finder is the candidate that can still
-see such a block, `utf8_multi` goes 172 MB/s -> 307 MB/s and `dna_2bit`
-424 MB/s -> 949 MB/s, with the same ratio on every case.
+see such a block, `utf8_multi` encodes at 307 MB/s and `dna_2bit` at 949 MB/s,
+with the same ratio on every case.
 
 ## What it does
 
@@ -685,14 +625,13 @@ Every number in this README is an `-O2` number: the CI matrix,
 `tests/runners/run.sh` and the release CLI all build at `-O2`. The compiler
 still has something to add at `-O3`, and the two ways to ask for it are not
 interchangeable. Both were measured on the level corpus (`bench_levels.c`, 25
-cases x 4 MiB in 64 KiB blocks; before/after runs interleaved A/B/A/B with the
-order swapped every round, median of the per-case throughput ratios, one
-pinned core):
+cases x 4 MiB in 64 KiB blocks; A/B/A/B runs interleaved with the order swapped
+every round, median of the per-case throughput ratios, one pinned core):
 
 | build | encode | notes |
 | --- | ---: | --- |
 | `-O2` | 1.000 | everything in this tree |
-| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.029 | 152 KB -> 166 KB of text; decode and every compressed size unchanged |
+| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.029 | 14 KB more text; decode and every compressed size unchanged |
 | the amalgamation at `-O3` | 1.071 | same as `#pragma GCC optimize("O3")` at the top of `src/zpse_unity.c` (1.066) |
 | that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
 | `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
