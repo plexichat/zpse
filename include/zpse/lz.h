@@ -53,6 +53,9 @@
 #define ZPSE_LZ_HASH_BITS_FAST 11u
 #define ZPSE_LZ_TABLE_ENTRIES   (1u << ZPSE_LZ_HASH_BITS) /* 8192 */
 #define ZPSE_LZ_TABLE_BYTES     (ZPSE_LZ_TABLE_ENTRIES * 2u) /* 16 KiB */
+
+
+
 /* The smallest payload zpse_lz_encode can produce for an n-byte block:
  * the literal-count word and one command. */
 #define ZPSE_LZ_MIN_PAYLOAD     8u

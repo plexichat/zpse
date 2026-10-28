@@ -14,16 +14,15 @@
  * is not a legitimate entry. */
 #define LZ_EMPTY 0xFFFFu
 
-static uint32_t lz_hash(const uint8_t *p, uint32_t hash_bits)
+static uint32_t lz_hash(uint32_t v, uint32_t hash_bits)
 {
     /* One multiply of the first four bytes at the cursor, top bits kept:
      * the multiply's high half is where the input bits are spread out, so
      * the index depends on all four bytes and the table needs no tag --
      * the four-byte compare at the candidate is the tag check. */
-    uint32_t v = zpse_load_u32le(p);
-
     return (v * UINT32_C(2654435761)) >> (32u - hash_bits);
 }
+
 
 static uint64_t lz_load64(const uint8_t *p)
 {
@@ -234,7 +233,8 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
 #endif
     while (pos + ZPSE_LZ_MIN_MATCH <= n) {
-        uint32_t h = lz_hash(in + pos, hash_bits);
+        uint32_t cur = zpse_load_u32le(in + pos);
+        uint32_t h = lz_hash(cur, hash_bits);
         uint32_t cand = tab[h];
         uint32_t len;
 
@@ -249,13 +249,28 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * loop the match finder spends its time in, and cannot change
          * which candidate is tested. */
         if (cand == LZ_EMPTY ||
-            zpse_load_u32le(in + cand) != zpse_load_u32le(in + pos)) {
+            zpse_load_u32le(in + cand) != cur) {
             /* Two misses are a coincidence; a run of them means the data
              * has no match here, so the cursor accelerates. */
             pos += 1u + (misses >> 5);
             misses++;
             continue;
         }
+        /* Lazy matching: if pos+1 has an 8-byte match, skip this position */
+        if (pos + 9u <= n) {
+            uint32_t v1 = zpse_load_u32le(in + pos + 1u);
+            uint32_t h1 = lz_hash(v1, ZPSE_LZ_HASH_BITS_FAST);
+            uint32_t cand1 = tab[h1];
+
+            if (cand1 != LZ_EMPTY && zpse_load_u32le(in + cand1) == v1 &&
+                cand1 + 9u <= n &&
+                lz_load64(in + pos + 1u) == lz_load64(in + cand1)) {
+                pos++;
+                misses = 0;
+                continue;
+            }
+        }
+
         /* Extend backward into the pending literals: an earlier start is a
          * longer match for the same four bytes. It can never cross the
          * last match's end, so the decoder's view of the stream does not
@@ -399,11 +414,23 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
  * form writes past the literal run, so it is only taken when both the
  * source and the destination have eight readable/writable bytes of slack;
  * the exact byte loop covers the last few bytes of a block, where they do
- * not. `lit_total` caps the read at the literal region and `oend` the
- * write at the output, so neither form can touch a byte the block does not
- * own. */
+ * not.
+ *
+ * Both slack tests are answers the caller already knows, which is why they
+ * arrive as two scalars rather than as two more pointer differences here:
+ * `lit_safe16` says the whole literal region has sixteen readable bytes of
+ * input after it (computed once per call, before the command loop), and
+ * `op_rem` is the output still unwritten, which the loop maintains anyway
+ * for its own bounds tests. A 16-byte load that starts inside the literal
+ * region and runs past its end still reads only bytes of the same input
+ * buffer -- the padding and the first command words -- and only `len` of
+ * them are stored, so the bytes written are the same ones the byte loop
+ * writes. The original form tested the exact distance to the end of the
+ * region, which made the wide path conditional on where in the region the
+ * run happened to start and cost two 64-bit subtractions per literal run
+ * to decide. */
 static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
-                             const uint8_t *lit_end, const uint8_t *oend)
+                             uint32_t op_rem, int lit_safe16)
 {
     if (len >= 16u) {
         do {
@@ -414,11 +441,9 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
         } while (len >= 16u);
     }
     if (len != 0u) {
-        if (len <= 8u && (uint32_t)(lit_end - src) >= 16u &&
-            (uint32_t)(oend - dst) >= 8u) {
+        if (len <= 8u && lit_safe16 != 0 && op_rem >= 8u) {
             memcpy(dst, src, 8u);
-        } else if (len > 8u && (uint32_t)(lit_end - src) >= 16u &&
-                   (uint32_t)(oend - dst) >= 16u) {
+        } else if (len > 8u && lit_safe16 != 0 && op_rem >= 16u) {
             memcpy(dst, src, 16u);
         } else {
             while (len != 0u) {
@@ -560,44 +585,63 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     op = out;
     oend = out + n;
 
-    while (op < oend) {
-        uint32_t cw;
-        uint32_t lit;
-        uint32_t off;
-        uint32_t mlen;
+    {
+        /* The three quantities every command is checked against are kept
+         * as counters rather than re-derived from pointers: `lit_rem` is
+         * the literal stream still unread, `op_rem` the output still
+         * unwritten, and `op_done` the output already written, so a
+         * command costs 32-bit subtract-and-compare instead of three
+         * 64-bit pointer differences. Same tests, same order, same
+         * streams accepted and refused -- only the arithmetic changed. */
+        uint32_t lit_rem = lit_bytes;
+        uint32_t op_rem = n;
+        uint32_t op_done = 0u;
+        /* True when a 16-byte read that starts anywhere in the literal
+         * region stays inside the input buffer: the region's end plus
+         * sixteen cannot pass the end of the frame's block. It is false
+         * only for a block whose literal region sits close enough to the
+         * end of the payload that there is no padding behind it. */
+        const int lit_safe16 =
+            ((uint32_t)(in_len - 4u - lit_bytes) >= 16u) ? 1 : 0;
 
-        if (cp + 4 > cend) {
-            return PSE_BAD_LZ;
-        }
-        cw = zpse_load_u32le(cp);
-        cp += 4;
-        lit = (cw >> 16) & 0xFFu;
-        off = cw & 0xFFFFu;
-        mlen = (cw >> 24) + ZPSE_LZ_MIN_MATCH;
-        if (lit > (uint32_t)(lend - lp)) {
-            return PSE_BAD_LZ;
-        }
-        if (lit > (uint32_t)(oend - op)) {
-            return PSE_BAD_LZ;
-        }
-        lz_copy_literals(op, lp, lit, lend, oend);
-        op += lit;
-        lp += lit;
-        if (off == 0u) {
-            /* A literal-only command has to make progress. */
-            if (lit == 0u) {
+        while (op_rem != 0u) {
+            uint32_t cw;
+            uint32_t lit;
+            uint32_t off;
+            uint32_t mlen;
+
+            if (cp + 4 > cend) {
                 return PSE_BAD_LZ;
             }
-            continue;
+            cw = zpse_load_u32le(cp);
+            cp += 4;
+            lit = (cw >> 16) & 0xFFu;
+            off = cw & 0xFFFFu;
+            mlen = (cw >> 24) + ZPSE_LZ_MIN_MATCH;
+            if (lit > lit_rem || lit > op_rem) {
+                return PSE_BAD_LZ;
+            }
+            lz_copy_literals(op, lp, lit, op_rem, lit_safe16);
+            op += lit;
+            lp += lit;
+            lit_rem -= lit;
+            op_rem -= lit;
+            op_done += lit;
+            if (off == 0u) {
+                /* A literal-only command has to make progress. */
+                if (lit == 0u) {
+                    return PSE_BAD_LZ;
+                }
+                continue;
+            }
+            if (off > op_done || mlen > op_rem) {
+                return PSE_BAD_LZ;
+            }
+            lz_copy_match(op, off, mlen, oend);
+            op += mlen;
+            op_rem -= mlen;
+            op_done += mlen;
         }
-        if (off > (uint32_t)(op - out)) {
-            return PSE_BAD_LZ;
-        }
-        if (mlen > (uint32_t)(oend - op)) {
-            return PSE_BAD_LZ;
-        }
-        lz_copy_match(op, off, mlen, oend);
-        op += mlen;
     }
     /* Every literal and every command has to be accounted for: a stream
      * that fills the output early and then stops is not the stream the
