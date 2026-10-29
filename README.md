@@ -41,8 +41,8 @@ WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 | --- | ---: | ---: | ---: |
 | `zeros` | 0.004 | 35 600 | **74 000** |
 | `const5A` | 0.004 | 35 500 | **74 000** |
-| `random` | 1.000 | 1 020 | **65 900** |
-| `lowentropy` (4-bit alphabet) | 0.508 | 210 | 45 900 |
+| `random` | 1.000 | 2 020 | **65 900** |
+| `lowentropy` (4-bit alphabet) | 0.508 | 300 | 45 900 |
 | `incr` (0..255 ramp) | 0.040 | 2 020 | 16 800 |
 | `strided` | 0.040 | 840 | 16 800 |
 | `alt00FF` | 0.004 | 10 950 | 22 700 |
@@ -61,7 +61,11 @@ the first byte with its high bit set, so a binary block pays almost nothing
 for it -- 1.25 us of the 7.3 us `alt00FF` takes to encode -- while a block that
 really is ASCII reads every byte at 32 bytes an iteration in AVX2, 1.19 us for
 a 64 KiB block. Decode is the same at every level, because the shapes written
-are.
+are. `random` is the row the tile classifier decides: every tile of every plane
+is a dense one, and its encode roughly doubled once the vector classify covered
+a plane's first tile too -- the tile whose stride predictor has no earlier
+bytes in the plane to read, which used to drop the whole plane's first tile to
+the byte loop.
 
 What the rows are: `zeros`/`const5A` are one-byte-value blocks (coded in
 248 bytes), `random` is incompressible (coded as a raw block, so decode is
@@ -516,15 +520,15 @@ constant" shape of the size corpus -- has a price that says flat and a trial
 that says otherwise, and the trial wins because it encodes the whole block. A
 block that compresses still gets its compression; only a block that really is
 noise stops after one trial. No case of the size corpus (768 cases) grows a
-byte for it, and the corpus mean encode rate is about 900 MB/s.
+byte for it, and the corpus mean encode rate is about 975 MB/s.
 
 The rows it is worth most on are the ones whose head and tail are noise:
 
 | case | encode |
 | --- | ---: |
-| `utf8_multi` | 590 MB/s |
-| `bools_nulls` | 900 MB/s |
-| `dna_2bit` | 920 MB/s |
+| `utf8_multi` | 470 MB/s |
+| `bools_nulls` | 1 980 MB/s |
+| `dna_2bit` | 1 940 MB/s |
 
 At the deepest level, where the match finder is the candidate that can still
 see such a block, `utf8_multi` encodes at 307 MB/s and `dna_2bit` at 949 MB/s,
