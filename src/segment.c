@@ -2736,13 +2736,6 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
  * zpse_segment_encode. */
 #define ZPSE_EST_TILES 8u
 #define ZPSE_EST_MIN_TILES 16u
-/* Tiles whose records the projection extrapolates from. Two, not four: the
- * tiles of a palette plane are alike by construction (that is why the form
- * wins on it), so half the plane already says what the rest costs, and every
- * tile coded before the form is taken is a pipeline whose bytes are thrown
- * away. The 1/8 margin the projection uses is unchanged, so a plane the early
- * extrapolation misprices keeps its tiles and only loses the comparison. */
-#define ZPSE_PAL_PROJ_TILES 2u
 
 /* Price of a plane's tile records, from a sample of `tiles` tiles spread
  * evenly over it.
@@ -3037,6 +3030,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     int plane_known_const;
     uint32_t pal_len;
     uint32_t pal_m;
+    /* Distinct values in the head probe (the first 256 bytes, or the whole
+     * plane when it is shorter). A subset of the plane's alphabet, so it is
+     * both the test for "worth pricing at all" and the floor of the price. */
+    uint32_t pal_head_m;
     int pal_try;
     /* Price of the dense literal form, or 0 when the plane is not a
      * candidate for it (its alphabet fits the palette form, or the form
@@ -3047,10 +3044,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * and the shift that divides by it (see the tile loop). */
     uint32_t lit_proj_at;
     uint32_t lit_proj_shift;
-    /* Tile count at which the palette projection is evaluated next, and the
-     * shift that divides by it (see the projection in the tile loop). */
-    uint32_t proj_at;
-    uint32_t proj_shift;
     /* Whether the previous tile armed the CONST_ZERO shortcut in
      * seg_prescreen_tile (see there). */
     int zero_cheap = 0;
@@ -3191,11 +3184,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
      * the form will write (the packer re-derives the palette per record),
      * so stopping the loop when pos reaches it can only leave the smaller
      * form. */
-    pal_try = (seg_plane_alphabet(plane,
-                                  (plane_len < 256u) ? plane_len : 256u, 16u,
-                                  pal_bits) <= 16u)
-                  ? 1
-                  : 0;
+    pal_head_m = seg_plane_alphabet(plane,
+                                    (plane_len < 256u) ? plane_len : 256u, 16u,
+                                    pal_bits);
+    pal_try = (pal_head_m <= 16u) ? 1 : 0;
     pal_len = 0u;
     pal_m = 0u;
     lit_len = 0u;
@@ -3208,13 +3200,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         memset(rep_key, 0, sizeof rep_key);
     }
 
-    /* The projection is evaluated after 4, 8, 16, ... tiles coded, so the
-     * extrapolation is a shift of a product rather than a 64-bit division
-     * per tile (that division cost a 4 KiB text plane 4% of its encode).
-     * Later checkpoints are also better evidence, and the exact rule above
-     * the loop still fires the moment the tiles have overtaken the form. */
-    proj_at = ZPSE_PAL_PROJ_TILES;
-    proj_shift = 1u;
     pos = 16u;
     for (t = 0; t < tc; t++) {
         uint32_t seg_pos = t * 256u;
@@ -3229,9 +3214,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * table wipe. */
         lanes->gen++;
 
-        if (pal_len != 0u && pos >= pal_len) {                int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
-                                                pal_m, pal_bits, pos, 0,
-                                                byte_budget, payload_cap);
+        if (pal_len != 0u && pos >= pal_len) {
+            int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
+                                            pal_m, pal_bits, pos, 0,
+                                            byte_budget, payload_cap);
 
             if (dn != 0) {
                 return dn;
@@ -3735,13 +3721,40 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * bitmap, a slow ramp) is not worth the plane-wide scan the pricing
          * needs. An eighth still admits a random one-bit plane, whose tiles
          * cost about a quarter of their bytes. Once priced, the loop above
-         * the tiles stops the moment the tiles can no longer win. */
+         * the tiles stops the moment the tiles can no longer win.
+         *
+         * The scan itself is skipped when it cannot change the answer. The
+         * head probe's values are a subset of the plane's, and the form's
+         * price only grows with the alphabet, so cost(plane_len, head_m) is
+         * a floor under any price the scan could return. When the tiles
+         * already project below that floor with the same eighth margin, no
+         * alphabet the scan finds can make the form win, and the plane is
+         * not read a second time -- on a dictionary plane, whose alphabet is
+         * the full sixteen and whose tiles win by a hair, that scan was 8%
+         * of the block's encode for a decision already made. */
         if (pal_try != 0 &&
             2u + (uint32_t)best_len >= (uint32_t)(nt >> 3)) {
             int dn;
+            int scan = 1;
 
             pal_try = 0;
-            pal_m = seg_plane_alphabet(plane, plane_len, 16u, pal_bits);
+            if (pal_head_m >= 2u) {
+                const uint32_t hdr = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+                uint32_t pc_lo = seg_dense_palette_cost(plane_len, pal_head_m);
+                uint32_t d = t + 1u;
+                uint64_t tot = (uint64_t)hdr * d + (uint64_t)(pos - hdr) * tc;
+
+                /* proj = tot / d, and the form is out when
+                 * proj + proj/8 <= pc_lo. Multiplying through by d keeps
+                 * the exact division out of the loop -- the same reason the
+                 * projection below compares products. */
+                if (9u * tot <= ((uint64_t)8u * pc_lo) * d) {
+                    scan = 0;
+                }
+            }
+            if (scan != 0) {
+                pal_m = seg_plane_alphabet(plane, plane_len, 16u, pal_bits);
+            }
             if (pal_m >= 2u && pal_m <= 16u) {
                 uint32_t pc = seg_dense_palette_cost(plane_len, pal_m);
 #if defined(ZPSE_TRIAL_STATS)
@@ -3810,21 +3823,29 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * sample was trying to obtain -- per-tile bytes, from real tiles --
          * and it is free, because those tiles are coded either way. Coding
          * a few more of them before deciding costs a losing palette plane a
-         * handful of pipelines; it saves every winning plane the sample. */
-        if (pal_len != 0u && t + 1u == proj_at) {
+         * handful of pipelines; it saves every winning plane the sample.
+         *
+         * The test runs after every tile once the form is priced, not at
+         * fixed tile counts: the checkpoints used to be absolute (2, 4, 8,
+         * ...), so a plane first priced at tile 100 of 256 waited until tile
+         * 128 for its next look, and one priced at tile 200 waited until the
+         * loop ended -- which is how a plane could write its whole tile path
+         * and then have the form replace all of it. A 64-bit division per
+         * tile is what those checkpoints were avoiding (it cost a 4 KiB text
+         * plane 4% of its encode), so the comparison is done on products
+         * instead: proj - proj/8 >= pal_len is 7 * tot >= 8 * pal_len * d
+         * with tot = hdr*d + (pos-hdr)*tc and d the tiles coded. */
+        if (pal_len != 0u && pos < pal_len && t + 1u < tc) {
             const uint32_t hdr = (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
-            uint32_t proj = hdr +
-                            (uint32_t)(((uint64_t)(pos - hdr) * tc) >>
-                                       proj_shift);
-            int dn;
+            uint32_t d = t + 1u;
+            uint64_t tot = (uint64_t)hdr * d + (uint64_t)(pos - hdr) * tc;
 
-            proj_shift++;
-            proj_at <<= 1;
-            if (pos < pal_len && proj - (proj >> 3) >= pal_len) {
-                dn = seg_dense_palette_emit(&h, payload_out, plane,
-                                            plane_len, pal_m, pal_bits,
-                                            pos, 1, byte_budget,
-                                            payload_cap);
+            if (7u * tot >= ((uint64_t)8u * pal_len) * d) {
+                int dn = seg_dense_palette_emit(&h, payload_out, plane,
+                                                plane_len, pal_m, pal_bits,
+                                                pos, 1, byte_budget,
+                                                payload_cap);
+
                 if (dn != 0) {
                     return dn;
                 }
