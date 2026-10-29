@@ -1062,6 +1062,35 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_FLAT_TRIALS 3
 #endif
 
+/* The band, as a fraction of the best window price (in 1/2^N), inside which
+ * the probe cannot separate two candidates, and how many of a field inside it
+ * are still tried in full (see the near-tie prune in zpse_block_encode).
+ *
+ * The band is 1/64, i.e. 1.6%: a full trial costs about six times a window
+ * price, so a field that prices within 1.6% of itself is a field where the
+ * trials are being paid to break a tie the block total barely reflects.
+ * dict_u8 is the measured case: its five survivors price within a fraction of
+ * a percent of each other, the four extra trials buy 216 bytes in 4 MiB
+ * (0.01%), and they are most of the block's encode time (342 -> 656 MB/s with
+ * the field cut to its best two).
+ *
+ * The floor is the other half of the trade, and it is 64 KiB: only a block at
+ * the format's full size prunes. A full block's trial is the most expensive
+ * thing the sweep can do (256 tiles, up to sixteen planes), so that is where
+ * the trade pays; every smaller block is settled exactly, because a short
+ * block's trial is cheap enough that pruning cannot buy anything worth its
+ * risk -- and the probe's sample covers a bigger fraction of it anyway, which
+ * is the opposite of the case the prune exists for. */
+#ifndef ZPSE_TIE_BAND_SHIFT
+#define ZPSE_TIE_BAND_SHIFT 6u
+#endif
+#ifndef ZPSE_TIE_MIN_N
+#define ZPSE_TIE_MIN_N 65536u
+#endif
+#ifndef ZPSE_TIE_KEEP
+#define ZPSE_TIE_KEEP 2u
+#endif
+
 static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint8_t tid, uint8_t sc,
                              const uint8_t *meta_bytes, uint16_t meta_len,
@@ -1423,10 +1452,30 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
 #define ZPSE_LZ_ACCEL_MAX 24u
 #endif
 #ifndef ZPSE_LZ_ACCEL_BALANCED
-#define ZPSE_LZ_ACCEL_BALANCED 12u
+#define ZPSE_LZ_ACCEL_BALANCED 12u /* levels 5-6: 8 bytes per command */
 #endif
-#ifndef ZPSE_LZ_ACCEL_CHEAP
-#define ZPSE_LZ_ACCEL_CHEAP 12u
+#ifndef ZPSE_LZ_ACCEL_L7
+#define ZPSE_LZ_ACCEL_L7 16u       /* level 7: 6 bytes per command */
+#endif
+#ifndef ZPSE_LZ_ACCEL_L8
+#define ZPSE_LZ_ACCEL_L8 20u       /* level 8: 4.8 bytes per command */
+#endif
+
+/* The sample margins, in sixteenths: the win on the sample a level will pay
+ * a match-finder pass for is 16 / num. Smaller is looser, and the ladder
+ * must never loosen upward (see the level table: a deeper level that
+ * accepted less would write a larger block than the one above it). */
+#ifndef ZPSE_LZ_SCREEN_NUM_MAX
+#define ZPSE_LZ_SCREEN_NUM_MAX 17u /* 1.0625x, levels 8-9 */
+#endif
+#ifndef ZPSE_LZ_SCREEN_NUM_L7
+#define ZPSE_LZ_SCREEN_NUM_L7 18u      /* 1.125x, level 7 */
+#endif
+#ifndef ZPSE_LZ_SCREEN_NUM_L6
+#define ZPSE_LZ_SCREEN_NUM_L6 19u      /* 1.1875x, level 6 */
+#endif
+#ifndef ZPSE_LZ_SCREEN_NUM_BALANCED
+#define ZPSE_LZ_SCREEN_NUM_BALANCED 20u /* 1.25x, level 5 */
 #endif
 
 /* The smallest win that pays for the LZ form's slower decode. A stream one
@@ -1439,23 +1488,80 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
 #define ZPSE_LZ_MIN_WIN_DIV 32u
 #endif
 
-/* Minimum output bytes per LZ command at this level's acceleration factor.
- * Levels 1-4 use the cheap factor, 5-6 the balanced one, 7-8 denser, 9 the
- * deepest (most commands per byte = best ratio, slowest decode). */
+/* ---- The effort ladder, one row per level --------------------------- *
+ *
+ * Every knob that decides WHICH shape a level writes is in this table. The
+ * table exists because the thresholds it replaces made the ladder shorter
+ * than it claimed to be: the sweep tested `lvl >= 5`, `lvl >= 7`, `lvl >= 9`
+ * and `lvl <= 2`, so levels 2, 4, 6 and 8 evaluated every test exactly as
+ * their neighbour below did and were aliases of it, not rungs. A level that
+ * appears on the ladder has to be a level, so each row differs from the row
+ * above it in at least one column and the columns are ordered so that the
+ * deeper row can only choose from a superset of the same shapes:
+ *
+ *   trials      full block encodes the sweep may spend; 0 = every survivor
+ *               (a level that tries more candidates can only take a smaller
+ *               total, never a larger one).
+ *   screen_num  the LZ sample margin in sixteenths -- the win on the sample
+ *               that pays for a match-finder pass is 16/num. Smaller num is
+ *               a looser margin, and a pass that runs can only be kept when
+ *               it is smaller, so the deeper row is never the larger one.
+ *   samples     how many samples the screen may spend (2 = head and middle,
+ *               1 = head only). A screen that refuses fewer passes keeps
+ *               more candidates, which again can only lower the total.
+ *   accel       the LZ decode bill (ZPSE_LZ_BPC_CROSS / accel bytes per
+ *               command); a larger factor accepts streams with shorter runs,
+ *               so it is a superset of the row above for the same reason.
+ *
+ * Levels 1-4 write no LZ form, so their LZ columns are zero and unused.
+ * The prescreen width (level 1 cheap, 2-9 full) and the every-plane pricing
+ * (5-9) are not here: they are single thresholds shared by whole tiers of
+ * the ladder, and they live in zpse_enc_speed's own comment in
+ * include/zpse/constants.h. */
+typedef struct {
+    uint8_t trials;
+    uint8_t screen_num;
+    uint8_t samples;
+    uint8_t accel;
+} ZpseLevel;
+
+static const ZpseLevel zpse_level[10] = {
+    /* 0: never used -- an empty level field normalises to BALANCED. */
+    { 0u, 0u, 0u, 0u },
+    /* 1 FASTEST: the probe's winner only, no match finder. */
+    { 1u, 0u, 0u, 0u },
+    /* 2: full nine-predictor prescreen, two trials. */
+    { 2u, 0u, 0u, 0u },
+    /* 3 FASTER: the same prescreen, three trials. */
+    { 3u, 0u, 0u, 0u },
+    /* 4: four trials, still no match finder. */
+    { 4u, 0u, 0u, 0u },
+    /* 5 BALANCED (default): every survivor, 1.25x screen, 8 B/command. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_BALANCED, 2u,
+      (uint8_t)ZPSE_LZ_ACCEL_BALANCED },
+    /* 6: the screen loosened to 1.1875x, same decode bill. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L6, 2u,
+      (uint8_t)ZPSE_LZ_ACCEL_BALANCED },
+    /* 7: 1.125x, 6 B/command. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L7, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7 },
+    /* 8: MAX's 1.0625x margin, two samples, 5 B/command. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 2u, (uint8_t)ZPSE_LZ_ACCEL_L8 },
+    /* 9 MAX: the head sample only, 4 B/command. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 1u,
+      (uint8_t)ZPSE_LZ_ACCEL_MAX }
+};
+
+/* The row for a level number (1-9). An out-of-range level cannot reach here
+ * -- enc_flags_ok rejects it -- so the default is a bound, not a policy. */
+static const ZpseLevel *zpse_level_row(uint32_t lvl)
+{
+    return &zpse_level[lvl <= 9u ? lvl : 9u];
+}
+
+/* Minimum output bytes per LZ command at this level's acceleration factor. */
 static uint32_t zpse_lz_min_bpc(uint32_t speed)
 {
-    uint32_t lvl = zpse_enc_speed(speed);
-    uint32_t accel;
-
-    if (lvl >= 9u) {
-        accel = (uint32_t)ZPSE_LZ_ACCEL_MAX;
-    } else if (lvl >= 7u) {
-        accel = 16u;
-    } else if (lvl >= 5u) {
-        accel = (uint32_t)ZPSE_LZ_ACCEL_BALANCED;
-    } else {
-        accel = (uint32_t)ZPSE_LZ_ACCEL_CHEAP;
-    }
+    uint32_t accel = (uint32_t)zpse_level_row(zpse_enc_speed(speed))->accel;
     uint32_t bpc;
 
     if (accel == 0u) {
@@ -1538,16 +1644,6 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
 #ifndef ZPSE_LZ_SCREEN_DEN
 #define ZPSE_LZ_SCREEN_DEN 16u
 #endif
-#ifndef ZPSE_LZ_SCREEN_NUM_MAX
-#define ZPSE_LZ_SCREEN_NUM_MAX 17u /* 1.0625x */
-#endif
-#ifndef ZPSE_LZ_SCREEN_NUM_BALANCED
-#define ZPSE_LZ_SCREEN_NUM_BALANCED 20u /* 1.25x */
-#endif
-#ifndef ZPSE_LZ_SCREEN_NUM_CHEAP
-#define ZPSE_LZ_SCREEN_NUM_CHEAP 20u /* 1.25x */
-#endif
-
 #ifndef ZPSE_LZ_SCREEN_SLACK_NUM
 #define ZPSE_LZ_SCREEN_SLACK_NUM 5u
 #endif
@@ -1623,13 +1719,8 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
                       ? n
                       : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
-    uint32_t num = (lvl >= 9u)
-                       ? (uint32_t)ZPSE_LZ_SCREEN_NUM_MAX
-                       : (lvl >= 7u)
-                             ? (uint32_t)ZPSE_LZ_SCREEN_NUM_MAX + 1u
-                             : (lvl >= 5u)
-                                   ? (uint32_t)ZPSE_LZ_SCREEN_NUM_BALANCED
-                                   : (uint32_t)ZPSE_LZ_SCREEN_NUM_CHEAP;
+    const ZpseLevel *row = zpse_level_row(lvl);
+    uint32_t num = (uint32_t)row->screen_num;
     uint32_t lz_s;
     uint32_t tile_s;
 
@@ -1662,7 +1753,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * (zeros_burst), and that head prices LZ at several times what the
      * block's pass reaches. Asked only after the tile price has already said
      * yes, so a block the old screen refused pays nothing new. */
-    if (have_best &&
+    if (row->samples > 1u && have_best &&
         !zpse_block_lz_sample_can_win(lz_s, sn, n, best_total)) {
         uint32_t off = (n - sn) / 2u;
         uint32_t lz_m = zpse_lz_encode(in + off, sn, e->cand,
@@ -2212,6 +2303,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * of them and fill the rest in (see zpse_block_exact_sum). */
         int every_plane = zpse_enc_speed(speed) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN;
         int pick = -1;
+        /* The head window turned out NOT to describe the block: it priced
+         * at the raw envelope and the tail window was the one that
+         * compressed (or could not be priced at all). The near-tie prune
+         * below must not trust a price on a window like that. */
+        int head_misleads = 0;
+        /* A survivor was kept because its CONTENT beat the winner's, not
+         * because its total was close (see the compaction). Such a field
+         * is not a tie, however close the totals are. */
+        int content_kept = 0;
         int ci;
         int k;
 
@@ -2342,6 +2442,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     ex[ci] <= limit || pc[ci] < pc[pick]) {
                     if (ci == pick) {
                         win = kept;
+                    } else if (ex[ci] != UINT32_MAX && ex[ci] > limit &&
+                               pc[ci] < pc[pick]) {
+                        content_kept = 1;
                     }
                     if (kept != ci) {
                         unsigned m;
@@ -2451,6 +2554,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 if (tp == UINT32_MAX ||
                     tp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
                     sample_flat = 0;
+                    head_misleads = 1;
                 }
             }
         }
@@ -2487,16 +2591,61 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             for (m = 0; m < ZPSE_MAX_CAND_META; m++)
                 meta_bufs[pick][m] = tb[m];
         }
-        /* The trials each cheap level is willing to spend. Levels 1-2 keep
-         * the winner only; levels 3-4 allow one runner-up trial; below that
-         * the second opinion is what costs the time the level exists to save.
-         * Level 5+ price every survivor in full. */
+        /* ---- A near-tied field is cut to its best two ------------------
+         *
+         * The survivor margin above keeps everything the winner has not
+         * beaten by 1/16, which on a homogeneous column keeps almost the
+         * whole list: every transposed shape prices the same record width
+         * on the same data, so the candidates differ by a fraction of a
+         * percent and the margin has no one to drop. The trial loop then
+         * encodes each of them in full to find out what the price already
+         * said -- and a full trial is ~6x a window price, so the tie is the
+         * most expensive thing the sweep does.
+         *
+         * A field whose THIRD-best price is inside ZPSE_TIE_BAND of its best
+         * is a field the price cannot order, and the block total it produces
+         * differs by about the band. So the two cheapest survivors (the
+         * winner, already in slot 0, and the next by price) are kept and the
+         * rest stop here. This is the same trade the levels make one rung at
+         * a time -- it just applies to the one shape of block where the rung
+         * would otherwise spend every trial it has on a coin flip.
+         *
+         * Four things hold it back, each of them a case where a tied price is
+         * known not to describe the block: a block short of the format's full
+         * size (see ZPSE_TIE_MIN_N), a head window that the tail disproved, a
+         * survivor kept because its CONTENT beat the winner's rather than its
+         * total, and a field of fewer than four. The size gate in
+         * tests/suites/test_sizes.c is what keeps those honest: without any
+         * of them a tied field on "three-value alphabet" blocks grows by 24
+         * bytes in 768 cases. */
         {
-            uint32_t lvl = zpse_enc_speed(speed);
-            if (pick >= 0 && lvl <= 2u) {
-                ncand = 1;
-            } else if (pick >= 0 && lvl <= 4u && ncand > 2) {
-                ncand = 2;
+            uint32_t cap = (uint32_t)zpse_level_row(
+                zpse_enc_speed(speed))->trials;
+
+            /* Only a level that prices EVERY survivor can cut a field: the
+             * cheap rungs already stop at their own trial count, and
+             * cutting under them would only reorder the handful they try. */
+            if (cap == 0u && ncand > (int)ZPSE_TIE_KEEP && n >= ZPSE_TIE_MIN_N) {
+                /* The survivors are sorted by price after the compaction
+                 * (ties in list order), so the third-cheapest is slot 2 and
+                 * the ones to drop are the tail of that order. */
+                uint32_t best = ex[0];
+                uint32_t third = ex[ZPSE_TIE_KEEP];
+
+                if (pick >= 0 && ncand >= 4 && !head_misleads &&
+                    !content_kept && third != UINT32_MAX &&
+                    third - best <= best >> ZPSE_TIE_BAND_SHIFT) {
+                    ncand = (int)ZPSE_TIE_KEEP;
+                }
+            }
+            /* The trials this level is willing to spend, from the level
+             * table: FASTEST keeps the probe's winner only, each cheap rung
+             * above it buys one more trial, and BALANCED and deeper price
+             * every survivor in full. Buying a trial is the only thing the
+             * cheap rungs do, so the table is also the whole difference
+             * between 1, 2, 3 and 4. */
+            if (pick >= 0 && cap != 0u && (uint32_t)ncand > cap) {
+                ncand = (int)cap;
             }
         }
     }

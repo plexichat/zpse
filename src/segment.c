@@ -1925,7 +1925,16 @@ void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             uint32_t enc_flags)
 {
     int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
-    int fast_tier = zpse_enc_speed(enc_flags) <= 2u;
+    /* Only FASTEST screens the three uniform predictors: it is the level
+     * that exists to write a block in one pass, and the cheap prescreen is
+     * half its encode. Level 2 is the first rung that can spend a second
+     * trial, and a trial ordered by a prescreen that cannot see STRIDE or
+     * the lane-history family is a trial spent on the wrong shape -- level
+     * 2 was handed the cheap prescreen while it still had only the
+     * probe's winner to try, which was harmless; now that it tries a
+     * runner-up, the runner-up has to be a real one. */
+    int fast_tier = zpse_enc_speed(enc_flags) <=
+                    (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX;
 
     seg_prescreen(a, nt, seg_base, seg_pos, initial_literal, fast_tier,
                   have_avx2, ks);
@@ -2785,7 +2794,9 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         uint8_t second_p;
 
         seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
-                      zpse_enc_speed(e->enc_flags) <= 2u, have_avx2, ks);
+                      zpse_enc_speed(e->enc_flags) <=
+                          (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX,
+                      have_avx2, ks);
         seg_scan_two(ks, &best_p, &second_p);
         best_k = ks[best_p];
         if (best_k == 0u) {
@@ -2948,8 +2959,14 @@ uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
         return UINT32_MAX;
     }
     if (tiles == 0u) {
+        /* How finely a level prices a plane before a trial. Two tiles is the
+         * cheap rungs' sample; four is FASTER's; eight is what every level
+         * that prices every plane uses, and level 4 takes it too because it
+         * is the last rung before those -- it has four trials to aim and no
+         * match finder, so the aim is what it can still afford. */
         uint32_t speed = zpse_enc_speed(e->enc_flags);
-        tiles = (speed <= 2u) ? 2u : (speed <= 4u) ? 4u : 8u;
+
+        tiles = (speed <= 2u) ? 2u : (speed <= 3u) ? 4u : 8u;
     }
     tc = (plane_len + 255u) / 256u;
     best = seg_tile_price(e, lanes, plane, plane_len, tc, tiles,
@@ -3398,8 +3415,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         zpse_trial_search_tiles++;
 #endif
         seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
-                           zpse_enc_speed(e->enc_flags) <= 2u, have_avx2,
-                           &zero_cheap, ks);
+                           zpse_enc_speed(e->enc_flags) <=
+                               (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX,
+                           have_avx2, &zero_cheap, ks);
         uint8_t second_p = 0xFFu;
         uint16_t sk = 0xFFFFu;
         seg_scan_two(ks, &best_p, &second_p);
@@ -3555,21 +3573,26 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                                    initial_literal, nsseg_pos, plane,
                                    have_avx2)) {
                     uint16_t nbk;
-                    uint32_t i;
+                    uint8_t np_second;
 
-                    npred = seg_screen_pred[0];
                     seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
                                   initial_literal,
-                                  zpse_enc_speed(e->enc_flags) <= 2u,
+                                  zpse_enc_speed(e->enc_flags) <=
+                                      (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX,
                                   have_avx2, nks);
+                    /* The winner of the next tile, by the same rule the
+                     * general path uses: fewest misses, ties to the lower
+                     * priority (seg_pred_rank). It used to be "first in
+                     * scan order among the tied", which made the scan
+                     * order -- a pure speed permutation, re-ranked every
+                     * trial by win count -- decide whether the run broke
+                     * here, and with it a byte of the stream. That leaked
+                     * the permutation into the output: two levels that run
+                     * different numbers of trials re-rank differently, so
+                     * the same block came out different-sized for a reason
+                     * no level documents. */
+                    seg_scan_two(nks, &npred, &np_second);
                     nbk = nks[npred];
-                    for (i = 1; i < 9u; i++) {
-                        uint16_t c = nks[seg_screen_pred[i]];
-                        if (c < nbk) {
-                            nbk = c;
-                            npred = seg_screen_pred[i];
-                        }
-                    }
                     if (nbk != 0u || npred != pred) {
                         break;
                     }

@@ -68,44 +68,52 @@
  * command loop rather than the tile reconstruction, which is why the level
  * caps how many commands per output byte it will accept.
  *
- *   1  ZPSE_ENC_SPEED_FASTEST   one trial per block, no match finder, the
- *                               prescreen only tries the three uniform
- *                               predictors (CONST_ZERO, LANE_PREVIOUS,
- *                               STRIDE_1), ASCII gate on every block
- *   2                           one trial per block, no match finder, same
- *                               cheap prescreen as level 1
- *   3  ZPSE_ENC_SPEED_FASTER    at most two full trials per block, no match
- *                               finder, full nine-predictor prescreen
- *   4                           at most two full trials per block, no match
- *                               finder, full nine-predictor prescreen
- *   5  ZPSE_ENC_SPEED_BALANCED  price the planes of every candidate, keep
- *                               those within a margin of the best, encode each
- *                               in full -- and offer the intra-block LZ form
- *                               as one more candidate on every block. The
- *                               match finder is a full pass at roughly a
- *                               quarter of the tile encoder's rate, so a
- *                               sample of the block is coded first and the
- *                               pass is paid for only when that sample shows
- *                               the form winning by a margin.
- *   6                           same as BALANCED
- *   7                           same as BALANCED, with a tighter LZ sample
- *                               margin and a denser acceleration factor
- *   8                           same as MAX's LZ behaviour (match finder on
- *                               every block) with BALANCED's screen margin
- *   9  ZPSE_ENC_SPEED_MAX       everything the default level does, with the
- *                               match finder's sample screen at its loosest
- *                               (see ZPSE_LZ_SCREEN_NUM_*). The two deepest
- *                               levels therefore differ mostly in how small a
- *                               win on that sample is worth a full pass, which
- *                               is what puts prose's LZ form at MAX and not
- *                               at the default level. No level's LZ candidate
- *                               can cost it size -- the form is kept only when
- *                               it is smaller than the best tile stream -- and
- *                               the trade it makes is decode speed: an LZ
- *                               stream decodes at the speed of its command
- *                               loop, so the level's acceleration factor
- *                               (see ZPSE_LZ_ACCEL_*) decides how slow
- *                               than the tile stream it is allowed to be.
+ *  1  ZPSE_ENC_SPEED_FASTEST  one trial per block: the probe's winner, on the
+ *                              cheap prescreen that tries only the three
+ *                              uniform predictors (CONST_ZERO,
+ *                              LANE_PREVIOUS, STRIDE_1). ASCII gate on every
+ *                              block, no match finder.
+ *  2                          full nine-predictor prescreen, two trials, no
+ *                              match finder
+ *  3  ZPSE_ENC_SPEED_FASTER   the same prescreen, three trials, no match
+ *                              finder
+ *  4                          four trials, still no match finder
+ *  5  ZPSE_ENC_SPEED_BALANCED price the planes of every candidate at every
+ *                              plane, keep those within a margin of the best,
+ *                              and encode each survivor in full -- except on
+ *                              a full-size block whose survivors are tied on
+ *                              that price, where the best two are tried and
+ *                              the rest dropped (see ZPSE_TIE_*). Also offer
+ *                              the intra-block LZ form as one more candidate.
+ *                              The match finder is a full pass at roughly a
+ *                              quarter of the tile encoder's rate, so a sample
+ *                              of the block is coded first and the pass is
+ *                              paid for only when that sample shows the form
+ *                              winning by 1.25x.
+ *  6                          the LZ sample margin loosened to 1.1875x; every
+ *                              other knob as BALANCED
+ *  7                          margin 1.125x, and the decode bill raised to an
+ *                              acceleration factor of 16 (6 output bytes per
+ *                              command, against BALANCED's 8)
+ *  8                          margin 1.0625x with an acceleration factor of
+ *                              20 (4.8 bytes per command)
+ *  9  ZPSE_ENC_SPEED_MAX      the same 1.0625x margin, one sample instead of
+ *                              two (so more blocks pay for a pass), and an
+ *                              acceleration factor of 24 (4 bytes per
+ *                              command) -- the loosest decode bill any level
+ *                              accepts
+ *
+ * The ladder is a table in src/block.c (zpse_level): each level differs from
+ * the one above it in at least one knob, and every knob moves in the
+ * direction that can only add candidates to the choice, so a deeper level
+ * cannot write a larger block than a shallower one (tests/suites/
+ * test_levels.c pins that). The cheap rungs buy trials one at a time; the
+ * deep rungs loosen the LZ screen one notch at a time. No level's LZ
+ * candidate can cost it size -- the form is kept only when it is smaller than
+ * the best tile stream -- and the trade it makes is decode speed: an LZ
+ * stream decodes at the speed of its command loop, so the level's
+ * acceleration factor (see ZPSE_LZ_ACCEL_*) decides how much slower than the
+ * tile stream it is allowed to be.
  *
  * An unsupported level is rejected with PSE_BAD_ARG rather than rounded to
  * one of these. */
@@ -127,12 +135,13 @@
 #define ZPSE_ENC_SPEED_DEFAULT  (ZPSE_ENC_SPEED_BALANCED >> ZPSE_ENC_SPEED_SHIFT)
 
 /* Extract the level number (1-9) from the options field, normalising the
- * empty field to the default level. Every level test in the encoder is a
- * threshold ("at least 5 prices every plane", "at most 2 screens three
- * predictors"), so a raw zero would put the default encoder on the cheap
- * side of all of them -- which is how the default level silently became the
- * most expensive-quality regression the size gate has ever caught. The
- * normalisation is here, in the one accessor, rather than at each test. */
+ * empty field to the default level. The encoder still has a few tier tests --
+ * "at least 5 prices every plane", "at least 5 runs the match finder",
+ * "at most 1 screens three predictors" -- so a raw zero would put the default
+ * encoder on the cheap side of all of them, which is how the default level
+ * silently became the most expensive-quality regression the size gate has
+ * ever caught. The normalisation is here, in the one accessor, rather than at
+ * each test. */
 static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
     uint32_t lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
                               ZPSE_ENC_SPEED_SHIFT);
@@ -144,6 +153,11 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
 #define ZPSE_ENC_SPEED_EVERY_PLANE_MIN 5u
 /* Levels that run the match finder at all (5-9). */
 #define ZPSE_ENC_SPEED_LZ_MIN 5u
+/* Levels whose segment prescreen is cut to the three uniform predictors (1
+ * only). The prescreen is what half of FASTEST's encode is; every rung above
+ * it has a second trial to order, and a runner-up chosen by a prescreen that
+ * cannot see STRIDE or the lane-history family is the wrong runner-up. */
+#define ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX 1u
 /* Every level uses the ASCII gate, MAX included: it decides only what the
  * tile side of a convicted block costs, and the LZ candidate is offered
  * afterwards whatever it decided, so no level can lose its LZ trial to it.
