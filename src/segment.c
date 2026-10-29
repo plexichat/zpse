@@ -2173,12 +2173,16 @@ static int seg_dense_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
     return (int)dtotal;
 }
 
-/* How much of the plane the scalar gather below reads before the vector
- * test takes over. It only has to be long enough to hold the whole
- * alphabet of a plane the dense palette form can use (at most sixteen
- * values); every later occurrence of a value costs a vector compare
- * instead of a read-modify-write of the set. */
-#define ZPSE_ALPHA_HEAD 1024u
+/* How much of the plane the presence gather below reads before the vector
+ * membership test takes over. It only has to be long enough to hold the
+ * whole alphabet of a plane the dense palette form can use (at most
+ * sixteen values, and a uniform sixteen-value plane has all of them in
+ * 256 bytes with probability 1 - 1e-7); every later occurrence of a value
+ * costs a vector compare instead of a presence store. The gather is one
+ * independent store a byte and the vector pass a quarter of a cycle a
+ * byte, so a short head is what the two costs want -- 1024 bytes of head
+ * was measured slower on exactly the planes this scan is for. */
+#define ZPSE_ALPHA_HEAD 256u
 
 int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n)
 {
@@ -2206,27 +2210,20 @@ int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n)
  *
  * The answer is the same the scalar probe gives -- membership of a byte in
  * a set of at most sixteen values -- so the caller can hand the offset
- * back to the scalar loop and get the identical alphabet and count. */
-static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
-    const uint8_t *p, uint32_t n, const uint32_t bits[8])
+ * back to the scalar loop and get the identical alphabet and count.
+ *
+ * The tables are the caller's, so a value found outside the set can be
+ * added to them without rebuilding all 256 entries: the caller below adds
+ * one and resumes the scan from after it, which is what keeps a plane
+ * whose alphabet is only slightly too large (a run of zeros with spikes
+ * from a wide range) from paying a rebuild per added value. */
+static void seg_alpha_tables(const uint32_t bits[8], uint8_t ta[16],
+                             uint8_t tb[16])
 {
-    uint8_t ta[16];
-    uint8_t tb[16];
-    const __m256i nib = _mm256_set1_epi8(0x0F);
-    const __m256i hi7 = _mm256_set1_epi8(7);
-    const __m256i zero = _mm256_setzero_si256();
-    const __m256i onehot = _mm256_setr_epi8(
-        1, 2, 4, 8, 16, 32, 64, (char)0x80,
-        1, 2, 4, 8, 16, 32, 64, (char)0x80,
-        1, 2, 4, 8, 16, 32, 64, (char)0x80,
-        1, 2, 4, 8, 16, 32, 64, (char)0x80);
-    __m256i tav;
-    __m256i tbv;
-    uint32_t i = 0u;
     unsigned v;
 
-    memset(ta, 0, sizeof ta);
-    memset(tb, 0, sizeof tb);
+    memset(ta, 0, 16u);
+    memset(tb, 0, 16u);
     for (v = 0u; v < 256u; v++) {
         if (((bits[v >> 5] >> (v & 31u)) & 1u) == 0u) {
             continue;
@@ -2237,10 +2234,34 @@ static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
             tb[v & 15u] |= (uint8_t)(1u << ((v >> 4) - 8u));
         }
     }
-    tav = _mm256_broadcastsi128_si256(
+}
+
+static void seg_alpha_tables_add(uint8_t ta[16], uint8_t tb[16], unsigned v)
+{
+    if ((v >> 4) < 8u) {
+        ta[v & 15u] |= (uint8_t)(1u << (v >> 4));
+    } else {
+        tb[v & 15u] |= (uint8_t)(1u << ((v >> 4) - 8u));
+    }
+}
+
+static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
+    const uint8_t *p, uint32_t n, const uint8_t ta[16], const uint8_t tb[16],
+    const uint32_t bits[8])
+{
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    const __m256i hi7 = _mm256_set1_epi8(7);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i onehot = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80,
+        1, 2, 4, 8, 16, 32, 64, (char)0x80);
+    const __m256i tav = _mm256_broadcastsi128_si256(
         _mm_loadu_si128((const __m128i *)(const void *)ta));
-    tbv = _mm256_broadcastsi128_si256(
+    const __m256i tbv = _mm256_broadcastsi128_si256(
         _mm_loadu_si128((const __m128i *)(const void *)tb));
+    uint32_t i = 0u;
 
     while (i + 32u <= n) {
         const __m256i cur = _mm256_loadu_si256(
@@ -2279,22 +2300,79 @@ static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
 }
 #endif /* ZPSE_PS_HAVE_AVX2 */
 
+/* SWAR population count (same idiom as mask.c): __builtin_popcount lowers
+ * to a libgcc call unless the whole build has -mpopcnt, which this
+ * portable codebase does not. */
+static uint32_t seg_pop32(uint32_t w)
+{
+    w = w - ((w >> 1) & 0x55555555u);
+    w = (w & 0x33333333u) + ((w >> 2) & 0x33333333u);
+    w = (w + (w >> 4)) & 0x0F0F0F0Fu;
+    return (w * 0x01010101u) >> 24;
+}
+
+#if ZPSE_PS_HAVE_AVX2
+/* One compare and one movemask per 32 values of the presence array: the
+ * complement of its movemask against zero has a one exactly where a value
+ * occurred, which is the word of `bits` for those 32 values. */
+static ZPSE_PS_AVX2 uint32_t seg_pres_fold_avx2(const uint8_t *pres,
+                                                uint32_t bits[8])
+{
+    const __m256i z = _mm256_setzero_si256();
+    uint32_t n = 0u;
+    unsigned w;
+
+    for (w = 0u; w < 8u; w++) {
+        const __m256i q = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pres + w * 32u));
+
+        bits[w] = (uint32_t)~_mm256_movemask_epi8(_mm256_cmpeq_epi8(q, z));
+        n += seg_pop32(bits[w]);
+    }
+    return n;
+}
+#endif
+
+/* Fold a 256-byte presence array (pres[v] != 0 iff value v occurred) into
+ * the 256-bit set `bits`, returning how many values it holds. Same result
+ * as setting one bit per occurrence, which is what the gather below used
+ * to do one byte at a time. */
+static uint32_t seg_pres_fold(const uint8_t *pres, uint32_t bits[8])
+{
+    uint32_t n = 0u;
+    unsigned w;
+
+#if ZPSE_PS_HAVE_AVX2
+    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        return seg_pres_fold_avx2(pres, bits);
+    }
+#endif
+    for (w = 0u; w < 256u; w++) {
+        if (pres[w] != 0u) {
+            bits[w >> 5] |= 1u << (w & 31u);
+            n++;
+        }
+    }
+    return n;
+}
+
 /* Which byte values the plane actually contains, as a 256-bit set.
  * Stops as soon as the alphabet exceeds `limit`, because every caller only
  * asks whether it is small: a text, code or noise plane bails out after 17
  * distinct values instead of scanning 64 KiB.
  *
  * The gather is a scalar bitmap probe, which is a dependent read-modify-
- * write per byte. On a plane that really does have a small alphabet that
- * probe runs over every byte of the plane, and on 64 KiB of four-bit data
- * it was measured at 46 us per block -- more than the palette form's own
- * pack. So the first ZPSE_ALPHA_HEAD bytes are gathered scalar (they hold
- * a palette plane's whole alphabet many times over) and the rest of the
- * plane is only TESTED for membership in what the head found, with one
- * vector pass whose cost does not depend on the alphabet size. A plane
- * with more than sixteen values still leaves the gather the first time the
- * test finds one, so the early exit that keeps text and noise cheap is
- * unchanged. */
+ * write per byte: a repeated value forwards a store to the very next load
+ * of the same word, so on a plane that really does have a small alphabet
+ * the probe is latency-bound at a few cycles a byte. On 64 KiB of four-bit
+ * data it was measured at 46 us per block -- more than the palette form's
+ * own pack. So the head is gathered into a 256-byte PRESENCE array instead
+ * (one independent store per byte, no read and no dependency) and folded
+ * once, and the rest of the plane is only TESTED for membership in what
+ * the head found, with one vector pass whose cost does not depend on the
+ * alphabet size. A plane with more than sixteen values still leaves the
+ * gather the first time that test finds one, so the early exit that keeps
+ * text and noise cheap is unchanged. */
 ZPSE_HOT static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane_len,
                                    uint32_t limit, uint32_t bits[8])
 {
@@ -2304,19 +2382,29 @@ ZPSE_HOT static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane
                                                   : ZPSE_ALPHA_HEAD;
 
     memset(bits, 0, 8u * sizeof bits[0]);
-    for (i = 0u; i < head; i++) {
-        unsigned v = plane[i];
-        uint32_t bit = 1u << (v & 31u);
+    {
+        uint8_t pres[256];
 
-        if ((bits[v >> 5] & bit) != 0u) {
-            continue;
+        memset(pres, 0, sizeof pres);
+        for (i = 0u; i + 8u <= head; i += 8u) {
+            pres[plane[i]] = 1u;
+            pres[plane[i + 1u]] = 1u;
+            pres[plane[i + 2u]] = 1u;
+            pres[plane[i + 3u]] = 1u;
+            pres[plane[i + 4u]] = 1u;
+            pres[plane[i + 5u]] = 1u;
+            pres[plane[i + 6u]] = 1u;
+            pres[plane[i + 7u]] = 1u;
         }
-        bits[v >> 5] |= bit;
-        n++;
+        for (; i < head; i++) {
+            pres[plane[i]] = 1u;
+        }
+        n = seg_pres_fold(pres, bits);
         if (n > limit) {
             return n;
         }
     }
+    i = head;
 #if ZPSE_PS_HAVE_AVX2
     /* The membership tables hold at most sixteen values, so the vector test
      * is only taken when the head found no more than that -- which is the
@@ -2325,13 +2413,39 @@ ZPSE_HOT static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane
      * plane. */
     if (n <= 16u && head < plane_len &&
         (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
-        uint32_t q = seg_alphabet_first_outside_avx2(plane + head,
-                                                     plane_len - head, bits);
+        /* A value the head missed is added to the tables and the vector
+         * test resumes after it, instead of the rest of the plane going to
+         * the byte loop: one added entry and one re-broadcast cost a few
+         * cycles, where that loop pays 2.5 cycles a byte for everything it
+         * re-reads. A plane whose alphabet is only slightly too large (a
+         * run of zeros with spikes drawn from a wide range) is the case
+         * this matters for -- and the count exits above `limit` after at
+         * most `limit` such additions, so the restarts are bounded. */
+        uint8_t ta[16];
+        uint8_t tb[16];
 
-        if (q == plane_len - head) {
-            return n;
+        seg_alpha_tables(bits, ta, tb);
+        for (;;) {
+            uint32_t q = seg_alphabet_first_outside_avx2(plane + i,
+                                                         plane_len - i, ta,
+                                                         tb, bits);
+
+            if (q == plane_len - i) {
+                return n;
+            }
+            i += q;
+            {
+                unsigned v = plane[i];
+
+                bits[v >> 5] |= 1u << (v & 31u);
+                seg_alpha_tables_add(ta, tb, v);
+            }
+            n++;
+            if (n > limit) {
+                return n;
+            }
+            i++;
         }
-        i = head + q;
     }
 #endif
     for (; i < plane_len; i++) {
