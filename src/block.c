@@ -1345,17 +1345,153 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return zpse_transform_forward(&tm, sc, in, n, planes, lens);
 }
 
+/* The prefix price could not be taken: the candidate's first tile in some
+ * plane is all-hit, so it MAY be a constant plane, and the dense form (which
+ * the tile sample cannot see) prices a constant plane below ten bytes a
+ * tile. Only the whole plane can settle that, so the caller stages the full
+ * window instead. Distinct from UINT32_MAX, which still means "could not be
+ * priced" and keeps the candidate. */
+#define ZPSE_PREFIX_NEED_FULL UINT32_C(0xFFFFFFFE)
+
+/* Price a multi-plane candidate from the transform PREFIX it reads.
+ *
+ * A candidate with more than one plane is priced one tile in each plane
+ * (zpse_block_exact_sum), and that tile is the plane's FIRST one: the fold
+ * to the plane's real tile count is arithmetic (16 + (price - 16) * tc). An
+ * every-plane pass therefore reads exactly 256 bytes of each plane, which
+ * for a width-w transform are the first 256*w bytes of the window -- 4 KiB
+ * of the probe's 12 KiB window at width 16, 1 KiB at width 4, 512 bytes at
+ * width 2 -- so staging the whole window to reach a third of it (width 16)
+ * is pure cost. Staging is a quarter to a third of what the probe spends on
+ * a 64 KiB block (measured with the ZPSE_BLOCK_STATS build: 45 000 of
+ * 196 000 cycles on a 4-bit plane, 41 000 of 120 000 on noise).
+ *
+ * The tile's own price is bit-for-bit the one the full staging produces: the
+ * same 256 bytes, the same segment position 0, the same initial literal,
+ * and a classify whose lane state starts where it starts in the full pass.
+ * The fold back to the real tile count is the one exact_sum applies.
+ *
+ * Returns the price, UINT32_MAX when the plane cannot be priced, or
+ * ZPSE_PREFIX_NEED_FULL when the prefix cannot answer the question (see
+ * above); the caller then runs the full staging. */
+static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
+                                        uint32_t n, uint8_t tid, uint8_t sc,
+                                        const uint8_t *meta_bytes,
+                                        uint16_t meta_len, uint32_t limit)
+{
+    ZpseTransformMeta tm;
+    uint32_t lens[16];
+    uint8_t *planes[16];
+    uint32_t pfront;
+    uint32_t records = 0u;
+    uint8_t wb = 0u;
+    uint32_t w;
+    uint32_t s;
+
+    if (e == 0 || in == 0 || sc < 2u || sc > 16u) {
+        return ZPSE_PREFIX_NEED_FULL;
+    }
+    if (zpse_transform_width(tid, sc, &wb) != PSE_OK || wb == 0u) {
+        return ZPSE_PREFIX_NEED_FULL;
+    }
+    w = (uint32_t)wb;
+    if (zpse_segment_lengths(n, w, lens) != PSE_OK) {
+        return ZPSE_PREFIX_NEED_FULL;
+    }
+    /* Every plane has to hold one whole tile for the fold to be the one
+     * exact_sum makes, and the prefix has to sit inside the window. */
+    for (s = 0u; s < sc; s++) {
+        if (lens[s] < 256u) {
+            return ZPSE_PREFIX_NEED_FULL;
+        }
+    }
+    pfront = 256u * w;
+    if (pfront > n || (uint64_t)sc * 256u > (uint64_t)ZPSE_E_SZ_TSTAGE) {
+        return ZPSE_PREFIX_NEED_FULL;
+    }
+    if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != PSE_OK) {
+        return ZPSE_PREFIX_NEED_FULL;
+    }
+    for (s = 0u; s < sc; s++) {
+        planes[s] = e->tstage + 256u * s;
+    }
+    {
+        uint32_t flens[16];
+
+        for (s = 0u; s < sc; s++) {
+            flens[s] = 256u;
+        }
+        if (zpse_transform_forward(&tm, sc, in, pfront, planes, flens) !=
+            PSE_OK) {
+            return ZPSE_PREFIX_NEED_FULL;
+        }
+    }
+    for (s = 0u; s < sc; s++) {
+        uint32_t tc = (lens[s] + 255u) >> 8;
+        uint32_t c = zpse_block_exact_plane(e, planes[s], 256u, 1u,
+                                            UINT32_MAX);
+
+        if (c == UINT32_MAX) {
+            return UINT32_MAX;
+        }
+        if (c == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u) {
+            /* All-hit first tile: the plane may still be constant, and the
+             * dense form prices that below ten bytes a tile. */
+            return ZPSE_PREFIX_NEED_FULL;
+        }
+        records += (c - (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) * tc;
+        /* The sweep's running verdict, applied per plane exactly as the full
+         * pass applies it: a bound already past `limit` cannot win, so the
+         * planes behind it do not have to be staged or priced. */
+        if (limit != UINT32_MAX) {
+            uint64_t lb = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
+                          (uint64_t)sc * 16u + (uint64_t)records;
+
+            if (lb > (uint64_t)limit) {
+                return (uint32_t)(lb > (uint64_t)UINT32_MAX
+                                      ? (uint64_t)UINT32_MAX
+                                      : lb);
+            }
+        }
+    }
+    return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u + (uint32_t)sc * 16u +
+           records;
+}
+
 /* Exact price of one candidate, used to break a prescreen tie: see
- * zpse_block_exact_plane. UINT32_MAX means "could not be priced". */
+ * zpse_block_exact_plane. UINT32_MAX means "could not be priced".
+ *
+ * `prefix_ok` is the sweep's own per-block verdict on prefix pricing (see
+ * zpse_block_prefix_price): it starts set and this function clears it the
+ * first time a prefix cannot answer, which on a block whose planes really
+ * are constant is the first transpose candidate it prices. NULL means "do
+ * not try": the callers that price one candidate on a sample (the ASCII
+ * gate, the LZ screen, the tail check) are not where the prefix pays. */
 static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                                        uint32_t n, uint8_t tid, uint8_t sc,
                                        const uint8_t *meta_bytes,
                                        uint16_t meta_len, unsigned tiles,
-                                       uint32_t limit, int every_plane)
+                                       uint32_t limit, int every_plane,
+                                       int *prefix_ok)
 {
     uint32_t lens[16];
     uint8_t *planes[16];
 
+    /* An every-plane pass reads one tile per plane, i.e. only the head of
+     * each plane, so the multi-plane candidates are priced from the prefix
+     * the transform has to write for it and the rest of the window is never
+     * staged. A candidate whose prefix cannot answer (a possibly constant
+     * plane -- see zpse_block_prefix_price) falls through to the full pass,
+     * and the block stops trying prefixes. */
+    if (prefix_ok != 0 && every_plane && *prefix_ok && sc > 1u) {
+        uint32_t p = zpse_block_prefix_price(e, in, n, tid, sc, meta_bytes,
+                                             meta_len, limit);
+
+        if (p != ZPSE_PREFIX_NEED_FULL) {
+            return p;
+        }
+        *prefix_ok = 0;
+    }
     if (zpse_block_planes(e, in, n, tid, sc, meta_bytes, meta_len, planes,
                           lens) != PSE_OK) {
         return UINT32_MAX;
@@ -1759,7 +1895,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return 1;
     }
     tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
-                                    ZPSE_DECIDE_TILES, UINT32_MAX, 1);
+                                    ZPSE_DECIDE_TILES, UINT32_MAX, 1, 0);
     if (tile_s == UINT32_MAX) {
         return 1;
     }
@@ -1956,7 +2092,7 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
             continue;
         }
         h = zpse_block_proxy_exact(e, in, pn, tids[j], scs[j], in, metas[j],
-                                   ZPSE_ASCII_SAMPLE_TILES, alim, 1);
+                                   ZPSE_ASCII_SAMPLE_TILES, alim, 1, 0);
         if (h == UINT32_MAX || h <= alim) {
             return 0;
         }
@@ -1964,7 +2100,7 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
             uint32_t t = zpse_block_proxy_exact(e, in + (n - pn), pn, tids[j],
                                                 scs[j], in, metas[j],
                                                 ZPSE_ASCII_SAMPLE_TILES,
-                                                alim, 1);
+                                                alim, 1, 0);
 
             if (t == UINT32_MAX || t <= alim) {
                 return 0;
@@ -2336,6 +2472,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * because its total was close (see the compaction). Such a field
          * is not a tie, however close the totals are. */
         int content_kept = 0;
+        /* Prefix pricing is tried on this block until a candidate's prefix
+         * cannot answer (a plane whose first tile is all-hit may be a
+         * constant plane, which only the whole plane settles). On a block
+         * whose planes really are constant that is the first transpose
+         * candidate it prices, and every candidate behind it -- and the
+         * ones after it on the same block -- uses the full pass, so the
+         * block pays one wasted prefix instead of one per shape. */
+        int prefix_ok = 1;
         int ci;
         int k;
 
@@ -2406,7 +2550,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
                                             ZPSE_DECIDE_TILES, lim,
-                                            every_plane);
+                                            every_plane, &prefix_ok);
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_cands_priced++;
             zpse_block_probe_cycles += blk_rdtsc() - t_cycle;
@@ -2573,7 +2717,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 uint32_t tp = zpse_block_proxy_exact(
                     e, in + (n - pn), pn, tids[pick], scounts[pick], wmb,
                     meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX,
-                    every_plane);
+                    every_plane, 0);
 
                 if (tp == UINT32_MAX ||
                     tp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
