@@ -1766,7 +1766,6 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
     const uint8_t *tile_bytes;
 
     (void)seg_base;
-    (void)initial_literal;
 
     if (fam == TILE_FAM_CONST) {
         c = (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
@@ -1779,8 +1778,22 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
         tile_bytes = actual;
     } else {
         if (fam == TILE_FAM_STRIDE) {
-            /* Real preceding plane bytes; requires seg_pos >= 16. */
-            memcpy(stg, actual - 16, 16);
+            /* The sixteen bytes the prediction reads for the tile's first
+             * positions. A tile that starts at least that far into the
+             * plane has all of them in place, and `direct` reads it in
+             * place. A tile closer to the start does not: the source
+             * position for those bytes is before the plane, where the
+             * scalar form predicts `initial_literal`, so the head starts
+             * with it and the real bytes follow. Same predictions as the
+             * scalar prologue, which is what lets a segment's first tile
+             * take this path at all. */
+            if (seg_pos >= 16u) {
+                memcpy(stg, actual - 16, 16);
+            } else {
+                memset(stg, initial_literal, 16u - seg_pos);
+                if (seg_pos != 0u)
+                    memcpy(stg + (16u - seg_pos), actual - seg_pos, seg_pos);
+            }
         } else {
             memcpy(stg, ent_second, 8);
             memcpy(stg + 8, ent_last, 8);
@@ -2061,10 +2074,13 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         tile_capture_hist(lanes, ent_last, ent_second);
 
 #if ZPSE_TILE_HAVE_AVX2
+    /* STRIDE reads the sixteen bytes before the tile and LANEHIST takes
+     * them from the entry lane state; both are staged, so any position in
+     * the plane works, including a tile at its very start. That tile used
+     * to fall through to the byte loop below, and it is exactly the tile a
+     * dense segment classifies first: a STRIDE winner there cost 3.2x the
+     * vector path (830 ns against 260 on a 256-byte four-value tile). */
     if (nt >= 32u && tile_fam_is_vectorisable(fam) &&
-        /* STRIDE reads the 16 real plane bytes before the tile; */
-        /* LANEHIST takes them from the entry lane state. */
-        (fam != TILE_FAM_STRIDE || seg_pos >= 16u) &&
         (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         uint8_t vl[8];
         uint8_t vs[8];
@@ -2393,6 +2409,7 @@ static ZPSE_TILE_AVX2 int tile_fill_at_pred_avx2(uint8_t predictor_id,
                                                  uint16_t nt, uint32_t s,
                                                  uint8_t c,
                                                  uint8_t initial_literal,
+                                                 uint32_t seg_pos,
                                                  ZpseTileClass *cl)
 {
     uint8_t stg[ZPSE_TILE_STG_LEN];
@@ -2402,7 +2419,16 @@ static ZPSE_TILE_AVX2 int tile_fill_at_pred_avx2(uint8_t predictor_id,
     uint32_t p = 0u;
 
     if (fam == TILE_FAM_STRIDE) {
-        memcpy(stg, actual - 16, 16);
+        /* Same head rule as tile_classify_avx2: real preceding bytes where
+         * the plane has them, `initial_literal` where the source position
+         * is before the plane. */
+        if (seg_pos >= 16u) {
+            memcpy(stg, actual - 16, 16);
+        } else {
+            memset(stg, initial_literal, 16u - seg_pos);
+            if (seg_pos != 0u)
+                memcpy(stg + (16u - seg_pos), actual - seg_pos, seg_pos);
+        }
     } else {
         memset(stg, initial_literal, 16);
     }
@@ -2486,10 +2512,9 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
 
 #if ZPSE_TILE_HAVE_AVX2
     if (nt >= 32u && tile_fam_is_vectorisable(fam) &&
-        (fam != TILE_FAM_STRIDE || seg_pos >= 16u) &&
         (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         return tile_fill_at_pred_avx2(predictor_id, fam, actual, nt, s, c,
-                                      initial_literal, cl);
+                                      initial_literal, seg_pos, cl);
     }
 #endif
 
@@ -2950,8 +2975,8 @@ int zpse_tile_encode(ZpseLaneState *lanes, const uint8_t *actual, uint16_t nt,
     if (lanes == 0 || actual == 0 || record_out == 0)
         return PSE_BAD_ARG;
     /* zpse_tile_encode packs the modes it is handed, which can be any of
-     * them (PALETTE_BITS and PACKED_BASE_M read at_pred), so this entry
-     * point keeps the full classification. */
+     * them (SIGNED_DELTA reads at_pred), so this entry point keeps the
+     * full classification rather than the lean one. */
     rc = tile_classify(lanes, actual, nt, predictor_id, initial_literal,
                        tile_reset, seg_base, seg_pos, &cl, 1);
     if (rc != PSE_OK)

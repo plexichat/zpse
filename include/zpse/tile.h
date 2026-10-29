@@ -121,11 +121,11 @@ int zpse_tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
 /* Same classification without cl->at_pred, the predictions at the
  * exception positions. It is the one product the encoder usually does not
  * read: a packed record takes its bytes from cl->res_at_exc or
- * cl->act_at_exc, and the predictions only for PALETTE_BITS,
- * PACKED_BASE_M and SIGNED_DELTA. Measured over the eighteen corpora,
- * 82% of the tiles the encoder searches pack as RAW_ACTUAL, and the
- * at_pred compaction is ~66 cycles of a ~320-cycle exception pass, so
- * skipping it is worth ~13% of a classify on a dense tile.
+ * cl->act_at_exc, and the predictions only for SIGNED_DELTA, which codes
+ * deltas from them. Measured over the eighteen corpora, 82% of the tiles
+ * the encoder searches pack as RAW_ACTUAL, and the at_pred compaction is
+ * ~66 cycles of a ~320-cycle exception pass, so skipping it is worth ~13%
+ * of a classify on a dense tile.
  *
  * Everything else -- words, k, constant_C, res_at_exc, act_at_exc, seen,
  * nu, rmax/dmin/dmax and the lane state -- is exactly what
