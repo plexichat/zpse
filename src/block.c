@@ -1461,12 +1461,13 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
 /* Exact price of one candidate, used to break a prescreen tie: see
  * zpse_block_exact_plane. UINT32_MAX means "could not be priced".
  *
- * `prefix_ok` is the sweep's own per-block verdict on prefix pricing (see
+ * `prefix_ok` is the caller's verdict on prefix pricing (see
  * zpse_block_prefix_price): it starts set and this function clears it the
  * first time a prefix cannot answer, which on a block whose planes really
  * are constant is the first transpose candidate it prices. NULL means "do
- * not try": the callers that price one candidate on a sample (the ASCII
- * gate, the LZ screen, the tail check) are not where the prefix pays. */
+ * not try": a caller that prices a candidate whose planes are not read from
+ * their head (a single-plane one spread over the window, or the tail
+ * check's whole-window price) is not where the prefix pays. */
 static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                                        uint32_t n, uint8_t tid, uint8_t sc,
                                        const uint8_t *meta_bytes,
@@ -1477,13 +1478,17 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
     uint32_t lens[16];
     uint8_t *planes[16];
 
-    /* An every-plane pass reads one tile per plane, i.e. only the head of
-     * each plane, so the multi-plane candidates are priced from the prefix
-     * the transform has to write for it and the rest of the window is never
-     * staged. A candidate whose prefix cannot answer (a possibly constant
-     * plane -- see zpse_block_prefix_price) falls through to the full pass,
-     * and the block stops trying prefixes. */
-    if (prefix_ok != 0 && every_plane && *prefix_ok && sc > 1u) {
+    /* A multi-plane candidate is priced with one tile in every plane, at
+     * every level (the cheap levels fill nothing in for a transpose any
+     * more), and that tile is the head of the plane -- so it is priced from
+     * the prefix the transform has to write for it and the rest of the
+     * window is never staged. That holds whatever `every_plane` says: the
+     * two passes agree plane for plane, and `every_plane` only differs for a
+     * single-plane candidate, whose spread of tiles is not in the prefix.
+     * A candidate whose prefix cannot answer (a possibly constant plane --
+     * see zpse_block_prefix_price) falls through to the full pass, and the
+     * caller stops trying prefixes. */
+    if (prefix_ok != 0 && *prefix_ok && sc > 1u) {
         uint32_t p = zpse_block_prefix_price(e, in, n, tid, sc, meta_bytes,
                                              meta_len, limit);
 
@@ -1894,8 +1899,17 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (lz_s == 0u) {
         return 1;
     }
-    tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
-                                    ZPSE_DECIDE_TILES, UINT32_MAX, 1, 0);
+    /* The shape is priced on its head windows, so a multi-plane one is
+     * priced from the transform prefix rather than by staging the sample:
+     * the screen runs before anything else on every block, and its answer
+     * only costs a candidate's price when the block is one LZ might win. */
+    {
+        int prefix_ok = 1;
+
+        tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
+                                        ZPSE_DECIDE_TILES, UINT32_MAX, 1,
+                                        &prefix_ok);
+    }
     if (tile_s == UINT32_MAX) {
         return 1;
     }
@@ -2087,20 +2101,27 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
     }
     for (j = 0; j < 3u; j++) {
         uint32_t h;
+        /* Per sample, not per gate: the prefix is a property of the bytes it
+         * reads, and the tail sample is different bytes from the head. */
+        int prefix_ok = 1;
 
         if ((uint32_t)scs[j] > pn) {
             continue;
         }
         h = zpse_block_proxy_exact(e, in, pn, tids[j], scs[j], in, metas[j],
-                                   ZPSE_ASCII_SAMPLE_TILES, alim, 1, 0);
+                                   ZPSE_ASCII_SAMPLE_TILES, alim, 1,
+                                   &prefix_ok);
         if (h == UINT32_MAX || h <= alim) {
             return 0;
         }
         if (n > pn) {
-            uint32_t t = zpse_block_proxy_exact(e, in + (n - pn), pn, tids[j],
-                                                scs[j], in, metas[j],
-                                                ZPSE_ASCII_SAMPLE_TILES,
-                                                alim, 1, 0);
+            uint32_t t;
+
+            prefix_ok = 1;
+            t = zpse_block_proxy_exact(e, in + (n - pn), pn, tids[j],
+                                       scs[j], in, metas[j],
+                                       ZPSE_ASCII_SAMPLE_TILES, alim, 1,
+                                       &prefix_ok);
 
             if (t == UINT32_MAX || t <= alim) {
                 return 0;
