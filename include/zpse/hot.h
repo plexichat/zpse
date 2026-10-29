@@ -55,4 +55,18 @@
 #define ZPSE_HOT
 #endif
 
+/* A block that is taken on almost every iteration. gcc's estimate of a
+ * branch chain is a product of per-test guesses, so a condition with enough
+ * terms to describe a whole fast path lands under the 50% that decides
+ * fall-through: the LZ decoder's seven-term one was laid out as a jump to a
+ * cold block instead of a straight-line run, which cost more than the
+ * condition itself. The hint says what the code means -- "this is the
+ * iteration" -- and is only a layout instruction. It cannot change which
+ * streams are accepted, and it compiles to nothing where it is unknown. */
+#if defined(__GNUC__) || defined(__clang__)
+#define ZPSE_LIKELY(X) __builtin_expect(!!(X), 1)
+#else
+#define ZPSE_LIKELY(X) (X)
+#endif
+
 #endif /* ZPSE_HOT_H */

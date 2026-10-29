@@ -476,11 +476,9 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
  * fifths of the matches are under sixteen bytes at a distance over
  * thirty-two), so the tail is most of the copy. */
 ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
-                          const uint8_t *oend)
+                          uint32_t room)
 {
     if (len <= 32u) {
-        uint32_t room = (uint32_t)(oend - dst);
-
         if (off >= 32u && room >= 32u) {
             memcpy(dst, dst - off, 32u);
             return;
@@ -551,11 +549,8 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
 {
     uint32_t lit_bytes, cmd_off, cmd_len;
     const uint8_t *lp;
-    const uint8_t *lend;
     const uint8_t *cp;
-    const uint8_t *cend;
     uint8_t *op;
-    uint8_t *oend;
 
     if (in == 0 || out == 0) {
         return PSE_BAD_ARG;
@@ -579,23 +574,34 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         return PSE_BAD_LZ;
     }
     lp = in + 4u;
-    lend = lp + lit_bytes;
     cp = in + cmd_off;
-    cend = in + in_len;
     op = out;
-    oend = out + n;
 
     {
-        /* The three quantities every command is checked against are kept
-         * as counters rather than re-derived from pointers: `lit_rem` is
-         * the literal stream still unread, `op_rem` the output still
-         * unwritten, and `op_done` the output already written, so a
-         * command costs 32-bit subtract-and-compare instead of three
-         * 64-bit pointer differences. Same tests, same order, same
-         * streams accepted and refused -- only the arithmetic changed. */
+        /* Everything a command is checked against is a counter rather than
+         * a pointer derived from a buffer end: `lit_rem` is the literal
+         * stream still unread, `op_rem` the output still unwritten,
+         * `op_done` the output already written, and `cmd_left` the command
+         * words still unread -- one command per word, so it is the bound
+         * `cp + 4 > cend` made. Four counters and the two cursors are the
+         * whole live set; keeping the input end, the literal end and the
+         * output end as pointers instead ran the loop three values short of
+         * the register file, and the spill cost was two reloads of derived
+         * command fields and one of the input end on every command (objdump:
+         * the fast path opened by popping it back off the stack). The two
+         * copies now take the room in front of their region, which is a
+         * counter already in hand, in place of a pointer to its end. Same
+         * tests, same order, same streams accepted and refused -- only the
+         * arithmetic changed. Measured over the corpus, twelve interleaved
+         * rounds against the tree before it: LZ decode alone comes out 24%
+         * faster on `json_rows`, 13% on `log_lines` and 8% on `var_string`,
+         * and the whole decoder 2.6% time-weighted across the 25 cases (1.5%
+         * geomean). The encoder is untouched and reads as it did. */
         uint32_t lit_rem = lit_bytes;
         uint32_t op_rem = n;
         uint32_t op_done = 0u;
+        uint32_t cmd_left = cmd_len / 4u;
+
         /* True when a 16-byte read that starts anywhere in the literal
          * region stays inside the input buffer: the region's end plus
          * sixteen cannot pass the end of the frame's block. It is false
@@ -610,17 +616,15 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             uint32_t off;
             uint32_t mlen;
 
-            if (cp + 4 > cend) {
+            if (cmd_left == 0u) {
                 return PSE_BAD_LZ;
             }
+            cmd_left--;
             cw = zpse_load_u32le(cp);
             cp += 4;
             lit = (cw >> 16) & 0xFFu;
             off = cw & 0xFFFFu;
             mlen = (cw >> 24) + ZPSE_LZ_MIN_MATCH;
-            if (lit > lit_rem || lit > op_rem) {
-                return PSE_BAD_LZ;
-            }
             /* One-shot path for the shape most commands of a text, JSON or
              * log block take: at most eight literal bytes and a match that
              * fits in sixteen, at a distance of at least sixteen. Both
@@ -628,32 +632,43 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * becomes one branch instead of the two copies' own cascades of
              * width tests -- which is what the loop is worth, because it is
              * per-command bound, not per-byte bound: a command emits five to
-             * eleven bytes and costs about twelve cycles whatever its
-             * shape. Measured on the LZ decoder alone, `json_rows` 2.37 ->
-             * 3.74 GB/s and `text_en` 1.54 -> 2.29.
+             * eleven bytes and costs the same short chain of compares and
+             * stores whatever its shape. Measured on the LZ decoder alone,
+             * `json_rows` 2.37 -> 3.74 GB/s and `text_en` 1.54 -> 2.29.
              *
              * The bounds are the general path's, tested as one expression
              * and in the order those tests would run in: the literal count
-             * was just checked, `off <= op_done + lit` is the distance test
-             * taken after the literal bytes are placed, and
-             * `lit + mlen + 16 <= op_rem` covers both the output bound and
-             * the sixteen bytes the match store writes past its run, which a
-             * later command reclaims exactly as the general path's slack
-             * does. Both stores over-copy and both over-copies are
-             * overwritten -- the literal's tail by the match store, the
-             * match's tail past the command -- so the bytes in `out` are the
-             * ones the general path writes, and a stream the general path
-             * would refuse is refused here too (every test it makes is in
-             * this condition, or already made above). */
+             * is tested here rather than in front of the condition, `off <=
+             * op_done + lit` is the distance test taken after the literal
+             * bytes are placed, and `lit + mlen + 16 <= op_rem` covers both
+             * the output bound and the sixteen bytes the match store writes
+             * past its run, which a later command reclaims exactly as the
+             * general path's slack does. Both stores over-copy and both
+             * over-copies are overwritten -- the literal's tail by the match
+             * store, the match's tail past the command -- so the bytes in
+             * `out` are the ones the general path writes, and a stream the
+             * general path would refuse is refused here too (every test it
+             * makes is in this condition, or already made above). */
             /* The output test is `op_rem >= 40`, not `lit + mlen + 16 <=
              * op_rem`: with lit <= 8 and mlen <= 16 the two are the same
              * bound, and a compare is one op where the sum is three. The
              * distance test is `off <= op_done`, one literal's worth
              * stricter than the general path's after the literals are
              * placed -- a match that starts within the first eight bytes of
-             * the block takes the general path instead. */
-            if (lit <= 8u && off >= 16u && mlen <= 16u && lit_safe16 != 0 &&
-                off <= op_done && op_rem >= 40u) {
+             * the block takes the general path instead.
+             *
+             * `lit <= lit_rem` is part of this condition rather than a test
+             * of its own before it: the general path below makes that test
+             * and has to for every command that falls through, so a command
+             * that fails it here is rejected there with the same status.
+             * Folding it in is worth one less branch and one less min() of
+             * the two counters per command, and the branch hint is worth the
+             * layout: with seven terms gcc stops believing the block is
+             * taken and moves it out of line, which costs more than the
+             * tests it saves. */
+            if (ZPSE_LIKELY(lit <= 8u && lit <= lit_rem && off >= 16u &&
+                            mlen <= 16u && lit_safe16 != 0 &&
+                            off <= op_done && op_rem >= 40u)) {
                 memcpy(op, lp, 8u);
                 memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
                 op += lit + mlen;
@@ -662,6 +677,9 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 op_rem -= lit + mlen;
                 op_done += lit + mlen;
                 continue;
+            }
+            if (lit > lit_rem || lit > op_rem) {
+                return PSE_BAD_LZ;
             }
             lz_copy_literals(op, lp, lit, op_rem, lit_safe16);
             op += lit;
@@ -679,18 +697,18 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             if (off > op_done || mlen > op_rem) {
                 return PSE_BAD_LZ;
             }
-            lz_copy_match(op, off, mlen, oend);
+            lz_copy_match(op, off, mlen, op_rem);
             op += mlen;
             op_rem -= mlen;
             op_done += mlen;
         }
-    }
-    /* Every literal and every command has to be accounted for: a stream
-     * that fills the output early and then stops is not the stream the
-     * encoder wrote, and silently ignoring the rest would let a corrupt
-     * count pass as valid. */
-    if (lp != lend || cp != cend) {
-        return PSE_BAD_LZ;
+        /* Every literal and every command has to be accounted for: a stream
+         * that fills the output early and then stops is not the stream the
+         * encoder wrote, and silently ignoring the rest would let a corrupt
+         * count pass as valid. */
+        if (cmd_left != 0u || lit_rem != 0u) {
+            return PSE_BAD_LZ;
+        }
     }
     return PSE_OK;
 }
