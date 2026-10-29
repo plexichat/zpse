@@ -2713,9 +2713,11 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
-            if (rr == (uint8_t)ZPSE_R_PALETTE_BITS ||
-                rr == (uint8_t)ZPSE_R_PACKED_BASE_M ||
-                rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+            /* Only SIGNED_DELTA reads the predictions: PALETTE_BITS and
+             * PACKED_BASE_M pack cl->res_at_exc, which the classification
+             * already filled, so materialising at_pred for them is a walk
+             * over the tile whose bytes nothing reads afterwards. */
+            if (rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
                 (void)zpse_tile_fill_at_pred_reset(pred, actual, nt, plane,
                                                    seg_pos, initial_literal,
                                                    &cl);
@@ -3534,10 +3536,14 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
-            /* Only the modes that read the predictions pay for them. */
-            if (rr == (uint8_t)ZPSE_R_PALETTE_BITS ||
-                rr == (uint8_t)ZPSE_R_PACKED_BASE_M ||
-                rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
+            /* Only the mode that reads the predictions pays for them:
+             * SIGNED_DELTA codes deltas from the prediction, while
+             * PALETTE_BITS and PACKED_BASE_M pack cl->res_at_exc, which
+             * the classification already produced. Filling at_pred for
+             * those two was a second pass over every exception of every
+             * dense tile -- the shape most tiles of a four-bit or
+             * text-alphabet plane have -- for bytes no packer reads. */
+            if (rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
                 (void)zpse_tile_fill_at_pred_reset(pred, actual, nt, plane,
                                                    seg_pos, initial_literal,
                                                    &cl);
