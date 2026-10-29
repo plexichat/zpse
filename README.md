@@ -347,8 +347,8 @@ offered afterwards whatever the gate decided. What the form costs is decode
 speed, and that is what the level's **acceleration factor** decides: an LZ stream decodes at the
 speed of its command loop, one 4-byte command per output run, so its rate
 follows the average run length. Over 64 KiB blocks, at six bytes per command
-prose decodes at about 2.5 GB/s, at eleven bytes JSON at 4.0, at twenty bytes
-variable strings at 3.9, and at a hundred or more the long-run patterns at 5
+prose decodes at about 2.5 GB/s, at eleven bytes JSON at 4.5, at twenty bytes
+variable strings at 5.7, and at a hundred or more the long-run patterns at 5
 to 6.5 -- against 5-13 GB/s for a tile stream. The match copy described below
 is what keeps the short end of that range from costing more than one command
 per match.
