@@ -1548,15 +1548,76 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
 #define ZPSE_LZ_SCREEN_NUM_CHEAP 20u /* 1.25x */
 #endif
 
+#ifndef ZPSE_LZ_SCREEN_SLACK_NUM
+#define ZPSE_LZ_SCREEN_SLACK_NUM 5u
+#endif
+#ifndef ZPSE_LZ_SCREEN_SLACK_DEN
+#define ZPSE_LZ_SCREEN_SLACK_DEN 4u
+#endif
+
+/* Could a sample of `sn` bytes code to `lz_s` and still beat the block?
+ *
+ * The sample's bytes per input byte, scaled to the block, is the estimate;
+ * `best_total` is what the sweep actually reached. The estimate reads high
+ * against the block's own pass because the match finder only sees the bytes
+ * it has already scanned: a 1 KiB sample cannot code the repeat that
+ * arrives 40 KiB later (zeros_burst's sample-scaled LZ is 6.8 KiB against
+ * the 5.3 KiB its pass produces, 28%). The slack is that correction, and a
+ * verdict is only taken from a sample that loses by more than it. */
+static int zpse_block_lz_sample_can_win(uint32_t lz_s, uint32_t sn,
+                                        uint32_t n, uint32_t best_total)
+{
+    /* The sample's size before scaling: what a payload carries whatever its
+     * input, i.e. the literal-count word and one command
+     * (ZPSE_LZ_MIN_PAYLOAD). At 1 KiB it is 1% of the sample and forgettable;
+     * scaled from 1 KiB to 64 KiB it is 8 bytes against a block that may code
+     * to a few hundred, and repeating it 64 times turns a 30-byte period into
+     * a block whose estimate is four times its real size (the text-ish corpus
+     * case: 60 bytes on the sample, 584 on the block, and an estimate of 3840
+     * that convicts it). */
+    uint32_t body = lz_s > (uint32_t)ZPSE_LZ_MIN_PAYLOAD
+                        ? lz_s - (uint32_t)ZPSE_LZ_MIN_PAYLOAD
+                        : (uint32_t)ZPSE_LZ_MIN_PAYLOAD;
+    uint64_t est = ((uint64_t)body * (uint64_t)n + ((uint64_t)sn - 1u)) /
+                   (uint64_t)sn;
+    uint32_t need = best_total -
+                    (best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u);
+
+    return est * (uint64_t)ZPSE_LZ_SCREEN_SLACK_DEN <=
+           (uint64_t)need * (uint64_t)ZPSE_LZ_SCREEN_SLACK_NUM;
+}
+
 /* Should the full match-finder pass be paid for? `tid`, `sc` and the
  * metadata describe the shape the sweep wants for this block, which is what
  * the sample's tile price is measured with; the sample itself is the head of
  * the block. Returns 1 (go ahead) when the sample cannot be coded or priced
  * -- the screen is an optimisation on the sweep, never a new way to drop a
- * candidate the sweep could not judge. */
+ * candidate the sweep could not judge.
+ *
+ * `have_best` / `best_total` are the sweep's own verdict on the whole block,
+ * and they are asked of the sample once its tile price has agreed with it:
+ * the pass is what the sample is estimating, so the comparison it makes when
+ * the stream is finished (zpse_block_lz_wins, against the same total) can be
+ * made here from the sample. It is what stops the pass where LZ cannot win for a
+ * reason the head cannot show -- a block whose tile win comes from a shape
+ * the sample's 64-byte planes cannot express. uuid_mix is that block:
+ * sixteen 6-byte-prefix records code as one command per record under LZ
+ * (0.875 of a byte per byte) and 0.63 under the width-16 transpose, and the
+ * pass aborted at its own size cap after spending 68% of the block's encode
+ * time. The tile price of the same shape on the same 1 KiB sample is far
+ * worse than its 64 KiB price, so the old test accepted it; the sweep's own
+ * total cannot make that mistake.
+ *
+ * The estimate is taken from two samples, the head and the middle, and only
+ * a block both of them convict is refused. One sample is not enough: a
+ * block's head can be a burst of noise in front of 64 KiB of zeros
+ * (zeros_burst), and that head prices LZ at several times what the block's
+ * pass reaches. The second sample is paid only by a block the first has
+ * already convicted, which is the block that was about to pay a full pass. */
 static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                 uint8_t tid, uint8_t sc, const uint8_t *mb,
-                                uint16_t meta_len, uint32_t speed)
+                                uint16_t meta_len, uint32_t speed,
+                                int have_best, uint32_t best_total)
 {
     uint32_t lvl = zpse_enc_speed(speed);
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
@@ -1587,8 +1648,35 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (tile_s == UINT32_MAX) {
         return 1;
     }
-    return (uint64_t)tile_s * (uint64_t)ZPSE_LZ_SCREEN_DEN >=
-           (uint64_t)lz_s * (uint64_t)num;
+    if ((uint64_t)tile_s * (uint64_t)ZPSE_LZ_SCREEN_DEN <
+        (uint64_t)lz_s * (uint64_t)num) {
+        /* The shapes the sweep offered cannot beat the sample. That is the
+         * ordinary answer on prose, and it costs one priced sample. */
+        return 0;
+    }
+    /* The tile price agrees with LZ on the sample; the block's own total may
+     * still disagree, and that is the case this second question is for (see
+     * the comment above). Two samples, the head and the middle, and only a
+     * block both of them convict loses its pass. One is not enough: a
+     * block's head can be a burst of noise in front of 64 KiB of zeros
+     * (zeros_burst), and that head prices LZ at several times what the
+     * block's pass reaches. Asked only after the tile price has already said
+     * yes, so a block the old screen refused pays nothing new. */
+    if (have_best &&
+        !zpse_block_lz_sample_can_win(lz_s, sn, n, best_total)) {
+        uint32_t off = (n - sn) / 2u;
+        uint32_t lz_m = zpse_lz_encode(in + off, sn, e->cand,
+                                       (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                                       lvl == 1u
+                                           ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                           : (uint32_t)ZPSE_LZ_HASH_BITS);
+
+        if (lz_m != 0u &&
+            !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Is this LZ stream worth taking? Smaller than the tile winner (or the
@@ -2673,7 +2761,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                  meta_lens[0] > 0 ? meta_bufs[0] : in,
                                  meta_lens[0],
                                  e->enc_flags &
-                                     (uint32_t)ZPSE_ENC_SPEED_MASK)) {
+                                     (uint32_t)ZPSE_ENC_SPEED_MASK,
+                                 have_best, best_total)) {
             uint32_t lz_total = 0u;
             uint32_t lz_cmds = 0u;
             uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
