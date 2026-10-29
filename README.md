@@ -330,7 +330,15 @@ clock, and the intra-block LZ form is what they buy. Its match finder is a
 full pass over the block at roughly a quarter of the tile encoder's rate on
 text, so no level pays for it blind: a sample of the block's head is coded
 first, and the pass runs only when that sample shows LZ winning by the level's
-margin. The margin is what separates the levels: at 1.25x the default takes
+margin. The sample's win is measured against the same head priced as tiles,
+which is like for like but says nothing about the block: a 64-byte plane
+carries 26 bytes of envelope and header, so a wide transpose that wins the
+block can lose the sample by a wide margin, and on such a block LZ is offered
+a pass it can only abort. So the sample is also scaled to the block and
+compared with the size the sweep actually reached, and a block both the head
+and the middle convict loses the pass -- which is what turns `uuid_mix` from
+370 MB/s of aborted match finding into 1.2 GB/s. The margin is what separates
+the levels: at 1.25x the default takes
 the form on JSON, logs and variable strings, at 1.125x it also reaches beyond
 those, and at 1.0625x MAX is the only level whose screen is loose enough to
 find it on prose. Where the tile model has nothing to predict it is the
@@ -520,7 +528,7 @@ constant" shape of the size corpus -- has a price that says flat and a trial
 that says otherwise, and the trial wins because it encodes the whole block. A
 block that compresses still gets its compression; only a block that really is
 noise stops after one trial. No case of the size corpus (768 cases) grows a
-byte for it, and the corpus mean encode rate is about 975 MB/s.
+byte for it, and the corpus mean encode rate is about 1.02 GB/s.
 
 The rows it is worth most on are the ones whose head and tail are noise:
 

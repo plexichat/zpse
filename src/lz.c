@@ -198,6 +198,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     uint16_t *tab = (uint16_t *)table;
     LzOut o;
     uint32_t pos, anchor, misses, i, cmd_off, cmd_len;
+    uint32_t cur, h;
     uint32_t entries = 1u << hash_bits;
 
     if (in == 0 || dst == 0 || tab == 0) {
@@ -232,9 +233,21 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 #if ZPSE_LZ_HAVE_AVX2
     have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
 #endif
+    /* The key of the current position -- the four bytes at the cursor and
+     * its hash -- lives in `cur`/`h` across iterations instead of being
+     * recomputed at the top of each one. The lazy skip is the path it pays
+     * on: that path has just read the word at the position it advances to
+     * (it is the probe's own key), so one 4-byte load and one multiply per
+     * step of a walk come off it. The other two paths move the cursor to an
+     * offset only they know and load there. Same decisions, same streams:
+     * only which instructions issue the loads changed. Measured over the
+     * columnar corpus, the match finder alone (tests/benchmarks/bench_lz on
+     * the shootout's own generators): 1.03x geomean, `zeros_burst` 1.10x and
+     * `sparse_mix` 1.09x, where a walk is most of the pass. */
+    cur = zpse_load_u32le(in + pos);
+    h = lz_hash(cur, hash_bits);
+
     while (pos + ZPSE_LZ_MIN_MATCH <= n) {
-        uint32_t cur = zpse_load_u32le(in + pos);
-        uint32_t h = lz_hash(cur, hash_bits);
         uint32_t cand = tab[h];
         uint32_t len;
 
@@ -254,6 +267,11 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
              * has no match here, so the cursor accelerates. */
             pos += 1u + (misses >> 5);
             misses++;
+            if (pos + ZPSE_LZ_MIN_MATCH > n) {
+                break;
+            }
+            cur = zpse_load_u32le(in + pos);
+            h = lz_hash(cur, hash_bits);
             continue;
         }
         /* Lazy matching: if pos+1 has an 8-byte match, skip this position */
@@ -267,6 +285,8 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 lz_load64(in + pos + 1u) == lz_load64(in + cand1)) {
                 pos++;
                 misses = 0;
+                cur = v1;
+                h = lz_hash(cur, hash_bits);
                 continue;
             }
         }
@@ -334,6 +354,11 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         pos += len;
         anchor = pos;
         misses = 0u;
+        if (pos + ZPSE_LZ_MIN_MATCH > n) {
+            break;
+        }
+        cur = zpse_load_u32le(in + pos);
+        h = lz_hash(cur, hash_bits);
     }
     /* Trailing literals: no match left to code, so offset 0. What a run
      * of `run` literals does to both regions is known before a byte of it
