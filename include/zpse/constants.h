@@ -81,9 +81,10 @@
  *  5  ZPSE_ENC_SPEED_BALANCED price the planes of every candidate at every
  *                              plane, keep those within a margin of the best,
  *                              and encode each survivor in full -- except on
- *                              a full-size block whose survivors are tied on
- *                              that price, where the best two are tried and
- *                              the rest dropped (see ZPSE_TIE_*). Also offer
+ *                              a full-size block whose survivors the price
+ *                              can order, where the best two are tried and
+ *                              the rest dropped (see ZPSE_TIE_*, and the
+ *                              tie_field column of the ladder). Also offer
  *                              the intra-block LZ form as one more candidate.
  *                              The match finder is a full pass at roughly a
  *                              quarter of the tile encoder's rate, so a sample
@@ -96,7 +97,9 @@
  *                              acceleration factor of 16 (6 output bytes per
  *                              command, against BALANCED's 8)
  *  8                          margin 1.0625x with an acceleration factor of
- *                              20 (4.8 bytes per command)
+ *                              20 (4.8 bytes per command), and the field cut
+ *                              back to a tied tail only: the deepest rungs
+ *                              encode every survivor their price separated.
  *  9  ZPSE_ENC_SPEED_MAX      the same 1.0625x margin, one sample instead of
  *                              two (so more blocks pay for a pass), and an
  *                              acceleration factor of 24 (4 bytes per

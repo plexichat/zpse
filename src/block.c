@@ -1091,6 +1091,22 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_TIE_KEEP 2u
 #endif
 
+/* The other half of that trade, and the levels column `tie_field`: the band
+ * above says "within 1.6% the price cannot order two shapes". Outside it the
+ * price HAS ordered them, and a full trial is ~6x the price that already said
+ * so. A level with tie_field set therefore cuts any field the four guards
+ * below allow to two survivors, band or no band; a level without it keeps the
+ * band, so the deepest rungs still encode every survivor their price could
+ * not separate AND every one it could.
+ *
+ * The trade is measured, and it is the same four guards that make it safe:
+ * with the field cut on every guarded block the whole 25-case columnar corpus
+ * writes byte-identical ratios (8.29, 7.10, 1.97 ... 2.72, 7.03 on every row)
+ * and tests/suites/test_sizes.c reports the same 768 cases, grew=0, the same
+ * -127 349 bytes of shrinkage. What moves is encode time where the field is
+ * wide: rle_lens 1.75 -> 2.4 GB/s and dict_u8 0.67 -> 0.80 GB/s, +3.4% and
+ * +4.3% on the mean of two alternating runs. */
+
 static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint8_t tid, uint8_t sc,
                              const uint8_t *meta_bytes, uint16_t meta_len,
@@ -1512,6 +1528,11 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  *   accel       the LZ decode bill (ZPSE_LZ_BPC_CROSS / accel bytes per
  *               command); a larger factor accepts streams with shorter runs,
  *               so it is a superset of the row above for the same reason.
+ *   tie_field   1 = cut a guarded full-size field to its best two on price
+ *               alone (see ZPSE_TIE_KEEP); 0 = only when the third price is
+ *               inside the near-tie band. Cutting trials can only raise a
+ *               block's total, so the column is non-increasing down the
+ *               ladder and the deeper row still chooses from a superset.
  *
  * Levels 1-4 write no LZ form, so their LZ columns are zero and unused.
  * The prescreen width (level 1 cheap, 2-9 full) and the every-plane pricing
@@ -1523,32 +1544,35 @@ typedef struct {
     uint8_t screen_num;
     uint8_t samples;
     uint8_t accel;
+    uint8_t tie_field;
 } ZpseLevel;
 
 static const ZpseLevel zpse_level[10] = {
     /* 0: never used -- an empty level field normalises to BALANCED. */
-    { 0u, 0u, 0u, 0u },
+    { 0u, 0u, 0u, 0u, 0u },
     /* 1 FASTEST: the probe's winner only, no match finder. */
-    { 1u, 0u, 0u, 0u },
+    { 1u, 0u, 0u, 0u, 0u },
     /* 2: full nine-predictor prescreen, two trials. */
-    { 2u, 0u, 0u, 0u },
+    { 2u, 0u, 0u, 0u, 0u },
     /* 3 FASTER: the same prescreen, three trials. */
-    { 3u, 0u, 0u, 0u },
+    { 3u, 0u, 0u, 0u, 0u },
     /* 4: four trials, still no match finder. */
-    { 4u, 0u, 0u, 0u },
-    /* 5 BALANCED (default): every survivor, 1.25x screen, 8 B/command. */
+    { 4u, 0u, 0u, 0u, 0u },
+    /* 5 BALANCED (default): every survivor, 1.25x screen, 8 B/command, and a
+     * guarded field cut to its best two on price. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_BALANCED, 2u,
-      (uint8_t)ZPSE_LZ_ACCEL_BALANCED },
+      (uint8_t)ZPSE_LZ_ACCEL_BALANCED, 1u },
     /* 6: the screen loosened to 1.1875x, same decode bill. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L6, 2u,
-      (uint8_t)ZPSE_LZ_ACCEL_BALANCED },
+      (uint8_t)ZPSE_LZ_ACCEL_BALANCED, 1u },
     /* 7: 1.125x, 6 B/command. */
-    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L7, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7 },
-    /* 8: MAX's 1.0625x margin, two samples, 5 B/command. */
-    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 2u, (uint8_t)ZPSE_LZ_ACCEL_L8 },
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L7, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7, 1u },
+    /* 8: MAX's 1.0625x margin, two samples, 5 B/command. The deepest rungs
+     * keep every survivor the price could not separate. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 2u, (uint8_t)ZPSE_LZ_ACCEL_L8, 0u },
     /* 9 MAX: the head sample only, 4 B/command. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 1u,
-      (uint8_t)ZPSE_LZ_ACCEL_MAX }
+      (uint8_t)ZPSE_LZ_ACCEL_MAX, 0u }
 };
 
 /* The row for a level number (1-9). An out-of-range level cannot reach here
@@ -2619,8 +2643,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * of them a tied field on "three-value alphabet" blocks grows by 24
          * bytes in 768 cases. */
         {
-            uint32_t cap = (uint32_t)zpse_level_row(
-                zpse_enc_speed(speed))->trials;
+            const ZpseLevel *row = zpse_level_row(zpse_enc_speed(speed));
+            uint32_t cap = (uint32_t)row->trials;
 
             /* Only a level that prices EVERY survivor can cut a field: the
              * cheap rungs already stop at their own trial count, and
@@ -2634,7 +2658,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
                 if (pick >= 0 && ncand >= 4 && !head_misleads &&
                     !content_kept && third != UINT32_MAX &&
-                    third - best <= best >> ZPSE_TIE_BAND_SHIFT) {
+                    (row->tie_field != 0u ||
+                     third - best <= best >> ZPSE_TIE_BAND_SHIFT)) {
                     ncand = (int)ZPSE_TIE_KEEP;
                 }
             }
