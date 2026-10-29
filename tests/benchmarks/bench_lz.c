@@ -8,6 +8,27 @@
  *
  * Best-of-reps timing; reports MB/s (1e6 B/s) of uncompressed input and
  * the payload size the matcher produced.
+ *
+ * These are the match finder's own numbers, so the slowest row is not a
+ * worst case for the encoder: `lowentropy` (a random stream over sixteen
+ * byte values) is the slow one, at 0.3-0.4 GB/s against `random`'s 17 GB/s
+ * depending on the host's state, and the difference is what the data leaves
+ * the finder to do.
+ * `random` never passes the 4-byte compare, so the miss accelerator walks
+ * the block in about 2 000 iterations; `lowentropy` passes it 4 655 times,
+ * each hit resetting that accelerator and restarting the loop, and the
+ * 4-byte matches it finds are worth 400 bytes in 65 536 (0.994 of the
+ * input) because a length-4 match pays for its own command word and no
+ * more. On 64 KiB blocks of this pattern no level pays that pass: the LZ
+ * screen prices the head's tiles at 766 bytes against the finder's 1 044
+ * and refuses at every rung from FASTEST to MAX, so the row measures work
+ * the encoder does not do. What it spends its 81 us on instead is the
+ * decision probe, which prices ten candidates exactly on the block's head,
+ * and two full trials: the identity, which is written at 33 288 bytes, and
+ * a transpose behind it, whose stream has already outgrown the block when
+ * it overflows the candidate buffer (PSE_OUTPUT_OVERFLOW, not a budget
+ * stop). See tests/tools/enc_profile and the ZPSE_BLOCK_STATS counters in
+ * src/block.c for the split.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
