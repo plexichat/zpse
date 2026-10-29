@@ -307,23 +307,26 @@ worth. There are nine levels, 1 = FASTEST to 9 = MAX, stored in bits 1-4 as
 `level << 1`; a field with no level bits is the default, BALANCED at level 5,
 and an unsupported level is rejected with `PSE_BAD_ARG` rather than rounded to
 a neighbour. No level changes the format: every level's stream is read by the
-same decoder, and a level only decides which shape gets written. The levels
-are adjacent rungs, not aliases -- each one costs encode time and returns
-ratio -- and all nine were measured in one binary over the columnar corpus
-(25 cases, 4 MiB each, 64 KiB blocks, best of three runs of the whole matrix
-on one host, `tests/benchmarks/bench_levels.c`):
+same decoder, and a level only decides which shape gets written. Five of the
+nine are distinct rungs -- each one costs encode time and returns ratio -- and
+the four between them (2, 4, 6, 8) repeat the tier below, which the table's
+`same as` column records rather than a measurement of its own. All nine were
+measured in one binary over the columnar corpus
+(25 cases, 4 MiB each, 64 KiB blocks, best of five runs of the whole matrix,
+each run the harness's own best of three timed reps, on one host,
+`tests/benchmarks/bench_levels.c`):
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.43 GB/s | 14.1 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
-| 2 | 3.99:1 | 1.44 GB/s | 14.1 GB/s | same as level 1 |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.09 GB/s | 14.3 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
-| 4 | 4.06:1 | 1.11 GB/s | 14.8 GB/s | same as level 3 |
-| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.49:1 | 669 MB/s | 12.1 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
-| 6 | 4.49:1 | 661 MB/s | 12.4 GB/s | same as level 5 |
-| 7 | 4.51:1 | 600 MB/s | 11.9 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
-| 8 | 4.51:1 | 600 MB/s | 12.5 GB/s | same as level 7 |
-| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 586 MB/s | 10.9 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.85 GB/s | 16.4 GB/s | one trial per block, the three uniform predictors screened only, no match finder |
+| 2 | 3.99:1 | 1.85 GB/s | 16.5 GB/s | same as level 1 |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.60 GB/s | 17.4 GB/s | the full nine-predictor prescreen, at most two full trials, no match finder |
+| 4 | 4.06:1 | 1.60 GB/s | 17.5 GB/s | same as level 3 |
+| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.50:1 | 984 MB/s | 14.0 GB/s | every candidate priced on a tile of every plane, survivors encoded in full, and the LZ form offered on a 1.25x sample win |
+| 6 | 4.50:1 | 985 MB/s | 13.7 GB/s | same as level 5 |
+| 7 | 4.53:1 | 893 MB/s | 13.8 GB/s | the LZ sample margin tightened to 1.125x, acceleration factor 16 |
+| 8 | 4.53:1 | 892 MB/s | 13.9 GB/s | same as level 7 |
+| 9 `ZPSE_ENC_SPEED_MAX` | 4.54:1 | 873 MB/s | 13.3 GB/s | the LZ sample margin at its loosest, 1.0625x, acceleration factor 24 |
 
 Levels 5 to 9 are the ones to reach for when bytes matter more than the
 clock, and the intra-block LZ form is what they buy. Its match finder is a
@@ -346,7 +349,7 @@ difference between raw and compression:
 
 | case | `ZPSE_ENC_SPEED_BALANCED` | `ZPSE_ENC_MAX` | tile stream alone |
 | --- | ---: | ---: | ---: |
-| `json_rows` | 2.05:1 | 2.05:1 | 1.09:1 |
+| `json_rows` | 2.06:1 | 2.06:1 | 1.09:1 |
 | `log_lines` | 2.63:1 | 2.63:1 | 1.09:1 |
 | `var_string` | 2.52:1 | 2.52:1 | 1.09:1 |
 | `utf8_multi` | 1.64:1 | 2.00:1 | 1.00:1 |
