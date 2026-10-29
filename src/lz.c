@@ -280,7 +280,18 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             uint32_t h1 = lz_hash(v1, ZPSE_LZ_HASH_BITS_FAST);
             uint32_t cand1 = tab[h1];
 
-            if (cand1 != LZ_EMPTY && zpse_load_u32le(in + cand1) == v1 &&
+            /* cand1 == pos is not a prior occurrence: when h1 == h the
+             * entry the probe reads is the one this iteration wrote a few
+             * lines up, so the test below would compare the cursor with
+             * itself and pass unconditionally. On a run of one byte every
+             * position then "has" an 8-byte match at pos+1, and the block
+             * is walked a byte at a time -- 64 KiB of iterations on an
+             * all-zero block, measured at 465 MB/s against const5A's
+             * 28 GB/s for the same shape -- to reach a position the
+             * backward extension below pulls straight back to the anchor.
+             * A self-reference is no match at all, so it is refused here. */
+            if (cand1 != LZ_EMPTY && cand1 != pos &&
+                zpse_load_u32le(in + cand1) == v1 &&
                 cand1 + 9u <= n &&
                 lz_load64(in + pos + 1u) == lz_load64(in + cand1)) {
                 pos++;
