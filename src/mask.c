@@ -598,9 +598,15 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
          * word operations plus one ctz per transition replace 256 bit
          * tests and the alternating branch that follows them (measured:
          * the bit scan cost ~640 cycles per record, 18% of a tile). */
-        uint16_t runs[257];
+        /* The edge list is the only array this needs: a run length is the
+         * difference of two consecutive edges, so the second array of run
+         * lengths -- and the pass that filled it -- is gone. The price
+         * still has to be known before the first payload byte is written,
+         * so the edges are walked twice, once to size the payload and once
+         * to write it; both walks are over the same 258-entry array, and
+         * neither re-reads the mask words. */
         uint16_t edge[258];
-        int nruns;
+        int nb = 0;
         uint32_t need = 0;
         int r;
         uint16_t o = 0;
@@ -610,7 +616,6 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
         if (zpse_mask_count_bits(words, nt) != (int)k)
             return PSE_BAD_MASK;
         {
-            int nb = 0;
             uint32_t prev = 0u;
             int wi;
 
@@ -643,40 +648,29 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
                 prev = w >> 31;
             }
             edge[nb++] = nt;
-            nruns = nb - 1;
-            for (r = 0; r < nruns; r++)
-                runs[r] = (uint16_t)(edge[r + 1] - edge[r]);
         }
-        for (r = 0; r < nruns; r++) {
-            uint32_t L = runs[r];
+        /* Runs of zero length (a split boundary, or a mask that opens with
+         * an exception) cost one byte; a run of L in 1..255 costs one; only
+         * L == 256 -- the whole tile, which the k tests above exclude but a
+         * split boundary does not -- needs the 255, 0, 1 form. */
+        for (r = 0; r + 1 < nb; r++) {
+            uint32_t L = (uint32_t)(edge[r + 1] - edge[r]);
 
-            if (L == 0) {
-                need += 1;
-            } else {
-                uint32_t chunks = (L + 254u) / 255u;
-
-                need += 2u * chunks - 1u;
-            }
+            need += (L == 0u) ? 1u : (2u * ((L + 254u) / 255u) - 1u);
         }
         if (need > payload_cap)
             return PSE_OUTPUT_OVERFLOW;
         if (need > 0 && payload_out == 0)
             return PSE_BAD_ARG;
-        for (r = 0; r < nruns; r++) {
-            uint32_t L = runs[r];
+        for (r = 0; r + 1 < nb; r++) {
+            uint32_t L = (uint32_t)(edge[r + 1] - edge[r]);
 
-            if (L == 0) {
+            while (L > 255u) {
+                payload_out[o++] = 255;
                 payload_out[o++] = 0;
-            } else {
-                uint32_t rem = L;
-
-                while (rem > 255u) {
-                    payload_out[o++] = 255;
-                    payload_out[o++] = 0;
-                    rem -= 255u;
-                }
-                payload_out[o++] = (uint8_t)rem;
+                L -= 255u;
             }
+            payload_out[o++] = (uint8_t)L;
         }
         return (int)o;
     }
