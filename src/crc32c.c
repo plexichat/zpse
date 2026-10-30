@@ -579,6 +579,13 @@ uint32_t zpse_crc32c_update(uint32_t crc, const uint8_t *data, size_t len)
 #endif
     zpse_crc32c_s8_init();
     crc = zpse_crc32c_slice8(crc, data, len);
+    /* The slice-by-8 pass takes `data` by value, so the tail has to be
+     * told where the eight-byte groups ended: without this the remainder
+     * is read from the FRONT of the buffer and every software-path CRC of
+     * a length that is not a multiple of eight is wrong. (It cannot be
+     * seen on x86-64, where the hardware chain answers first, or in any
+     * suite here, for the same reason.) */
+    data += len & ~(size_t)7u;
     len &= 7u;
     while (len != 0u) {
         crc = zpse_crc32c_table[(crc ^ *data++) & 0xFFu] ^ (crc >> 8);
