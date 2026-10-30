@@ -674,6 +674,23 @@ Portable C11, no compiler-specific code outside `#if defined(__GNUC__)`
 guards; AVX2 paths are selected at runtime (`zpse_cpu_caps()`), and the scalar
 fallbacks are bit-identical, which is what the parity suite exists to prove.
 
+One toolchain does not get the AVX2 kernels: gcc on Windows. A 256-bit vector
+passed to a function by value reaches the stack in a slot the compiler emits
+`vmovdqa` for, and MinGW gcc cannot align that slot -- it caps
+`-mpreferred-stack-boundary` at 4 and rejects 5, `-mstackrealign` and
+`force_align_arg_pointer` realign only to the 16 bytes it accepts, and
+`__m256i_u` does not change the ABI temporary, which is aligned for the
+vector mode rather than the type. The kernels therefore faulted on the first
+vector helper they called: `test_transforms`, `test_lz`, `test_ascii`,
+`test_levels`, `test_sizes` and the fuzz driver all died on
+`vmovdqa %ymm0,0x20(%rsp)` in `zpse_merge2_avx2` / `zpse_merge4_avx2`. So
+`include/zpse/hot.h` answers `ZPSE_AVX2_ABI_OK 0` there and every kernel site
+compiles to its SSE2 or scalar twin. MSVC keeps them (it aligns a 32-byte
+type on the stack to 32) and so does clang. `-DZPSE_AVX2_ABI_OK=0` builds the
+kernels out anywhere, which is how that configuration is tested on Linux: the
+parity, fuzz and lseed suites print the same digests from it as from the
+default build, and the whole suite passes on Windows gcc.
+
 ### What the compiler adds, and what the tags are worth
 
 Every number in this README is an `-O2` number: the CI matrix,

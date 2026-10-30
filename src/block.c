@@ -2419,12 +2419,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * the scalar, SIMD and swapped-order builds.
      *
      * sample == 2 means the identity's plane predicts every sampled tile,
-     * so its trial is about to reach the global floor and end the sweep on
-     * the first attempt: pricing the other candidates would then be pure
-     * cost, and on a constant block it is most of the encode. The sample
-     * says nothing about "is one candidate clearly better than another"
-     * unless it looked at more than one plane, so the gate is exact about
-     * what it knows. */
+     * which reads like "its trial is about to reach the global floor and
+     * end the sweep on the first attempt, so pricing the other candidates
+     * is pure cost". It is not, and the pass below is deliberately NOT
+     * gated on it: measured, skipping the pricing pass when sample == 2
+     * costs 1.95x on the zeros_burst case of the columnar corpus (453 ->
+     * 232 MB/s, 64 KiB blocks) and 1.25x on sparse_mix. The reason is the
+     * one that makes the two forms different: what ends a sweep early is
+     * the pricing loop's own break when the identity PRICES at its floor,
+     * and a block whose zeros start after a noise head never gets that
+     * price while its identity trial still cannot reach the floor either.
+     * With no prices there is no break and the trial loop walks the whole
+     * survivor list; with them, the probe's first candidate settles it. */
 #ifndef ZPSE_KEEP_EXACT_SWEEP
     /* ---- Decide from a sample, then encode once ---------------- *
      * DEFAULT; build with -DZPSE_KEEP_EXACT_SWEEP for the old sweep, which

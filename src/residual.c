@@ -42,10 +42,10 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) && !defined(_MSC_VER)
 #define ZPSE_RES_AVX2 __attribute__((target("avx2")))
-#define ZPSE_RES_HAVE_AVX2 1
+#define ZPSE_RES_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #elif defined(__AVX2__)
 #define ZPSE_RES_AVX2
-#define ZPSE_RES_HAVE_AVX2 1
+#define ZPSE_RES_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #else
 #define ZPSE_RES_AVX2
 #define ZPSE_RES_HAVE_AVX2 0
@@ -1279,7 +1279,6 @@ static int residual_decode_mode3(const uint8_t *payload,
     uint32_t nfull;
     uint32_t j;
     uint32_t bad = 0u;
-    int rc;
 
     if (payload_len < 1u) {
         return PSE_BAD_RESIDUAL;
@@ -1302,6 +1301,11 @@ static int residual_decode_mode3(const uint8_t *payload,
 
     j = 0u;
 #if ZPSE_RES_HAVE_AVX2
+    /* Declared here, not with the others: the vector batch is the only
+     * caller, and the kernel-less build (see ZPSE_AVX2_ABI_OK) must not
+     * carry an unused local. */
+    int rc;
+
     /* Nibble-packed batches of eight groups (see residual_decode_mode3_nib).
      * One group is always left to the scalar loops below, so the two bytes
      * of padding the g == 7 stores can leave past a batch always land in a

@@ -235,10 +235,10 @@ ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_xor16, _mm_xor_si128, ZPSE_XOR8)
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) && !defined(_MSC_VER)
 #define ZPSE_T_AVX2 __attribute__((target("avx2")))
-#define ZPSE_T_HAVE_AVX2 1
+#define ZPSE_T_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #elif defined(__AVX2__)
 #define ZPSE_T_AVX2
-#define ZPSE_T_HAVE_AVX2 1
+#define ZPSE_T_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #else
 #define ZPSE_T_AVX2
 #define ZPSE_T_HAVE_AVX2 0

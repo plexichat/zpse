@@ -1140,7 +1140,7 @@ void seg_screen_rank(void)
  * baseline ISA. The runtime capability check still decides whether it
  * runs. */
 #define ZPSE_PS_AVX2 __attribute__((target("avx2"), aligned(64)))
-#define ZPSE_PS_HAVE_AVX2 1
+#define ZPSE_PS_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #elif defined(__AVX2__)
 /* MSVC has no per-function target attribute: the AVX2 intrinsics exist
  * only when the whole translation unit is built with /arch:AVX2, which
@@ -1150,7 +1150,7 @@ void seg_screen_rank(void)
  * check in seg_prescreen() gates execution, so a /arch:AVX2 binary is
  * still correct on a CPU without AVX2. */
 #define ZPSE_PS_AVX2
-#define ZPSE_PS_HAVE_AVX2 1
+#define ZPSE_PS_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #else
 #define ZPSE_PS_AVX2
 #define ZPSE_PS_HAVE_AVX2 0
@@ -1204,6 +1204,30 @@ void seg_screen_rank(void)
         a8 = _mm256_sub_epi8(a8, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
                  _mm256_loadu_si256((const __m256i *)(const void *)        \
                      ((PB_) + 13u + (size_t)(Q_)))), MASK_));              \
+    } while (0)
+
+/* The same accumulation for the fast tier, which reads only ks[0], ks[1]
+ * and ks[5] (CONST_ZERO, LANE_PREVIOUS, STRIDE_1) and leaves the other six
+ * counters sentinel -- the scalar twin guards exactly those six with
+ * `if (!fast_tier)` and publishes the same three. Evaluating all nine and
+ * overwriting six results afterwards was hidden by the sentinel stores in
+ * the epilogue, but it still paid six cmpeq/and/sub triples, the
+ * LANE_DELTA and LANE_AVERAGE operands, and the three shifted loads at
+ * PB+12/13/14 on every 32-byte chunk. a0, a1 and a3 are the only terms the
+ * fast tier publishes (see the epilogue: acc[0] -> ks[0], acc[1] -> ks[1],
+ * acc[3] -> ks[5]), and none of them reads h16, so dropping the rest
+ * cannot change a count this tier reports. The caller keeps its own load
+ * block and blends for both paths, which keeps the branch to one test and
+ * lets gcc delete the chain that is dead here. */
+#define SEG_PS_CHUNK_FAST(v_, h8L_, MASK_, PB_, Q_)                        \
+    do {                                                                   \
+        a0 = _mm256_sub_epi8(a0, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, zero), MASK_));                     \
+        a1 = _mm256_sub_epi8(a1, _mm256_and_si256(                         \
+                 _mm256_cmpeq_epi8(v_, h8L_), MASK_));                     \
+        a3 = _mm256_sub_epi8(a3, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
+                 _mm256_loadu_si256((const __m256i *)(const void *)        \
+                     ((PB_) + 15u + (size_t)(Q_)))), MASK_));              \
     } while (0)
 
 /* One pass for the whole tile, so there is no scalar prologue or tail to
@@ -1305,7 +1329,11 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
             h8L = _mm256_blendv_epi8(h8L, initv, m8);
             h16 = _mm256_blendv_epi8(h16, initv, m16);
         }
-        SEG_PS_CHUNK(v, h8L, h8S, h16, all, pb, p);
+        if (fast_tier) {
+            SEG_PS_CHUNK_FAST(v, h8L, all, pb, p);
+        } else {
+            SEG_PS_CHUNK(v, h8L, h8S, h16, all, pb, p);
+        }
         p += 32u;
     }
     if (p < (uint32_t)nt) {
@@ -1347,7 +1375,11 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
                 h8L = _mm256_blendv_epi8(h8L, initv, m8);
                 h16 = _mm256_blendv_epi8(h16, initv, m16);
             }
-            SEG_PS_CHUNK(v, h8L, h8S, h16, valid, tb, q);
+            if (fast_tier) {
+                SEG_PS_CHUNK_FAST(v, h8L, valid, tb, q);
+            } else {
+                SEG_PS_CHUNK(v, h8L, h8S, h16, valid, tb, q);
+            }
         }
     }
 
@@ -2356,9 +2388,11 @@ static ZPSE_PS_AVX2 uint32_t seg_alphabet_first_outside_avx2(
 }
 #endif /* ZPSE_PS_HAVE_AVX2 */
 
+#if ZPSE_PS_HAVE_AVX2
 /* SWAR population count (same idiom as mask.c): __builtin_popcount lowers
  * to a libgcc call unless the whole build has -mpopcnt, which this
- * portable codebase does not. */
+ * portable codebase does not. It lives inside the kernel guard because
+ * the vector fold is its only caller (see ZPSE_AVX2_ABI_OK). */
 static uint32_t seg_pop32(uint32_t w)
 {
     w = w - ((w >> 1) & 0x55555555u);
@@ -2367,7 +2401,6 @@ static uint32_t seg_pop32(uint32_t w)
     return (w * 0x01010101u) >> 24;
 }
 
-#if ZPSE_PS_HAVE_AVX2
 /* One compare and one movemask per 32 values of the presence array: the
  * complement of its movemask against zero has a one exactly where a value
  * occurred, which is the word of `bits` for those 32 values. */

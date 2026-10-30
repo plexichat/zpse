@@ -1020,11 +1020,11 @@ static ZPSE_TILE_RARE void tile_seen_trim(uint32_t seen[8], unsigned keep,
  * entries makes the kernels' cost a property of their own code. */
 #define ZPSE_TILE_AVX2 __attribute__((target("avx2"), aligned(64)))
 #define ZPSE_TILE_AVX2P __attribute__((target("avx2,popcnt"), aligned(64)))
-#define ZPSE_TILE_HAVE_AVX2 1
+#define ZPSE_TILE_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #elif defined(__AVX2__)
 #define ZPSE_TILE_AVX2
 #define ZPSE_TILE_AVX2P
-#define ZPSE_TILE_HAVE_AVX2 1
+#define ZPSE_TILE_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #else
 #define ZPSE_TILE_AVX2
 #define ZPSE_TILE_AVX2P

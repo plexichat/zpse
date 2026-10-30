@@ -69,4 +69,43 @@
 #define ZPSE_LIKELY(X) (X)
 #endif
 
+/* Whether this toolchain can be handed the 256-bit kernels at all.
+ *
+ * A `__m256i` stack slot has to be 32-byte aligned, because that is what
+ * gcc emits for it: `vmovdqa`, not `vmovdqu`. On the SysV ABI the alignment
+ * is there. On Windows x64 the compiler cannot provide it -- MinGW gcc caps
+ * -mpreferred-stack-boundary at 4 (it rejects 5) -- so every 256-bit value
+ * that reaches the stack is a fault waiting for its address. Ordinary
+ * locals are not the problem: gcc spills them with `vmovdqu` when it can
+ * see they are only vector registers. The problem is a vector argument
+ * passed BY VALUE to a function gcc chose not to inline (and a vector
+ * return through the hidden pointer): the caller materialises the argument
+ * in an aligned temporary and the callee reads it as aligned, and nothing
+ * in the sources can change either assumption.
+ *
+ * Measured on this tree, with gcc 16.1 (MinGW-w64) at -O2 and the same
+ * sources passing under Linux gcc: test_transforms, test_lz, test_ascii,
+ * test_levels, test_sizes and the fuzz driver died in zpse_merge2_avx2 /
+ * zpse_merge4_avx2 on `vmovdqa %ymm0,0x20(%rsp)` -- the argument block of
+ * `zpse_chain_undo32`. `__m256i_u` (alignment 1) does not help, because
+ * the ABI temporary is aligned for the vector MODE, not the type, and
+ * -mstackrealign / force_align_arg_pointer do not either, because both
+ * realign to the 16-byte boundary that is the most MinGW accepts.
+ *
+ * So on that toolchain the runtime gate answers "no AVX2" and every kernel
+ * site falls back to its SSE2 or scalar twin, which are bit-exact (that is
+ * what tests/test_parity.c proves on every platform) and are what a CPU
+ * without AVX2 runs anyway. MSVC keeps the kernels: it aligns a 32-byte
+ * type on the stack to 32. clang keeps them too. The macro can be set on
+ * the command line (-DZPSE_AVX2_ABI_OK=0) to build the kernels out
+ * anywhere, which is how the fallback build is tested on Linux. */
+#ifndef ZPSE_AVX2_ABI_OK
+#if defined(__GNUC__) && !defined(__clang__) && \
+    (defined(_WIN32) || defined(__CYGWIN__))
+#define ZPSE_AVX2_ABI_OK 0
+#else
+#define ZPSE_AVX2_ABI_OK 1
+#endif
+#endif
+
 #endif /* ZPSE_HOT_H */

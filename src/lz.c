@@ -36,10 +36,10 @@ static uint64_t lz_load64(const uint8_t *p)
     defined(_M_IX86)
 #if defined(__GNUC__) && !defined(_MSC_VER)
 #define ZPSE_LZ_AVX2 __attribute__((target("avx2")))
-#define ZPSE_LZ_HAVE_AVX2 1
+#define ZPSE_LZ_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #elif defined(__AVX2__)
 #define ZPSE_LZ_AVX2
-#define ZPSE_LZ_HAVE_AVX2 1
+#define ZPSE_LZ_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #else
 #define ZPSE_LZ_HAVE_AVX2 0
 #endif
@@ -339,7 +339,13 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             len += m;
             if (!hit) {
                 if (have_avx2) {
+#if ZPSE_LZ_HAVE_AVX2
+                    /* `have_avx2` is a constant 0 when the kernel is
+                     * compiled out (see ZPSE_AVX2_ABI_OK), so this branch
+                     * is unreachable -- but it still has to parse, and the
+                     * kernel it names does not exist in that build. */
                     len = lz_extend_avx2(in, pos, cand, len, n);
+#endif
                 } else {
                     while (pos + len + 8u <= n && cand + len + 8u <= n &&
                            lz_load64(in + pos + len) ==
