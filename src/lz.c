@@ -9,6 +9,15 @@
 #include <stdint.h>
 #include <string.h>
 
+/* SSE2 is the baseline of every x86-64 build and of MSVC on x86; the guard
+ * is the same one src/dense.c and src/transform.c use, so the kernel below
+ * compiles everywhere and costs nothing where it cannot. */
+#if defined(__SSE2__) || defined(_M_X64) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define ZPSE_LZ_HAVE_SSE2 1
+#include <emmintrin.h>
+#endif
+
 /* An empty hash slot. Positions are 16-bit because a block is at most
  * 64 KiB, and the encoder never inserts a position past n - 4, so 0xFFFF
  * is not a legitimate entry. */
@@ -190,6 +199,72 @@ static void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
         len -= chunk;
     }
     lz_put_cmd(o, off, run, len);
+}
+
+/* Move the command stream into place behind the literals, and unreverse it
+ * in the same pass.
+ *
+ * Commands were pushed backwards from the end of the buffer, so the region
+ * [src, src + len) holds them in reverse order while the output wants them
+ * forwards at [off, off + len). That used to be a memmove of the whole
+ * command stream followed by an in-place four-byte swap per command: two
+ * passes over up to 64 KiB, the second at 2 loads, 2 stores and four
+ * address computations per command word.
+ *
+ * The destination is always below the source (the caller checks
+ * off <= src), so when the two regions do not overlap the move and the
+ * reversal are one pass: read the source from its end downwards, write the
+ * destination upwards, and each step takes four commands out of one
+ * 16-byte load with one dword shuffle -- _mm_shuffle_epi32 with 0x1B
+ * reverses the order of the four words and leaves each word's own bytes
+ * alone, which is exactly the permutation wanted. Nothing is read twice
+ * and nothing is written twice.
+ *
+ * Overlap can only happen at the very end of a buffer the block nearly
+ * fills (lz_emit_short refuses to go there in any compressible case), and
+ * there the two passes are kept as they were: memmove is defined for an
+ * overlapping move, and the reversal is a swap pair, not a copy. Same
+ * bytes either way. */
+static void lz_commands_out(uint8_t *dst, uint32_t src, uint32_t off,
+                            uint32_t len)
+{
+    uint32_t words = len / 4u;
+
+    if (off + len <= src) {
+        uint32_t i = 0u;
+
+#if ZPSE_LZ_HAVE_SSE2
+        for (; i + 4u <= words; i += 4u) {
+            __m128i v = _mm_loadu_si128(
+                (const __m128i *)(const void *)(dst + src + len - 16u -
+                                                (size_t)i * 4u));
+
+            _mm_storeu_si128((__m128i *)(void *)(dst + off + (size_t)i * 4u),
+                             _mm_shuffle_epi32(v, 0x1B));
+        }
+#endif /* ZPSE_LZ_HAVE_SSE2 */
+        for (; i < words; i++) {
+            zpse_store_u32le(dst + off + (size_t)i * 4u,
+                             zpse_load_u32le(dst + src + len - 4u -
+                                             (size_t)i * 4u));
+        }
+        return;
+    }
+    memmove(dst + off, dst + src, len);
+    {
+        uint32_t lo = off;
+        uint32_t hi = off + len - 4u;
+
+        while (lo < hi) {
+            uint32_t a = zpse_load_u32le(dst + lo);
+            uint32_t b = zpse_load_u32le(dst + hi);
+
+            zpse_store_u32le(dst + lo, b);
+            zpse_store_u32le(dst + hi, a);
+            lo += 4u;
+            hi -= 4u;
+        }
+    }
 }
 
 ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
@@ -420,27 +495,14 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cmd_off + cmd_len > cap || cmd_off > o.cmd_hi) {
         return 0u;
     }
-    memmove(dst + cmd_off, dst + o.cmd_hi, cmd_len);
     /* The commands were pushed backwards from the end of the buffer, so
-     * the block now holds them in reverse: put them back in the order the
-     * decoder reads them. (The alternative -- growing them forwards into
-     * space the literal stream has not reached yet -- cannot be done
-     * without a second buffer, since neither stream's length is known
-     * until the block is finished.) */
-    {
-        uint32_t lo = cmd_off;
-        uint32_t hi = cmd_off + cmd_len - 4u;
-
-        while (lo < hi) {
-            uint32_t a = zpse_load_u32le(dst + lo);
-            uint32_t b = zpse_load_u32le(dst + hi);
-
-            zpse_store_u32le(dst + lo, b);
-            zpse_store_u32le(dst + hi, a);
-            lo += 4u;
-            hi -= 4u;
-        }
-    }
+     * the block holds them in reverse and behind the literals: put them
+     * back in the order the decoder reads them, in one pass that copies as
+     * it reverses. (The alternative -- growing them forwards into space
+     * the literal stream has not reached yet -- cannot be done without a
+     * second buffer, since neither stream's length is known until the
+     * block is finished.) */
+    lz_commands_out(dst, o.cmd_hi, cmd_off, cmd_len);
     /* Deterministic padding: a byte the decoder never reads is still a
      * byte of the stream, and the encoder promises identical output. */
     for (i = 4u + o.lit_total; i < cmd_off; i++) {

@@ -740,6 +740,73 @@ static ZPSE_T_AVX2 void zpse_prefix_stream_avx2(uint8_t *dst, const uint8_t *in,
     }
 }
 
+/* 16-wide delta/xor inverse, 4 KiB of output per pass.
+ *
+ * The SSE2 group loop in zpse_transform_inverse restores one 16-row group
+ * per plane inside a register -- load 16 bytes, four shift-ops for the
+ * inclusive prefix -- and then has to hand the chain's last byte to the
+ * next iteration through a GPR: `_mm_cvtsi128_si32(_mm_srli_si128(v, 15))`
+ * out, a broadcast back in. That round trip is once per plane per sixteen
+ * rows, i.e. 4096 times for a 64 KiB block, and it sits on the critical
+ * path of a chain that is otherwise eight independent planes' worth of
+ * work (the flip side of the same coin is that the sixteen chains are
+ * independent, so it is throughput rather than latency that binds).
+ *
+ * So the two halves of that loop are separated here. The chain is a
+ * byte-wise prefix scan over a contiguous run of a plane, which is what
+ * zpse_prefix_sum32 / zpse_prefix_xor32 exist for: eight 32-byte ladders
+ * per carry link, the running value kept in a vector register as a
+ * broadcast, no GPR round trip inside a 256-byte chunk. The interleave is
+ * the same 16x16 gather the non-delta inverse uses, run over a 4 KiB
+ * staging block whose sixteen 256-byte runs sit four cache lines apart,
+ * so direct (unblocked) staging is the right form for it -- see
+ * zpse_t16x16_inverse_direct. Both kernels are bit-exact on their own
+ * (tests/test_parity.c compares them against the scalar reference), so
+ * the composition is: the staging byte at index 255 of a plane's run is
+ * that plane's chain value after the chunk, which is exactly the carry
+ * the SSE2 loop would have extracted.
+ *
+ * Only complete chunks of sixteen groups are done here. `*g` and `pv` are
+ * advanced for the caller's SSE2 group loop and its ragged tail, which
+ * produce exactly the bytes they always did. */
+static ZPSE_T_AVX2 void zpse_delta16_inverse_avx2(const uint8_t *const segs[16],
+                                                  uint8_t *out, uint32_t rows,
+                                                  uint32_t *g, uint8_t pv[16],
+                                                  int delta)
+{
+    enum { ZPSE_D16_CHUNK = 16u }; /* groups per staging pass */
+    uint8_t buf[16u * 16u * ZPSE_D16_CHUNK] __attribute__((aligned(64)));
+    const uint8_t *bin[16];
+    uint8_t *tout[16];
+    uint32_t q = *g;
+    unsigned t;
+
+    for (t = 0; t < 16u; t++) {
+        bin[t] = buf + (size_t)t * (16u * (size_t)ZPSE_D16_CHUNK);
+    }
+    while ((q + (uint32_t)ZPSE_D16_CHUNK) * 16u <= rows) {
+        for (t = 0; t < 16u; t++) {
+            uint8_t *d = (uint8_t *)(uintptr_t)bin[t];
+            const uint8_t *src = segs[t] + (size_t)q * 16u;
+
+            if (delta != 0) {
+                zpse_prefix_sum32(src, d, 16u * (uint32_t)ZPSE_D16_CHUNK,
+                                  pv[t]);
+            } else {
+                zpse_prefix_xor32(src, d, 16u * (uint32_t)ZPSE_D16_CHUNK,
+                                  pv[t]);
+            }
+            pv[t] = d[16u * (uint32_t)ZPSE_D16_CHUNK - 1u];
+        }
+        for (t = 0; t < 16u; t++) {
+            tout[t] = out + (size_t)q * 256u + (size_t)t * 16u;
+        }
+        zpse_t16x16_inverse_direct(bin, tout, (uint32_t)ZPSE_D16_CHUNK);
+        q += (uint32_t)ZPSE_D16_CHUNK;
+    }
+    *g = q;
+}
+
 #endif /* ZPSE_T_HAVE_AVX2 */
 
 /* In-place delta/xor over one contiguous plane: p[j] = p[j] - p[j-1]
@@ -2250,7 +2317,13 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
         for (s = 0; s < w; s++) {
             pv[s] = prev[s];
         }
-        for (g = 0; (g + 1u) * 16u <= rows; g++) {
+        g = 0;
+#if ZPSE_T_HAVE_AVX2
+        if (rows >= 256u && zpse_t_avx2()) {
+            zpse_delta16_inverse_avx2(segs, out, rows, &g, pv, delta);
+        }
+#endif /* ZPSE_T_HAVE_AVX2 */
+        for (; (g + 1u) * 16u <= rows; g++) {
             __m128i r[16];
             unsigned t;
 

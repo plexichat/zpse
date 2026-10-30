@@ -14,6 +14,80 @@
 #include "zpse/predictor.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
+#include "zpse/vector.h"
+
+/* 256-bit kernels for the two whole-record passes below (the exclusion
+ * inverse of a dense record's residual stream). Same dispatch shape as
+ * src/transform.c and src/residual.c: the per-function target attribute
+ * lets a translation unit built at the baseline ISA still compile them,
+ * and ZPSE_AVX2_ABI_OK keeps them out of builds whose ABI cannot pass a
+ * 32-byte vector (see zpse/hot.h), where the SSE2 loop is what runs. */
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_DENSE_AVX2 __attribute__((target("avx2")))
+#define ZPSE_DENSE_HAVE_AVX2 ZPSE_AVX2_ABI_OK
+#elif defined(__AVX2__)
+#define ZPSE_DENSE_AVX2
+#define ZPSE_DENSE_HAVE_AVX2 ZPSE_AVX2_ABI_OK
+#else
+#define ZPSE_DENSE_HAVE_AVX2 0
+#endif
+#else
+#define ZPSE_DENSE_HAVE_AVX2 0
+#endif
+
+#if ZPSE_DENSE_HAVE_AVX2
+#include <immintrin.h>
+#endif
+
+/* out[0..n) += 1 at 32 bytes per step. The whole loop is one instruction
+ * per 32 bytes either way -- PADDB -- so the win is simply half the
+ * iterations, and it is taken for the same reason as every other 256-bit
+ * kernel here: a dense record is up to 4 KiB and this pass is the entire
+ * decode of a constant plane that does not sit on 255. */
+#if ZPSE_DENSE_HAVE_AVX2
+static ZPSE_DENSE_AVX2 void dense_add_one_avx2(uint8_t *out, uint32_t n)
+{
+    uint32_t i = 0u;
+    const __m256i one = _mm256_set1_epi8(1);
+
+    for (; i + 32u <= n; i += 32u) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(out + i));
+
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            _mm256_add_epi8(v, one));
+    }
+    for (; i < n; i++) {
+        out[i] = (uint8_t)(out[i] + 1u);
+    }
+}
+
+/* out[0..n) = zpse_exclusion_inverse(out[i], fill), 32 bytes per step. The
+ * compare is unsigned and the result is r + (r >= fill), so the byte mask
+ * of `max(r, fill) == r` IS the increment: one PADD of a compare mask, no
+ * branch, and VPMINUB/VPCMPEQB are both single-uop on AVX2 just as their
+ * 128-bit forms are. */
+static ZPSE_DENSE_AVX2 void dense_exclusion_map_avx2(uint8_t *out, uint32_t n,
+                                                     uint8_t fill)
+{
+    uint32_t i = 0u;
+    const __m256i f = _mm256_set1_epi8((char)fill);
+    const __m256i one = _mm256_set1_epi8(1);
+
+    for (; i + 32u <= n; i += 32u) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(out + i));
+        __m256i ge = _mm256_cmpeq_epi8(_mm256_max_epu8(v, f), v);
+
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            _mm256_add_epi8(v, _mm256_and_si256(ge, one)));
+    }
+    for (; i < n; i++) {
+        out[i] = zpse_exclusion_inverse(out[i], fill);
+    }
+}
+#endif /* ZPSE_DENSE_HAVE_AVX2 */
 
 /* out[0..n) += 1, byte-wise with wrap, which is the exclusion inverse for
  * a zero prediction (zpse_exclusion_inverse(r, 0) == r + 1 for every r).
@@ -24,6 +98,12 @@ static void dense_add_one(uint8_t *out, uint32_t n)
 {
     uint32_t i = 0u;
 
+#if ZPSE_DENSE_HAVE_AVX2
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        dense_add_one_avx2(out, n);
+        return;
+    }
+#endif
 #if ZPSE_DENSE_HAVE_SSE2
     {
         const __m128i one = _mm_set1_epi8(1);
@@ -54,6 +134,12 @@ static void dense_exclusion_map(uint8_t *out, uint32_t n, uint8_t fill)
 {
     uint32_t i = 0u;
 
+#if ZPSE_DENSE_HAVE_AVX2
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        dense_exclusion_map_avx2(out, n, fill);
+        return;
+    }
+#endif
 #if ZPSE_DENSE_HAVE_SSE2
     {
         const __m128i f = _mm_set1_epi8((char)fill);
