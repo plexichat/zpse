@@ -87,7 +87,10 @@
  * sources passing under Linux gcc: test_transforms, test_lz, test_ascii,
  * test_levels, test_sizes and the fuzz driver died in zpse_merge2_avx2 /
  * zpse_merge4_avx2 on `vmovdqa %ymm0,0x20(%rsp)` -- the argument block of
- * `zpse_chain_undo32`. `__m256i_u` (alignment 1) does not help, because
+ * a 256-bit helper passed by value (`zpse_chain_undo32`; its arithmetic now
+ * lives in two always-inlined twins, so that argument block has gone from
+ * the tree but the shape it demonstrated has not). `__m256i_u` (alignment
+ * 1) does not help, because
  * the ABI temporary is aligned for the vector MODE, not the type, and
  * -mstackrealign / force_align_arg_pointer do not either, because both
  * realign to the 16-byte boundary that is the most MinGW accepts.

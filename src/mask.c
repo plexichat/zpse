@@ -17,9 +17,13 @@ static void zpse_mask_set_at(uint32_t words[8], uint16_t pos)
 
 /* Set every bit of the range [from, from+len).
  *
- * The RUNS decoder knows each miss run as one length, and a near-dense
- * mask -- 253 exceptions in 256 positions, which is three hit bytes and
- * seven bytes of payload -- was previously written one position at a time
+ * Two callers hand it a range rather than a position: the ALL_EXCEPTION
+ * decoder, whose mask is the whole of [0, nt) (one call, at most eight
+ * stores, in place of nt read-modify-writes through zpse_mask_set_at and
+ * its bounds test), and the RUNS decoder, which knows each miss run as one
+ * length. A near-dense mask -- 253 exceptions in 256 positions, which is
+ * three hit bytes and seven bytes of payload -- was previously written one
+ * position at a time
  * through zpse_mask_set_at: a load, OR and store to the same word for
  * every position, so each bit paid the store-to-load latency of the one
  * before it (measured ~5 cycles per exception, 56% of that shape's whole
@@ -299,15 +303,14 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
         if (k != 0 || payload_len != 0)
             return PSE_BAD_MASK;
         return PSE_OK;
-    case ZPSE_M_ALL_EXCEPTION: {
-        uint16_t p;
-
+    case ZPSE_M_ALL_EXCEPTION:
         if (k != nt || payload_len != 0)
             return PSE_BAD_MASK;
-        for (p = 0; p < nt; p++)
-            zpse_mask_set_at(words, p);
+        /* Every position is an exception, so the mask is [0, nt) as one
+         * run: a word at a time instead of nt load-OR-store rounds on the
+         * same eight words, each waiting on the store before it. */
+        zpse_mask_set_range(words, 0u, nt);
         return PSE_OK;
-    }
     case ZPSE_M_RAW_BITMAP: {
         uint16_t need;
         unsigned byte_i;
@@ -327,6 +330,16 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
          * bytes) keeps the byte loop, so no byte past the payload -- whose
          * length is exactly `need` here -- is ever read. Identical bytes
          * either way, and lanes past `need` stay zero. */
+        /* Every byte of that assembly is a byte of the wire on a
+         * little-endian host, so there the whole assembly is the copy the
+         * encoder already does the other way round: one 32-byte copy for a
+         * full tile, against eight reassembled stores. The words past
+         * `need` stay zero from the clear above either way. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        memcpy(words, payload, (size_t)need);
+        (void)byte_i;
+#else
         for (byte_i = 0; byte_i + 4u <= (unsigned)need; byte_i += 4u) {
             words[byte_i >> 2] =
                 (uint32_t)payload[byte_i] |
@@ -338,6 +351,7 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
             words[byte_i >> 2] |=
                 (uint32_t)payload[byte_i] << ((byte_i & 3u) * 8u);
         }
+#endif
         /* Bits >= nt sit in the high bits of the final byte and MUST be
          * zero (Sec. 8). The old scan ran p from nt to need*8 and is
          * therefore only ever non-empty when nt is not a multiple of 8. */
@@ -465,18 +479,48 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
         return PSE_BAD_MASK;
 
     switch (mask_mode) {
-    case ZPSE_M_ALL_HIT:
+    /* The two constant forms have to prove their count against the header,
+     * and both counts have a cheaper question behind them: "is the count
+     * zero" is "is every bit below nt clear" and "is the count nt" is "is
+     * every bit below nt set". A masked compare answers each in at most
+     * eight tests, where the count costs a 32-byte copy and a vector pass
+     * (or a popcount of the whole mask) to produce a number that is then
+     * compared with a constant. Bits at or above nt are ignored, exactly as
+     * the count ignores them. */
+    case ZPSE_M_ALL_HIT: {
+        uint16_t last;
+        uint16_t wi;
+        uint32_t keep;
+
         if (k != 0)
             return PSE_BAD_MASK;
-        if (zpse_mask_count_bits(words, nt) != 0)
+        last = (uint16_t)((nt - 1u) >> 5u);
+        keep = (uint32_t)(((UINT64_C(1) << (((nt - 1u) & 31u) + 1u)) - 1u));
+        for (wi = 0; wi < last; wi++) {
+            if (words[wi] != 0u)
+                return PSE_BAD_MASK;
+        }
+        if ((words[last] & keep) != 0u)
             return PSE_BAD_MASK;
         return 0;
-    case ZPSE_M_ALL_EXCEPTION:
+    }
+    case ZPSE_M_ALL_EXCEPTION: {
+        uint16_t last;
+        uint16_t wi;
+        uint32_t keep;
+
         if (k != nt)
             return PSE_BAD_MASK;
-        if (zpse_mask_count_bits(words, nt) != (int)nt)
+        last = (uint16_t)((nt - 1u) >> 5u);
+        keep = (uint32_t)(((UINT64_C(1) << (((nt - 1u) & 31u) + 1u)) - 1u));
+        for (wi = 0; wi < last; wi++) {
+            if (words[wi] != UINT32_C(0xFFFFFFFF))
+                return PSE_BAD_MASK;
+        }
+        if ((words[last] & keep) != keep)
             return PSE_BAD_MASK;
         return 0;
+    }
     case ZPSE_M_RAW_BITMAP: {
         uint16_t need;
         unsigned byte_i;

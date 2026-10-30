@@ -1970,10 +1970,6 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
     for (s = 0; s < m; s++) {
         out[1u + s] = pal[s];
     }
-    /* Zero the packed region in one go: the wide path below stores whole
-     * bytes over it and the tail only ORs bits into it. */
-    memset(out + 1u + m, 0, (size_t)packed);
-
     /* Eight values are b bytes together (8*b bits) and every 8-value group
      * starts on a byte boundary (group g begins at bit 8*b*g), so a group
      * is exactly the little-endian store of the 8b-bit word
@@ -1987,6 +1983,20 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
         uint32_t g = 0u;
         uint16_t gi = 0u;
 
+        /* The packed region is zeroed only where a bit writer will OR into
+         * it, i.e. from the first byte the fast packers below did not
+         * write. Each of them stores WHOLE bytes and stops on a byte
+         * boundary -- sixteen values per eight bytes for the nibble form,
+         * thirty-two per four for the one-bit form, sixteen per four for
+         * the two-bit one -- so the bytes below `g` are written by them and
+         * nothing else, and clearing the whole region first was a store of
+         * bytes that the very next step overwrote. A dense tile's fast path
+         * covers the region completely, which is the common case here, so
+         * for those calls the clear is now empty instead of `k * b / 8`
+         * bytes. The bytes past `g` are exactly the ones the eight-value
+         * and single-value tails below can touch (a whole group is b bytes
+         * and every group starts on a byte boundary), and they are still
+         * zero before the first OR, so the payload is byte-identical. */
 #if ZPSE_RES_HAVE_SSSE3
         /* The dense palette (a nibble per value, every residual below 32)
          * retires sixteen values per step; everything it does not consume,
@@ -2002,6 +2012,10 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
             g = (uint32_t)gi >> 2u;
         }
 #endif
+
+        if (g < packed) {
+            memset(dst + g, 0, (size_t)(packed - g));
+        }
 
         for (; (uint32_t)gi + 8u <= (uint32_t)k;
              gi = (uint16_t)(gi + 8u)) {

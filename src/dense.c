@@ -271,6 +271,24 @@ static uint8_t dense_exc_value(const uint8_t *resid, uint8_t res_mode,
     return zpse_exclusion_inverse(resid[j], xhat);
 }
 
+/* Store `v` at p[0..n) without a per-byte exception test: a record's
+ * prediction runs are what the position loop used to walk one byte at a
+ * time, and a run of a few hundred bytes is a memset. The short form stays
+ * a byte loop -- a call to memset for five bytes costs more than the five
+ * stores it replaces, and a whole-record store would have to be bounded by
+ * the record, whose end is exactly where writing past the last run would
+ * land in the next record's bytes. */
+static void dense_fill(uint8_t *p, uint32_t n, uint8_t v)
+{
+    if (n >= 8u) {
+        memset(p, v, (size_t)n);
+        return;
+    }
+    while (n-- != 0u) {
+        *p++ = v;
+    }
+}
+
 static int dense_check_mask(uint8_t mask_mode, const uint8_t *mask,
                             uint32_t nt, uint32_t k, uint32_t mask_len)
 {
@@ -493,21 +511,36 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
     if (pred == (uint8_t)ZPSE_P_CONST_ZERO ||
         pred == (uint8_t)ZPSE_P_TILE_CONSTANT) {
         uint8_t fill = (pred == (uint8_t)ZPSE_P_CONST_ZERO) ? 0u : constant_c;
+        uint32_t at = 0u;
 
-        for (p = 0u; p < nt; p++) {
-            uint8_t x;
+        /* The prediction is the same byte everywhere, so the record is that
+         * byte with k exceptions on top of it. Walking the positions one at
+         * a time made the exception test a data-dependent branch taken at
+         * k of nt positions -- mispredicting at a third of them on the mask
+         * this form is chosen for -- and stored every byte twice over. The
+         * runs between exceptions are filled instead, and the units are
+         * consumed in the same ascending order as before, so j still ends
+         * at k and the residual stream is read identically. The mask has
+         * k < nt here (ALL_EXCEPTION took the no-prediction path above and
+         * k == 0 the fill above that), but a position at or past nt is
+         * refused rather than written: that is the same PSE_BAD_MASK the
+         * position loop's j != k check answered with. */
+        for (j = 0; j < (uint32_t)k; j++) {
+            uint32_t pos = dense_next(mask_mode, mask, nt, j, at);
 
-            if (p == next) {
-                x = dense_exc_value(scratch, res_mode, j, fill);
-                j++;
-                next = (j < k)
-                           ? dense_next(mask_mode, mask, nt, j, p + 1u)
-                           : nt;
-            } else {
-                x = fill;
+            if (pos >= (uint32_t)nt) {
+                return PSE_BAD_MASK;
             }
-            out[p] = x;
+            if (pos > at) {
+                dense_fill(out + at, pos - at, fill);
+            }
+            out[pos] = dense_exc_value(scratch, res_mode, j, fill);
+            at = pos + 1u;
         }
+        if (at < (uint32_t)nt) {
+            dense_fill(out + at, (uint32_t)nt - at, fill);
+        }
+        j = k;
     } else if (pred == (uint8_t)ZPSE_P_LANE_PREVIOUS) {
         for (p = 0u; p < nt; p++) {
             unsigned lane = p & 7u;
@@ -572,9 +605,30 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
         }
     } else {
         uint32_t s = dense_stride(pred);
+        uint32_t head = (s < (uint32_t)nt) ? s : (uint32_t)nt;
 
-        for (p = 0u; p < nt; p++) {
-            uint8_t xhat = (p < s) ? literal : out[p - s];
+        /* Positions below the stride read the entry literal rather than the
+         * record, so the first `s` of them are handled here and the steady
+         * state below reads out[p - s] unconditionally: the `p < s` select
+         * was one compare per position of the whole record for a decision
+         * that is fixed after the first s bytes. The order of the stores,
+         * the exception positions and the units consumed are unchanged. */
+        for (p = 0u; p < head; p++) {
+            uint8_t x;
+
+            if (p == next) {
+                x = dense_exc_value(scratch, res_mode, j, literal);
+                j++;
+                next = (j < k)
+                           ? dense_next(mask_mode, mask, nt, j, p + 1u)
+                           : nt;
+            } else {
+                x = literal;
+            }
+            out[p] = x;
+        }
+        for (; p < nt; p++) {
+            uint8_t xhat = out[p - s];
             uint8_t x;
 
             if (p == next) {

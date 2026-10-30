@@ -536,13 +536,26 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
                              uint32_t op_rem, int lit_safe16)
 {
+    /* Two 16-byte copies per iteration rather than one. Both loads start at
+     * or before src + len - 16, so they read inside the run exactly as the
+     * single-copy form does and this needs no new slack test -- it is the
+     * same two loads and two stores with one loop branch instead of two,
+     * which is what a literal run of a few hundred bytes is bound by (a run
+     * that reaches the LZ path at all is the > 8 case the one-shot command
+     * path above does not take). The single 16-byte step stays for the
+     * 16..31 remainder. */
+    while (len >= 32u) {
+        memcpy(dst, src, 16u);
+        memcpy(dst + 16u, src + 16u, 16u);
+        dst += 32u;
+        src += 32u;
+        len -= 32u;
+    }
     if (len >= 16u) {
-        do {
-            memcpy(dst, src, 16u);
-            dst += 16u;
-            src += 16u;
-            len -= 16u;
-        } while (len >= 16u);
+        memcpy(dst, src, 16u);
+        dst += 16u;
+        src += 16u;
+        len -= 16u;
     }
     if (len != 0u) {
         if (len <= 8u && lit_safe16 != 0 && op_rem >= 8u) {
@@ -596,6 +609,26 @@ ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
             return;
         }
     }
+    /* A run of one byte is a fill, not a copy: off == 1 means every byte of
+     * the match is the byte just written, so the whole match is that byte
+     * repeated. It is the worst case for the doubling loop below -- which
+     * spends four byte passes (1, 2, 4 and 8 bytes) before any wide store
+     * runs, i.e. fifteen byte moves per sixteen bytes of a long run -- and
+     * it is the shape every long run in a stream has. A fill writes exactly
+     * `len` bytes, so the output bound and the reclaim argument are the ones
+     * the caller already checked, and the doubling loop's own result for
+     * off 1 is the same bytes. */
+#if ZPSE_LZ_HAVE_SSE2
+    if (off == 1u && len >= 16u) {
+        const __m128i rep = _mm_set1_epi8((char)dst[-1]);
+
+        do {
+            _mm_storeu_si128((__m128i *)(void *)dst, rep);
+            dst += 16u;
+            len -= 16u;
+        } while (len >= 16u);
+    }
+#endif /* ZPSE_LZ_HAVE_SSE2 */
     /* A short offset is a repeating pattern, not a slow copy. Copy it once
      * at its own width, which doubles the distance, and repeat: after one
      * pass the last `off` bytes hold two periods, so a copy at twice the
@@ -621,7 +654,18 @@ ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
         off <<= 1;
     }
     if (off >= 32u) {
-        while (len >= 32u) {
+        /* Two 32-byte copies per iteration. The second load reads at
+         * dst + 32 - off, which is at or before dst because off >= 32, so
+         * it can only read bytes the first store or an earlier iteration
+         * already wrote -- the recurrence the single-step loop has, with one
+         * loop branch per 64 bytes instead of one per 32. */
+        while (len >= 64u) {
+            memcpy(dst, dst - off, 32u);
+            memcpy(dst + 32u, dst + 32u - off, 32u);
+            dst += 64u;
+            len -= 64u;
+        }
+        if (len >= 32u) {
             memcpy(dst, dst - off, 32u);
             dst += 32u;
             len -= 32u;

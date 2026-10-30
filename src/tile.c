@@ -4283,27 +4283,39 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
              * exceptions would run past its end, and those keep the per-bit
              * walk, which never reads beyond the units the group consumes
              * (consumed + popcount(m8) <= k <= ZPSE_TILE_UNIT_BYTES). */
-            cnt = (uint32_t)tile_popcount32(m8);
-            if ((uint32_t)consumed + 8u <= ZPSE_TILE_UNIT_BYTES) {
-                r = _mm_shuffle_epi8(
-                    _mm_loadl_epi64(
-                        (const __m128i *)(const void *)(units + consumed)),
-                    tile_unit_index(bits, bitv, one));
-            } else {
-                uint8_t tmp[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
-                uint32_t got = 0u;
-                uint32_t wg = m8;
-                uint32_t bit = 0u;
+            /* The group's unit count is the index ladder's own last lane
+             * plus the top bit: byte 7 of tile_unit_index() is the
+             * exclusive count of lanes 0..6, so the count of set bits in
+             * m8 is that byte plus bit 7. One vector->GPR move and one
+             * shift replace the ten-operation SWAR popcount this group
+             * used to spend on the same number -- and the ladder was being
+             * built anyway, three lines down. */
+            {
+                __m128i idx = tile_unit_index(bits, bitv, one);
 
-                while (wg != 0u) {
-                    if ((wg & 1u) != 0u) {
-                        tmp[bit] = units[consumed + got];
-                        got++;
+                cnt = (uint32_t)(uint8_t)_mm_extract_epi8(idx, 7) +
+                      ((uint32_t)m8 >> 7u);
+                if ((uint32_t)consumed + 8u <= ZPSE_TILE_UNIT_BYTES) {
+                    r = _mm_shuffle_epi8(
+                        _mm_loadl_epi64(
+                            (const __m128i *)(const void *)(units + consumed)),
+                        idx);
+                } else {
+                    uint8_t tmp[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+                    uint32_t got = 0u;
+                    uint32_t wg = m8;
+                    uint32_t bit = 0u;
+
+                    while (wg != 0u) {
+                        if ((wg & 1u) != 0u) {
+                            tmp[bit] = units[consumed + got];
+                            got++;
+                        }
+                        wg >>= 1u;
+                        bit++;
                     }
-                    wg >>= 1u;
-                    bit++;
+                    r = _mm_loadl_epi64((const __m128i *)(const void *)tmp);
                 }
-                r = _mm_loadl_epi64((const __m128i *)(const void *)tmp);
             }
 
             if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
@@ -4497,7 +4509,21 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
          * the per-bit walk, which never reads past the units it consumes
          * (consumed + popcount(w) <= k <= ZPSE_TILE_UNIT_BYTES). */
         if ((uint32_t)consumed + 32u <= ZPSE_TILE_UNIT_BYTES) {
-            uint32_t lo = (uint32_t)tile_popcount32(w & UINT32_C(0xFFFF));
+            /* Both counts the chunk needs are already in the index ladder
+             * it was about to build. Byte 15 of tile_unit_index32() is the
+             * exclusive count of the low half's lanes 0..14, so the low
+             * half's popcount -- where the high half's unit window starts
+             * -- is that byte plus bit 15 of w; byte 31 is the same count
+             * for the high half's lanes, so the chunk's total is the low
+             * half's popcount plus that byte plus bit 31. Two vector->GPR
+             * moves and three scalar ops replace the two ten-operation
+             * SWAR popcounts this chunk used to run (one for the window
+             * offset, one for the consumed count). Both halves stay in a
+             * byte in the ladder (at most 16), so the adds cannot carry. */
+            __m256i idx = tile_unit_index32(_mm256_and_si256(mb, one));
+            uint32_t lo = (uint32_t)(uint8_t)_mm_extract_epi8(
+                              _mm256_castsi256_si128(idx), 15) +
+                          ((w >> 15u) & 1u);
             __m128i win_lo = _mm_loadu_si128(
                 (const __m128i *)(const void *)(units + consumed));
             __m128i win_hi = _mm_loadu_si128(
@@ -4505,9 +4531,10 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
             __m256i win = _mm256_castsi128_si256(win_lo);
 
             win = _mm256_inserti128_si256(win, win_hi, 1);
-            r = _mm256_shuffle_epi8(
-                win, tile_unit_index32(_mm256_and_si256(mb, one)));
-            consumed = (uint16_t)(consumed + (uint16_t)tile_popcount32(w));
+            r = _mm256_shuffle_epi8(win, idx);
+            consumed = (uint16_t)(consumed + (uint16_t)(
+                            lo + (uint32_t)(uint8_t)_mm256_extract_epi8(idx, 31) +
+                            (w >> 31u)));
         } else {
             uint8_t tmp[32];
             uint32_t wg = w;

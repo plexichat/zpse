@@ -2543,6 +2543,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * ones after it on the same block -- uses the full pass, so the
          * block pays one wasted prefix instead of one per shape. */
         int prefix_ok = 1;
+        /* The identity's global floor over this window: a pure function of
+         * pn (one segment, no metadata, so it is the smallest total any
+         * candidate of this block could reach). See where it is filled. */
+        uint32_t cfloor;
         int ci;
         int k;
 
@@ -2570,6 +2574,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             ex[ci] = UINT32_MAX;
             pc[ci] = UINT32_MAX;
         }
+        /* Answered once instead of once per candidate: the loop below ends
+         * the sweep the moment the identity prices at this floor, and the
+         * floor itself is two variable-divisor divisions (pn over 256 and
+         * over the dense record length) over a window none of the candidates
+         * may change. Same value, same comparison, ten fewer calls on a
+         * full candidate list. */
+        cfloor = zpse_block_cand_floor(pn);
         for (k = 0; k < nord; k++) {
             const uint8_t *mb;
             uint32_t lim = UINT32_MAX;
@@ -2643,8 +2654,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 (ex[ci] == ex[pick] && idx[ci] < idx[pick])) {
                 pick = ci;
             }
-            if (idx[ci] == 0u && scounts[ci] == 1u &&
-                ex[ci] == zpse_block_cand_floor(pn)) {
+            if (idx[ci] == 0u && scounts[ci] == 1u && ex[ci] == cfloor) {
                 break;
             }
         }

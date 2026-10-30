@@ -334,11 +334,22 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
     if (payload_len < 1u || payload_len > 32u)
         return PSE_BAD_ENUMERATIVE_RANK;
 
-    /* Minimal byte length for C(nt,k); the format requires
-     * mask_payload_size == L exactly. */
-    L = zpse_comb_payload_len(nt, k, NULL);
-    if (L < 0)
-        return L;
+    /* C(nt,k) is evaluated ONCE here and answers both of the questions
+     * this function asks of it: the minimal payload length the format
+     * requires, and the range pre-check R < C(nt,k) further down. It used
+     * to be evaluated twice -- once inside zpse_comb_payload_len and again
+     * for the pre-check -- and above 64 bits that evaluation is the whole
+     * Pascal-row construction (nt-1 rounds of k u256 additions), so an
+     * enumerative tile ranked in u256 paid for it twice. k is in
+     * [1, nt-1] here, so C >= nt >= 2 and L is ceil(bitlen(C-1)/8) exactly
+     * as zpse_comb_payload_len computes it, including the L >= 1 that the
+     * caller has already required of payload_len. */
+    cnk = zpse_comb_choose_u256(nt, k);
+    {
+        ZpseU256 cm1 = zpse_u256_sub(cnk, u256_one());
+
+        L = (u256_bitlen(cm1) + 7) / 8;
+    }
     if ((int)payload_len != L)
         return PSE_BAD_ENUMERATIVE_RANK;
 
@@ -349,8 +360,8 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
         r.w[li] |= (uint64_t)payload[take] << ((take & 7u) * 8u);
     }
 
-    /* Range pre-check BEFORE unranking: R < C(nt,k). */
-    cnk = zpse_comb_choose_u256(nt, k);
+    /* Range pre-check BEFORE unranking: R < C(nt,k), from the value
+     * computed at the top. */
     if (zpse_u256_gte(r, cnk))
         return PSE_BAD_ENUMERATIVE_RANK;
 

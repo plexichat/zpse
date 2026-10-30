@@ -2855,7 +2855,15 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
     uint32_t sum = 0u;
     uint32_t nsum = 0u;
     uint32_t t;
+    int fast_tier;
 
+    /* The level is a property of the call, not of the sampled tile, and the
+     * caller's own tile loop hoists the same answer for the same reason
+     * (nothing below writes e->enc_flags): asking zpse_enc_speed once per
+     * priced tile was a call plus a mask, shift and compare per sample for a
+     * value that cannot change. */
+    fast_tier = zpse_enc_speed(e->enc_flags) <=
+                (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX;
     if (step == 0u) {
         step = 1u;
     }
@@ -2873,9 +2881,7 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
         int tile_len = -1;
         uint8_t second_p;
 
-        seg_prescreen(actual, nt, plane, seg_pos, initial_literal,
-                      zpse_enc_speed(e->enc_flags) <=
-                          (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX,
+        seg_prescreen(actual, nt, plane, seg_pos, initial_literal, fast_tier,
                       have_avx2, ks);
         seg_scan_two(ks, &best_p, &second_p);
         best_k = ks[best_p];
@@ -3362,7 +3368,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         uint32_t wcap; /* and the capacity it is packed with */
         int rep_slot = -1; /* repeat-cache slot this tile fills, or -1 */
         uint64_t rep_slot_key = 0u; /* and the key it is filled with */
-        int ascii_ok; /* 1 iff every byte of the tile is below 0x80 */
 
         /* Bound check for the byte budget, before any work for this
          * tile: `pos` grows monotonically, so once it is past the budget
@@ -3463,16 +3468,18 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * the tile itself would take -- and no predictor here can be
          * trusted to beat that on the shapes that reach this point, which
          * is why the sweep below is skipped at the gate levels once the
-         * prescreen confirms no predictor is close. `ascii_len` is also
-         * what the comparison after the sweep uses at the ratio levels, so
-         * the scan is not wasted there either. */
+         * prescreen confirms no predictor is close. At the ratio levels the
+         * same form is offered as one more candidate after the sweep, and
+         * that is where the scan is made: see the note before the test
+         * below, which is why nothing is scanned here. */
         /* A gated block has already had every one of its bytes scanned for
          * the high bit (zpse_ascii_scan over the whole block, which is what
-         * let the gate fire), so the per-tile scan here would re-prove it 256
-         * times per block. Skip it, and keep the per-tile test for the blocks
-         * that did not gate. */
-        ascii_ok = (gate != 0) ? 1
-                   : ((nt >= 8u && zpse_tile_is_ascii(actual, nt)) ? 1 : 0);
+         * let the gate fire), so the per-tile scan would re-prove it 256
+         * times per block. For the blocks that did not gate the scan is not
+         * made here at all: the form it admits can only be taken when it
+         * beats the record the sweep is about to find, and that comparison
+         * is made (with the scan) after the sweep, where the tiles the run
+         * and the repeat cache write get it for nothing. */
         /* The block encoder's gate: its samples have already shown that
          * no cheap shape beats seven bits a byte on this block, so the
          * record is written here and the prescreen, the classify, the mode
@@ -3480,7 +3487,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * difference between a text block costing a full sweep per tile
          * and costing a scan and a bit pack -- and the form is the same
          * bytes either way, so the stream is unchanged. */
-        if (ascii_ok && gate != 0) {
+        if (gate != 0) {
             uint32_t alen = zpse_tile_ascii_len(nt);
 
             if (pos + 2u + alen > payload_cap) {
@@ -3807,8 +3814,20 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         }
         /* The ratio levels take the seven-bit form when it is smaller than
          * what the sweep found; on text it always is, on structured ASCII
-         * the sweep wins and this costs one compare. */
-        if (ascii_ok && zpse_tile_ascii_len(nt) < (uint32_t)best_len) {
+         * the sweep wins and this costs one compare.
+         *
+         * This is also where the scan that admits the form is made, rather
+         * than for every tile before the sweep: the form is only taken when
+         * its length is already below the winning record's, so a tile whose
+         * record costs less than seven bits a byte -- structured ASCII, and
+         * every tile the all-hit run or the repeat cache wrote -- never needs
+         * the answer and no longer pays a 256-byte scan for it. The tests are
+         * the same ones in the same order (the length compare, then the
+         * nt >= 8 floor the scan always had), the tile's bytes cannot change
+         * between the two points, and zpse_tile_is_ascii is pure, so the
+         * record chosen here is the one that was chosen before. */
+        if (nt >= 8u && zpse_tile_ascii_len(nt) < (uint32_t)best_len &&
+            zpse_tile_is_ascii(actual, nt)) {
             best_len = (int)zpse_tile_ascii_len(nt);
             (void)zpse_tile_pack_ascii(actual, nt, payload_out + pos + 2u,
                                        payload_cap - pos - 2u);
