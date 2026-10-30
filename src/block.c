@@ -2131,6 +2131,37 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
     return 1;
 }
 
+/* The exact total the gated tile trial writes for a block of `n` bytes.
+ *
+ * A block the ASCII gate convicted has exactly one candidate -- the
+ * identity, one segment -- and every tile of it takes the seven-bit form
+ * (segment.c's `ascii_gate` branch), so its trial total is arithmetic: the
+ * block envelope, the segment directory and header, and 2 + zpse_tile_ascii_len
+ * for each of the ceil(n/256) tiles. Nothing in the segment encoder can
+ * pick another form on such a plane: the dense constant record needs a
+ * one-value plane, which the gate's own head probe has already ruled out;
+ * the palette and literal forms are only priced by the general tile path,
+ * which this block never enters; and the flat abort cannot fire because an
+ * ASCII record of 234 bytes against a 256-byte tile pays for itself on the
+ * first tile. So this is the number the trial produces, which is what lets
+ * the match finder run BEFORE that trial and bound it (see the early pass
+ * in zpse_block_encode) without changing a decision.
+ *
+ * Only called for a gated block. */
+static uint32_t zpse_block_ascii_total(uint32_t n)
+{
+    uint32_t tc = (n + 255u) / 256u;
+    uint32_t full = 2u + zpse_tile_ascii_len((uint16_t)256);
+    uint32_t last = n - 256u * (tc - 1u);
+    uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
+                     (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE +
+                     (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+
+    total += (tc - 1u) * full;
+    total += 2u + zpse_tile_ascii_len((uint16_t)last);
+    return total;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -2849,8 +2880,81 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int ntried = 0;
     /* The gate's single trial writes straight into `out` (see the loop). */
     int direct_out = (e->ascii_gate != 0u && ncand == 1) ? 1 : 0;
+    /* Set once the match finder has run, wherever it ran (see the early
+     * pass below); the candidate block after the trials then skips it. */
+    int lz_done = 0;
     uint8_t *tdst = e->cand;
     uint32_t tcap = (uint32_t)ZPSE_E_SZ_CAND;
+
+    /* ---- The match finder before the trial, on a gated block -------- *
+     *
+     * A gated block has one candidate and its trial writes the seven-bit
+     * form, whose total is known before the trial runs (see
+     * zpse_block_ascii_total): 59 960 bytes of a 64 KiB block. The LZ
+     * candidate is offered with that total as the running verdict, so the
+     * screen and the pass see exactly the arguments they see today, after
+     * the trial.
+     *
+     * What changes is the order and the budget. When the pass wins, its
+     * stream becomes the winner before the tile trial starts, so the trial
+     * is handed the LZ total as its byte budget instead of the RAW envelope
+     * and stops as soon as it writes past it -- which on prose is 40% of the
+     * block rather than all of it. The stream written is the same: the LZ
+     * form won the comparison either way, so the tile stream it replaces was
+     * discarded either way, and a trial the budget stops cannot win (its
+     * total only grows). When the pass loses, nothing is decided early and
+     * the trial runs exactly as it does today.
+     *
+     * This is why it is exact: the screen's verdict is a function of
+     * (sample, tile price, best_total), and best_total here is the number
+     * the trial was going to produce -- not a guess. A block whose trial
+     * could deviate from zpse_block_ascii_total never reaches this code
+     * (the gate clears, or it is not the identity-only shape). */
+    if (e->ascii_gate != 0u && ncand == 1) {
+        uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
+        uint32_t atotal = zpse_block_ascii_total(n);
+        uint32_t lz_floor = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
+                            ZPSE_LZ_MIN_PAYLOAD +
+                            4u * ((n + ZPSE_LZ_MAX_MATCH - 1u) /
+                                  ZPSE_LZ_MAX_MATCH);
+
+        if (e->lz != 0 && atotal > lz_floor &&
+            zpse_block_lz_level(lz_speed, e->ascii_gate)) {
+            uint32_t lz_total = 0u;
+            uint32_t lz_cmds = 0u;
+            uint32_t lz_cap = (uint32_t)ZPSE_E_SZ_CAND;
+            uint32_t win = atotal / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u;
+
+            /* This is the screen the candidate block below would run, on
+             * the same sample, the same tile price and the same verdict
+             * total (the trial's is atotal by construction), so its answer
+             * IS that block's answer and it must not ask again: on a gated
+             * block the screen is a 1 KiB match-finder pass plus a priced
+             * sample, a tenth of a text block's encode. */
+            lz_done = 1;
+            if (zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
+                                     meta_lens[0] > 0 ? meta_bufs[0] : in,
+                                     meta_lens[0], lz_speed, 1, atotal)) {
+                if (atotal < (uint32_t)ZPSE_E_SZ_CAND && atotal > win) {
+                    lz_cap = atotal - win;
+                }
+                rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
+                                       e->best, lz_cap, &lz_total, &lz_cmds);
+                if (rc == PSE_OK &&
+                    zpse_block_lz_wins(n, lz_cmds, lz_total, 1, atotal,
+                                       lz_speed)) {
+                    /* The stream is already in e->best, which is where the
+                     * winner is read from below; `out` must not be written
+                     * by the trial any more, since the trial is about to
+                     * lose. */
+                    have_best = 1;
+                    best_total = lz_total;
+                    best_idx = 15u;
+                    direct_out = 0;
+                }
+            }
+        }
+    }
 #if defined(ZPSE_BLOCK_STATS)
     /* The total the first trial produced, and whether it succeeded at all.
      * The difference between it and the block's final winner is exactly
@@ -3080,7 +3184,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * text), and what they will trade for it is the level's acceleration
      * factor (see ZPSE_LZ_ACCEL_*): the match finder is a full pass over the
      * block, so it is the most expensive candidate in the sweep. */
-    if (zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+    if (!lz_done &&
+        zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         e->lz != 0) {
         /* Exact floor first: one command codes at most 259 bytes, so an
