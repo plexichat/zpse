@@ -702,41 +702,11 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * layout: with seven terms gcc stops believing the block is
              * taken and moves it out of line, which costs more than the
              * tests it saves. */
-            /* Fast path for match-only commands. */
-            if (ZPSE_LIKELY(lit == 0u && mlen >= 4u &&
-                            off <= op_done && op_rem >= mlen + 32u)) {
-                if (mlen <= 8u && off >= 8u) {
-                    memcpy(op, op - (ptrdiff_t)off, 8u);
-                    op += mlen; op_rem -= mlen; op_done += mlen; continue;
-                } else if (mlen <= 16u && off >= 16u) {
-                    memcpy(op, op - (ptrdiff_t)off, 16u);
-                    op += mlen; op_rem -= mlen; op_done += mlen; continue;
-                } else if (mlen <= 32u && off >= 32u) {
-                    memcpy(op, op - (ptrdiff_t)off, 32u);
-                    op += mlen; op_rem -= mlen; op_done += mlen; continue;
-                }
-            }
-            if (ZPSE_LIKELY(lit <= 8u && lit <= lit_rem && off >= 8u &&
+            if (ZPSE_LIKELY(lit <= 8u && lit <= lit_rem && off >= 16u &&
                             mlen <= 16u && lit_safe16 != 0 &&
                             off <= op_done && op_rem >= 40u)) {
-                if (lit == 0u) {
-                    if (off >= 16u) {
-                        memcpy(op, op - (ptrdiff_t)off, 16u);
-                    } else if (off >= 8u) {
-                        memcpy(op, op - (ptrdiff_t)off, 8u);
-                    } else {
-                        goto general;
-                    }
-                } else {
-                    memcpy(op, lp, 8u);
-                    if (off >= 16u) {
-                        memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
-                    } else if (off >= 8u) {
-                        memcpy(op + lit, op + lit - (ptrdiff_t)off, 8u);
-                    } else {
-                        goto general;
-                    }
-                }
+                memcpy(op, lp, 8u);
+                memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
                 op += lit + mlen;
                 lp += lit;
                 lit_rem -= lit;
@@ -744,7 +714,6 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 op_done += lit + mlen;
                 continue;
             }
-general:
             if (lit > lit_rem || lit > op_rem) {
                 return PSE_BAD_LZ;
             }
