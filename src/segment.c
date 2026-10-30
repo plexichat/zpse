@@ -1170,8 +1170,15 @@ void seg_screen_rank(void)
  * counter sums the hits directly: no movemask plus popcount round trip per
  * comparison, and no 3-cycle latency chain to serialise on. `MASK` is all
  * ones for a full chunk and the validity vector for the last, partial one
- * (whose bytes past the tile end are zero padding that must not match). */
-#define SEG_PS_CHUNK(v_, h8L_, h8S_, h16_, MASK_)                          \
+ * (whose bytes past the tile end are zero padding that must not match).
+ *
+ * PB is the byte before the tile minus fifteen -- i.e. the 16-byte head
+ * followed by the tile -- and Q the position of the chunk inside it, so
+ * every operand is one constant-offset load. PB is the plane's own bytes
+ * whenever they exist (see the function), and the staging buffer when they
+ * do not: a segment's first tile, and the last chunk of a tile that ends
+ * before its 32-byte load would. */
+#define SEG_PS_CHUNK(v_, h8L_, h8S_, h16_, MASK_, PB_, Q_)                 \
     do {                                                                   \
         __m256i _d2 = _mm256_sub_epi8(_mm256_add_epi8(h8L_, h8L_), h16_);  \
         __m256i _av = _mm256_avg_epu8(h8L_, h16_);                         \
@@ -1183,20 +1190,20 @@ void seg_screen_rank(void)
                  _mm256_cmpeq_epi8(v_, _d2), MASK_));                      \
         a3 = _mm256_sub_epi8(a3, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
                  _mm256_loadu_si256((const __m256i *)(const void *)        \
-                     (stg + 15u + (size_t)p))), MASK_));                   \
+                     ((PB_) + 15u + (size_t)(Q_)))), MASK_));              \
         a4 = _mm256_sub_epi8(a4, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
                  _mm256_loadu_si256((const __m256i *)(const void *)        \
-                     (stg + 14u + (size_t)p))), MASK_));                   \
+                     ((PB_) + 14u + (size_t)(Q_)))), MASK_));              \
         a5 = _mm256_sub_epi8(a5, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
                  _mm256_loadu_si256((const __m256i *)(const void *)        \
-                     (stg + 12u + (size_t)p))), MASK_));                   \
+                     ((PB_) + 12u + (size_t)(Q_)))), MASK_));              \
         a6 = _mm256_sub_epi8(a6, _mm256_and_si256(                         \
                  _mm256_cmpeq_epi8(v_, h8S_), MASK_));                     \
         a7 = _mm256_sub_epi8(a7, _mm256_and_si256(                         \
                  _mm256_cmpeq_epi8(v_, _av), MASK_));                      \
         a8 = _mm256_sub_epi8(a8, _mm256_and_si256(_mm256_cmpeq_epi8(v_,    \
                  _mm256_loadu_si256((const __m256i *)(const void *)        \
-                     (stg + 13u + (size_t)p))), MASK_));                   \
+                     ((PB_) + 13u + (size_t)(Q_)))), MASK_));              \
     } while (0)
 
 /* One pass for the whole tile, so there is no scalar prologue or tail to
@@ -1250,58 +1257,98 @@ static ZPSE_PS_AVX2 void seg_prescreen_avx2(const uint8_t *a, uint16_t nt,
                                          -1,-1,-1,-1,-1,-1,-1,-1,
                                          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
     uint32_t p = 0;
+    /* The head+tile base every operand load is relative to (see
+     * SEG_PS_CHUNK). Once sixteen plane bytes sit before the tile, the
+     * plane itself is that base and nothing is copied: the staging buffer
+     * below exists only for the two cases where those bytes are not there
+     * to read -- a segment's first tile, and the final chunk, whose 32-byte
+     * load would otherwise run past the end of the plane (and, on the
+     * identity candidate, past the caller's own buffer). */
+    const uint8_t *pb;
 
     (void)seg_base;
     a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = a8 = zero;
 
-    if (seg_pos == 0u) {
-        /* A segment's first tile. The encoder resets the lane state for
-         * every tile, so both things this head has to stand for are
-         * `init` here: the STRIDE `d < s` fallback, and the LANEHIST
-         * entry state (whose first 8 and first 16 lanes the p == 0
-         * blends below force to `init` regardless of what the head
-         * holds). Reading a - 16 would step outside the plane, so fill
-         * the head instead -- it is the same value the scalar loop
-         * would have used. */
-        memset(stg, init, 16);
+    if (seg_pos < 16u) {
+        /* A segment's first tile (seg_pos is a tile offset, so it is 0
+         * here): fewer than sixteen plane bytes precede it. The encoder
+         * resets the lane state for every tile, so both things this head
+         * has to stand for are `init` -- the STRIDE `d < s` fallback, and
+         * the LANEHIST entry state (whose first 8 and first 16 lanes the
+         * p == 0 blends below force to `init` regardless of what the head
+         * holds). Reading a - 16 would step outside the plane, so fill the
+         * head instead -- it is the same value the scalar loop would have
+         * used. The whole tile is staged because the chunk offsets below
+         * address it through this same base. */
+        if (seg_pos == 0u) {
+            memset(stg, init, 16);
+        } else {
+            memcpy(stg, a - 16, 16);
+        }
+        memcpy(stg + 16, a, nt);
+        memset(stg + 16 + nt, 0, 32);
+        pb = stg;
     } else {
-        memcpy(stg, a - 16, 16);
+        pb = a - 16;
     }
-    memcpy(stg + 16, a, nt);
-    memset(stg + 16 + nt, 0, 32);
 
     while (p + 32u <= (uint32_t)nt) {
         __m256i v = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + 16u + p));
+            (const __m256i *)(const void *)(pb + 16u + p));
         __m256i h8S = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + 8u + p));
+            (const __m256i *)(const void *)(pb + 8u + p));
         __m256i h8L = h8S;
         __m256i h16 = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + p));
+            (const __m256i *)(const void *)(pb + p));
 
         if (p == 0u) {
             h8L = _mm256_blendv_epi8(h8L, initv, m8);
             h16 = _mm256_blendv_epi8(h16, initv, m16);
         }
-        SEG_PS_CHUNK(v, h8L, h8S, h16, all);
+        SEG_PS_CHUNK(v, h8L, h8S, h16, all, pb, p);
         p += 32u;
     }
     if (p < (uint32_t)nt) {
         uint32_t rem = (uint32_t)nt - p;
         __m256i valid = _mm256_cmpgt_epi8(_mm256_set1_epi8((char)rem), idx);
-        __m256i v = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + 16u + p));
-        __m256i h8S = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + 8u + p));
-        __m256i h8L = h8S;
-        __m256i h16 = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + p));
+        const uint8_t *tb;
+        uint32_t q;
 
-        if (p == 0u) {
-            h8L = _mm256_blendv_epi8(h8L, initv, m8);
-            h16 = _mm256_blendv_epi8(h16, initv, m16);
+        /* The partial chunk is evaluated as a full one, so the bytes past
+         * the tile end have to be readable and must not match: the staged
+         * form pads them with zeros and the validity mask keeps them out of
+         * the counts.
+         *
+         * A segment's first tile is already staged whole (head, tile, pad),
+         * so the chunk is addressed at its own offset inside it, exactly as
+         * a full chunk is. Anywhere else the chunk's 16 preceding bytes are
+         * plane bytes and only the chunk itself is staged, which is the
+         * point of this path: the full chunks never copy anything. */
+        if (seg_pos < 16u) {
+            tb = stg;
+            q = p;
+        } else {
+            memcpy(stg, a + p - 16, 16);
+            memcpy(stg + 16, a + p, rem);
+            memset(stg + 16 + rem, 0, 32);
+            tb = stg;
+            q = 0u;
         }
-        SEG_PS_CHUNK(v, h8L, h8S, h16, valid);
+        {
+            __m256i v = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(tb + 16u + q));
+            __m256i h8S = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(tb + 8u + q));
+            __m256i h8L = h8S;
+            __m256i h16 = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(tb + q));
+
+            if (p == 0u) {
+                h8L = _mm256_blendv_epi8(h8L, initv, m8);
+                h16 = _mm256_blendv_epi8(h16, initv, m16);
+            }
+            SEG_PS_CHUNK(v, h8L, h8S, h16, valid, tb, q);
+        }
     }
 
     {
