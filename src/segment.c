@@ -2003,7 +2003,7 @@ void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             uint8_t initial_literal, uint16_t ks[12],
                             uint32_t enc_flags)
 {
-    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
     /* Only FASTEST screens the three uniform predictors: it is the level
      * that exists to write a block in one pass, and the cheap prescreen is
      * half its encode. Level 2 is the first rung that can spend a second
@@ -2059,7 +2059,7 @@ static int seg_plane_is_const(const uint8_t *p, uint32_t n)
     uint32_t i = 0u;
 
 #if ZPSE_PS_HAVE_AVX2
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         return seg_plane_is_const_avx2(p, n);
     }
 #endif
@@ -2093,7 +2093,7 @@ static int seg_plane_is_const(const uint8_t *p, uint32_t n)
  * what matters, not the absolute number. */
 uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
 {
-    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
     uint32_t tc = (plane_len + 255u) / 256u;
     uint32_t cost = 16u;
     uint32_t sum = 0u;
@@ -2432,7 +2432,7 @@ static uint32_t seg_pres_fold(const uint8_t *pres, uint32_t bits[8])
     unsigned w;
 
 #if ZPSE_PS_HAVE_AVX2
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         return seg_pres_fold_avx2(pres, bits);
     }
 #endif
@@ -2501,7 +2501,7 @@ ZPSE_HOT static uint32_t seg_plane_alphabet(const uint8_t *plane, uint32_t plane
      * the case where the scalar probe would otherwise walk the whole
      * plane. */
     if (n <= 16u && head < plane_len &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         /* A value the head missed is added to the tables and the vector
          * test resumes after it, instead of the rest of the plane going to
          * the byte loop: one added entry and one re-broadcast cost a few
@@ -3033,7 +3033,7 @@ uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
 {
     uint32_t tc;
     uint32_t best;
-    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
 
     if (e == 0 || lanes == 0 || plane == 0 || plane_len == 0u) {
         return UINT32_MAX;
@@ -3119,7 +3119,16 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     uint32_t t;
     uint8_t *tmp;
     uint32_t tmp_cap;
-    int have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    /* The two encoder-wide answers the tile loop asks for on every tile.
+     * Neither can change while this call runs -- block.c sets the ASCII gate
+     * before the trial and clears it afterwards, and nothing below writes
+     * e->enc_flags -- so reading them out of the encoder once is the same
+     * answer, without a load plus mask/shift/compare per searched tile (the
+     * level is asked three times per tile: the prescreen call, the all-hit
+     * run's own prescreen call, and the ratio-level gate test). */
+    int fast_tier;
+    int gate;
     uint8_t dense_v;
     int dense_ok;
     /* 1 iff the block layer already proved this very plane is one byte
@@ -3177,6 +3186,11 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     if (payload_cap < 16u) {
         return PSE_OUTPUT_OVERFLOW;
     }
+    /* Assigned after the argument checks, not with the declarations: both
+     * read through `e`. */
+    fast_tier = zpse_enc_speed(e->enc_flags) <=
+                (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX;
+    gate = (e->ascii_gate != 0u) ? 1 : 0;
     tc = (plane_len + 255u) / 256u;
 
     h.segment_decoded_size = plane_len;
@@ -3457,7 +3471,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * let the gate fire), so the per-tile scan here would re-prove it 256
          * times per block. Skip it, and keep the per-tile test for the blocks
          * that did not gate. */
-        ascii_ok = (e->ascii_gate != 0u) ? 1
+        ascii_ok = (gate != 0) ? 1
                    : ((nt >= 8u && zpse_tile_is_ascii(actual, nt)) ? 1 : 0);
         /* The block encoder's gate: its samples have already shown that
          * no cheap shape beats seven bits a byte on this block, so the
@@ -3466,7 +3480,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * difference between a text block costing a full sweep per tile
          * and costing a scan and a bit pack -- and the form is the same
          * bytes either way, so the stream is unchanged. */
-        if (ascii_ok && e->ascii_gate != 0u) {
+        if (ascii_ok && gate != 0) {
             uint32_t alen = zpse_tile_ascii_len(nt);
 
             if (pos + 2u + alen > payload_cap) {
@@ -3495,9 +3509,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         zpse_trial_search_tiles++;
 #endif
         seg_prescreen_tile(actual, nt, plane, seg_pos, initial_literal,
-                           zpse_enc_speed(e->enc_flags) <=
-                               (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX,
-                           have_avx2, &zero_cheap, ks);
+                           fast_tier, have_avx2, &zero_cheap, ks);
         uint8_t second_p = 0xFFu;
         uint16_t sk = 0xFFFFu;
         seg_scan_two(ks, &best_p, &second_p);
@@ -3656,10 +3668,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                     uint8_t np_second;
 
                     seg_prescreen(plane + nsseg_pos, nnt, plane, nsseg_pos,
-                                  initial_literal,
-                                  zpse_enc_speed(e->enc_flags) <=
-                                      (uint32_t)ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX,
-                                  have_avx2, nks);
+                                  initial_literal, fast_tier, have_avx2, nks);
                     /* The winner of the next tile, by the same rule the
                      * general path uses: fewest misses, ties to the lower
                      * priority (seg_pred_rank). It used to be "first in

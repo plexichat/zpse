@@ -600,14 +600,15 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
          * the bit scan cost ~640 cycles per record, 18% of a tile). */
         /* The edge list is the only array this needs: a run length is the
          * difference of two consecutive edges, so the second array of run
-         * lengths -- and the pass that filled it -- is gone. The price
-         * still has to be known before the first payload byte is written,
-         * so the edges are walked twice, once to size the payload and once
-         * to write it; both walks are over the same 258-entry array, and
-         * neither re-reads the mask words. */
+         * lengths -- and the pass that filled it -- is gone. The price still
+         * has to be known before the first payload byte is written, but it
+         * is a property of the list rather than a second walk over it: every
+         * run is exactly one byte (see below), so the payload is `nb - 1`
+         * bytes and the sizing walk is gone with the split loop it existed
+         * to pay for. Neither the list nor the mask words are re-read. */
         uint16_t edge[258];
         int nb = 0;
-        uint32_t need = 0;
+        uint32_t need;
         int r;
         uint16_t o = 0;
 
@@ -649,28 +650,22 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
             }
             edge[nb++] = nt;
         }
-        /* Runs of zero length (a split boundary, or a mask that opens with
-         * an exception) cost one byte; a run of L in 1..255 costs one; only
-         * L == 256 -- the whole tile, which the k tests above exclude but a
-         * split boundary does not -- needs the 255, 0, 1 form. */
-        for (r = 0; r + 1 < nb; r++) {
-            uint32_t L = (uint32_t)(edge[r + 1] - edge[r]);
-
-            need += (L == 0u) ? 1u : (2u * ((L + 254u) / 255u) - 1u);
-        }
+        /* Every run is one byte, so the payload is exactly `nb - 1` bytes.
+         *
+         * A run longer than 255 would have to be split as the 255, 0, rest
+         * form, and that cannot happen here: `nt <= 256` (the mask contract),
+         * and the k guard above keeps at least one hit and at least one
+         * exception, so no run of one value covers the whole tile and the
+         * longest possible run is `nt - 1 <= 255`. The split loop therefore
+         * never ran, and the sizing walk that existed to price it was
+         * arithmetic on a constant. */
+        need = (uint32_t)(nb - 1);
         if (need > payload_cap)
             return PSE_OUTPUT_OVERFLOW;
         if (need > 0 && payload_out == 0)
             return PSE_BAD_ARG;
         for (r = 0; r + 1 < nb; r++) {
-            uint32_t L = (uint32_t)(edge[r + 1] - edge[r]);
-
-            while (L > 255u) {
-                payload_out[o++] = 255;
-                payload_out[o++] = 0;
-                L -= 255u;
-            }
-            payload_out[o++] = (uint8_t)L;
+            payload_out[o++] = (uint8_t)(edge[r + 1] - edge[r]);
         }
         return (int)o;
     }

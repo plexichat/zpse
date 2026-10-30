@@ -214,7 +214,7 @@ int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt)
     if (actual == 0)
         return 0;
 #if ZPSE_TILE_HAVE_AVX2
-    if (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2)
+    if (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2)
         return zpse_tile_is_ascii_avx2(actual, nt);
 #endif
     for (; (uint32_t)i + 8u <= (uint32_t)nt; i = (uint16_t)(i + 8u)) {
@@ -279,7 +279,7 @@ int zpse_ascii_scan(const uint8_t *p, uint32_t n)
         return 0;
     }
 #if ZPSE_TILE_HAVE_AVX2
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u)
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u)
         return zpse_ascii_scan_avx2(p, n);
 #endif
     /* Thirty-two bytes an iteration, as four independent accumulators: the
@@ -1069,13 +1069,21 @@ static int tile_fam_is_vectorisable(int fam)
 /* Accumulate one 32-byte chunk's exception bits into `words`. `p` is a
  * multiple of 32, so the 32 mask bits land in exactly one word and no
  * straddling shift is needed; `MASK` is all ones for a full chunk and the
- * validity vector for the last, partial one. */
+ * validity vector for the last, partial one.
+ *
+ * The store is a plain assignment, not an OR. Every word is written by
+ * exactly one chunk of this loop (the chunks partition `[0, nt)` and `words`
+ * is zeroed on entry), so an OR only buys a read-modify-write of memory that
+ * the store then overwrites -- one extra load and one extra serialising
+ * edge per chunk, eight per tile. The exception walk that runs afterwards
+ * ORs single bits in (`TILE_TAKE_EXC*`), which stays idempotent over a word
+ * this loop has already filled in full. */
 #define TILE_CL_CHUNK(v_, pv_, MASK_)                                       \
     do {                                                                    \
         __m256i _eq = _mm256_cmpeq_epi8(v_, pv_);                           \
         /* andnot is ~_eq & MASK, i.e. the same 32 exception bits as        \
          * XOR-against-all-ones followed by an AND, in one instruction. */  \
-        words[(uint32_t)p >> 5] |= (uint32_t)_mm256_movemask_epi8(          \
+        words[(uint32_t)p >> 5] = (uint32_t)_mm256_movemask_epi8(           \
             _mm256_andnot_si256(_eq, MASK_));                               \
     } while (0)
 
@@ -2081,7 +2089,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
      * dense segment classifies first: a STRIDE winner there cost 3.2x the
      * vector path (830 ns against 260 on a 256-byte four-value tile). */
     if (nt >= 32u && tile_fam_is_vectorisable(fam) &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         uint8_t vl[8];
         uint8_t vs[8];
 
@@ -2098,7 +2106,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
             uint8_t c = cl->constant_C;
 #if defined(__SSE2__)
-            if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
+            if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
                 nt >= 16u) {
                 uint32_t p = 0u;
                 __m128i cvec = _mm_set1_epi8((char)c);
@@ -2139,7 +2147,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
             }
         } else {
 #if defined(__SSE2__)
-            if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
+            if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
                 nt >= 16u) {
                 uint32_t p = 0u;
                 __m128i zero = _mm_setzero_si128();
@@ -2176,7 +2184,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     case TILE_FAM_STRIDE: {
         uint32_t s = tile_stride_of(predictor_id);
 #if defined(__SSE2__)
-        if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSE2) != 0u && nt >= 16u) {
+        if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSE2) != 0u && nt >= 16u) {
             /* The positions that precede the plane have no byte behind
              * them and predict the initial literal; there are at most
              * eight of them. Taking those first is what lets this path
@@ -2512,7 +2520,7 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
 
 #if ZPSE_TILE_HAVE_AVX2
     if (nt >= 32u && tile_fam_is_vectorisable(fam) &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         return tile_fill_at_pred_avx2(predictor_id, fam, actual, nt, s, c,
                                       initial_literal, seg_pos, cl);
     }
@@ -2916,7 +2924,7 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
             act_src = cl->act_at_exc;
         } else {
 #if ZPSE_TILE_HAVE_AVX2
-            if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u)
+            if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u)
                 tile_gather_act_avx2(actual, nt, words, avals);
             else
 #endif
@@ -3579,7 +3587,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
     } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
 #if ZPSE_TILE_HAVE_AVX2
         if (total >= 16u &&
-            (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
             tile_prefix_sum_avx2(w + 1u, units, total, run);
         } else
 #endif
@@ -3595,7 +3603,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
         int done = 0;
 #if ZPSE_TILE_HAVE_AVX2
         if (total >= 16u &&
-            (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
             done = (tile_chain_excl_avx2(w + 1u, units, total, run) == 0);
         }
 #endif
@@ -3622,7 +3630,7 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
 
 #if ZPSE_TILE_HAVE_AVX2
     if ((uint32_t)nt >= 16u &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         tile_stride1_fill_avx2(out, (uint32_t)nt, mw, w);
         return (uint16_t)total;
     }
@@ -3896,7 +3904,7 @@ static uint16_t tile_stride_recon_scalar(uint8_t *out, uint16_t nt, uint32_t s,
      * same count, so the caller cannot tell which ran. */
 #if ZPSE_TILE_HAVE_AVX2
     if (s >= 2u && s <= 4u && nt >= 32u &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         return tile_stride_recon_wide(
             out, nt, s, seg_base, seg_pos, init, words,
             (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA)
@@ -4820,7 +4828,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
      * machine without AVX2 fall through to the scalar loops. */
     if ((uint32_t)nt >= 32u &&
         (fam == TILE_FAM_CONST || fam == TILE_FAM_LANEHIST) &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         uint8_t ent_last[8];
         uint8_t ent_second[8];
 
@@ -4862,7 +4870,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
             int done = 0;
 #if ZPSE_TILE_HAVE_AVX2
             if (s == 8u && (uint32_t)nt >= 32u &&
-                (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+                (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
                 /* Stride 8 is the 8-lane LANE_PREVIOUS recurrence with the
                  * tile's *real* preceding eight bytes as the entry lane
                  * state (init at the very start of the segment). */

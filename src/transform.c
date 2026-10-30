@@ -607,6 +607,28 @@ static ZPSE_T_AVX2 void zpse_t16x16_forward_blocked(const uint8_t *const in[16],
     }
 }
 
+/* Direct scatter: the same network writing the sixteen planes in place.
+ *
+ * The mirror of zpse_t16x16_inverse_direct below, and for the same reason.
+ * Staging exists only to break the L1 set conflict of planes exactly `rows`
+ * bytes apart -- 4096 for a 64 KiB block, i.e. the same set for all sixteen
+ * -- and a caller whose planes are closer together already has that
+ * (768-byte planes for the sweep's 12 KiB window, 256-byte ones for its
+ * prefix price: 12 and 4 cache lines apart, sixteen distinct sets). For
+ * those the 8 KiB buffer and its sixteen memcpys per group are pure cost,
+ * and the sweep pays it once per candidate per block. Same kernel, same
+ * group, same bytes; only the order of the stores differs. */
+static ZPSE_T_AVX2 void zpse_t16x16_forward_direct(const uint8_t *const in[16],
+                                                   uint8_t *const out[16],
+                                                   uint32_t rows)
+{
+    uint32_t g;
+
+    for (g = 0; (g + 1u) * 16u <= rows; g++) {
+        zpse_t16x16_avx2(in, g * 256u, out, g * 16u);
+    }
+}
+
 /* Direct gather: the same network reading the sixteen planes in place.
  *
  * Staging exists only to break the L1 set conflict of planes exactly
@@ -1597,6 +1619,31 @@ int zpse_transform_width(uint8_t transform_id, uint8_t segment_count,
     return PSE_OK;
 }
 
+/* (n + w - 1 - s) / w, for the segment widths the format allows.
+ *
+ * All five are powers of two (`zpse_valid_count`), and the quotient is asked
+ * for sixteen times per staged plane: once per segment by
+ * `zpse_segment_lengths`, then again by `zpse_transform_validate_sizes`, and
+ * a third time per candidate by the sweep's floor. A variable-divisor `div`
+ * is 20-30 cycles each on x86-64, so the shift is worth the two compares; on
+ * the 256-byte prefix plane the divisions were the largest single item in a
+ * call that exists to transform 4 KiB. */
+static uint32_t zpse_seg_len(uint32_t n, uint32_t w, uint32_t s)
+{
+    uint32_t sh = 0u;
+
+    if (w >= 16u) {
+        sh = 4u;
+    } else if (w >= 8u) {
+        sh = 3u;
+    } else if (w >= 4u) {
+        sh = 2u;
+    } else if (w >= 2u) {
+        sh = 1u;
+    }
+    return (n + w - 1u - s) >> sh;
+}
+
 int zpse_segment_lengths(uint32_t n, uint8_t w, uint32_t out_lens[16])
 {
     uint32_t s;
@@ -1611,7 +1658,7 @@ int zpse_segment_lengths(uint32_t n, uint8_t w, uint32_t out_lens[16])
         return PSE_BAD_ARG;
     }
     for (s = 0; s < (uint32_t)w; s++) {
-        out_lens[s] = (n + (uint32_t)w - 1u - s) / (uint32_t)w;
+        out_lens[s] = zpse_seg_len(n, (uint32_t)w, s);
     }
     for (s = (uint32_t)w; s < 16u; s++) {
         out_lens[s] = 0;
@@ -1637,7 +1684,8 @@ int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
         return rc;
     }
     for (s = 0; s < w; s++) {
-        uint32_t expect = (n + (uint32_t)w - 1u - (uint32_t)s) / (uint32_t)w;
+        uint32_t expect = zpse_seg_len(n, (uint32_t)w, (uint32_t)s);
+
         if (seg_lens[s] != expect) {
             return PSE_BAD_SEGMENT_DIRECTORY;
         }
@@ -1648,9 +1696,33 @@ int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
     return PSE_OK;
 }
 
-ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
-                           const uint8_t *in, uint32_t n,
-                           uint8_t *segs[16], const uint32_t seg_lens[16])
+/* The forward transform, with `trusted` choosing how much of the argument
+ * contract is re-established.
+ *
+ * `trusted == 0` is the public entry point's job: every decoded-shaped
+ * question about the arguments (the stride formula, the disjointness of
+ * sixteen planes) is answered here, because the caller may be handing in
+ * anything.
+ *
+ * `trusted != 0` is for the encoder's own staged planes, and it exists
+ * because those checks are not free: `zpse_transform_validate_sizes` runs a
+ * per-segment comparison after the lengths have already been computed by the
+ * caller from the same formula, and the disjointness loops are 16 + 120
+ * range tests at w = 16. Measured on the block sweep's staging, the checks
+ * were the larger part of the call on the 256-byte prefix plane -- which is
+ * paid once per candidate per block, ~12 times. Nothing they can answer is
+ * in doubt there: `zpse_block_planes` lays the planes out as
+ * `e->tstage + running_total` with `running_total == n`, so they cannot
+ * overlap each other or the input, and it derives the lengths with
+ * `zpse_segment_lengths`. The same width derivation and the same argument
+ * checks that are cheap stay in both forms, so a trusted caller that got the
+ * shape wrong still cannot write outside the planes.
+ *
+ * Byte-identical either way: every skipped test can only return PSE_BAD_*.
+ */
+static ZPSE_HOT int zpse_transform_forward_impl(
+    const ZpseTransformMeta *meta, uint8_t seg_count, const uint8_t *in,
+    uint32_t n, uint8_t *segs[16], const uint32_t seg_lens[16], int trusted)
 {
     uint8_t w = 0;
     uint8_t s;
@@ -1675,10 +1747,12 @@ ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_c
     if (meta->width_W != w || seg_count != w) {
         return PSE_BAD_TRANSFORM;
     }
-    rc = zpse_transform_validate_sizes(meta->transform_id, seg_count, n,
-                                       seg_lens);
-    if (rc != PSE_OK) {
-        return rc;
+    if (!trusted) {
+        rc = zpse_transform_validate_sizes(meta->transform_id, seg_count, n,
+                                           seg_lens);
+        if (rc != PSE_OK) {
+            return rc;
+        }
     }
     for (s = 0; s < w; s++) {
         if (segs[s] == 0) {
@@ -1690,17 +1764,19 @@ ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_c
     if ((delta || xorr) && !meta->has_seeds) {
         return PSE_BAD_ARG;
     }
-    for (s = 0; s < w; s++) {
-        if (zpse_ranges_overlap(in, n, segs[s], seg_lens[s])) {
-            return PSE_BAD_ARG;
-        }
-    }
-    for (s = 0; s < w; s++) {
-        uint8_t t;
-        for (t = (uint8_t)(s + 1u); t < w; t++) {
-            if (zpse_ranges_overlap(segs[s], seg_lens[s],
-                                    segs[t], seg_lens[t])) {
+    if (!trusted) {
+        for (s = 0; s < w; s++) {
+            if (zpse_ranges_overlap(in, n, segs[s], seg_lens[s])) {
                 return PSE_BAD_ARG;
+            }
+        }
+        for (s = 0; s < w; s++) {
+            uint8_t t;
+            for (t = (uint8_t)(s + 1u); t < w; t++) {
+                if (zpse_ranges_overlap(segs[s], seg_lens[s],
+                                        segs[t], seg_lens[t])) {
+                    return PSE_BAD_ARG;
+                }
             }
         }
     }
@@ -1769,7 +1845,16 @@ ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_c
                 tin[t] = in + (size_t)t * 16u;
                 tout[t] = segs[t];
             }
-            zpse_t16x16_forward_blocked(tin, tout, rows);
+            /* Blocked only where it pays: the staging buys nothing unless
+             * the destination planes share an L1 set, which they do exactly
+             * when their spacing is a multiple of 4 KiB (a 64 KiB block's
+             * 4096-byte planes). The sweep stages a 12 KiB window (768-byte
+             * planes) or a 256-byte prefix, so it takes the direct form. */
+            if ((((uintptr_t)segs[1] - (uintptr_t)segs[0]) & 4095u) == 0u) {
+                zpse_t16x16_forward_blocked(tin, tout, rows);
+            } else {
+                zpse_t16x16_forward_direct(tin, tout, rows);
+            }
             g = rows / 16u;
         } else
 #endif /* ZPSE_T_HAVE_AVX2 */
@@ -1869,6 +1954,23 @@ ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_c
         }
     }
     return PSE_OK;
+}
+
+ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
+                           const uint8_t *in, uint32_t n,
+                           uint8_t *segs[16], const uint32_t seg_lens[16])
+{
+    return zpse_transform_forward_impl(meta, seg_count, in, n, segs, seg_lens,
+                                      0);
+}
+
+ZPSE_HOT int zpse_transform_forward_planes(const ZpseTransformMeta *meta,
+                                          uint8_t seg_count, const uint8_t *in,
+                                          uint32_t n, uint8_t *segs[16],
+                                          const uint32_t seg_lens[16])
+{
+    return zpse_transform_forward_impl(meta, seg_count, in, n, segs, seg_lens,
+                                      1);
 }
 
 ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,

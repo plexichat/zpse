@@ -231,7 +231,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
      * (nothing here can change what the CPU is). */
     int have_avx2 = 0;
 #if ZPSE_LZ_HAVE_AVX2
-    have_avx2 = (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+    have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
 #endif
     /* The key of the current position -- the four bytes at the cursor and
      * its hash -- lives in `cur`/`h` across iterations instead of being

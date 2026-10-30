@@ -370,7 +370,7 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     if (b < 1u || b > 4u) {
         return 0u;
     }
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
         return 0u;
     }
 #if ZPSE_RES_HAVE_AVX2
@@ -380,7 +380,7 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
      * scalar tail below finishes whatever it leaves, exactly as it does
      * for the 128-bit loop. */
     if (b == 4u && m == 16u && k >= 64u &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         i = residual_decode_mode2_avx2_m16(palette, src, k, exc_out);
     }
 #endif
@@ -1311,7 +1311,7 @@ static int residual_decode_mode3(const uint8_t *payload,
      * of padding the g == 7 stores can leave past a batch always land in a
      * group those loops then write in full. */
     if (g >= 7u && g <= 8u && nfull >= 9u &&
-        (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         rc = residual_decode_mode3_nib(payload, nfull, k, m, exc_out, &j);
         if (rc != PSE_OK) {
             return rc;
@@ -1693,7 +1693,7 @@ static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_simd(
     __m128i nibv;
     uint16_t i = 0u;
 
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
         return 0u;
     }
     memcpy(lo, idx_of, sizeof lo);
@@ -1743,7 +1743,7 @@ static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_bits(
     const __m128i onev = _mm_set1_epi8((char)p1);
     uint16_t i = 0u;
 
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
         return 0u;
     }
     while ((uint32_t)i + 32u <= (uint32_t)k) {
@@ -1786,7 +1786,7 @@ static ZPSE_RES_SSSE3 uint16_t residual_encode_mode2_b2(
     __m128i mult;
     uint16_t i = 0u;
 
-    if ((zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
         return 0u;
     }
     memcpy(lo, idx_of, sizeof lo);

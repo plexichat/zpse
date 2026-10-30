@@ -695,7 +695,7 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (tid == 0u && sc == 1u) {
         planes[0] = (uint8_t *)(uintptr_t)in;
     } else {
-        rc = zpse_transform_forward(&tm, sc, in, n, planes, lens);
+        rc = zpse_transform_forward_planes(&tm, sc, in, n, planes, lens);
         if (rc != PSE_OK) {
             return rc;
         }
@@ -1342,7 +1342,12 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         planes[0] = (uint8_t *)(uintptr_t)in;
         return PSE_OK;
     }
-    return zpse_transform_forward(&tm, sc, in, n, planes, lens);
+    /* The trusted form: the planes were just laid out above as
+     * `tstage + running_total` with `running_total == n`, and `lens` came
+     * from `zpse_segment_lengths`, so the disjointness of the sixteen planes
+     * (16 + 120 range tests at w = 16) is a fact this function established
+     * on the way in. See zpse_transform_forward_impl. */
+    return zpse_transform_forward_planes(&tm, sc, in, n, planes, lens);
 }
 
 /* The prefix price could not be taken: the candidate's first tile in some
@@ -1421,8 +1426,8 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
         for (s = 0u; s < sc; s++) {
             flens[s] = 256u;
         }
-        if (zpse_transform_forward(&tm, sc, in, pfront, planes, flens) !=
-            PSE_OK) {
+        if (zpse_transform_forward_planes(&tm, sc, in, pfront, planes,
+                                          flens) != PSE_OK) {
             return ZPSE_PREFIX_NEED_FULL;
         }
     }
@@ -2891,6 +2896,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int lz_done = 0;
     uint8_t *tdst = e->cand;
     uint32_t tcap = (uint32_t)ZPSE_E_SZ_CAND;
+    /* Per-slot floor, filled once before the trial loop (see there). */
+    uint32_t fl[ZPSE_MAX_CAND];
 
     /* ---- The match finder before the trial, on a gated block -------- *
      *
@@ -2971,6 +2978,32 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int win_pos = -1;
 #endif
 
+    /* One floor per candidate, computed once.
+     *
+     * `zpse_block_floor` is a pure function of (n, transform, segment count,
+     * metadata length), and none of those four is written between here and
+     * the end of the sweep -- the candidate build and the pricing compaction
+     * are both behind us. The loop below nevertheless asks for it twice per
+     * REMAINING candidate: once at the top for the per-candidate skip, and
+     * once per iteration for the post-trial scan, so a ten-candidate block
+     * pays about fifty-five calls for ten distinct values. Each one
+     * re-derives the width, runs `zpse_segment_lengths` (a variable-divisor
+     * division per segment on the wide shapes) and walks the planes, which
+     * is more arithmetic than the tiles a trial spends on a 16 KiB window.
+     * The slot order is the one the loop uses, and it is fixed here: the
+     * compaction that renumbers the slots ran already.
+     *
+     * Same arguments, same function, same value, and UINT32_MAX (a shape
+     * that cannot be priced) compares exactly as it did at both sites. */
+    {
+        int fi;
+
+        for (fi = 0; fi < ncand; fi++) {
+            fl[fi] = zpse_block_floor(n, tids[fi], scounts[fi],
+                                     meta_lens[fi]);
+        }
+    }
+
     for (oi = 0; oi < ncand; oi++) {
         int i = oi;
         uint32_t t = 0;
@@ -2994,8 +3027,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * earlier candidate because it merely ties would change the
          * stream, and the parity suite proves it does not. */
         if (have_best && (uint32_t)idx[i] > best_idx &&
-            zpse_block_floor(n, tids[i], scounts[i], meta_lens[i]) >
-                best_total) {
+            fl[i] > best_total) {
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_trials_skipped++;
 #endif
@@ -3141,7 +3173,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     earlier_left = 1;
                     continue;
                 }
-                f = zpse_block_floor(n, tids[j], scounts[j], meta_lens[j]);
+                f = fl[j];
                 if (f < min_floor) {
                     min_floor = f;
                 }
