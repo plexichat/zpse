@@ -1,3 +1,6 @@
+# local agent/assistant instructions, not part of the project
+AGENTS.md
+
 # build artefacts
 *.exe
 *.o
