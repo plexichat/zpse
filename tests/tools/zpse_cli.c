@@ -158,6 +158,18 @@ static int write_file(const char *path, const uint8_t *buf, size_t len)
 
 static int parse_level(const char *s, uint32_t *flags)
 {
+    /* The level is a FIELD, not a flag: the caller arrives with the
+     * default (BALANCED) already in it, so every branch below has to
+     * replace those bits rather than OR into them. It used to OR, and the
+     * result was a `-l` that silently encoded a different level than it
+     * named -- 10|2 is 10, so `-l 1` ran BALANCED; 10|4 is 14, so
+     * `-l 2` and `-l 3` both ran level 7; 10|18 is 26, above the field's
+     * 9, so `-l 8` and `-l 9` ran whatever `(26 & mask) >> shift` is and
+     * the header printed "level ?". Only `-l 5` and `-l 7` did what they
+     * said. Clearing the field here is the whole fix, and it keeps the
+     * other bits of the word (CHECKSUM) untouched. */
+    *flags &= ~(uint32_t)ZPSE_ENC_SPEED_MASK;
+
     if (strcmp(s, "fastest") == 0 || strcmp(s, "1") == 0) {
         *flags |= ZPSE_ENC_SPEED_FASTEST;
     } else if (strcmp(s, "2") == 0) {

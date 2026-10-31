@@ -950,30 +950,36 @@ at copy speed -- and `dickens`, `ooffice`, `reymont` and `webster` are the
 text problem in one line each: 1.09 to 1.36 on data that a general-purpose
 LZ at the same speed reaches in the twos.
 
-Running the ladder over Silesia also breaks a property the level table claims:
+Running the ladder over Silesia is how a CLI bug surfaced. `-l N` used to OR
+the level into a word that already held the default, so `-l 1` ran BALANCED,
+`-l 2` and `-l 3` both ran level 7, `-l 6` ran 7 as well, and `-l 8`/`-l 9`
+left the field above its range (the header printed `level ?`). Only `-l 5`
+and `-l 7` did what they said. `parse_level` now replaces the field instead of
+OR-ing into it, and the ladder is what the level table documents:
 
-| level | dickens + webster | encode |
-| --- | ---: | ---: |
-| 1 FASTEST | 1.30 | 0.43 GB/s |
-| 2 | 1.47 | 0.34 |
-| 3 FASTER | 1.47 | 0.36 |
-| 4 | 1.30 | 0.49 |
-| 5 BALANCED (default) | 1.30 | 0.50 |
-| 6 | 1.47 | 0.32 |
-| 7 | 1.47 | 0.31 |
-| 8 | 1.51 | 0.30 |
-| 9 MAX | 1.51 | 0.30 |
+| level | dickens + webster | ratio | encode |
+| --- | ---: | ---: | ---: |
+| 1 FASTEST | 47,256,891 | 1.09 | 1.19 GB/s |
+| 2 | 47,256,861 | 1.09 | 1.21 |
+| 3 FASTER | 47,256,861 | 1.09 | 1.18 |
+| 4 | 47,256,861 | 1.09 | 1.22 |
+| 5 BALANCED (default) | 39,796,481 | 1.30 | 0.49 |
+| 6 | 36,950,349 | 1.40 | 0.40 |
+| 7 | 35,152,045 | 1.47 | 0.35 |
+| 8 | 34,155,474 | 1.51 | 0.29 |
+| 9 MAX | 34,155,474 | 1.51 | 0.33 |
 
-Level 4 writes the same total as level 1 and 5 writes the same as level 4,
-while level 3 is 12% smaller than all three. The table's own contract is that
-a deeper level chooses from a superset of the shapes above it -- more trials,
-looser screen, wider decode bill -- so this cannot happen if the trial cap
-really keeps the cheapest `cap` survivors. Two changes have been measured
-against it and neither is the cause: cutting the default level's field to its
-best two on price (its `tie_field`) moves the total by 0.09%, and sizing the
-LZ screen's table to its sample is a 17% encode regression. Until the cap's
-order is instrumented, the ladder is what it measures on Silesia and not what
-it documents, and the default level sits on the wrong side of the 3/4 step.
+Sizes are non-increasing from level 2 up, which is the property the table
+promises, and the step from level 4 to 5 is where the match finder is offered
+to every block. Over the whole corpus MAX writes 114,711,960 bytes (1.85:1)
+against 132,691,893 at the default (1.60:1): on text the default gives up 12%
+of its size to run two to three times faster, and that trade is now something
+a caller can actually ask for by name.
+
+The four cheap levels (1-4) write the same stream within 30 bytes of each
+other because none of them runs the match finder, and on English prose the
+tile stream is the same shape at one trial as at four -- their differences
+show up on structured columns, which is what the 25-case corpus measures.
 
 ### What the compiler adds, and what the tags are worth
 

@@ -14,6 +14,9 @@
 #include "zpse/types.h"
 
 #include <string.h>
+#if defined(ZPSE_TRACE_TRIALS)
+#include <stdio.h>
+#endif
 
 /* Capacity of the transform sweep's candidate list, and of one candidate's
  * transform metadata. The list used to hold three shapes -- RAW_BYTES,
@@ -2862,6 +2865,23 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         {
             const ZpseLevel *row = zpse_level_row(zpse_enc_speed(speed));
             uint32_t cap = (uint32_t)row->trials;
+#if defined(ZPSE_TRACE_TRIALS)
+            {
+                int q;
+
+                fprintf(stderr,
+                        "sweep n=%u speed=%u lvl=%u ncand=%d cap=%u pick=%d "
+                        "h=%d c=%d:",
+                        n, (unsigned)speed,
+                        (unsigned)zpse_enc_speed(speed), ncand,
+                        (unsigned)cap, pick, head_misleads, content_kept);
+                for (q = 0; q < ncand && q < (int)ZPSE_MAX_CAND; q++) {
+                    fprintf(stderr, " [%u %u]", (unsigned)tids[q],
+                            (unsigned)ex[q]);
+                }
+                fprintf(stderr, "\n");
+            }
+#endif
 
             /* Only a level that prices EVERY survivor can cut a field: the
              * cheap rungs already stop at their own trial count, and
@@ -3076,6 +3096,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq, tdst, tcap, &t,
                                 &budget_hit, have_best, best_total, flat_min);
+#endif
+#if defined(ZPSE_TRACE_TRIALS)
+        fprintf(stderr, "  trial oi=%d tid=%u rc=%d t=%u haven=%d bt=%u\n",
+                oi, (unsigned)tids[i], rc, t, have_best, best_total);
 #endif
         if (rc != PSE_OK) {
             /* A trial the budget stopped cannot win: its total only grows as
