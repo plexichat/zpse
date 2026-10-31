@@ -451,8 +451,11 @@ written with **one store**, as long as the store
 covers the match, its width does not exceed the distance (so its load cannot
 reach bytes it has not itself written), and the store stays inside the output.
 The bytes it writes past the match are ones a later command overwrites, so the
-slack is reclaimed rather than leaked -- the same argument `lz_copy_literals`
-already made for literals, applied to the other half of the command.
+slack is reclaimed rather than leaked, and the store is only taken when the
+room before `dst` covers its width -- a match at the very end of a block gets
+the exact byte loop instead. `lz_copy_literals` is the same shape with the
+same bound, which is what lets a block be decoded into exactly its own bytes
+and no more.
 
 That is why a command costs about the same whatever its match length, and why
 the stream's rate follows its bytes per command rather than its ratio: the
@@ -863,14 +866,23 @@ blocks.
 The read side has its own function, `zpse_decompress_frame_parallel()`, and it
 needs the index for the same reason `x` does: block *k*'s offset is only in the
 table. A frame without one decodes sequentially inside the same call. What it
-adds over the serial decoder is a per-worker **staging block** of
-`nominal_block_size + 64` bytes, and that is not caution: the LZ decoder's
-one-shot command paths write up to sixteen bytes past the match they copy, on
-the argument that the next command overwrites them. In one sequential buffer
-that is true and free; in a parallel decode block *k*'s tail is block *k+1*'s
-head, so each worker decodes into its staging block -- which has the slack --
-and copies the bytes it produced into place. One copy per block at memory
-speed, against a block decode several times slower.
+adds over the serial decoder is nothing per worker but an arena: block *k*'s
+bytes belong at `k * nominal_block_size` in the caller's buffer and the seek
+writes them straight there, so there is no staging block and no second copy.
+
+That is only true because a block decode stays inside its own output. The LZ
+decoder's one-shot command paths write up to sixteen bytes past the match they
+copy, on the argument that the next command overwrites them, and
+`lz_copy_literals` did the same with its tail -- while testing the room in
+front of the *run* rather than in front of the store, which let a block whose
+literal run ended with a 9-to-15-byte remainder write up to seven bytes past
+its end. In one sequential buffer nobody notices; across workers, block *k*'s
+tail is block *k+1*'s head. The literal copy now tests the room in front of
+where it stores, and `tests/suites/test_frame.c` holds the bound down by
+seeking every block into a heap buffer of exactly the bytes wanted, so a
+sanitiser has nowhere to miss it. Before that fix the parallel path staged
+each block and copied it into place; removing the copy is worth up to a third
+of the parallel decode rate on frames too large for cache.
 
 Both directions stay serial on small frames, because a thread start costs more
 than the queue: encode wants four blocks per worker and decode thirty-two (a
@@ -889,16 +901,16 @@ that the queue threshold keeps it on one worker.
 
 | frame | encode 1 | 2 | 3 | 6 | decode 1 | 2 | 3 | 6 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 MiB | 1.64 | 2.26 | 2.62 | 3.00 | — | — | — | — |
-| 4 MiB | 1.56 | 2.55 | 3.52 | 4.58 | 5.58 | 7.39 | 8.77 | 8.73 |
-| 16 MiB | 0.62 | 1.02 | 1.63 | 2.77 | 4.01 | 5.44 | 8.48 | 11.09 |
-| 64 MiB | 0.58 | 1.11 | 1.61 | 2.58 | 4.04 | 5.83 | 7.79 | 10.88 |
+| 1 MiB | 1.22 | 2.44 | 3.15 | 3.00 | — | — | — | — |
+| 4 MiB | 1.29 | 2.66 | 3.80 | 4.33 | 5.67 | 8.70 | 8.96 | 8.69 |
+| 16 MiB | 0.63 | 1.22 | 1.72 | 2.34 | 4.10 | 6.87 | 9.86 | 12.25 |
+| 64 MiB | 0.61 | 1.14 | 1.68 | 3.04 | 4.21 | 7.68 | 10.26 | 14.82 |
 
 Encode scales better than decode because it has five times more to do: the
 encode column is the sweep and the match finder on four different column
 shapes, and the decode column is a block reconstruction that already runs at
-four to six gigabytes a second on one core. A 64 MiB frame goes from 0.58 to
-2.58 GB/s of encode and from 4.04 to 10.88 GB/s of decode, and the frames
+four to six gigabytes a second on one core. A 64 MiB frame goes from 0.61 to
+3.04 GB/s of encode and from 4.21 to 14.82 GB/s of decode, and the frames
 below about four megabytes stay serial in both directions.
 
 Every frame in that table was checked twice: the workers' frame is compared

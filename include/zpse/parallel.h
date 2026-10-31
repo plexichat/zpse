@@ -76,24 +76,22 @@ size_t zpse_parallel_bound(size_t n, uint32_t nominal_block_size,
  * so the decoded frame is the sequential one, byte for byte.
  *
  * `dec_arenas` holds `arena_count` caller-owned 320 KiB decode arenas
- * (ZPSE_DEC_ARENA_SIZE, 64-B aligned), and `staging` holds
- * threads * (nominal_block_size + 64) bytes, also caller-owned. The staging
- * block is not laziness: the LZ decoder's one-shot command paths write up to
- * sixteen bytes past the match they copy, on the argument that the next
- * command overwrites them. Inside one sequential buffer that is true and
- * costs nothing, but block k's tail is block k+1's head when both are decoded
- * in parallel, so each worker decodes into its own staging block (which has
- * the slack) and copies the bytes it produced into place. The copy is one per
- * block at memory speed against a block decode several times slower, and it
- * is what makes the parallel result the sequential result instead of a race.
+ * (ZPSE_DEC_ARENA_SIZE, 64-B aligned). A worker has no other state and no
+ * buffer of its own: it decodes block k into `output + k * nominal` and
+ * writes nothing outside it, so two workers cannot touch the same byte. That
+ * bound is a property of the block decoder, not of this call -- the LZ
+ * decoder's one-shot command paths used to write up to sixteen bytes past
+ * the match they copied and rely on the next command to reclaim them, which
+ * across two workers is a race between block k's tail and block k+1's head.
+ * It now tests the room in front of every store, and this path decodes in
+ * place instead of through a per-worker staging block.
  *
  * Returns PSE_OK with *out_len_out, or a negative status. */
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    uint8_t *output, size_t out_cap,
                                    size_t *out_len_out, unsigned threads,
                                    void *const dec_arenas[],
-                                   unsigned arena_count,
-                                   uint8_t *staging);
+                                   unsigned arena_count);
 
 #ifdef __cplusplus
 }

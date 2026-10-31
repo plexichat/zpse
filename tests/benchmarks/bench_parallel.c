@@ -51,7 +51,6 @@ static void *enc_arenas[MAXT] = { enc_mem[0], enc_mem[1], enc_mem[2],
                                   enc_mem[3], enc_mem[4], enc_mem[5] };
 static void *dec_arenas[MAXT] = { dec_mem[0], dec_mem[1], dec_mem[2],
                                   dec_mem[3], dec_mem[4], dec_mem[5] };
-static unsigned char stage[MAXT * (BLK + 64u)];
 
 static double now_ns(void)
 {
@@ -119,7 +118,7 @@ static double dec_once(const uint8_t *comp, size_t len, uint8_t *out, size_t n,
     int rc;
 
     rc = zpse_decompress_frame_parallel(comp, len, out, n, &got, threads,
-                                        (void *const *)dec_arenas, MAXT, stage);
+                                        (void *const *)dec_arenas, MAXT);
     if (rc != PSE_OK || got != n) {
         return 0.0;
     }

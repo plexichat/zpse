@@ -49,8 +49,6 @@ static void *arenas[MAXTHREADS] = { ea[0], ea[1], ea[2], ea[3], ea[4], ea[5] };
 static void *decs[MAXTHREADS] = { dmt[0], dmt[1], dmt[2],
                                   dmt[3], dmt[4], dmt[5] };
 
-static unsigned char stage[MAXTHREADS * (BLKMAX + 64u)];
-
 static uint8_t in[MAXN];
 static uint8_t ref[COMP_CAP];
 static uint8_t par[COMP_CAP];
@@ -182,7 +180,7 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     memset(out, 0, n);
     rc = zpse_decompress_frame_parallel(par, plen, out, sizeof out, &pgot,
                                         threads, (void *const *)decs,
-                                        MAXTHREADS, stage);
+                                        MAXTHREADS);
     CHECK(rc == PSE_OK, "%u workers: parallel decode (n %u, index %d): %s",
           threads, n, indexed, zpse_status_name(rc));
     CHECK(rc == PSE_OK && pgot == n && memcmp(out, in, n) == 0,

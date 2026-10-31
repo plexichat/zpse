@@ -250,7 +250,13 @@ static int zpse_mt_close(ZpseMtJob *j, int with_index, size_t *out_len_out)
  * A decode worker needs no staging at all: block k's decoded bytes belong at
  * k * nominal in the caller's buffer, and the index already says where the
  * block starts, so the worker decodes straight into its final place. The
- * only per-worker state is the decoder arena. */
+ * only per-worker state is the decoder arena. That is only true because a
+ * block decode is bounded by its own output: the LZ decoder used to write a
+ * few bytes past the end of a run and rely on the next command to reclaim
+ * them, which in a frame means overwriting the next block's first bytes.
+ * The literal copy now tests the room in front of where it stores
+ * (lz_copy_literals), so exactly `nominal` bytes are written and no worker
+ * can touch another's. */
 typedef struct ZpseMtDecJob {
     const uint8_t *in;
     size_t in_len;
@@ -265,7 +271,6 @@ typedef struct ZpseMtDecJob {
 typedef struct ZpseMtDecArg {
     ZpseMtDecJob *job;
     void *arena;
-    uint8_t *stage; /* this worker's block buffer, nominal + 64 bytes */
 } ZpseMtDecArg;
 
 static void zpse_mt_dec_fail(ZpseMtDecJob *j, int rc)
@@ -275,7 +280,7 @@ static void zpse_mt_dec_fail(ZpseMtDecJob *j, int rc)
     }
 }
 
-static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena, uint8_t *stage)
+static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena)
 {
     ZpseDecoder d;
     int rc;
@@ -288,6 +293,7 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena, uint8_t *stage)
     for (;;) {
         size_t i;
         size_t off;
+        size_t room;
         uint32_t got = 0u;
 
         if (j->failed != 0) {
@@ -298,12 +304,19 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena, uint8_t *stage)
             return;
         }
         off = i * j->nominal;
-        /* `stage` is a nominal block plus the slack a block decode may
-         * write past its own end; decoding straight into `out` would put
-         * that slack in the next block's first bytes, which another worker
-         * owns. */
-        rc = zpse_frame_seek(&d, j->in, j->in_len, (uint32_t)i, stage,
-                             (uint32_t)(j->nominal + 64u), &got);
+        if (off > j->out_cap) {
+            zpse_mt_dec_fail(j, PSE_OUTPUT_OVERFLOW);
+            return;
+        }
+        /* Decoded straight into its final place: the seek writes the block's
+         * own bytes and nothing else, so its room is exactly the room the
+         * caller's buffer has left at this block. */
+        room = j->out_cap - off;
+        if (room > j->nominal) {
+            room = j->nominal;
+        }
+        rc = zpse_frame_seek(&d, j->in, j->in_len, (uint32_t)i, j->out + off,
+                             (uint32_t)room, &got);
         if (rc != PSE_OK) {
             zpse_mt_dec_fail(j, rc);
             return;
@@ -312,11 +325,10 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena, uint8_t *stage)
             zpse_mt_dec_fail(j, PSE_BAD_HEADER);
             return;
         }
-        if (off > j->out_cap || (size_t)got > j->out_cap - off) {
+        if ((size_t)got > j->out_cap - off) {
             zpse_mt_dec_fail(j, PSE_OUTPUT_OVERFLOW);
             return;
         }
-        memcpy(j->out + off, stage, (size_t)got);
     }
 }
 
@@ -325,7 +337,7 @@ static DWORD WINAPI zpse_mt_dec_entry(LPVOID p)
 {
     ZpseMtDecArg *a = (ZpseMtDecArg *)p;
 
-    zpse_mt_dec_worker(a->job, a->arena, a->stage);
+    zpse_mt_dec_worker(a->job, a->arena);
     return 0;
 }
 #else
@@ -333,7 +345,7 @@ static void *zpse_mt_dec_entry(void *p)
 {
     ZpseMtDecArg *a = (ZpseMtDecArg *)p;
 
-    zpse_mt_dec_worker(a->job, a->arena, a->stage);
+    zpse_mt_dec_worker(a->job, a->arena);
     return 0;
 }
 #endif
@@ -341,9 +353,8 @@ static void *zpse_mt_dec_entry(void *p)
 static int zpse_mt_dec_run(const uint8_t *in, size_t in_len, uint8_t *out,
                            size_t out_cap, size_t nblocks, size_t nominal,
                            size_t last_len, unsigned threads,
-                           void *const arenas[], uint8_t *staging)
+                           void *const arenas[])
 {
-    size_t stage_stride = nominal + 64u;
     ZpseMtDecJob job;
     ZpseMtDecArg args[ZPSE_MT_MAX_THREADS];
 #if defined(_WIN32)
@@ -366,7 +377,6 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len, uint8_t *out,
     for (w = 1u; w < threads; w++) {
         args[w].job = &job;
         args[w].arena = arenas[w];
-        args[w].stage = staging + (size_t)w * stage_stride;
 #if defined(_WIN32)
         handles[w] = CreateThread(NULL, 0, zpse_mt_dec_entry, &args[w], 0, NULL);
         if (handles[w] == NULL) {
@@ -379,7 +389,7 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len, uint8_t *out,
 #endif
         started++;
     }
-    zpse_mt_dec_worker(&job, arenas[0], staging);
+    zpse_mt_dec_worker(&job, arenas[0]);
     for (w = 1u; w <= started; w++) {
 #if defined(_WIN32)
         WaitForSingleObject(handles[w], INFINITE);
@@ -477,8 +487,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    uint8_t *output, size_t out_cap,
                                    size_t *out_len_out, unsigned threads,
                                    void *const dec_arenas[],
-                                   unsigned arena_count,
-                                   uint8_t *staging)
+                                   unsigned arena_count)
 {
     ZpseFrameHeader fh;
     uint32_t count = 0u;
@@ -542,11 +551,8 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                 fh.content_size > (uint64_t)out_cap) {
                 return PSE_OUTPUT_OVERFLOW;
             }
-            if (staging == 0) {
-                return PSE_BAD_ARG;
-            }
             rc = zpse_mt_dec_run(in, in_len, output, out_cap, (size_t)count,
-                                 nominal, 0u, t, dec_arenas, staging);
+                                 nominal, 0u, t, dec_arenas);
             if (rc != PSE_OK) {
                 return rc;
             }
@@ -585,7 +591,6 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
     (void)threads;
     (void)arena_count;
     (void)nominal;
-    (void)staging;
 #endif
     return zpse_mt_dec_serial(in, in_len, output, out_cap, out_len_out,
                               dec_arenas[0]);

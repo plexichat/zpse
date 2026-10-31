@@ -17,6 +17,7 @@
  *     level, a short final block, one block, many blocks).
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "zpse/zpse.h"
 
@@ -100,11 +101,31 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
     /* The whole frame still decodes sequentially, and its index agrees. */
     {
         size_t got = 0;
+
+        /* A decoder may write a few bytes past a match and rely on a later
+         * command to overwrite them. At the end of a buffer there is no
+         * later command, so the buffer gets a canary and the decode has to
+         * leave it alone: a decode that writes into a caller's memory past
+         * the bytes it reports is a buffer overflow, not a detail. */
+        memset(out, 0x5A, sizeof out);
         CHECK(zpse_decompress_frame(comp, clen, out, sizeof out, &got, da) ==
                   PSE_OK,
               "indexed frame sequential decode");
         CHECK(got == n && memcmp(out, in, n) == 0,
               "indexed frame sequential bytes");
+        {
+            size_t j;
+            int touched = 0;
+
+            for (j = got; j < sizeof out; j++) {
+                if (out[j] != 0x5A) {
+                    touched = 1;
+                    break;
+                }
+            }
+            CHECK(!touched, "sequential decode wrote past its %lu bytes",
+                  (unsigned long)got);
+        }
     }
 
     /* Every block, in an order that is not the stream's: a seek that
@@ -121,11 +142,45 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
         if (want > blk_size) {
             want = blk_size;
         }
+        /* Same canary on the seek path: one block in a caller's buffer is
+         * exactly the case where an over-copy has nowhere to go. */
+        memset(blk, 0x5A, sizeof blk);
         CHECK(zpse_seek_frame(comp, clen, k, blk, sizeof blk, &got, da) ==
                   PSE_OK,
               "seek block %u of %u", k, nblocks);
         CHECK(got == want, "seek block %u produced %u of %u", k, got, want);
         CHECK(memcmp(blk, in + off, want) == 0, "seek block %u bytes", k);
+        {
+            uint32_t j;
+            int touched = 0;
+
+            for (j = want; j < (uint32_t)sizeof blk; j++) {
+                if (blk[j] != 0x5A) {
+                    touched = 1;
+                    break;
+                }
+            }
+            CHECK(!touched, "seek block %u wrote past its %u bytes", k,
+                  want);
+        }
+        /* And the strictest form of the same question: a buffer holding
+         * exactly the bytes wanted and nothing else. A decoder that writes
+         * a few bytes past its own output is invisible in a larger buffer,
+         * and this is the only shape that cannot hide it. */
+        {
+            uint8_t *tight = (uint8_t *)malloc(want);
+
+            CHECK(tight != 0, "exact-size seek buffer");
+            if (tight != 0) {
+                memset(tight, 0x5A, want);
+                CHECK(zpse_seek_frame(comp, clen, k, tight, want, &got, da) ==
+                          PSE_OK,
+                      "exact-size seek block %u of %u", k, nblocks);
+                CHECK(got == want && memcmp(tight, in + off, want) == 0,
+                      "exact-size seek block %u bytes", k);
+                free(tight);
+            }
+        }
     }
 
     /* Out of range: one past the end, and the far end of the space. */

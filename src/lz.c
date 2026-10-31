@@ -544,23 +544,34 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
      * that reaches the LZ path at all is the > 8 case the one-shot command
      * path above does not take). The single 16-byte step stays for the
      * 16..31 remainder. */
+    uint32_t room = op_rem;
+
     while (len >= 32u) {
         memcpy(dst, src, 16u);
         memcpy(dst + 16u, src + 16u, 16u);
         dst += 32u;
         src += 32u;
         len -= 32u;
+        room -= 32u;
     }
     if (len >= 16u) {
         memcpy(dst, src, 16u);
         dst += 16u;
         src += 16u;
         len -= 16u;
+        room -= 16u;
     }
     if (len != 0u) {
-        if (len <= 8u && lit_safe16 != 0 && op_rem >= 8u) {
+        /* `op_rem` is the room in front of the run, not in front of `dst`:
+         * the steps above have already spent part of it, so the tail tests
+         * `room`. Testing `op_rem` let the wide store run up to fifteen
+         * bytes past the end of a block whose literal run ended with a
+         * 9..15-byte remainder -- harmless in a frame, where the next block
+         * follows, and a buffer overflow in `zpse_seek_frame`, where it
+         * does not. */
+        if (len <= 8u && lit_safe16 != 0 && room >= 8u) {
             memcpy(dst, src, 8u);
-        } else if (len > 8u && lit_safe16 != 0 && op_rem >= 16u) {
+        } else if (len > 8u && lit_safe16 != 0 && room >= 16u) {
             memcpy(dst, src, 16u);
         } else {
             while (len != 0u) {
