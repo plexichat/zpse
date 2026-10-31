@@ -530,6 +530,34 @@ decode, did not: 2.0% time-weighted (1.9% geomean) over the corpus, of 4 to 17%
 on the width-8 rows -- `i64_mixed` 16.6%, `ts_seq` 8.8%, `ts_ns` 8.5%, `ts_us`
 4.3% -- with encode unmoved, since it never runs this kernel.
 
+Width 2 was the last chain still keeping its carried byte in memory, and it
+takes the same fix: two broadcasts in registers, written back once after the
+loop. `dict_u16le`, a two-byte record column, gains 8.8% of decode and
+`dict_u8` 1.4%; a second run put `dict_u16le` at 9.5%. The 32-byte width-4
+loop also unpacks each plane with its partner as soon as both are de-chained,
+so two planes are live instead of four, which is `i32_seq` 1.5%.
+
+The encode side of the same transform is a per-plane delta chain that runs
+after the parity split. Its carry crossed to a GPR once per 64 bytes -- a
+`psrldq` to extract the last byte and a `movd` to broadcast it back -- while
+the byte itself was available in a register either way. Keeping the carry as
+the shifted vector and OR-ing it in costs one `psrldq` per 64 bytes instead
+of three ops: `i64_mixed` encode 2.0%. `ts_seq` and `ts_us` did not move, and
+that is the useful half of the measurement -- they run the same function, so
+their encode time is not in it. The parity tree is not worth chasing at all:
+in the encoder profile the width-8 split does not reach the top of the list
+on any DT8 case, while the chain does (12.5% of `i64_mixed`).
+
+Two cheaper-looking changes were measured and dropped. Showing a
+stride-family group's mask as one 16-bit load instead of a shift and a mask
+of the 32-bit word, and replacing the group loop's unit-window bound with
+sixteen bytes of slack in the caller's two unit arrays, remove one compare
+and one branch per group between them -- and came out at -0.4% on
+`ts_gapped`, the case that kernel exists for, and nothing anywhere else. A
+16-position group in that kernel is about eight uops and the bound was never
+the cost; what is left is the recurrence. Both were reverted rather than kept
+as neutral edits that would also have to defend a new padding contract.
+
 The LZ command loop is bound per command, not per byte: a command emits five to
 eleven bytes and costs about twelve cycles whatever its shape, so the copy
 widths are not where its time is. Its shape is. Nine commands in ten on a text,

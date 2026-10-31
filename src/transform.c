@@ -834,14 +834,21 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
     /* Four chunks per iteration. Each chunk's incoming byte is the last
      * byte of the PREVIOUS chunk's original content, which is a byte of a
      * load that has already happened, so all four shifts come out of
-     * registers and only the seed for the next group of four crosses the
-     * loop -- one psrldq per 64 bytes. The 16-byte form that still takes
-     * the remainder reads that seed back out of the plane, at a position
+     * registers, and the seed for the next group of four is that last byte
+     * alone -- one psrldq per 64 bytes, kept in a register. It used to be
+     * extracted to a GPR and broadcast back, which put two shuffle-port ops
+     * and a cross-domain move on the chain every 64 bytes for nothing. The
+     * 16-byte form that still takes the remainder reads that seed back out
+     * of the plane, at a position
      * the store of the same iteration has just written, so the store queue
      * can only forward it after the store retires; the wide form above
      * reads nothing it has just written. The residual 16-byte loop and the
      * byte tail are unchanged, and every position gets the same byte as
      * before. */
+    /* Byte 0 is the byte that crosses into the next chunk; nothing else in
+     * it is read. */
+    __m128i last = _mm_cvtsi32_si128((int)prev);
+
     for (q = 0; (size_t)q + 64u <= (size_t)n; q += 64u) {
         __m128i a = _mm_loadu_si128((const __m128i *)(const void *)(p + q));
         __m128i b =
@@ -850,8 +857,7 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
             _mm_loadu_si128((const __m128i *)(const void *)(p + q + 32u));
         __m128i d =
             _mm_loadu_si128((const __m128i *)(const void *)(p + q + 48u));
-        __m128i pa = _mm_or_si128(_mm_slli_si128(a, 1),
-                                  _mm_cvtsi32_si128((int)prev));
+        __m128i pa = _mm_or_si128(_mm_slli_si128(a, 1), last);
         __m128i pb =
             _mm_or_si128(_mm_slli_si128(b, 1), _mm_srli_si128(a, 15));
         __m128i pc =
@@ -859,7 +865,7 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
         __m128i pd =
             _mm_or_si128(_mm_slli_si128(d, 1), _mm_srli_si128(c, 15));
 
-        prev = (uint8_t)_mm_cvtsi128_si32(_mm_srli_si128(d, 15));
+        last = _mm_srli_si128(d, 15);
         if (delta) {
             _mm_storeu_si128((__m128i *)(void *)(p + q), _mm_sub_epi8(a, pa));
             _mm_storeu_si128((__m128i *)(void *)(p + q + 16u),
@@ -879,6 +885,7 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
                              _mm_xor_si128(d, pd));
         }
     }
+    prev = (uint8_t)_mm_cvtsi128_si32(last);
     for (; (size_t)q + 16u <= (size_t)n; q += 16u) {
         __m128i cur = _mm_loadu_si128((const __m128i *)(const void *)(p + q));
         __m128i prv = _mm_or_si128(_mm_slli_si128(cur, 1),
@@ -1533,6 +1540,89 @@ zpse_chain_xor32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
                             _mm256_permute2x128_si256(r[2], r[3], 0x31));      \
     }
 
+/* merge2's chain forms, one function per chain.
+ *
+ * The array-indexed ZPSE_MERGE2_BODY above updates `carry[t]` through memory
+ * every 32 rows: vpextrw the chunk's total out to a GPR, add it, store it,
+ * vpbroadcastb it back on the next iteration. That store/load pair sits on
+ * the chain's own carried value, which is the shape merge4 and merge8 were
+ * moved off. These are the same loops with the two carries held as
+ * broadcasts in vector registers (zpse_chain_add32v / zpse_chain_xor32v), so
+ * nothing crosses to a GPR inside the loop and the two bytes go back to
+ * `carry` once, after it. One function per chain rather than a `delta`
+ * argument, so the flag cannot end up being tested per 32 bytes. */
+static ZPSE_T_AVX2 uint32_t
+zpse_merge2_chain_add(uint8_t *out, const uint8_t *const segs[16],
+                      uint32_t rows, uint8_t *carry)
+{
+    const __m256i ctl = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15);
+    const __m256i ctl_all = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15_all);
+    __m256i c0 = _mm256_set1_epi8((char)carry[0]);
+    __m256i c1 = _mm256_set1_epi8((char)carry[1]);
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        uint8_t *d = out + (size_t)g * 2u;
+        __m256i a, b, lo, hi;
+
+        a = zpse_chain_add32v(
+            ctl, ctl_all,
+            _mm256_loadu_si256((const __m256i *)(const void *)(segs[0] + g)),
+            &c0);
+        b = zpse_chain_add32v(
+            ctl, ctl_all,
+            _mm256_loadu_si256((const __m256i *)(const void *)(segs[1] + g)),
+            &c1);
+        lo = _mm256_unpacklo_epi8(a, b);
+        hi = _mm256_unpackhi_epi8(a, b);
+        _mm256_storeu_si256((__m256i *)(void *)d,
+                            _mm256_permute2x128_si256(lo, hi, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),
+                            _mm256_permute2x128_si256(lo, hi, 0x31));
+    }
+    carry[0] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c0));
+    carry[1] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c1));
+    return g;
+}
+
+static ZPSE_T_AVX2 uint32_t
+zpse_merge2_chain_xor(uint8_t *out, const uint8_t *const segs[16],
+                      uint32_t rows, uint8_t *carry)
+{
+    const __m256i ctl = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15);
+    const __m256i ctl_all = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15_all);
+    __m256i c0 = _mm256_set1_epi8((char)carry[0]);
+    __m256i c1 = _mm256_set1_epi8((char)carry[1]);
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {
+        uint8_t *d = out + (size_t)g * 2u;
+        __m256i a, b, lo, hi;
+
+        a = zpse_chain_xor32v(
+            ctl, ctl_all,
+            _mm256_loadu_si256((const __m256i *)(const void *)(segs[0] + g)),
+            &c0);
+        b = zpse_chain_xor32v(
+            ctl, ctl_all,
+            _mm256_loadu_si256((const __m256i *)(const void *)(segs[1] + g)),
+            &c1);
+        lo = _mm256_unpacklo_epi8(a, b);
+        hi = _mm256_unpackhi_epi8(a, b);
+        _mm256_storeu_si256((__m256i *)(void *)d,
+                            _mm256_permute2x128_si256(lo, hi, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),
+                            _mm256_permute2x128_si256(lo, hi, 0x31));
+    }
+    carry[0] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c0));
+    carry[1] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c1));
+    return g;
+}
+
 /* merge4's two chain-carrying forms: the four planes and their four carries
  * are named scalars rather than arrays, so nothing in the loop is indexed and
  * every value stays in a register, and the carries are the vector ones from
@@ -1546,23 +1636,23 @@ zpse_chain_xor32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
         uint8_t *d = out + (size_t)g * 4u;                                     \
                                                                               \
         p0 = UNDO(ctl, ctl_all,                                                \
-                  _mm256_loadu_si256(                                         \
-                      (const __m256i *)(const void *)(segs[0] + g)),          \
-                  &c0);                                                       \
+                  _mm256_loadu_si256(                                          \
+                      (const __m256i *)(const void *)(segs[0] + g)),           \
+                  &c0);                                                        \
         p1 = UNDO(ctl, ctl_all,                                                \
-                  _mm256_loadu_si256(                                         \
-                      (const __m256i *)(const void *)(segs[1] + g)),          \
-                  &c1);                                                       \
-        p2 = UNDO(ctl, ctl_all,                                                \
-                  _mm256_loadu_si256(                                         \
-                      (const __m256i *)(const void *)(segs[2] + g)),          \
-                  &c2);                                                       \
-        p3 = UNDO(ctl, ctl_all,                                                \
-                  _mm256_loadu_si256(                                         \
-                      (const __m256i *)(const void *)(segs[3] + g)),          \
-                  &c3);                                                       \
+                  _mm256_loadu_si256(                                          \
+                      (const __m256i *)(const void *)(segs[1] + g)),           \
+                  &c1);                                                        \
         lo0 = _mm256_unpacklo_epi8(p0, p1);                                    \
         hi0 = _mm256_unpackhi_epi8(p0, p1);                                    \
+        p2 = UNDO(ctl, ctl_all,                                                \
+                  _mm256_loadu_si256(                                          \
+                      (const __m256i *)(const void *)(segs[2] + g)),           \
+                  &c2);                                                        \
+        p3 = UNDO(ctl, ctl_all,                                                \
+                  _mm256_loadu_si256(                                          \
+                      (const __m256i *)(const void *)(segs[3] + g)),           \
+                  &c3);                                                        \
         lo1 = _mm256_unpacklo_epi8(p2, p3);                                    \
         hi1 = _mm256_unpackhi_epi8(p2, p3);                                    \
         r0 = _mm256_unpacklo_epi16(lo0, lo1);                                  \
@@ -1719,20 +1809,14 @@ static ZPSE_T_AVX2 uint32_t
 zpse_merge2_avx2(uint8_t *out, const uint8_t *const segs[16], uint32_t rows,
                  uint8_t *carry, int delta)
 {
-    const __m256i ctl = _mm256_loadu_si256(
-        (const __m256i *)(const void *)zpse_avx2_ctl15);
     uint32_t g;
 
     if (carry == 0) {
         ZPSE_MERGE2_BODY(ZPSE_CHAIN_NONE)
         return g;
     }
-    if (delta) {
-        ZPSE_MERGE2_BODY(ZPSE_CHAIN_ADD)
-        return g;
-    }
-    ZPSE_MERGE2_BODY(ZPSE_CHAIN_XOR)
-    return g;
+    return delta ? zpse_merge2_chain_add(out, segs, rows, carry)
+                 : zpse_merge2_chain_xor(out, segs, rows, carry);
 }
 
 static ZPSE_T_AVX2 uint32_t
