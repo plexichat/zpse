@@ -1,0 +1,92 @@
+# Silesia on a schedule: the only real-world corpus the tree measures.
+#
+# The suites pin a 25-case generator corpus; Silesia is what a user would
+# actually compress, and half of it is text -- the shape this codec is weakest
+# on. It does not gate a pull request: a 67 MB download and 200 MiB of
+# encoding do not belong in every push. It runs weekly instead, publishes the
+# table on the run page, and fails when the ratio regresses.
+#
+# The check is a ceiling on packed bytes rather than a comparison against the
+# last run (which would need state): the encoder is deterministic, so the same
+# build always writes the same total, and an intentional ratio change updates
+# the baseline below in the same commit. The slack is 0.1%, which is smaller
+# than any trade this codec would make on purpose (the ladder's own steps are
+# 4-12% on text) and larger than nothing, so a size-neutral refactor passes.
+name: bench-silesia
+
+on:
+  schedule:
+    - cron: '23 4 * * 1' # Mondays, 04:23 UTC
+  workflow_dispatch:
+
+jobs:
+  silesia:
+    name: silesia / ${{ matrix.cc }}
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc-15, clang]
+    env:
+      # Packed bytes over the twelve files: 126,902,432 at the default level
+      # (6) and 114,711,960 at MAX. See the README's Silesia section.
+      BASELINE_DEFAULT: 126902432
+      BASELINE_MAX: 114711960
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch the corpus once
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/silesia"
+          curl -sSLo "$RUNNER_TEMP/silesia/silesia.zip" \
+            http://mattmahoney.net/dc/silesia.zip
+          python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+            "$RUNNER_TEMP/silesia/silesia.zip" "$RUNNER_TEMP/silesia"
+          rm -f "$RUNNER_TEMP/silesia/silesia.zip"
+
+      - name: Default level
+        # No level argument at all: this row is the library's default
+        # (ZPSE_ENC_SPEED_DEFAULT), whatever the codec says that is today,
+        # rather than a number the workflow has to keep in step by hand.
+        run: |
+          set -o pipefail
+          SILESIA_DIR="$RUNNER_TEMP/silesia" KEEP=1 CC="${{ matrix.cc }}" \
+            bash tests/benchmarks/silesia.sh '' 2 | tee default.txt
+
+      - name: MAX
+        run: |
+          set -o pipefail
+          SILESIA_DIR="$RUNNER_TEMP/silesia" KEEP=1 CC="${{ matrix.cc }}" \
+            bash tests/benchmarks/silesia.sh 9 1 | tee max.txt
+
+      - name: Gate on ratio
+        run: |
+          set -euo pipefail
+          check() { # file baseline label
+            local packed allowed
+            if ! grep -q '^TOTAL' "$1"; then
+              echo "::error::$3: no TOTAL row in $1 (did the bench fail?)"
+              return 1
+            fi
+            packed=$(awk '/^TOTAL/ { print $3 }' "$1")
+            allowed=$(( $2 + $2 / 1000 ))
+            echo "$3: packed=$packed baseline=$2 allowed=$allowed"
+            if [ "$packed" -gt "$allowed" ]; then
+              echo "::error::$3: $packed packed bytes is above $allowed" \
+                   "(baseline $2, 0.1% slack) -- ratio regression"
+              return 1
+            fi
+          }
+          check default.txt "$BASELINE_DEFAULT" 'default level'
+          check max.txt "$BASELINE_MAX" 'MAX'
+
+      - name: Keep the tables
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silesia-${{ matrix.cc }}
+          path: |
+            default.txt
+            max.txt
+          if-no-files-found: warn

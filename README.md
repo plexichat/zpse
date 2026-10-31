@@ -318,8 +318,8 @@ is a match finder -- which is what the intra-block LZ form gives it at levels
 
 `ZPSE_ENC_*` in the `enc_flags` word chooses how much encode time a block is
 worth. There are nine levels, 1 = FASTEST to 9 = MAX, stored in bits 1-4 as
-`level << 1`; a field with no level bits is the default, BALANCED at level 5,
-and an unsupported level is rejected with `PSE_BAD_ARG` rather than rounded to
+`level << 1`; a field with no level bits is the default, level 6, and an
+unsupported level is rejected with `PSE_BAD_ARG` rather than rounded to
 a neighbour. No level changes the format: every level's stream is read by the
 same decoder, and a level only decides which shape gets written. All nine are
 rungs, not aliases: 1 to 4 buy trials one at a time, and 5 to 9 loosen the
@@ -337,8 +337,8 @@ each run the harness's own best of three timed reps, on one host,
 | 2 | 4.06:1 | 1.66 GB/s | 16.6 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
 | 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.62 GB/s | 17.2 GB/s | the same prescreen, three full trials |
 | 4 | 4.06:1 | 1.60 GB/s | 16.9 GB/s | four full trials, still no match finder |
-| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.47:1 | 1.02 GB/s | 13.9 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
-| 6 | 4.48:1 | 974 MB/s | 13.8 GB/s | the LZ sample margin loosened to 1.1875x; the decode bill unchanged |
+| 5 `ZPSE_ENC_SPEED_BALANCED` | 4.47:1 | 1.02 GB/s | 13.9 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
+| 6 (default) | 4.48:1 | 974 MB/s | 13.8 GB/s | the LZ sample margin loosened to 1.1875x; the decode bill unchanged. The default: smaller and faster to decode than level 5 on real data, see the Silesia section |
 | 7 | 4.50:1 | 963 MB/s | 13.6 GB/s | the margin loosened to 1.125x and the acceleration factor raised to 16 (6 bytes per command) |
 | 8 | 4.51:1 | 909 MB/s | 13.5 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
 | 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 852 MB/s | 11.7 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
@@ -930,25 +930,25 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.09 | 0.95 GB/s | 1.55 GB/s |
-| mozilla | 51,220,480 | 1.60 | 0.28 | 1.16 |
-| mr | 9,970,564 | 2.32 | 0.31 | 1.10 |
-| nci | 33,553,445 | 3.75 | 0.23 | 1.09 |
-| ooffice | 6,152,192 | 1.15 | 0.29 | 1.76 |
-| osdb | 10,085,684 | 1.00 | 1.04 | 3.16 |
-| reymont | 6,627,202 | 1.10 | 1.45 | 14.53 |
-| samba | 21,606,400 | 1.77 | 0.39 | 1.32 |
-| sao | 7,251,944 | 1.00 | 1.42 | 14.36 |
-| webster | 41,458,703 | 1.36 | 0.44 | 1.38 |
-| x-ray | 8,474,240 | 1.72 | 0.51 | 2.99 |
-| xml | 5,345,280 | 2.99 | 0.66 | 3.60 |
-| **total** | **211,938,580** | **1.60** | **0.36** | **1.42** |
+| dickens | 10,192,446 | 1.09 | 1.57 GB/s | 2.45 GB/s |
+| mozilla | 51,220,480 | 1.64 | 0.28 | 1.59 |
+| mr | 9,970,564 | 2.32 | 0.31 | 1.13 |
+| nci | 33,553,445 | 4.00 | 0.24 | 1.60 |
+| ooffice | 6,152,192 | 1.22 | 0.25 | 1.72 |
+| osdb | 10,085,684 | 1.02 | 0.93 | 2.28 |
+| reymont | 6,627,202 | 1.10 | 0.62 | 11.90 |
+| samba | 21,606,400 | 1.92 | 0.36 | 1.64 |
+| sao | 7,251,944 | 1.00 | 1.34 | 10.73 |
+| webster | 41,458,703 | 1.50 | 0.36 | 1.25 |
+| x-ray | 8,474,240 | 1.72 | 0.47 | 2.94 |
+| xml | 5,345,280 | 3.13 | 0.61 | 3.04 |
+| **total** | **211,938,580** | **1.67** | **0.34** | **1.68** |
 
-`zpse_cli bench -r 2`, default level, 64 KiB blocks, one pinned core. The
-`osdb` and `sao` rows are the raw fallback doing its job -- 1.00:1 and decodes
-at copy speed -- and `dickens`, `ooffice`, `reymont` and `webster` are the
-text problem in one line each: 1.09 to 1.36 on data that a general-purpose
-LZ at the same speed reaches in the twos.
+`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core. The
+`sao` row is the raw fallback doing its job -- 1.00:1 at copy speed -- and
+`osdb` is almost there; `dickens`, `ooffice`, `reymont` and `webster` are the
+text problem in one line each: 1.09 to 1.50 on data that a general-purpose LZ
+at the same speed reaches in the twos.
 
 Running the ladder over Silesia is how a CLI bug surfaced. `-l N` used to OR
 the level into a word that already held the default, so `-l 1` ran BALANCED,
@@ -963,18 +963,25 @@ OR-ing into it, and the ladder is what the level table documents:
 | 2 | 47,256,861 | 1.09 | 1.21 |
 | 3 FASTER | 47,256,861 | 1.09 | 1.18 |
 | 4 | 47,256,861 | 1.09 | 1.22 |
-| 5 BALANCED (default) | 39,796,481 | 1.30 | 0.49 |
-| 6 | 36,950,349 | 1.40 | 0.40 |
+| 5 BALANCED | 39,796,481 | 1.30 | 0.49 |
+| 6 (default) | 36,950,349 | 1.40 | 0.40 |
 | 7 | 35,152,045 | 1.47 | 0.35 |
 | 8 | 34,155,474 | 1.51 | 0.29 |
 | 9 MAX | 34,155,474 | 1.51 | 0.33 |
 
 Sizes are non-increasing from level 2 up, which is the property the table
 promises, and the step from level 4 to 5 is where the match finder is offered
-to every block. Over the whole corpus MAX writes 114,711,960 bytes (1.85:1)
-against 132,691,893 at the default (1.60:1): on text the default gives up 12%
-of its size to run two to three times faster, and that trade is now something
-a caller can actually ask for by name.
+to every block.
+
+The default is level 6 rather than 5 because on this corpus level 6 is not a
+trade at all: 126,902,432 packed bytes against 132,691,893 (1.67:1 against
+1.60:1), encode 344 against 352 MB/s, which is inside the run-to-run spread,
+and decode 18% faster, because a block the LZ form takes is a copy loop to
+decode rather than a tile reconstruction. The only knob that separates them is
+the screen margin, and a looser margin can only offer the finder more blocks,
+never a larger stream. MAX still goes further -- 114,711,960 bytes, 1.85:1 --
+for about 30% less encode rate, which is the rung to choose when size is the
+only thing that matters.
 
 The four cheap levels (1-4) write the same stream within 30 bytes of each
 other because none of them runs the match finder, and on English prose the

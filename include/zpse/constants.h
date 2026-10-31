@@ -134,8 +134,24 @@
 #define ZPSE_ENC_SPEED_MAX      (UINT32_C(9) << ZPSE_ENC_SPEED_SHIFT)  /* level 9 */
 
 /* The level an options field with no level bits encodes at: the default is
- * BALANCED, level 5. */
-#define ZPSE_ENC_SPEED_DEFAULT  (ZPSE_ENC_SPEED_BALANCED >> ZPSE_ENC_SPEED_SHIFT)
+ * level 6, one rung below BALANCED.
+ *
+ * BALANCED (5) was the default, and level 6 is a superset of its trade rather
+ * than a step away from it: the only difference is the LZ screen margin
+ * (1.1875x against 1.25x), so level 6 offers the match finder to blocks level
+ * 5 refuses, and a stream the finder offers can only be kept when it is
+ * smaller. Measured over Silesia (202 MiB of real data, one pinned core,
+ * `tests/benchmarks/silesia.sh`): 132,691,893 packed bytes at level 5 against
+ * 126,902,432 at level 6, i.e. 4.4% smaller, while encode is 352 against 344
+ * MB/s -- inside the run-to-run spread -- and decode is 18% FASTER (1371
+ * against 1625 MB/s), because a block the LZ form takes is a copy loop to
+ * decode rather than a tile reconstruction. That is not a ratio/speed trade
+ * to argue about; every measured axis moves the right way or does not move.
+ *
+ * What it costs is the ladder's cheapest rung below it: level 5 still exists
+ * and still writes what it wrote, so a caller who wants that exact stream can
+ * ask for it by number. */
+#define ZPSE_ENC_SPEED_DEFAULT  (ZPSE_ENC_SPEED_L6 >> ZPSE_ENC_SPEED_SHIFT)
 
 /* Extract the level number (1-9) from the options field, normalising the
  * empty field to the default level. The encoder still has a few tier tests --

@@ -287,7 +287,12 @@ static void free_arenas(void **a, unsigned threads)
 static int cmd_codec(int argc, char **argv)
 {
     int compress = (argv[1][0] == 'c');
-    uint32_t enc_flags = ZPSE_ENC_SPEED_BALANCED;
+    /* No level bits: the library's own default applies. This used to
+     * hard-code BALANCED, which made the tool ignore ZPSE_ENC_SPEED_DEFAULT
+     * entirely -- when the default moved from level 5 to level 6, `zpse`
+     * without -l kept writing level 5 and the header kept saying "balanced"
+     * while the codec's default was a rung deeper. One source of truth. */
+    uint32_t enc_flags = 0u;
     uint32_t block = ZPSE_MAX_BLOCK_SIZE;
     int indexed = 0;
     unsigned threads = 1u;
@@ -481,7 +486,12 @@ static int check_seek(const uint8_t *frame, size_t frame_len,
 
 static int cmd_bench(int argc, char **argv)
 {
-    uint32_t enc_flags = ZPSE_ENC_SPEED_BALANCED;
+    /* No level bits: the library's own default applies. This used to
+     * hard-code BALANCED, which made the tool ignore ZPSE_ENC_SPEED_DEFAULT
+     * entirely -- when the default moved from level 5 to level 6, `zpse`
+     * without -l kept writing level 5 and the header kept saying "balanced"
+     * while the codec's default was a rung deeper. One source of truth. */
+    uint32_t enc_flags = 0u;
     uint32_t block = ZPSE_MAX_BLOCK_SIZE;
     int indexed = 0;
     int quiet = 0;
