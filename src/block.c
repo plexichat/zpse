@@ -2007,10 +2007,10 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * literal total, the literals padded to a word, then commands to the
      * end of the payload. */
     if (cmds_out != 0) {
-        uint32_t lit_total = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE);
-        uint32_t cmd_off = 4u + ((lit_total + 3u) & ~3u);
-
-        *cmds_out = (payload > cmd_off) ? (payload - cmd_off) / 4u : 0u;
+        /* The payload header carries the count: the token stream is
+         * variable length, so the payload length no longer divides into
+         * commands. */
+        *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
     }
     total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
     flags = (uint8_t)(ZPSE_B_LZ | ZPSE_B_RESET |
@@ -2963,8 +2963,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t atotal = zpse_block_ascii_total(n);
         uint32_t lz_floor = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
                             ZPSE_LZ_MIN_PAYLOAD +
-                            4u * ((n + ZPSE_LZ_MAX_MATCH - 1u) /
-                                  ZPSE_LZ_MAX_MATCH);
+                            (uint32_t)ZPSE_LZ_MIN_CMD *
+                                ((n + ZPSE_LZ_MAX_MATCH - 1u) /
+                                 ZPSE_LZ_MAX_MATCH);
 
         if (e->lz != 0 && atotal > lz_floor &&
             zpse_block_lz_level(lz_speed, e->ascii_gate)) {
@@ -3266,16 +3267,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                             e->ascii_gate) &&
         e->lz != 0) {
         /* Exact floor first: one command codes at most 259 bytes, so an
-         * LZ payload can never be smaller than its 8-byte header plus one
-         * 4-byte command per 259 bytes of output. A winner already under
+         * LZ payload can never be smaller than its 12-byte header plus one
+         * 2-byte command per 259 bytes of output. A winner already under
          * that cannot be beaten, and on the blocks the tiles already
          * handle well -- a constant or all-hit plane is 248 bytes, far
          * below the ~1 KiB floor of a 64 KiB block -- the whole match
          * finder is skipped. */
         uint32_t lz_floor = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
                             ZPSE_LZ_MIN_PAYLOAD +
-                            4u * ((n + ZPSE_LZ_MAX_MATCH - 1u) /
-                                  ZPSE_LZ_MAX_MATCH);
+                            (uint32_t)ZPSE_LZ_MIN_CMD *
+                                ((n + ZPSE_LZ_MAX_MATCH - 1u) /
+                                 ZPSE_LZ_MAX_MATCH);
 
         if ((!have_best || best_total > lz_floor) &&
             zpse_block_lz_screen(e, in, n, tids[0], scounts[0],

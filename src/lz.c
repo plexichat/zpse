@@ -82,189 +82,163 @@ lz_extend_avx2(const uint8_t *in, uint32_t pos, uint32_t cand, uint32_t len,
 }
 #endif /* ZPSE_LZ_HAVE_AVX2 */
 
-/* Output under construction. Literals grow forward from dst + 4; commands
- * grow backward from the end of the buffer, and are compacted behind the
- * literals once the block is done. The two cannot collide: every append
- * checks that the gap between them can still hold the other region. */
+/* The payload header: the literal count and the token count, then the
+ * stream. Both counts are needed -- the stream is variable length, so its
+ * length does not divide into commands. */
+#define LZ_HDR 8u
+
+/* Output under construction: one forward-growing stream, so a command is
+ * written once, where it stays. A token, its literals, its distance and,
+ * when the token asked for one, its length escape -- the same order the
+ * decoder reads them in. Nothing is compacted or reversed at the end. */
 typedef struct LzOut {
     uint8_t *dst;
     uint32_t cap;
-    uint32_t lit_total; /* literal bytes written */
-    uint32_t cmd_hi;    /* first command byte; commands live at [cmd_hi,cap) */
+    uint32_t pos;       /* next free byte of the stream */
+    uint32_t lit_total; /* literal bytes written so far */
+    uint32_t cmds;      /* tokens written */
+    uint32_t rep[4];    /* recent distances, most recent first */
     int fail;
 } LzOut;
 
-static void lz_put_literals(LzOut *o, const uint8_t *src, uint32_t len)
+/* Extra bytes an escape adds after the token byte, for a field whose value
+ * is `v` and whose nibble already carries `base` (fifteen). */
+static uint32_t lz_esc_len(uint32_t v, uint32_t base)
 {
-    if (o->fail || len == 0u) {
-        return;
+    if (v < base) {
+        return 0u;
     }
-    if (o->cmd_hi < 4u || o->lit_total > o->cmd_hi - 4u ||
-        len > o->cmd_hi - 4u - o->lit_total) {
-        o->fail = 1;
-        return;
-    }
-    memcpy(o->dst + 4u + o->lit_total, src, len);
-    o->lit_total += len;
+    v -= base;
+    return 1u + v / 255u;
 }
 
-static void lz_put_cmd(LzOut *o, uint32_t off, uint32_t lit, uint32_t mlen)
+static uint32_t lz_varint_len(uint32_t v)
 {
+    uint32_t n = 1u;
+
+    while (v >= 0x80u) {
+        v >>= 7;
+        n++;
+    }
+    return n;
+}
+
+static uint8_t *lz_put_esc(uint8_t *p, uint32_t v, uint32_t base)
+{
+    v -= base;
+    while (v >= 255u) {
+        *p++ = 255u;
+        v -= 255u;
+    }
+    *p++ = (uint8_t)v;
+    return p;
+}
+
+static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
+{
+    while (v >= 0x80u) {
+        *p++ = (uint8_t)(v | 0x80u);
+        v >>= 7;
+    }
+    *p++ = (uint8_t)v;
+    return p;
+}
+
+/* One command: the literal run before the match (possibly none), the
+ * distance and the match length. `off == 0` writes a literal-only command,
+ * which is how a trailing run and each 255-byte literal chunk are coded.
+ *
+ * The distance goes through the four-entry repeat cache, and the decoder
+ * updates it identically (see lz.h), so the two sides agree on which value
+ * means which distance without a byte being spent on it. */
+static void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
+                        uint32_t off, uint32_t mlen)
+{
+    uint32_t offv;
+    uint32_t sz;
+    uint32_t idx;
+    uint8_t *t;
+
     if (o->fail) {
         return;
     }
-    if (o->cmd_hi < 4u) {
+    if (off == 0u) {
+        offv = 0u;
+        mlen = ZPSE_LZ_MIN_MATCH; /* ignored by the decoder; keep it legal */
+    } else {
+        for (idx = 0u; idx < 4u; idx++) {
+            if (o->rep[idx] == off) {
+                break;
+            }
+        }
+        if (idx < 4u) {
+            offv = idx + 1u;
+            while (idx > 0u) {
+                o->rep[idx] = o->rep[idx - 1u];
+                idx--;
+            }
+        } else {
+            offv = off + 4u;
+            o->rep[3] = o->rep[2];
+            o->rep[2] = o->rep[1];
+            o->rep[1] = o->rep[0];
+        }
+        o->rep[0] = off;
+    }
+    sz = 1u + lz_esc_len(lit, 15u) + lit + lz_varint_len(offv) +
+         lz_esc_len(mlen - ZPSE_LZ_MIN_MATCH, 15u);
+    if (o->pos > o->cap || sz > o->cap - o->pos) {
         o->fail = 1;
         return;
     }
-    o->cmd_hi -= 4u;
-    if (o->cmd_hi < 4u + o->lit_total) {
-        o->fail = 1;
-        return;
+    t = o->dst + o->pos;
+    *t++ = (uint8_t)(((lit < 15u ? lit : 15u) << 4) |
+                     (uint8_t)(mlen - ZPSE_LZ_MIN_MATCH < 15u
+                                   ? mlen - ZPSE_LZ_MIN_MATCH
+                                   : 15u));
+    if (lit >= 15u) {
+        t = lz_put_esc(t, lit, 15u);
     }
-    zpse_store_u32le(o->dst + o->cmd_hi,
-                     (off & 0xFFFFu) | ((lit & 0xFFu) << 16) |
-                         (((mlen - ZPSE_LZ_MIN_MATCH) & 0xFFu) << 24));
-}
-
-/* The shape every command takes except a long run or a long match: a
- * literal run that fits the token's 8-bit field, a match that fits its
- * length field. Kept apart from lz_emit so the two appends share one
- * capacity test and neither goes through the out-of-line copy lz_emit
- * compiles to -- the tokens that follow a short match are mostly a few
- * bytes long, and a call per token is most of what that path costs on
- * hex, text and URL blocks, where a match is found every few bytes.
- *
- * A run below eight bytes is copied by one overlapping eight-byte store:
- * the bytes past the run land in the gap between the literal region and
- * the commands, which the end of the block zero-fills, and the read past
- * the run stays inside the block -- a run that reaches the end of the
- * block comes from the trailing-literal path, not from here. */
-static void lz_emit_short(LzOut *o, const uint8_t *lit, uint32_t run,
-                          uint32_t off, uint32_t len, const uint8_t *in_end)
-{
-    uint32_t room;
-    uint8_t *ldst;
-
-    if (o->fail || o->cmd_hi < 4u || o->lit_total > o->cmd_hi - 4u) {
-        o->fail = 1;
-        return;
+    if (lit != 0u) {
+        memcpy(t, lit_src, lit);
+        t += lit;
+        o->lit_total += lit;
     }
-    room = o->cmd_hi - 4u - o->lit_total;
-    /* Room for the run, and the command word behind it. */
-    if (run > room || room - run < 4u) {
-        o->fail = 1;
-        return;
+    t = lz_put_varint(t, offv);
+    if (mlen - ZPSE_LZ_MIN_MATCH >= 15u) {
+        t = lz_put_esc(t, mlen - ZPSE_LZ_MIN_MATCH, 15u);
     }
-    ldst = o->dst + 4u + o->lit_total;
-    if (run < 8u && room - run >= 8u && (uint32_t)(in_end - lit) >= 8u) {
-        uint64_t v;
-
-        memcpy(&v, lit, 8u);
-        memcpy(ldst, &v, 8u);
-    } else if (run != 0u) {
-        memcpy(ldst, lit, run);
-    }
-    o->lit_total += run;
-    o->cmd_hi -= 4u;
-    zpse_store_u32le(o->dst + o->cmd_hi,
-                     (off & 0xFFFFu) | ((run & 0xFFu) << 16) |
-                         (((len - ZPSE_LZ_MIN_MATCH) & 0xFFu) << 24));
+    o->pos = (uint32_t)(t - o->dst);
+    o->cmds++;
 }
 
 /* One match and the literals that precede it. Runs longer than a token
- * can express are split into repeated commands: the literals go in front
- * of the first command and the rest carry zero literals, so the decoder's
- * loop never needs a length escape. */
+ * can express are split into repeated commands with the same distance:
+ * the literals go in front of the first command and the rest carry none,
+ * so the decoder's loop never needs an unbounded escape for a long run --
+ * and after the first chunk the repeat code makes every command shorter. */
 static void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
                     uint32_t off, uint32_t len)
 {
     while (run > ZPSE_LZ_MAX_LITERALS) {
-        lz_put_literals(o, lit_src, ZPSE_LZ_MAX_LITERALS);
-        lz_put_cmd(o, 0u, ZPSE_LZ_MAX_LITERALS, 0u);
+        lz_emit_cmd(o, lit_src, ZPSE_LZ_MAX_LITERALS, 0u, 0u);
         lit_src += ZPSE_LZ_MAX_LITERALS;
         run -= ZPSE_LZ_MAX_LITERALS;
     }
-    lz_put_literals(o, lit_src, run);
     while (len > ZPSE_LZ_MAX_MATCH) {
         uint32_t chunk = ZPSE_LZ_MAX_MATCH;
 
         /* Leave at least one minimum-length match for the last command,
-         * so every command word it writes is a legal match length. */
+         * so every command it writes is a legal match length. */
         if (len - chunk < ZPSE_LZ_MIN_MATCH) {
             chunk = len - ZPSE_LZ_MIN_MATCH;
         }
-        lz_put_cmd(o, off, run, chunk);
+        lz_emit_cmd(o, lit_src, run, off, chunk);
+        lit_src += run;
         run = 0u;
         len -= chunk;
     }
-    lz_put_cmd(o, off, run, len);
-}
-
-/* Move the command stream into place behind the literals, and unreverse it
- * in the same pass.
- *
- * Commands were pushed backwards from the end of the buffer, so the region
- * [src, src + len) holds them in reverse order while the output wants them
- * forwards at [off, off + len). That used to be a memmove of the whole
- * command stream followed by an in-place four-byte swap per command: two
- * passes over up to 64 KiB, the second at 2 loads, 2 stores and four
- * address computations per command word.
- *
- * The destination is always below the source (the caller checks
- * off <= src), so when the two regions do not overlap the move and the
- * reversal are one pass: read the source from its end downwards, write the
- * destination upwards, and each step takes four commands out of one
- * 16-byte load with one dword shuffle -- _mm_shuffle_epi32 with 0x1B
- * reverses the order of the four words and leaves each word's own bytes
- * alone, which is exactly the permutation wanted. Nothing is read twice
- * and nothing is written twice.
- *
- * Overlap can only happen at the very end of a buffer the block nearly
- * fills (lz_emit_short refuses to go there in any compressible case), and
- * there the two passes are kept as they were: memmove is defined for an
- * overlapping move, and the reversal is a swap pair, not a copy. Same
- * bytes either way. */
-static void lz_commands_out(uint8_t *dst, uint32_t src, uint32_t off,
-                            uint32_t len)
-{
-    uint32_t words = len / 4u;
-
-    if (off + len <= src) {
-        uint32_t i = 0u;
-
-#if ZPSE_LZ_HAVE_SSE2
-        for (; i + 4u <= words; i += 4u) {
-            __m128i v = _mm_loadu_si128(
-                (const __m128i *)(const void *)(dst + src + len - 16u -
-                                                (size_t)i * 4u));
-
-            _mm_storeu_si128((__m128i *)(void *)(dst + off + (size_t)i * 4u),
-                             _mm_shuffle_epi32(v, 0x1B));
-        }
-#endif /* ZPSE_LZ_HAVE_SSE2 */
-        for (; i < words; i++) {
-            zpse_store_u32le(dst + off + (size_t)i * 4u,
-                             zpse_load_u32le(dst + src + len - 4u -
-                                             (size_t)i * 4u));
-        }
-        return;
-    }
-    memmove(dst + off, dst + src, len);
-    {
-        uint32_t lo = off;
-        uint32_t hi = off + len - 4u;
-
-        while (lo < hi) {
-            uint32_t a = zpse_load_u32le(dst + lo);
-            uint32_t b = zpse_load_u32le(dst + hi);
-
-            zpse_store_u32le(dst + lo, b);
-            zpse_store_u32le(dst + hi, a);
-            lo += 4u;
-            hi -= 4u;
-        }
-    }
+    lz_emit_cmd(o, lit_src, run, off, len);
 }
 
 ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
@@ -272,7 +246,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 {
     uint16_t *tab = (uint16_t *)table;
     LzOut o;
-    uint32_t pos, anchor, misses, i, cmd_off, cmd_len;
+    uint32_t pos, anchor, misses, i;
     uint32_t cur, h;
     uint32_t entries = 1u << hash_bits;
 
@@ -292,8 +266,13 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     }
     o.dst = dst;
     o.cap = cap;
+    o.pos = (uint32_t)LZ_HDR;
     o.lit_total = 0u;
-    o.cmd_hi = cap;
+    o.cmds = 0u;
+    o.rep[0] = 1u;
+    o.rep[1] = 1u;
+    o.rep[2] = 1u;
+    o.rep[3] = 1u;
     o.fail = 0;
 
     pos = 0u;
@@ -433,13 +412,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 }
             }
         }
-        if (pos - anchor <= ZPSE_LZ_MAX_LITERALS &&
-            len <= ZPSE_LZ_MAX_MATCH) {
-            lz_emit_short(&o, in + anchor, pos - anchor, pos - cand, len,
-                          in + n);
-        } else {
-            lz_emit(&o, in + anchor, pos - anchor, pos - cand, len);
-        }
+        lz_emit(&o, in + anchor, pos - anchor, pos - cand, len);
         if (o.fail) {
             return 0u;
         }
@@ -458,7 +431,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
      * total that cannot fit cap is refused by the verification below
      * whether it is copied first or not. Computing it first is what keeps
      * an aborting call from copying up to 64 KiB of literals and 257
-     * command words in 255-byte steps that the verification then throws
+     * commands in 255-byte steps that the verification then throws
      * away: on an incompressible block every remaining byte is a literal,
      * and a capped pass (see zpse_block_try_lz) reaches here with one.
      * The arithmetic is 64-bit so the comparison cannot wrap. */
@@ -466,11 +439,9 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t run = n - anchor;
         uint64_t ncmd = ((uint64_t)run + ZPSE_LZ_MAX_LITERALS - 1u) /
                         (uint64_t)ZPSE_LZ_MAX_LITERALS;
-        uint64_t lit_end = (uint64_t)o.lit_total + (uint64_t)run;
-        uint64_t off_end = 4u + ((lit_end + 3u) & ~(uint64_t)3u);
-        uint64_t len_end = (uint64_t)(cap - o.cmd_hi) + 4u * ncmd;
+        uint64_t need = 3u * ncmd + (uint64_t)run;
 
-        if (off_end + len_end > (uint64_t)cap) {
+        if ((uint64_t)o.pos + need > (uint64_t)cap) {
             return 0u;
         }
     }
@@ -479,37 +450,18 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         const uint8_t *src = in + anchor;
 
         while (run > ZPSE_LZ_MAX_LITERALS) {
-            lz_put_literals(&o, src, ZPSE_LZ_MAX_LITERALS);
-            lz_put_cmd(&o, 0u, ZPSE_LZ_MAX_LITERALS, 0u);
+            lz_emit_cmd(&o, src, ZPSE_LZ_MAX_LITERALS, 0u, 0u);
             src += ZPSE_LZ_MAX_LITERALS;
             run -= ZPSE_LZ_MAX_LITERALS;
         }
-        lz_put_literals(&o, src, run);
-        lz_put_cmd(&o, 0u, run, 0u);
+        lz_emit_cmd(&o, src, run, 0u, 0u);
     }
     if (o.fail) {
         return 0u;
     }
-    cmd_len = cap - o.cmd_hi;
-    cmd_off = 4u + ((o.lit_total + 3u) & ~3u);
-    if (cmd_off + cmd_len > cap || cmd_off > o.cmd_hi) {
-        return 0u;
-    }
-    /* The commands were pushed backwards from the end of the buffer, so
-     * the block holds them in reverse and behind the literals: put them
-     * back in the order the decoder reads them, in one pass that copies as
-     * it reverses. (The alternative -- growing them forwards into space
-     * the literal stream has not reached yet -- cannot be done without a
-     * second buffer, since neither stream's length is known until the
-     * block is finished.) */
-    lz_commands_out(dst, o.cmd_hi, cmd_off, cmd_len);
-    /* Deterministic padding: a byte the decoder never reads is still a
-     * byte of the stream, and the encoder promises identical output. */
-    for (i = 4u + o.lit_total; i < cmd_off; i++) {
-        dst[i] = 0u;
-    }
     zpse_store_u32le(dst, o.lit_total);
-    return cmd_off + cmd_len;
+    zpse_store_u32le(dst + 4u, o.cmds);
+    return o.pos;
 }
 
 /* Literals are copied a 16-byte step at a time -- the size the compiler
@@ -526,10 +478,9 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
  * input after it (computed once per call, before the command loop), and
  * `op_rem` is the output still unwritten, which the loop maintains anyway
  * for its own bounds tests. A 16-byte load that starts inside the literal
- * region and runs past its end still reads only bytes of the same input
- * buffer -- the padding and the first command words -- and only `len` of
- * them are stored, so the bytes written are the same ones the byte loop
- * writes. The original form tested the exact distance to the end of the
+ * run and goes past its end still reads only bytes of the same input
+ * buffer -- whatever the stream holds next -- and only `len` of them are
+ * stored, so the bytes written are the same ones the byte loop writes. The original form tested the exact distance to the end of the
  * region, which made the wide path conditional on where in the region the
  * run happened to start and cost two 64-bit subtractions per literal run
  * to decide. */
@@ -703,12 +654,14 @@ ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
     }
 }
 
+/* One forward pass, no seeking: a token, its literals, its distance and,
+ * when the token asked for one, its length escape. */
 ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                    uint32_t n)
 {
-    uint32_t lit_bytes, cmd_off, cmd_len;
+    uint32_t lit_total, cmd_count;
     const uint8_t *lp;
-    const uint8_t *cp;
+    const uint8_t *tend;
     uint8_t *op;
 
     if (in == 0 || out == 0) {
@@ -720,198 +673,139 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     if (in_len < ZPSE_LZ_MIN_PAYLOAD) {
         return PSE_TRUNCATED;
     }
-    lit_bytes = zpse_load_u32le(in);
-    if (lit_bytes > in_len - 4u) {
+    lit_total = zpse_load_u32le(in);
+    cmd_count = zpse_load_u32le(in + 4u);
+    if (lit_total > in_len - LZ_HDR || cmd_count == 0u) {
         return PSE_BAD_LZ;
     }
-    cmd_off = 4u + ((lit_bytes + 3u) & ~3u);
-    if (cmd_off > in_len) {
-        return PSE_BAD_LZ;
-    }
-    cmd_len = in_len - cmd_off;
-    if (cmd_len < 4u || (cmd_len & 3u) != 0u) {
-        return PSE_BAD_LZ;
-    }
-    lp = in + 4u;
-    cp = in + cmd_off;
+    lp = in + LZ_HDR;
+    tend = in + in_len;
     op = out;
-
     {
-        /* Everything a command is checked against is a counter rather than
-         * a pointer derived from a buffer end: `lit_rem` is the literal
-         * stream still unread, `op_rem` the output still unwritten,
-         * `op_done` the output already written, and `cmd_left` the command
-         * words still unread -- one command per word, so it is the bound
-         * `cp + 4 > cend` made. Four counters and the two cursors are the
-         * whole live set; keeping the input end, the literal end and the
-         * output end as pointers instead ran the loop three values short of
-         * the register file, and the spill cost was two reloads of derived
-         * command fields and one of the input end on every command (objdump:
-         * the fast path opened by popping it back off the stack). The two
-         * copies now take the room in front of their region, which is a
-         * counter already in hand, in place of a pointer to its end. Same
-         * tests, same order, same streams accepted and refused -- only the
-         * arithmetic changed. Measured over the corpus, twelve interleaved
-         * rounds against the tree before it: LZ decode alone comes out 24%
-         * faster on `json_rows`, 13% on `log_lines` and 8% on `var_string`,
-         * and the whole decoder 2.6% time-weighted across the 25 cases (1.5%
-         * geomean). The encoder is untouched and reads as it did. */
-        uint32_t lit_rem = lit_bytes;
+        uint32_t lit_seen = 0u;
         uint32_t op_rem = n;
         uint32_t op_done = 0u;
-        uint32_t cmd_left = cmd_len / 4u;
-
-        /* True when a 16-byte read that starts anywhere in the literal
-         * region stays inside the input buffer: the region's end plus
-         * sixteen cannot pass the end of the frame's block. It is false
-         * only for a block whose literal region sits close enough to the
-         * end of the payload that there is no padding behind it. */
-        const int lit_safe16 =
-            ((uint32_t)(in_len - 4u - lit_bytes) >= 16u) ? 1 : 0;
-        /* One of the two one-shot bounds is about the block, not the
-         * command: whether an eight-byte literal load stays inside the
-         * input at all. Folding it into the output-room bound turns two
-         * tests into one on every command of the fast path -- a block
-         * without the padding asks for more output room than the block can
-         * have, so its commands fall through to the general path, which
-         * makes its own bounds and refuses the same streams. */
-        const uint32_t fast_min_rem =
-            (lit_safe16 != 0) ? 40u : 0xFFFFFFFFu;
+        uint32_t cmd_left = cmd_count;
+        uint32_t rep0 = 1u, rep1 = 1u, rep2 = 1u, rep3 = 1u;
 
         while (op_rem != 0u) {
-            uint32_t cw;
+            uint32_t tok;
             uint32_t lit;
             uint32_t off;
             uint32_t mlen;
+            uint32_t v;
+            uint8_t b;
 
             if (cmd_left == 0u) {
                 return PSE_BAD_LZ;
             }
             cmd_left--;
-            cw = zpse_load_u32le(cp);
-            cp += 4;
-            lit = (cw >> 16) & 0xFFu;
-            off = cw & 0xFFFFu;
-            mlen = (cw >> 24) + ZPSE_LZ_MIN_MATCH;
-            /* One-shot path for the shape most commands of a text, JSON or
-             * log block take: at most eight literal bytes and a match that
-             * fits in sixteen, at a distance of at least sixteen. Both
-             * copies become one store with no tail, and the whole command
-             * becomes one branch instead of the two copies' own cascades of
-             * width tests -- which is what the loop is worth, because it is
-             * per-command bound, not per-byte bound: a command emits five to
-             * eleven bytes and costs the same short chain of compares and
-             * stores whatever its shape. Measured on the LZ decoder alone,
-             * `json_rows` 2.37 -> 3.74 GB/s and `text_en` 1.54 -> 2.29.
-             *
-             * The bounds are the general path's, tested as one expression
-             * and in the order those tests would run in: the literal count
-             * is tested here rather than in front of the condition, `off <=
-             * op_done + lit` is the distance test taken after the literal
-             * bytes are placed, and `lit + mlen + 16 <= op_rem` covers both
-             * the output bound and the sixteen bytes the match store writes
-             * past its run, which a later command reclaims exactly as the
-             * general path's slack does. Both stores over-copy and both
-             * over-copies are overwritten -- the literal's tail by the match
-             * store, the match's tail past the command -- so the bytes in
-             * `out` are the ones the general path writes, and a stream the
-             * general path would refuse is refused here too (every test it
-             * makes is in this condition, or already made above). */
-            /* The output test is `op_rem >= fast_min_rem`, not `lit + mlen
-             * + 16 <= op_rem`: with lit <= 8 and mlen <= 16 the two are the
-             * same bound, and a compare is one op where the sum is three.
-             * `fast_min_rem` carries the block-wide half of the old
-             * condition (`lit_safe16`) as well, so the padding question is
-             * folded into that one compare rather than asked again. The
-             * distance test is `off <= op_done`, one literal's worth
-             * stricter than the general path's after the literals are
-             * placed -- a match that starts within the first eight bytes of
-             * the block takes the general path instead.
-             *
-             * `lit <= lit_rem` is part of this condition rather than a test
-             * of its own before it: the general path below makes that test
-             * and has to for every command that falls through, so a command
-             * that fails it here is rejected there with the same status.
-             * Folding it in is worth one less branch and one less min() of
-             * the two counters per command, and the branch hint is worth the
-             * layout: with seven terms gcc stops believing the block is
-             * taken and moves it out of line, which costs more than the
-             * tests it saves. */
-            if (ZPSE_LIKELY(lit <= 8u && lit <= lit_rem && off >= 16u &&
-                            mlen <= 16u && off <= op_done &&
-                            op_rem >= fast_min_rem)) {
-                memcpy(op, lp, 8u);
-                memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
-                op += lit + mlen;
-                lp += lit;
-                lit_rem -= lit;
-                op_rem -= lit + mlen;
-                op_done += lit + mlen;
-                continue;
-            }
-            /* The same one-shot shape, one width up: a match of 17..32
-             * bytes at a distance of at least thirty-two is still one
-             * overlapping store, and a command whose literal run is at most
-             * eight bytes still fits it in the same forty bytes of output
-             * the sixteen-byte form proves it has (8 + 32). It is a second
-             * branch rather than a width chosen inside the first one
-             * because the first one's shape -- eight literals and a match
-             * that fits in sixteen -- is most commands of a JSON block, and
-             * a select in front of it cost that path two compares it never
-             * needed (json_rows 4570 -> 4340 MB/s). Here nothing is paid
-             * unless the sixteen-byte form has already declined, which is
-             * one command in twenty-five on json_rows and one in three on
-             * log_lines -- where 2.33M of 4.98M commands are matches of
-             * 17..32 bytes at a distance over 32 and used to fall through to
-             * lz_copy_match's width ladder and doubling loop for them.
-             *
-             * The bytes are the ladder's own: at distance d >= w the w bytes
-             * before a match position are exactly the bytes it repeats, and
-             * a store past the match is reclaimed by the next command
-             * (lz_copy_match's slack argument). The conditions are the first
-             * branch's with the wider pair, tested in the same order, and a
-             * command that fails them still reaches the general path below,
-             * which accepts and rejects exactly what it did. */
-            if (lit <= 8u && lit <= lit_rem && off >= 32u &&
-                mlen <= 32u && off <= op_done && op_rem >= fast_min_rem) {
-                memcpy(op, lp, 8u);
-                memcpy(op + lit, op + lit - (ptrdiff_t)off, 32u);
-                op += lit + mlen;
-                lp += lit;
-                lit_rem -= lit;
-                op_rem -= lit + mlen;
-                op_done += lit + mlen;
-                continue;
-            }
-            if (lit > lit_rem || lit > op_rem) {
+            if (lp >= tend) {
                 return PSE_BAD_LZ;
             }
-            lz_copy_literals(op, lp, lit, op_rem, lit_safe16);
-            op += lit;
-            lp += lit;
-            lit_rem -= lit;
-            op_rem -= lit;
-            op_done += lit;
-            if (off == 0u) {
+            tok = *lp++;
+            lit = tok >> 4;
+            if (lit == 15u) {
+                do {
+                    if (lp >= tend) {
+                        return PSE_BAD_LZ;
+                    }
+                    b = *lp++;
+                    lit += b;
+                } while (b == 255u);
+            }
+            mlen = (tok & 15u) + ZPSE_LZ_MIN_MATCH;
+            if (lit > op_rem || (uint32_t)(tend - lp) < lit) {
+                return PSE_BAD_LZ;
+            }
+            if (lit != 0u) {
+                lz_copy_literals(op, lp, lit, op_rem, 0);
+                op += lit;
+                lp += lit;
+                op_rem -= lit;
+                op_done += lit;
+                lit_seen += lit;
+            }
+            /* The distance: 7-bit groups, high bit means another byte
+             * follows. Zero is a literal-only command, one to four name a
+             * recent distance, and anything above that is the distance plus
+             * four. The cache is updated exactly as lz_emit_cmd updates it,
+             * which is the whole contract of the encoding. */
+            v = 0u;
+            {
+                uint32_t shift = 0u;
+
+                do {
+                    if (lp >= tend || shift > 21u) {
+                        return PSE_BAD_LZ;
+                    }
+                    b = *lp++;
+                    v |= (uint32_t)(b & 0x7Fu) << shift;
+                    shift += 7u;
+                } while ((b & 0x80u) != 0u);
+            }
+            if (v == 0u) {
                 /* A literal-only command has to make progress. */
                 if (lit == 0u) {
                     return PSE_BAD_LZ;
                 }
                 continue;
             }
+            if ((tok & 15u) == 15u) {
+                do {
+                    if (lp >= tend) {
+                        return PSE_BAD_LZ;
+                    }
+                    b = *lp++;
+                    mlen += b;
+                } while (b == 255u);
+            }
+            if (v <= 4u) {
+                if (v == 1u) {
+                    off = rep0;
+                } else if (v == 2u) {
+                    off = rep1;
+                    rep1 = rep0;
+                    rep0 = off;
+                } else if (v == 3u) {
+                    off = rep2;
+                    rep2 = rep1;
+                    rep1 = rep0;
+                    rep0 = off;
+                } else {
+                    off = rep3;
+                    rep3 = rep2;
+                    rep2 = rep1;
+                    rep1 = rep0;
+                    rep0 = off;
+                }
+            } else {
+                off = v - 4u;
+                rep3 = rep2;
+                rep2 = rep1;
+                rep1 = rep0;
+                rep0 = off;
+            }
             if (off > op_done || mlen > op_rem) {
                 return PSE_BAD_LZ;
             }
-            lz_copy_match(op, off, mlen, op_rem);
+            /* A short match at a long distance is one store: at distance d
+             * the d bytes before the match are the bytes it repeats, and a
+             * store past the match is reclaimed by the next command. */
+            if (ZPSE_LIKELY(off >= 16u && mlen <= 16u && op_rem >= 16u)) {
+                memcpy(op, op - (ptrdiff_t)off, 16u);
+            } else if (off >= 32u && mlen <= 32u && op_rem >= 32u) {
+                memcpy(op, op - (ptrdiff_t)off, 32u);
+            } else {
+                lz_copy_match(op, off, mlen, op_rem);
+            }
             op += mlen;
             op_rem -= mlen;
             op_done += mlen;
         }
-        /* Every literal and every command has to be accounted for: a stream
-         * that fills the output early and then stops is not the stream the
-         * encoder wrote, and silently ignoring the rest would let a corrupt
-         * count pass as valid. */
-        if (cmd_left != 0u || lit_rem != 0u) {
+        /* Every literal and every command has to be accounted for, and the
+         * stream has to end where the payload does. */
+        if (cmd_left != 0u || lit_seen != lit_total || lp != tend) {
             return PSE_BAD_LZ;
         }
     }

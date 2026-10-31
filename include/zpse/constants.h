@@ -145,19 +145,15 @@
  * block BALANCED would have taken -- a stream the finder offers can only be
  * kept when it is smaller, and a bill that accepts shorter runs only admits
  * more of them. Measured over Silesia (202 MiB of real data, one pinned core,
- * `tests/benchmarks/silesia.sh`, six interleaved rounds): 132,691,893 packed
- * bytes at level 5 against 126,090,987 at level 6, i.e. 5.0% smaller, encode
- * 329 against 311 MB/s and decode 1384 against 1494 MB/s. That is a little
- * encode rate for a smaller stream that also decodes faster.
+ * `tests/benchmarks/silesia.sh`): 113,246,135 packed bytes at level 5 against
+ * 106,140,388 at level 6, i.e. 6.3% smaller, for 6% of the encode rate (315
+ * against 296 MB/s on the prose pair).
  *
  * The two knobs are not equal in cost, which is what the level table's row 6
  * is built from: raising the bill alone is free -- it only filters streams the
- * match-finder pass has already produced, so it cannot add a pass -- and is
- * worth 0.64% on its own (126,902,432 -> 126,090,987 bytes at 316 against 315
- * MB/s over six interleaved rounds). The margin alone is worth the remaining
- * 4.4%, and costs 15% of the encode rate (119,841,369 bytes at 283 against
- * 332 MB/s), because it buys match-finder passes. So the default takes the
- * free knob and leaves the paid one to level 7.
+ * match-finder pass has already produced, so it cannot add a pass -- while
+ * the margin costs one, because it offers the finder more blocks. So the
+ * default takes the free knob and leaves the paid one to level 7.
  *
  * What it costs is the ladder's cheapest rung below it: level 5 still exists
  * and still writes what it wrote, so a caller who wants that exact stream can

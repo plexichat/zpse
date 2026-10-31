@@ -81,7 +81,7 @@ int main(void)
         in[i] = (uint8_t)i;
         in[i + 1u] = (uint8_t)(i >> 8);
     }
-    check("spike every 256", 65536u, 1211u);
+    check("spike every 256", 65536u, 1066u);
 
     {
         uint32_t r = 0xBEEFu;

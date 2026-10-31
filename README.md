@@ -416,7 +416,7 @@ encodes it gets back from the prune instead (see above). The
 ASCII gate below replaces the tile-side sweep, not the match finder, which is
 offered afterwards whatever the gate decided. What the form costs is decode
 speed, and that is what the level's **acceleration factor** decides: an LZ stream decodes at the
-speed of its command loop, one 4-byte command per output run, so its rate
+speed of its command loop, one command per output run, so its rate
 follows the average run length. Over 64 KiB blocks, at six bytes per command
 prose decodes at about 2.5 GB/s, at eleven bytes JSON at 4.5, at twenty bytes
 variable strings at 5.9, and at a hundred or more the long-run patterns at 5
@@ -947,25 +947,26 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.09 | 1.53 GB/s | 2.76 GB/s |
-| mozilla | 51,220,480 | 1.64 | 0.24 GB/s | 1.16 GB/s |
-| mr | 9,970,564 | 2.32 | 0.27 GB/s | 1.06 GB/s |
-| nci | 33,553,445 | 4.00 | 0.21 GB/s | 1.56 GB/s |
-| ooffice | 6,152,192 | 1.22 | 0.21 GB/s | 1.72 GB/s |
-| osdb | 10,085,684 | 1.02 | 0.78 GB/s | 1.82 GB/s |
-| reymont | 6,627,202 | 1.26 | 0.54 GB/s | 4.17 GB/s |
-| samba | 21,606,400 | 1.93 | 0.31 GB/s | 1.33 GB/s |
-| sao | 7,251,944 | 1.00 | 1.19 GB/s | 7.33 GB/s |
-| webster | 41,458,703 | 1.50 | 0.32 GB/s | 1.33 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.43 GB/s | 2.33 GB/s |
-| xml | 5,345,280 | 3.13 | 0.49 GB/s | 3.12 GB/s |
-| **total** | **211,938,580** | **1.68** | **0.30 GB/s** | **1.48 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.72 GB/s | 1.72 GB/s |
+| mozilla | 51,220,480 | 1.96 | 0.22 GB/s | 0.90 GB/s |
+| mr | 9,970,564 | 2.32 | 0.31 GB/s | 1.14 GB/s |
+| nci | 33,553,445 | 5.14 | 0.21 GB/s | 1.14 GB/s |
+| ooffice | 6,152,192 | 1.47 | 0.16 GB/s | 0.69 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.55 GB/s | 1.89 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.27 GB/s | 0.91 GB/s |
+| samba | 21,606,400 | 2.48 | 0.29 GB/s | 0.83 GB/s |
+| sao | 7,251,944 | 1.01 | 1.13 GB/s | 9.76 GB/s |
+| webster | 41,458,703 | 1.95 | 0.25 GB/s | 0.65 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.50 GB/s | 3.08 GB/s |
+| xml | 5,345,280 | 3.83 | 0.49 GB/s | 1.30 GB/s |
+| **total** | **211,938,580** | **2.00** | **0.27 GB/s** | **0.89 GB/s** |
 
-`zpse_cli bench -r 3`, default level (6), 64 KiB blocks, one pinned core. The
-`sao` row is the raw fallback doing its job -- 1.00:1 at copy speed -- and
-`osdb` is almost there; `dickens`, `ooffice`, `reymont` and `webster` are the
-text problem in one line each: 1.09 to 1.50 on data that a general-purpose LZ
-at the same speed reaches in the twos.
+`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core. The
+`sao` row is the raw fallback doing its job at copy speed, and `osdb` is close
+behind it. The prose rows are the ones the token form moved: `dickens` from
+1.09 to 1.16 and `webster` from 1.50 to 1.95 at the default, and the pair at
+1.87 together at MAX. `dickens` is the one file the default still refuses the
+LZ form on -- the screen margin that would take it is level 7's.
 
 ### Against lz4 and zstd, on the same bytes
 
@@ -979,36 +980,26 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.33 GB/s | 0.50 GB/s | no |
-| zpse 5 BALANCED | 1.60:1 | 0.21 GB/s | 0.54 GB/s | no |
-| zpse 6 (default) | 1.68:1 | 0.21 GB/s | 0.54 GB/s | no |
-| zpse 9 MAX | 1.85:1 | 0.17 GB/s | 0.52 GB/s | no |
-| lz4 -1 | 2.11:1 | 1.58 GB/s | 1.15 GB/s | yes |
-| lz4 -3 | 2.60:1 | 0.32 GB/s | 1.34 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.12 GB/s | 1.30 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.31 GB/s | 0.90 GB/s | yes |
-| zstd -3 | 3.20:1 | 0.19 GB/s | 0.76 GB/s | yes |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.48 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.30 GB/s | 0.58 GB/s | no |
+| zpse 5 BALANCED | 1.87:1 | 0.21 GB/s | 0.52 GB/s | no |
+| zpse 6 (default) | 2.00:1 | 0.20 GB/s | 0.49 GB/s | no |
+| zpse 9 MAX | 2.18:1 | 0.18 GB/s | 0.51 GB/s | no |
+| lz4 -1 | 2.11:1 | 1.82 GB/s | 1.53 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.16 GB/s | 1.49 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.34 GB/s | 1.01 GB/s | yes |
+| zstd -3 | 3.20:1 | 0.23 GB/s | 0.91 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.85 GB/s | yes |
 
-On Silesia this codec is on nobody's frontier: `lz4 -1` is smaller than
-every level, several times faster to encode than the best of them, and faster
-to decode as well, so it dominates all four zpse rows and the deeper levels
-just walk along the same curve towards zstd. That is not an artefact of the
-harness. There are three causes, one per axis.
-
-*Ratio.* On prose the tile path falls back to packing seven bits a byte, and
-the LZ form that would beat it charges a fixed four bytes per command however
-long the run. At the 5.6 bytes of output per command that prose produces,
-the commands alone cost 0.71 bytes per byte of input, against roughly 0.21
-for lz4's variable-length token on the same data, so the form loses its own
-win before the literals are counted. Both fixes are format changes: a
-variable-length token, and repeat-offset codes for the distances that recur.
+MAX is now smaller than `lz4 -1` -- 2.18:1 against 2.11 -- and the default is
+within 5% of it, so the ratio half of the comparison is settled. The rows are
+still off the frontier, for two reasons rather than three.
 
 *Encode.* A block here is decided, not merely encoded: the probe prices the
 candidate shapes, the ASCII gate prices three of them on two samples, and a
 block the gate convicts pays a screened match-finder pass. That decision is
-what caps the encoder at about a gigabyte a second, and `lz4 -1` makes none
-of it -- one pass, one token per match, no comparison of shapes.
+what caps the encoder near a fifth of `lz4 -1`'s rate, and lz4 makes none of
+it -- one pass, one token per match, no comparison of shapes. `zstd -1` is the
+same story at a smaller multiple.
 
 *Decode.* An LZ block decodes at the rate of its own command loop, so the
 tile stream's multi-gigabyte rate is not available on `dickens` or `webster`
@@ -1027,22 +1018,30 @@ frontier rule:
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 4.35:1 | 0.42 GB/s | 0.73 GB/s | no |
-| zpse 5 BALANCED | 5.15:1 | 0.37 GB/s | 0.78 GB/s | yes |
-| zpse 6 (default) | 5.18:1 | 0.37 GB/s | 0.72 GB/s | yes |
-| zpse 9 MAX | 5.21:1 | 0.37 GB/s | 0.78 GB/s | yes |
-| lz4 -1 | 3.30:1 | 1.42 GB/s | 0.89 GB/s | yes |
-| lz4 -3 | 3.54:1 | 0.46 GB/s | 0.99 GB/s | no |
-| lz4 -9 | 3.61:1 | 0.27 GB/s | 0.96 GB/s | no |
-| zstd -1 | 4.78:1 | 0.62 GB/s | 1.16 GB/s | yes |
-| zstd -3 | 4.91:1 | 0.38 GB/s | 1.26 GB/s | yes |
-| zstd -19 | 5.71:1 | 0.004 GB/s | 1.04 GB/s | yes |
+| zpse 5 BALANCED | 5.29:1 | 0.40 GB/s | 0.92 GB/s | yes |
+| zpse 6 (default) | 5.32:1 | 0.42 GB/s | 0.86 GB/s | yes |
+| zpse 9 MAX | 5.34:1 | 0.40 GB/s | 0.90 GB/s | yes |
+| lz4 -1 | 3.30:1 | 1.63 GB/s | 1.22 GB/s | yes |
+| lz4 -3 | 3.54:1 | 0.49 GB/s | 1.13 GB/s | no |
+| lz4 -9 | 3.61:1 | 0.33 GB/s | 1.17 GB/s | no |
+| zstd -1 | 4.80:1 | 0.68 GB/s | 1.41 GB/s | yes |
+| zstd -3 | 4.88:1 | 0.45 GB/s | 1.37 GB/s | yes |
+| zstd -19 | 5.75:1 | 0.006 GB/s | 1.24 GB/s | yes |
 
 Every level from 5 up is on the frontier here, on ratio and encode rate:
-level 5 writes 5% smaller than `zstd -3` at the same encoder speed, which is
+level 5 writes 8% smaller than `zstd -3` at the same encoder speed, which is
 what keeps it out of reach of both tools at once. It is a narrow lead, and it
-does not extend to decode, where zstd is ahead -- the frontier is a set, not a
-win, and this codec is on it for the shape of data it was built for.
+does not extend to decode, where zstd is still ahead -- the frontier is a set,
+not a win, and this codec is on it for the shape of data it was built for.
+
+One check on that claim belongs here, because it is the difference between a
+corpus and a format. A *real* table export in CSV form is not typed columns:
+on 58 MB of ride-hailing trips (`uber-rides-data1.csv`, the same harness and
+the same rule) zpse reads 3.58:1 at 144 MB/s against `lz4 -1`'s 3.69:1 at
+1.25 GB/s -- a hair behind on ratio and an order of magnitude behind on rate,
+because a CSV is prose with separator punctuation. The typed-column shape the
+table above measures is what a binary table format stores, not what a text
+export of the same rows contains.
 
 Running the ladder over Silesia is how a CLI bug surfaced. `-l N` used to OR
 the level into a word that already held the default, so `-l 1` ran BALANCED,
@@ -1053,28 +1052,25 @@ OR-ing into it, and the ladder is what the level table documents:
 
 | level | dickens + webster | ratio | encode |
 | --- | ---: | ---: | ---: |
-| 1 FASTEST | 47,256,891 | 1.09 | 1.19 GB/s |
-| 2 | 47,256,861 | 1.09 | 1.21 |
-| 3 FASTER | 47,256,861 | 1.09 | 1.18 |
-| 4 | 47,256,861 | 1.09 | 1.22 |
-| 5 BALANCED | 39,796,481 | 1.30 | 0.49 |
-| 6 (default) | 36,950,349 | 1.40 | 0.40 |
-| 7 | 35,152,045 | 1.47 | 0.35 |
-| 8 | 34,155,474 | 1.51 | 0.29 |
-| 9 MAX | 34,155,474 | 1.51 | 0.33 |
+| 1 FASTEST | 47,256,891 | 1.09 | 1.89 GB/s |
+| 2 | 47,256,861 | 1.09 | 1.73 |
+| 3 FASTER | 47,256,861 | 1.09 | 1.83 |
+| 4 | 47,256,861 | 1.09 | 1.83 |
+| 5 BALANCED | 31,411,878 | 1.64 | 0.32 |
+| 6 (default) | 30,126,388 | 1.71 | 0.30 |
+| 7 | 28,254,795 | 1.83 | 0.25 |
+| 8 | 27,622,876 | 1.87 | 0.23 |
+| 9 MAX | 27,622,876 | 1.87 | 0.24 |
 
 Sizes are non-increasing from level 2 up, which is the property the table
 promises, and the step from level 4 to 5 is where the match finder is offered
 to every block.
 
-The default is level 6 rather than 5 because on this corpus level 6 is not a
-trade at all: 126,902,432 packed bytes against 132,691,893 (1.67:1 against
-1.60:1), encode 344 against 352 MB/s, which is inside the run-to-run spread,
-and decode 18% faster, because a block the LZ form takes is a copy loop to
-decode rather than a tile reconstruction. The only knob that separates them is
-the screen margin, and a looser margin can only offer the finder more blocks,
-never a larger stream. MAX still goes further -- 114,711,960 bytes, 1.85:1 --
-for about 30% less encode rate, which is the rung to choose when size is the
+The default is level 6 rather than 5 because level 6 buys real size for a
+small rate: 106,140,388 packed bytes against 113,246,135 over all twelve
+files (2.00:1 against 1.87:1), encode 296 against 315 MB/s on the prose pair,
+and decode 4% lower. MAX goes further -- 97,634,045 bytes, 2.17:1 -- for
+about a third less encode rate, which is the rung to choose when size is the
 only thing that matters.
 
 The four cheap levels (1-4) write the same stream within 30 bytes of each

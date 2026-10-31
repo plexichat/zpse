@@ -125,23 +125,42 @@ static uint32_t build_payload(uint8_t *dst, uint32_t cap, uint32_t lit_bytes,
                               const uint8_t *lits, const uint32_t *cmds,
                               uint32_t ncmds)
 {
-    uint32_t cmd_off = 4u + ((lit_bytes + 3u) & ~3u);
+    uint32_t at = 8u;
+    uint32_t lit_at = 0u;
     uint32_t i;
 
-    if (cmd_off + 4u * ncmds > cap) {
+    /* One forward stream again: each command is its token byte, its
+     * literals, then its distance. Every command below is small enough for
+     * the token's own nibbles, so no stream here needs an escape. */
+    if (cap < 8u) {
         return 0u;
     }
-    zpse_store_u32le(dst, lit_bytes);
-    if (lit_bytes > 0u) {
-        memcpy(dst + 4u, lits, lit_bytes);
-    }
-    for (i = 4u + lit_bytes; i < cmd_off; i++) {
-        dst[i] = 0u;
-    }
     for (i = 0; i < ncmds; i++) {
-        zpse_store_u32le(dst + cmd_off + 4u * i, cmds[i]);
+        uint32_t cw = cmds[i];
+        uint32_t off = cw & 0xFFFFu;
+        uint32_t lit = (cw >> 16) & 0xFFu;
+        uint32_t mlen = ((cw >> 24) & 0xFFu) + ZPSE_LZ_MIN_MATCH;
+        uint32_t v = (off == 0u) ? 0u : (off + 4u);
+
+        if (at + 3u + lit > cap) {
+            return 0u;
+        }
+        dst[at++] = (uint8_t)(((lit << 4) & 0xF0u) |
+                              ((mlen - ZPSE_LZ_MIN_MATCH) & 0x0Fu));
+        if (lit > 0u) {
+            memcpy(dst + at, lits + lit_at, lit);
+            at += lit;
+            lit_at += lit;
+        }
+        while (v >= 0x80u) {
+            dst[at++] = (uint8_t)(v | 0x80u);
+            v >>= 7;
+        }
+        dst[at++] = (uint8_t)v;
     }
-    return cmd_off + 4u * ncmds;
+    zpse_store_u32le(dst, lit_bytes);
+    zpse_store_u32le(dst + 4u, ncmds);
+    return at;
 }
 
 static uint32_t cmd(uint32_t off, uint32_t lit, uint32_t mlen)

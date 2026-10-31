@@ -12,22 +12,42 @@
  * Payload layout (the block header is not part of it):
  *
  *   u32 literal_bytes        count of literal bytes that follow
+ *   u32 command_count        number of tokens that follow
  *   u8  literals[]           literal_bytes bytes, padded to a 4-byte
  *                            boundary with bytes the decoder never reads
- *   u32 commands[]           fixed 32-bit command words to the end
+ *   token stream             to the end of the payload
  *
- * A command word is
+ * Each command is a token byte and an offset:
  *
- *   bits  0..15   offset, 1..65535; 0 means "no match, literals only"
- *   bits 16..23   literal bytes copied before the match, 0..255
- *   bits 24..31   match length minus four, 4..259 bytes
+ *   token       high nibble: literal bytes copied before the match,
+ *               0..14 or 15 for "more follows"
+ *               low nibble:  match length minus four, 0..14 or 15 for
+ *               "more follows"
+ *   escapes     each nibble that reads 15 is followed by 255-chained
+ *               bytes: every 0xFF adds 255 and the first byte below 255
+ *               ends the run
+ *   offset      7-bit groups, least significant first, high bit set on
+ *               every byte but the last:
+ *                 0      no match, literals only
+ *                 1..4   the i-th most recently used distance
+ *                 5..    an explicit distance, value minus four
  *
- * There are no escape words and no variable-length tokens: every command
- * is one aligned 32-bit load however long the run it codes. A run longer
- * than 255 literals or 259 match bytes is written as repeated commands
- * with the same offset, which is what keeps the decoder's inner loop
- * branch-uniform (a 64 KiB run of one byte costs one command per 259
- * bytes, 1.6% of the input, and still decodes at copy speed).
+ * The repeat distances are the four most recent matches, most recent
+ * first, seeded to four ones. Using one moves it to the front; using an
+ * explicit distance pushes it to the front and drops the oldest. That is
+ * worth nothing on prose (almost every match is a fresh distance) and
+ * 24% of the matches on executable and archive data, where a structure
+ * repeats at a stride the finder keeps landing on.
+ *
+ * Four bytes per command, whatever the run, was the old form and it was
+ * the codec's worst ratio decision: prose averages 5.6 bytes of output
+ * per command, so commands cost 0.71 bytes per byte of input against
+ * roughly 0.21 for a variable-length token. Moving to one bought 25% of
+ * the payload on `dickens` (1.26:1 to 1.57:1), 22% on `webster` and 19%
+ * on `mozilla`, measured by re-encoding the commands the finder already
+ * produced. A run longer than 255 literals or 259 match bytes is still
+ * several commands with the same offset, and after the first the repeat
+ * code makes every one of them a byte shorter.
  *
  * Decoding stops when the output is full, and requires that the literal
  * count, the literal stream, the command stream and the output length all
@@ -56,9 +76,16 @@
 
 
 
+/* The smallest possible command: a token byte and one offset byte. A
+ * stream can never code more than ZPSE_LZ_MAX_MATCH bytes with one of
+ * them, which is the floor the block encoder budgets against. */
+#define ZPSE_LZ_MIN_CMD         2u
+
 /* The smallest payload zpse_lz_encode can produce for an n-byte block:
- * the literal-count word and one command. */
-#define ZPSE_LZ_MIN_PAYLOAD     8u
+ * the two header words and one command -- a token byte and a one-byte
+ * distance. A block whose first match starts at offset one is exactly
+ * this, so anything larger would refuse payloads the encoder writes. */
+#define ZPSE_LZ_MIN_PAYLOAD     10u
 
 /* Encode n <= 65536 bytes into dst[0..cap). `table` is ZPSE_LZ_TABLE_BYTES
  * of caller-owned scratch (the encoder arena); it is filled and left
