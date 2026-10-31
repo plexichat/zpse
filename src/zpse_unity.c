@@ -17,5 +17,6 @@
 #include "segment.c"
 #include "block.c"
 #include "frame.c"
+#include "parallel.c"
 #include "vector.c"
 #include "api.c"

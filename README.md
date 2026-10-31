@@ -1,9 +1,11 @@
 # zpse
 
 A block-format compressor in C11. Fixed 64 KiB blocks, fixed-size
-caller-owned arenas, no allocation, no I/O, no threads, no global state, and
-an encoder whose output depends only on its input — so a compressed stream is
-byte-identical on every build, every compiler and every SIMD level.
+caller-owned arenas, no allocation, no I/O, no global state, and no threads in
+the codec itself (the optional parallel frame encoder is one module, compiled
+out unless it is asked for) — and an encoder whose output depends only on its
+input, so a compressed stream is byte-identical on every build, every compiler,
+every SIMD level and every thread count.
 
 It is built for the case where a codec has to be *predictable*: decode ten
 to seventy gigabytes a second out of cache, never touch the allocator, and
@@ -331,19 +333,19 @@ each run the harness's own best of three timed reps, on one host,
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.92 GB/s | 15.9 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
-| 2 | 4.06:1 | 1.66 GB/s | 16.5 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.57 GB/s | 17.2 GB/s | the same prescreen, three full trials |
-| 4 | 4.06:1 | 1.54 GB/s | 17.4 GB/s | four full trials, still no match finder |
-| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.47:1 | 1.14 GB/s | 13.6 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
-| 6 | 4.48:1 | 1.05 GB/s | 13.9 GB/s | the LZ sample margin loosened to 1.1875x; the decode bill unchanged |
-| 7 | 4.50:1 | 1.04 GB/s | 13.8 GB/s | the margin loosened to 1.125x and the acceleration factor raised to 16 (6 bytes per command) |
-| 8 | 4.51:1 | 994 MB/s | 13.3 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
-| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 969 MB/s | 13.5 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.77 GB/s | 16.2 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
+| 2 | 4.06:1 | 1.66 GB/s | 16.6 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.62 GB/s | 17.2 GB/s | the same prescreen, three full trials |
+| 4 | 4.06:1 | 1.60 GB/s | 16.9 GB/s | four full trials, still no match finder |
+| 5 `ZPSE_ENC_SPEED_BALANCED` (default) | 4.47:1 | 1.02 GB/s | 13.9 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
+| 6 | 4.48:1 | 974 MB/s | 13.8 GB/s | the LZ sample margin loosened to 1.1875x; the decode bill unchanged |
+| 7 | 4.50:1 | 963 MB/s | 13.6 GB/s | the margin loosened to 1.125x and the acceleration factor raised to 16 (6 bytes per command) |
+| 8 | 4.51:1 | 909 MB/s | 13.5 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
+| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 852 MB/s | 11.7 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
 
 Levels 3 and 4 read as the same mean ratio because on this corpus a third or
-fourth candidate almost never wins: the extra trials cost encode time (1.55 to
-1.50 GB/s) and buy the odd block, which is worth a rung to the caller who
+fourth candidate almost never wins: the extra trials cost encode time (1.62 to
+1.60 GB/s) and buy the odd block, which is worth a rung to the caller who
 wants it and worth nothing to the average. Level 2 is the visible step in that
 tier, because the prescreen it switches to is what changes which shape the
 winner is.
@@ -764,6 +766,11 @@ No build system: the library is a set of `.c` files plus headers, and
 gcc -std=c11 -O2 -Iinclude src/zpse_unity.c your_program.c -o your_program
 ```
 
+The parallel frame encoder is the one part behind a switch: add `-DZPSE_MT
+-pthread` (POSIX; the Win32 path uses `CreateThread` instead) to compile it in.
+`tests/runners/run.sh` builds `test_parallel` both ways and requires the same
+frames from each.
+
 Portable C11, no compiler-specific code outside `#if defined(__GNUC__)`
 guards; AVX2 paths are selected at runtime (`zpse_cpu_caps()`), and the scalar
 fallbacks are bit-identical, which is what the parity suite exists to prove.
@@ -811,13 +818,47 @@ Frames are seekable only when they were written with `-x`; without an index
 `dir` says so rather than scanning, because a block header carries its own size
 but not its offset.
 
-Per-block independence is also what multicore encode needs, and that is where
-it stops for now: a parallel encoder wants a work queue over block indices, a
-per-worker arena, and an ordered writer that appends blocks and builds the
-index as they complete. The format already allows it -- blocks cannot refer
-across boundaries -- but the CLI cannot do it from outside the library, because
-`zpse_compress_frame*` is one call that owns the output layout. That hook is
-the prerequisite, not the threading.
+`zpse_cli bench` reads whole files by default; `-n BYTES` times only the first
+N bytes of each one, which is how a single case gets looked at without waiting
+for the rest of the corpus.
+
+### Using more than one core
+
+Blocks are independent, so a frame can be encoded by several workers at once.
+What forced a frame to be built front to back was never the format, only the
+output layout: block *k*'s offset depends on the sizes of blocks 0..k-1. That
+layout is computed, not searched, so it does not need the encoder. Each worker
+writes its block into a reserved slot of `nominal_block_size + 32` bytes -- the
+raw form is the largest a block can be -- and one serial pass moves the blocks
+together and appends the index:
+
+```c
+size_t clen = 0;
+int rc = zpse_compress_frame_parallel(in, n, comp, sizeof comp, &clen,
+                                      65536, 0u, 1, 4u, enc_arenas, 4u);
+```
+
+`enc_arenas` is one 448 KiB encode arena per worker, still caller-owned, so the
+library still never allocates, and the compaction is a `memmove` per block at
+memory speed against an encode that runs at one to two gigabytes a second. The
+result is byte-identical to the serial call -- same blocks, same header, same
+index -- which is what `tests/suites/test_parallel.c` asserts at every worker
+count it tries.
+
+Threading is compiled in only under `ZPSE_MT`. Without it the call is the
+serial encoder, so a caller ships one build and gets cores only where it asked
+for them; a codec that never starts a thread is a different promise from one
+that might, and the default keeps the first. A frame with fewer than four
+blocks per worker is encoded serially too: spawning a thread costs more than
+the tenth of a millisecond it would save, and the bytes are the same either
+way.
+
+`zpse_cli c -t N` and `zpse_cli bench -t N` are that call, one arena per
+worker. `dir` and `x` are unchanged, because they are the read side and the
+index is built by the same pass whichever encoder wrote the blocks. Every
+figure in this file is one core and one thread: the parallel path exists so a
+caller with cores to spare does not have to split blocks itself, not to make a
+single decode faster.
 
 ### What the compiler adds, and what the tags are worth
 

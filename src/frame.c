@@ -408,6 +408,78 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     return PSE_OK;
 }
 
+int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
+                           uint32_t nominal_block_size, uint64_t content_size,
+                           uint32_t block_count, size_t *out_len_out)
+{
+    ZpseFrameHeader fh;
+    size_t need = (size_t)ZPSE_INDEX_HEADER_SIZE +
+                  (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count;
+    uint32_t at;
+    uint32_t off;
+    uint32_t k;
+    uint32_t crc;
+    int rc;
+
+    if (out == 0 || out_len_out == 0 || block_count == 0u) {
+        return PSE_BAD_ARG;
+    }
+    if (pos < (size_t)ZPSE_FRAME_HEADER_SIZE || pos > (size_t)UINT32_MAX) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    if (out_cap < pos || need > out_cap - pos) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    at = (uint32_t)pos;
+    off = (uint32_t)ZPSE_FRAME_HEADER_SIZE;
+    for (k = 0; k < block_count; k++) {
+        ZpseBlockHeader bh;
+        uint8_t *ent = out + at + ZPSE_INDEX_HEADER_SIZE +
+                       (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
+
+        if ((size_t)off + (size_t)ZPSE_BLOCK_HEADER_SIZE > pos) {
+            return PSE_BAD_HEADER;
+        }
+        rc = zpse_block_header_parse(&bh, out + off,
+                                     (uint32_t)(pos - (size_t)off));
+        if (rc != PSE_OK) {
+            return rc;
+        }
+        if (bh.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
+            (size_t)off + (size_t)bh.compressed_block_size > pos ||
+            bh.block_sequence_number != k) {
+            return PSE_BAD_HEADER;
+        }
+        zpse_store_u32le(ent, off);
+        zpse_store_u32le(ent + 4u, bh.compressed_block_size);
+        off += bh.compressed_block_size;
+    }
+    if ((size_t)off != pos) {
+        return PSE_BAD_HEADER;
+    }
+    crc = zpse_crc32c(out + at + (size_t)ZPSE_INDEX_HEADER_SIZE,
+                      (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count);
+    zpse_store_u32le(out + at, ZPSE_INDEX_MAGIC);
+    zpse_store_u32le(out + at + 4u, block_count);
+    zpse_store_u32le(out + at + 8u, crc);
+    zpse_store_u32le(out + at + 12u, 0u);
+    /* The header is written last, because the field it carries is where
+     * the table it describes begins. */
+    rc = zpse_frame_header_build(&fh, nominal_block_size, content_size, 1,
+                                 block_count, 1, 1);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    fh.frame_index_offset = at;
+    zpse_frame_reseal(&fh);
+    rc = zpse_frame_header_write(&fh, out);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    *out_len_out = pos + need;
+    return PSE_OK;
+}
+
 int zpse_frame_encode(ZpseEncoder *e, const uint8_t *in, size_t n,
                       uint32_t nominal_block_size,
                       uint8_t *out, size_t out_cap, size_t *out_len_out)
@@ -498,59 +570,14 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
      * each block already carries its own compressed size in its header,
      * so the table is a walk over the headers -- 32 bytes per block read
      * back, rather than an array of block offsets the encoder would have
-     * to allocate. */
+     * to allocate. A parallel encoder finishes the same way, which is why
+     * the table is a function of its own. */
     if (with_index) {
-        size_t need = (size_t)ZPSE_INDEX_HEADER_SIZE +
-                      (size_t)ZPSE_INDEX_ENTRY_SIZE * nblocks;
-        uint32_t at = (uint32_t)pos;
-        uint32_t off = (uint32_t)ZPSE_FRAME_HEADER_SIZE;
-        uint32_t k;
-        uint32_t crc;
-
-        if (pos > (size_t)UINT32_MAX || need > out_cap - pos) {
-            return PSE_OUTPUT_OVERFLOW;
-        }
-        for (k = 0; k < (uint32_t)nblocks; k++) {
-            ZpseBlockHeader bh;
-            uint8_t *ent = out + at + ZPSE_INDEX_HEADER_SIZE +
-                           (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
-
-            if ((size_t)off + (size_t)ZPSE_BLOCK_HEADER_SIZE > pos) {
-                return PSE_BAD_HEADER;
-            }
-            rc = zpse_block_header_parse(&bh, out + off,
-                                         (uint32_t)(pos - (size_t)off));
-            if (rc != PSE_OK) {
-                return rc;
-            }
-            if (bh.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
-                (size_t)off + (size_t)bh.compressed_block_size > pos ||
-                bh.block_sequence_number != k) {
-                return PSE_BAD_HEADER;
-            }
-            zpse_store_u32le(ent, off);
-            zpse_store_u32le(ent + 4u, bh.compressed_block_size);
-            off += bh.compressed_block_size;
-        }
-        if ((size_t)off != pos) {
-            return PSE_BAD_HEADER;
-        }
-        crc = zpse_crc32c(out + at + (size_t)ZPSE_INDEX_HEADER_SIZE,
-                          (size_t)ZPSE_INDEX_ENTRY_SIZE * nblocks);
-        zpse_store_u32le(out + at, ZPSE_INDEX_MAGIC);
-        zpse_store_u32le(out + at + 4u, (uint32_t)nblocks);
-        zpse_store_u32le(out + at + 8u, crc);
-        zpse_store_u32le(out + at + 12u, 0u);
-        /* The header was written before the blocks; now that the index has
-         * a position, seal it again so the offset it carries is the one a
-         * reader finds. */
-        fh.frame_index_offset = at;
-        zpse_frame_reseal(&fh);
-        rc = zpse_frame_header_write(&fh, out);
+        rc = zpse_frame_write_index(out, pos, out_cap, nominal_block_size,
+                                    (uint64_t)n, (uint32_t)nblocks, &pos);
         if (rc != PSE_OK) {
             return rc;
         }
-        pos += need;
     }
     *out_len_out = pos;
     if (pos > (size_t)INT_MAX) {

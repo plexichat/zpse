@@ -54,4 +54,18 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                     uint32_t block_index, uint8_t *output, uint32_t out_cap,
                     uint32_t *out_len_out);
 
+/* Finish a frame whose blocks are already written and end at `pos`: write
+ * the header (sealed, carrying the index position) and append the
+ * FrameIndex. The table is built by walking the block headers -- each
+ * carries its own compressed size -- so the encoder never has to remember
+ * an offset, and every entry is checked against the block it names.
+ *
+ * This is the shared tail of the serial and the multi-core encoder: both
+ * have the blocks, and neither has the table until it is walked. `out`
+ * needs ZPSE_INDEX_HEADER_SIZE + 8 per block free at `pos`. Returns PSE_OK
+ * with *out_len_out = pos + table, or a negative status. */
+int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
+                           uint32_t nominal_block_size, uint64_t content_size,
+                           uint32_t block_count, size_t *out_len_out);
+
 #endif /* ZPSE_FRAME_H */

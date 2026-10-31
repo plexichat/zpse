@@ -14,7 +14,11 @@
  *   -c         emit the per-block payload CRC32-C (verified on decode)
  *   -b N       nominal block size, 1..65536 (default 65536)
  *   -x         append the FrameIndex (random access); bench also seeks
+ *   -t N       encode with N worker threads (default 1: the single-core
+ *              path every figure in the README was measured on)
  *   -r N       bench repetitions per file (0 = pick from the file size)
+ *   -n N       bench: time only the first N bytes of each file (0 = the
+ *              whole file), for one case without the whole corpus
  *   -q         bench: summary line only, no per-file rows
  *
  * Exit 0 on success, 1 on an I/O, codec or verification failure, 2 on a
@@ -222,14 +226,50 @@ static size_t frame_bound(size_t n, uint32_t block, int indexed)
 
 static int compress_mem(const uint8_t *in, size_t n, uint8_t *out,
                         size_t out_cap, size_t *out_len, uint32_t block,
-                        uint32_t enc_flags, int indexed, void *arena)
+                        uint32_t enc_flags, int indexed,
+                        void *const arenas[], unsigned threads)
 {
-    if (indexed) {
-        return zpse_compress_frame_indexed(in, n, out, out_cap, out_len,
-                                           block, enc_flags, arena);
+    /* One entry point for both shapes: the parallel call is the serial one
+     * when it is asked for one worker, or built without ZPSE_MT, so the
+     * single-thread path measured here is the same code. */
+    return zpse_compress_frame_parallel(in, n, out, out_cap, out_len, block,
+                                        enc_flags, indexed, threads, arenas,
+                                        threads);
+}
+
+/* One encode arena per worker, 64-byte aligned, allocated once. */
+static void **alloc_enc_arenas(unsigned threads)
+{
+    void **a = (void **)malloc(sizeof(void *) * (size_t)threads);
+    unsigned i;
+
+    if (a == NULL) {
+        return NULL;
     }
-    return zpse_compress_frame_ex(in, n, out, out_cap, out_len, block,
-                                  enc_flags, arena);
+    for (i = 0; i < threads; i++) {
+        a[i] = ZPSE_CLI_ALIGNED(64u, ZPSE_ENC_ARENA_SIZE);
+        if (a[i] == NULL) {
+            while (i > 0u) {
+                ZPSE_CLI_FREE(a[--i]);
+            }
+            free(a);
+            return NULL;
+        }
+    }
+    return a;
+}
+
+static void free_enc_arenas(void **a, unsigned threads)
+{
+    unsigned i;
+
+    if (a == NULL) {
+        return;
+    }
+    for (i = 0; i < threads; i++) {
+        ZPSE_CLI_FREE(a[i]);
+    }
+    free(a);
 }
 
 static int cmd_codec(int argc, char **argv)
@@ -238,6 +278,7 @@ static int cmd_codec(int argc, char **argv)
     uint32_t enc_flags = ZPSE_ENC_SPEED_BALANCED;
     uint32_t block = ZPSE_MAX_BLOCK_SIZE;
     int indexed = 0;
+    unsigned threads = 1u;
     const char *in_path;
     const char *out_path;
     uint8_t *in;
@@ -245,7 +286,8 @@ static int cmd_codec(int argc, char **argv)
     size_t in_len = 0u;
     size_t out_len = 0u;
     size_t out_cap;
-    void *arena;
+    void **enc_arenas = NULL;
+    void *dec_arena = NULL;
     int rc;
     int i = 2;
 
@@ -278,6 +320,21 @@ static int cmd_codec(int argc, char **argv)
         case 'x':
             indexed = 1;
             break;
+        case 't': {
+            char *end = NULL;
+            unsigned long v;
+
+            if (++i >= argc) {
+                return 2;
+            }
+            v = strtoul(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 1u || v > 64u) {
+                fprintf(stderr, "zpse_cli: bad thread count '%s'\n", argv[i]);
+                return 2;
+            }
+            threads = (unsigned)v;
+            break;
+        }
         default:
             fprintf(stderr, "zpse_cli: unknown option '%s'\n", argv[i]);
             return 2;
@@ -298,8 +355,14 @@ static int cmd_codec(int argc, char **argv)
         return 1;
     }
     if (compress) {
-        out_cap = frame_bound(in_len, block, indexed);
-        arena = ZPSE_CLI_ALIGNED(64u, ZPSE_ENC_ARENA_SIZE);
+        size_t ser = frame_bound(in_len, block, indexed);
+        size_t par = zpse_parallel_bound(in_len, block, indexed);
+
+        /* The worker path reserves a fixed slot per block and compacts
+         * afterwards, so it wants the larger buffer; the compaction never
+         * costs a byte of the result. */
+        out_cap = par > ser ? par : ser;
+        enc_arenas = alloc_enc_arenas(threads);
     } else {
         ZpseFrameHeader h;
 
@@ -317,36 +380,42 @@ static int cmd_codec(int argc, char **argv)
             return 1;
         }
         out_cap = (size_t)h.content_size;
-        arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
+        dec_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
     }
-    if (arena == NULL) {
+    if (compress ? (enc_arenas == NULL) : (dec_arena == NULL)) {
         fprintf(stderr, "zpse_cli: arena allocation failed\n");
+        free_enc_arenas(enc_arenas, threads);
+        ZPSE_CLI_FREE(dec_arena);
         free(in);
         return 1;
     }
     out = (uint8_t *)malloc(out_cap + 1u);
     if (out == NULL) {
         fprintf(stderr, "zpse_cli: out of memory\n");
-        ZPSE_CLI_FREE(arena);
+        free_enc_arenas(enc_arenas, threads);
+        ZPSE_CLI_FREE(dec_arena);
         free(in);
         return 1;
     }
 
     if (compress) {
         rc = compress_mem(in, in_len, out, out_cap, &out_len, block, enc_flags,
-                          indexed, arena);
+                          indexed, enc_arenas, threads);
     } else {
-        rc = zpse_decompress_frame(in, in_len, out, out_cap, &out_len, arena);
+        rc = zpse_decompress_frame(in, in_len, out, out_cap, &out_len,
+                                  dec_arena);
     }
     if (rc != 0) {
         fprintf(stderr, "zpse_cli: codec failed rc=%d\n", rc);
-        ZPSE_CLI_FREE(arena);
+        free_enc_arenas(enc_arenas, threads);
+        ZPSE_CLI_FREE(dec_arena);
         free(out);
         free(in);
         return 1;
     }
     rc = write_file(out_path, out, out_len);
-    ZPSE_CLI_FREE(arena);
+    free_enc_arenas(enc_arenas, threads);
+    ZPSE_CLI_FREE(dec_arena);
     free(out);
     free(in);
     return rc;
@@ -401,6 +470,8 @@ static int cmd_bench(int argc, char **argv)
     int indexed = 0;
     int quiet = 0;
     long reps_arg = 0;
+    long bytes_cap = 0;
+    unsigned threads = 1u;
     int i = 2;
     int files;
     int f;
@@ -412,7 +483,7 @@ static int cmd_bench(int argc, char **argv)
     unsigned long long tot_passed = 0u;
     double tot_enc_ns = 0.0;
     double tot_dec_ns = 0.0;
-    void *enc_arena;
+    void **enc_arenas;
     void *dec_arena;
 
     for (; i < argc && argv[i][0] == '-'; i++) {
@@ -456,6 +527,34 @@ static int cmd_bench(int argc, char **argv)
             }
             break;
         }
+        case 't': {
+            char *end = NULL;
+            unsigned long v;
+
+            if (++i >= argc) {
+                return 2;
+            }
+            v = strtoul(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 1u || v > 64u) {
+                fprintf(stderr, "zpse_cli: bad thread count '%s'\n", argv[i]);
+                return 2;
+            }
+            threads = (unsigned)v;
+            break;
+        }
+        case 'n': {
+            char *end = NULL;
+
+            if (++i >= argc) {
+                return 2;
+            }
+            bytes_cap = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || bytes_cap < 0) {
+                fprintf(stderr, "zpse_cli: bad byte cap '%s'\n", argv[i]);
+                return 2;
+            }
+            break;
+        }
         case 'x':
             indexed = 1;
             break;
@@ -472,18 +571,19 @@ static int cmd_bench(int argc, char **argv)
         fprintf(stderr, "usage: zpse_cli bench [opts] FILE...\n");
         return 2;
     }
-    enc_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_ENC_ARENA_SIZE);
+    enc_arenas = alloc_enc_arenas(threads);
     dec_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
-    if (enc_arena == NULL || dec_arena == NULL) {
+    if (enc_arenas == NULL || dec_arena == NULL) {
         fprintf(stderr, "zpse_cli: arena allocation failed\n");
-        ZPSE_CLI_FREE(enc_arena);
+        free_enc_arenas(enc_arenas, threads);
         ZPSE_CLI_FREE(dec_arena);
         return 1;
     }
     if (!quiet) {
-        printf("level %s%s%s, block %u, %s\n", level_name(enc_flags),
-               (enc_flags & ZPSE_ENC_CHECKSUM) ? ", crc" : "", "",
-               (unsigned)block, indexed ? "indexed" : "no index");
+        printf("level %s%s, block %u, %s, %u thread%s\n", level_name(enc_flags),
+               (enc_flags & ZPSE_ENC_CHECKSUM) ? ", crc" : "",
+               (unsigned)block, indexed ? "indexed" : "no index",
+               threads, threads == 1u ? "" : "s");
         printf("%-14s %11s %11s %7s %10s %10s %8s\n", "file", "bytes",
                "packed", "ratio", "enc MB/s", "dec MB/s", "ms");
     }
@@ -509,7 +609,19 @@ static int cmd_bench(int argc, char **argv)
             failures++;
             continue;
         }
+        /* A byte cap is what makes one case quick: the corpus members are
+         * 4 MiB each and a whole-corpus run is minutes. */
+        if (bytes_cap > 0 && n > (size_t)bytes_cap) {
+            n = (size_t)bytes_cap;
+        }
         comp_cap = frame_bound(n, block, indexed);
+        {
+            size_t par = zpse_parallel_bound(n, block, indexed);
+
+            if (par > comp_cap) {
+                comp_cap = par;
+            }
+        }
         comp = (uint8_t *)malloc(comp_cap + 1u);
         out = (uint8_t *)malloc(n + 1u);
         if (comp == NULL || out == NULL) {
@@ -535,7 +647,7 @@ static int cmd_bench(int argc, char **argv)
         t0 = now_ns();
         for (r = 0; r < reps; r++) {
             if (compress_mem(in, n, comp, comp_cap, &comp_len, block,
-                             enc_flags, indexed, enc_arena) != 0) {
+                             enc_flags, indexed, enc_arenas, threads) != 0) {
                 fprintf(stderr, "zpse_cli: compress failed on %s (n=%lu)\n",
                         path, (unsigned long)n);
                 ok = 0;
@@ -601,8 +713,8 @@ static int cmd_bench(int argc, char **argv)
                (double)tot_passed / tot_dec_ns * 1e3,
                (tot_enc_ns + tot_dec_ns) / 1e6);
     }
-    ZPSE_CLI_FREE(enc_arena);
     ZPSE_CLI_FREE(dec_arena);
+    free_enc_arenas(enc_arenas, threads);
     if (failures) {
         fprintf(stderr, "zpse_cli: %d file(s) failed\n", failures);
         return 1;

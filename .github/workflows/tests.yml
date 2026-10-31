@@ -47,6 +47,8 @@ jobs:
         run: CC=${{ matrix.cc }} bash tests/runners/run.sh
       - name: Strict amalgamation build
         run: ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude src/zpse_unity.c -c -o /tmp/zpse.o
+      - name: Strict amalgamation build (ZPSE_MT)
+        run: ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -DZPSE_MT -pthread -Iinclude src/zpse_unity.c -c -o /tmp/zpse_mt.o
       - name: Every translation unit builds alone
         run: |
           set -e

@@ -45,7 +45,7 @@ same() {
 
 fail=0
 
-for t in test_roundtrip test_transforms test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_ascii test_levels test_frame test_sizes test_colref test_colcorpus; do
+for t in test_roundtrip test_transforms test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus; do
     src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
@@ -121,6 +121,29 @@ for suite in parity fuzz lseed; do
         fi
     done
 done
+
+# The parallel frame encoder is compiled out unless ZPSE_MT is defined, so
+# the loop above ran test_parallel against its serial fallback. Build the
+# same suite once with threads in and require it to pass: it asserts the
+# threaded frame equals the serial one byte for byte, at every worker count
+# it tries. POSIX needs -pthread; the Win32 path uses CreateThread, so the
+# flag would only be an unused library there.
+echo "=== multi-core encode (ZPSE_MT) ==="
+mt_flags="-DZPSE_MT"
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS* | CYGWIN*) ;;
+*) mt_flags="$mt_flags -pthread" ;;
+esac
+# shellcheck disable=SC2086
+if ! "$CC" -std=c11 -O2 -Wall -Wextra $mt_flags -I "$inc" \
+    "$repo/tests/suites/test_parallel.c" "$unity" \
+    -o "$tmp/test_parallel.mt$exe"; then
+    echo "BUILD FAILED: test_parallel ($mt_flags)"
+    fail=1
+elif ! "$tmp/test_parallel.mt$exe"; then
+    echo "SUITE FAILED: test_parallel ($mt_flags)"
+    fail=1
+fi
 
 if [ "$fail" -eq 0 ]; then
     echo "ALL SUITES PASS"

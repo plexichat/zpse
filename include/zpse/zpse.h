@@ -39,6 +39,7 @@
 #include "lz.h"
 #include "block.h"
 #include "frame.h"
+#include "parallel.h"
 #include "vector.h"
 #include "api.h"
 
