@@ -526,37 +526,48 @@ vector register instead, the running value in all 32 bytes and advanced by one
 entirely; the eight bytes are written back once, after the loop, for the 16-row
 form that continues the chain. Width 4 already worked that way and width 8,
 where `ts_us`, `ts_ns`, `ts_seq`, `i64_mixed` and `sorted_near` spend their
-decode, did not: 2.0% time-weighted (1.9% geomean) over the corpus, of 4 to 17%
-on the width-8 rows -- `i64_mixed` 16.6%, `ts_seq` 8.8%, `ts_ns` 8.5%, `ts_us`
-4.3% -- with encode unmoved, since it never runs this kernel.
+decode, did not, and neither did width 2. Both now hold each plane's carried
+byte as a broadcast in a vector register and write it back once, after the
+loop, rather than extracting the chunk's total to a GPR, adding it to
+`carry[]`, storing that and broadcasting it back at the top of the next
+iteration.
 
-Width 2 was the last chain still keeping its carried byte in memory, and it
-takes the same fix: two broadcasts in registers, written back once after the
-loop. `dict_u16le`, a two-byte record column, gains 8.8% of decode and
-`dict_u8` 1.4%; a second run put `dict_u16le` at 9.5%. The 32-byte width-4
-loop also unpacks each plane with its partner as soon as both are de-chained,
-so two planes are live instead of four, which is `i32_seq` 1.5%.
+The chain's ladder was the next thing to measure, and on half the width-8 rows
+it turned out to have nothing to do. A delta plane is all zeros wherever its
+source plane is constant, and a constant plane is the common case for the high
+bytes of a wide column: an i64's four high bytes, a padding or flag byte, an
+offset's top bytes. Undoing the chain on a 32-byte chunk of zeros is the
+identity -- the prefix is zero, so the plane is the incoming carry and the
+carry does not move -- yet it paid the same five shuffle-port shift-adds,
+cross-lane link and broadcast as any other chunk. One `testz` now answers that
+question and returns the carry, so the zero chunks stop paying. Decode over
+the corpus: 4.9% time-weighted (5.2% geomean), which is `i64_mixed` 45%,
+`i32_seq` 23%, `struct_offsets` 20%, `ts_ns` 13%, `ts_seq` 12%, `sorted_near`
+11%, `ts_us` 10% and `dict_u16le` 10%, against nothing measurable on the
+columns whose delta planes are dense. That split is the statement that the
+test is where the win is, not that a branch is free.
 
 The encode side of the same transform is a per-plane delta chain that runs
-after the parity split. Its carry crossed to a GPR once per 64 bytes -- a
-`psrldq` to extract the last byte and a `movd` to broadcast it back -- while
-the byte itself was available in a register either way. Keeping the carry as
-the shifted vector and OR-ing it in costs one `psrldq` per 64 bytes instead
-of three ops: `i64_mixed` encode 2.0%. `ts_seq` and `ts_us` did not move, and
-that is the useful half of the measurement -- they run the same function, so
-their encode time is not in it. The parity tree is not worth chasing at all:
-in the encoder profile the width-8 split does not reach the top of the list
-on any DT8 case, while the chain does (12.5% of `i64_mixed`).
+after the parity split, and it now steps 32 bytes at a time instead of 16.
+`vpslldq` is lane-local, so byte 16 of a chunk cannot come from the shift: one
+permute puts lane 0's top byte into both lanes, one shift right fifteen moves
+it down to byte 0, and a blend restores the carried byte in lane 0 -- three
+ops, and the same value is what the next chunk's carry becomes after one more
+shift. Text, JSON and the two-byte rows gain 1.5 to 3.7% of encode.
+`dna_2bit` reads -1.6%, which is inside this host's drift floor but is also
+why the change reads as 0.5% on the corpus rather than as the sum of its
+parts.
 
-Two cheaper-looking changes were measured and dropped. Showing a
-stride-family group's mask as one 16-bit load instead of a shift and a mask
-of the 32-bit word, and replacing the group loop's unit-window bound with
-sixteen bytes of slack in the caller's two unit arrays, remove one compare
-and one branch per group between them -- and came out at -0.4% on
-`ts_gapped`, the case that kernel exists for, and nothing anywhere else. A
-16-position group in that kernel is about eight uops and the bound was never
-the cost; what is left is the recurrence. Both were reverted rather than kept
-as neutral edits that would also have to defend a new padding contract.
+Two attempts were measured and dropped. A stride-family group's mask as one
+16-bit load instead of a shift and a mask of the 32-bit word, plus the group
+loop's unit-window bound replaced by sixteen bytes of slack in the caller's
+two arrays, remove one compare and one branch per group between them -- and
+came out at -0.4% on `ts_gapped`, the case that kernel exists for. A
+sixteen-position group there is about eight uops and the bound was never the
+cost. Folding the copy into the CRC's three-chain pass, one 16-byte load per
+region feeding a store and two `crc32` steps, measures zero: the checksum
+saturates one port at eight bytes per instruction, so overlapping it with the
+store traffic buys nothing and the extra code is not worth a tie.
 
 The LZ command loop is bound per command, not per byte: a command emits five to
 eleven bytes and costs about twelve cycles whatever its shape, so the copy
