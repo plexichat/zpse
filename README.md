@@ -909,9 +909,10 @@ that the queue threshold keeps it on one worker.
 Encode scales better than decode because it has five times more to do: the
 encode column is the sweep and the match finder on four different column
 shapes, and the decode column is a block reconstruction that already runs at
-four to six gigabytes a second on one core. A 64 MiB frame goes from 0.61 to
-3.04 GB/s of encode and from 4.21 to 14.82 GB/s of decode, and the frames
-below about four megabytes stay serial in both directions.
+four to six gigabytes a second on one core. A 64 MiB frame goes from one
+worker to six at a little under five times on encode and three and a half on
+decode (its last row above), and the frames below about four megabytes stay
+serial in both directions.
 
 Every frame in that table was checked twice: the workers' frame is compared
 byte for byte with the one-worker frame (that is the `identical frames` column
