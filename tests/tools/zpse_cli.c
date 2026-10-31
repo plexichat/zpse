@@ -3,6 +3,8 @@
  * Usage:
  *   zpse_cli c [opts] IN OUT     compress a file
  *   zpse_cli d IN OUT            decompress a frame file
+ *   zpse_cli x FILE BLOCK OUT    decode one block through the frame index
+ *   zpse_cli dir FILE            print the frame's random-access directory
  *   zpse_cli bench [opts] FILE...  compress and decompress each file IN
  *                                MEMORY (nothing written), verify the
  *                                round trip, report ratio and throughput
@@ -284,6 +286,8 @@ static int cmd_codec(int argc, char **argv)
     if (i >= argc || argc - i != 2) {
         fprintf(stderr, "usage: zpse_cli c [opts] IN OUT\n"
                         "       zpse_cli d IN OUT\n"
+                        "       zpse_cli x FILE BLOCK OUT\n"
+                        "       zpse_cli dir FILE\n"
                         "       zpse_cli bench [opts] FILE...\n");
         return 2;
     }
@@ -606,11 +610,129 @@ static int cmd_bench(int argc, char **argv)
     return 0;
 }
 
+/* `dir`: print the frame's random-access directory. The index is the thing
+ * that makes a zpse frame seekable -- block n's offset and packed size, one
+ * entry each, checksummed as a table -- and nothing in the CLI surfaced it
+ * before, so a caller had to link the library to see what a frame carries.
+ * The decoded length comes from the entry's block header via the same
+ * seek path a random read uses, so what this prints is what a seek gets. */
+static int cmd_dir(int argc, char **argv)
+{
+    uint8_t *in;
+    uint8_t *blk;
+    size_t in_len = 0u;
+    uint32_t count = 0u;
+    uint32_t k;
+    void *dec_arena;
+    int rc;
+
+    if (argc != 3) {
+        fprintf(stderr, "usage: zpse_cli dir FILE\n");
+        return 2;
+    }
+    in = read_file(argv[2], &in_len);
+    if (in == NULL) {
+        return 1;
+    }
+    rc = zpse_frame_index_count(in, in_len, &count);
+    if (rc != PSE_OK) {
+        fprintf(stderr, "zpse_cli: %s carries no usable index (rc=%d); "
+                        "encode it with -x\n", argv[2], rc);
+        free(in);
+        return 1;
+    }
+    blk = (uint8_t *)malloc(ZPSE_MAX_BLOCK_SIZE);
+    dec_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
+    if (blk == NULL || dec_arena == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        ZPSE_CLI_FREE(dec_arena);
+        free(blk);
+        free(in);
+        return 1;
+    }
+    printf("%s: %u blocks\n", argv[2], (unsigned)count);
+    printf("%-8s %10s\n", "block", "bytes");
+    for (k = 0; k < count; k++) {
+        uint32_t got = 0u;
+
+        rc = zpse_seek_frame(in, in_len, k, blk, (uint32_t)ZPSE_MAX_BLOCK_SIZE,
+                             &got, dec_arena);
+        if (rc != PSE_OK) {
+            fprintf(stderr, "zpse_cli: block %u does not seek (rc=%d)\n",
+                    (unsigned)k, rc);
+            ZPSE_CLI_FREE(dec_arena);
+            free(blk);
+            free(in);
+            return 1;
+        }
+        printf("%-8u %10u\n", (unsigned)k, (unsigned)got);
+    }
+    ZPSE_CLI_FREE(dec_arena);
+    free(blk);
+    free(in);
+    return 0;
+}
+
+/* `x`: decode one block through the index, without touching the others.
+ * This is the CLI's random read; on a multi-GiB frame it is the difference
+ * between decoding one block and decoding the file. */
+static int cmd_seek(int argc, char **argv)
+{
+    uint8_t *in;
+    uint8_t *out;
+    size_t in_len = 0u;
+    uint32_t got = 0u;
+    unsigned long idx;
+    char *end = NULL;
+    void *dec_arena;
+    int rc;
+
+    if (argc != 5) {
+        fprintf(stderr, "usage: zpse_cli x FILE BLOCK OUT\n");
+        return 2;
+    }
+    idx = strtoul(argv[3], &end, 10);
+    if (end == argv[3] || *end != '\0' || idx > 0xFFFFFFFFu) {
+        fprintf(stderr, "zpse_cli: bad block index '%s'\n", argv[3]);
+        return 2;
+    }
+    in = read_file(argv[2], &in_len);
+    if (in == NULL) {
+        return 1;
+    }
+    out = (uint8_t *)malloc(ZPSE_MAX_BLOCK_SIZE);
+    dec_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
+    if (out == NULL || dec_arena == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        ZPSE_CLI_FREE(dec_arena);
+        free(out);
+        free(in);
+        return 1;
+    }
+    rc = zpse_seek_frame(in, in_len, (uint32_t)idx, out,
+                         (uint32_t)ZPSE_MAX_BLOCK_SIZE, &got, dec_arena);
+    if (rc != PSE_OK) {
+        fprintf(stderr, "zpse_cli: seek of block %lu failed (rc=%d)\n", idx,
+                rc);
+        ZPSE_CLI_FREE(dec_arena);
+        free(out);
+        free(in);
+        return 1;
+    }
+    rc = write_file(argv[4], out, (size_t)got);
+    ZPSE_CLI_FREE(dec_arena);
+    free(out);
+    free(in);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr, "usage: zpse_cli c [opts] IN OUT\n"
                         "       zpse_cli d IN OUT\n"
+                        "       zpse_cli x FILE BLOCK OUT\n"
+                        "       zpse_cli dir FILE\n"
                         "       zpse_cli bench [opts] FILE...\n"
                         "       zpse_cli --version\n");
         return 2;
@@ -621,6 +743,12 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "bench") == 0) {
         return cmd_bench(argc, argv);
+    }
+    if (strcmp(argv[1], "dir") == 0) {
+        return cmd_dir(argc, argv);
+    }
+    if (strcmp(argv[1], "x") == 0) {
+        return cmd_seek(argc, argv);
     }
     if (argc >= 2 && argv[1][1] == '\0' &&
         (argv[1][0] == 'c' || argv[1][0] == 'd')) {

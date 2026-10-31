@@ -1059,6 +1059,12 @@ int main(int argc, char **argv)
                     }
                     if (first) snprintf(tbuf, sizeof tbuf, "(no blocks)");
                     printf("transforms(%s): %s\n", cases[i].name, tbuf);
+                    /* Exact byte counts per case: the ratio column is what
+                     * the eye reads, this is what a ratio change has to be
+                     * measured against. */
+                    printf("sizes(%s): %llu -> %llu bytes\n", cases[i].name,
+                           (unsigned long long)CSIZE,
+                           (unsigned long long)tot_c);
                 }
                 sum_ratio[c] += ratio;
                 sum_enc[c] += enc_mb;

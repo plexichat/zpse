@@ -785,6 +785,40 @@ kernels out anywhere, which is how that configuration is tested on Linux: the
 parity, fuzz and lseed suites print the same digests from it as from the
 default build, and the whole suite passes on Windows gcc.
 
+### ASCII tiles, packed four groups at a time
+
+The ASCII tile form keeps seven bits per byte, so a group of eight characters
+becomes seven bytes. The packer took them one group at a time: `pext` the
+seven fields, copy seven bytes, and test on every group whether eight would
+fit. Only the last group can answer no, so the bulk was paying a branch and a
+narrow store to answer a question it had already settled. Four groups now go
+out per iteration with four independent `pext`s, each stored as one eight-byte
+write whose spare byte lands on the next group's first byte and is overwritten
+by it; the loop stops while a full group still follows, so that spare byte is
+always inside the payload, and the group that cannot prove it keeps the
+exact-length form. `text_en`, the ASCII row of the columnar corpus, gains 35%
+of encode and the corpus encode mean 1.6% geomean. Sizes are unchanged to the
+byte -- this is a store pattern, not a coding decision -- which the size suite
+checks across its 768 cases.
+
+### The CLI's seekable directory
+
+`zpse_cli dir FILE` prints the frame's random-access directory: one row per
+block, taken from the index, with the decoded length the entry describes.
+`zpse_cli x FILE BLOCK OUT` decodes exactly that block through the index,
+which on a large frame is the difference between one block and the whole file.
+Frames are seekable only when they were written with `-x`; without an index
+`dir` says so rather than scanning, because a block header carries its own size
+but not its offset.
+
+Per-block independence is also what multicore encode needs, and that is where
+it stops for now: a parallel encoder wants a work queue over block indices, a
+per-worker arena, and an ordered writer that appends blocks and builds the
+index as they complete. The format already allows it -- blocks cannot refer
+across boundaries -- but the CLI cannot do it from outside the library, because
+`zpse_compress_frame*` is one call that owns the output layout. That hook is
+the prerequisite, not the threading.
+
 ### What the compiler adds, and what the tags are worth
 
 Every number in this README is an `-O2` number: the CI matrix,

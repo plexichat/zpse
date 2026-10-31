@@ -493,10 +493,40 @@ static ZPSE_ASCII_BMI2 uint32_t tile_ascii_pack_bmi2_body(const uint8_t *in,
 {
     uint32_t groups = nt >> 3;
     uint32_t rest = nt - groups * 8u;
-    uint32_t g;
+    uint32_t g = 0u;
     uint32_t p = 0u;
 
-    for (g = 0; g < groups; g++) {
+    /* Four groups an iteration. The four pexts are independent, and each
+     * group's seven bytes leave as one eight-byte store: the spare byte
+     * lands on the next group's first byte, which the next store writes
+     * anyway. The loop stops while at least one full group still follows,
+     * so that spare byte is always inside the payload, and the group it
+     * cannot prove that of is left to the exact-length form below. What
+     * this removes is the "is there room for eight" test, which the
+     * one-group form paid on every group to answer a question only the last
+     * one asks. */
+    while (g + 4u < groups) {
+        uint64_t a;
+        uint64_t b;
+        uint64_t c;
+        uint64_t d;
+
+        memcpy(&a, in + (size_t)g * 8u, sizeof a);
+        memcpy(&b, in + (size_t)g * 8u + 8u, sizeof b);
+        memcpy(&c, in + (size_t)g * 8u + 16u, sizeof c);
+        memcpy(&d, in + (size_t)g * 8u + 24u, sizeof d);
+        a = _pext_u64(a, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        b = _pext_u64(b, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        c = _pext_u64(c, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        d = _pext_u64(d, UINT64_C(0x7F7F7F7F7F7F7F7F));
+        memcpy(out + p, &a, sizeof a);
+        memcpy(out + p + 7u, &b, sizeof b);
+        memcpy(out + p + 14u, &c, sizeof c);
+        memcpy(out + p + 21u, &d, sizeof d);
+        p += 28u;
+        g += 4u;
+    }
+    for (; g < groups; g++) {
         uint64_t w;
         uint64_t v;
 
