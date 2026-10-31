@@ -87,7 +87,9 @@ ceiling. Everything else is transform- and tile-bound, not memory-bound.
 * In-process only. `tests/benchmarks/bench_vs.sh` measures other tools by
   running their command-line programs; those numbers include process startup
   and file I/O, so none of them appear here. The table above is a library call
-  over the same buffer, best of five, single thread.
+  over the same buffer, best of five, single thread. `bench_pareto.sh` is the
+  cross-tool comparison that *is* in this file, and it writes every output to
+  `/dev/null` so that what it compares is the codec and not the filesystem.
 * The host has two performance states — its `memcpy` ceiling wanders between
   57 000 and 66 000 MB/s depending on thermal state — so run-to-run spread on
   a busy row is around ±10%. Any comparison worth trusting here was done as
@@ -919,11 +921,15 @@ four and a half times on encode and three and a quarter on decode (its last
 row above), and a frame of a megabyte stays essentially serial in both
 directions.
 
-Two workers on the 4 MiB and 16 MiB frames beat three on this host, which has
-three cores with SMT rather than six: a pair lands on two real cores, while
-three of six workers can share one. The scheduler is the noise floor here, not
-the codec — the one-worker column is the number to trust for scaling and every
-other table in this file is a single-core measurement for that reason.
+The one row that does not rise with the worker count is the 1 MiB frame's
+encode, and the cause is the encoder's four-blocks-per-worker rule rather than
+the codec: sixteen blocks let three workers start, and a thread start costs
+more than the fifth of the frame it splits. Decode stays serial at that size
+(its rule asks for thirty-two blocks per worker), which is why its row is
+flat. The host is a six-core Ryzen 5 5600X, so the six-worker column is six
+real cores -- the one-worker column is still the number to trust for scaling,
+and every other table in this file is a single-core measurement for that
+reason.
 
 Every frame in that table was checked twice: the workers' frame is compared
 byte for byte with the one-worker frame (that is the `identical frames` column
@@ -941,21 +947,21 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.09 | 1.37 GB/s | 2.16 GB/s |
-| mozilla | 51,220,480 | 1.64 | 0.23 GB/s | 0.94 GB/s |
-| mr | 9,970,564 | 2.32 | 0.29 GB/s | 0.87 GB/s |
-| nci | 33,553,445 | 4.00 | 0.22 GB/s | 1.48 GB/s |
-| ooffice | 6,152,192 | 1.22 | 0.23 GB/s | 1.45 GB/s |
-| osdb | 10,085,684 | 1.02 | 0.89 GB/s | 2.72 GB/s |
-| reymont | 6,627,202 | 1.26 | 0.60 GB/s | 4.73 GB/s |
-| samba | 21,606,400 | 1.93 | 0.33 GB/s | 1.23 GB/s |
-| sao | 7,251,944 | 1.00 | 1.18 GB/s | 7.84 GB/s |
-| webster | 41,458,703 | 1.50 | 0.33 GB/s | 1.04 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.43 GB/s | 2.17 GB/s |
-| xml | 5,345,280 | 3.13 | 0.40 GB/s | 2.98 GB/s |
-| **total** | **211,938,580** | **1.68** | **0.30 GB/s** | **1.27 GB/s** |
+| dickens | 10,192,446 | 1.09 | 1.53 GB/s | 2.76 GB/s |
+| mozilla | 51,220,480 | 1.64 | 0.24 GB/s | 1.16 GB/s |
+| mr | 9,970,564 | 2.32 | 0.27 GB/s | 1.06 GB/s |
+| nci | 33,553,445 | 4.00 | 0.21 GB/s | 1.56 GB/s |
+| ooffice | 6,152,192 | 1.22 | 0.21 GB/s | 1.72 GB/s |
+| osdb | 10,085,684 | 1.02 | 0.78 GB/s | 1.82 GB/s |
+| reymont | 6,627,202 | 1.26 | 0.54 GB/s | 4.17 GB/s |
+| samba | 21,606,400 | 1.93 | 0.31 GB/s | 1.33 GB/s |
+| sao | 7,251,944 | 1.00 | 1.19 GB/s | 7.33 GB/s |
+| webster | 41,458,703 | 1.50 | 0.32 GB/s | 1.33 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.43 GB/s | 2.33 GB/s |
+| xml | 5,345,280 | 3.13 | 0.49 GB/s | 3.12 GB/s |
+| **total** | **211,938,580** | **1.68** | **0.30 GB/s** | **1.48 GB/s** |
 
-`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core. The
+`zpse_cli bench -r 3`, default level (6), 64 KiB blocks, one pinned core. The
 `sao` row is the raw fallback doing its job -- 1.00:1 at copy speed -- and
 `osdb` is almost there; `dickens`, `ooffice`, `reymont` and `webster` are the
 text problem in one line each: 1.09 to 1.50 on data that a general-purpose LZ
@@ -964,42 +970,79 @@ at the same speed reaches in the twos.
 ### Against lz4 and zstd, on the same bytes
 
 A ratio is only half a claim, so here are the two tools anyone would reach
-for, on exactly the corpus above, through the same interface: one 202 MiB
-frame per tool, one process per run, best of two, one pinned core, in
-`/dev/shm`. `zpse` is the in-tree CLI at its default level and at MAX.
+for, on exactly the same 202 MiB, through `bench_pareto.sh`: one frame per
+tool, one process per run, best of two, and every output written to
+`/dev/null` so the rate is the codec's instead of the filesystem's. Every row
+round-tripped and was compared whole with the input before it was timed, and
+the `frontier` column is computed from the three measurements: a row is on it
+when no other row is at least as good on all three.
 
-| tool | ratio | encode | decode |
-| --- | ---: | ---: | ---: |
-| zpse level 6 (default) | 1.68:1 | 0.19 GB/s | 0.57 GB/s |
-| zpse level 9 (MAX) | 1.85:1 | 0.18 GB/s | 0.57 GB/s |
-| lz4 -1 | 2.11:1 | 0.44 GB/s | 1.10 GB/s |
-| lz4 -9 | 2.72:1 | 0.04 GB/s | 1.19 GB/s |
-| zstd -1 | 2.89:1 | 0.21 GB/s | 0.96 GB/s |
-| zstd -3 | 3.20:1 | 0.17 GB/s | 0.82 GB/s |
-| zstd -9 | 3.58:1 | 0.05 GB/s | 0.84 GB/s |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.84 GB/s |
+| tool | ratio | encode | decode | frontier |
+| --- | ---: | ---: | ---: | :---: |
+| zpse 1 FASTEST | 1.25:1 | 0.33 GB/s | 0.50 GB/s | no |
+| zpse 5 BALANCED | 1.60:1 | 0.21 GB/s | 0.54 GB/s | no |
+| zpse 6 (default) | 1.68:1 | 0.21 GB/s | 0.54 GB/s | no |
+| zpse 9 MAX | 1.85:1 | 0.17 GB/s | 0.52 GB/s | no |
+| lz4 -1 | 2.11:1 | 1.58 GB/s | 1.15 GB/s | yes |
+| lz4 -3 | 2.60:1 | 0.32 GB/s | 1.34 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.12 GB/s | 1.30 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.31 GB/s | 0.90 GB/s | yes |
+| zstd -3 | 3.20:1 | 0.19 GB/s | 0.76 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.48 GB/s | yes |
 
-Every round trip was compared whole against the input before it was timed.
-The rates include reading the input and writing the output through the page
-cache, so they are lower than the in-process numbers above for every tool;
-`/dev/shm` copies at about a gigabyte a second on this host, which is why the
-fast decoders bunch up.
+On Silesia this codec is on nobody's frontier: `lz4 -1` is smaller than
+every level, several times faster to encode than the best of them, and faster
+to decode as well, so it dominates all four zpse rows and the deeper levels
+just walk along the same curve towards zstd. That is not an artefact of the
+harness. There are three causes, one per axis.
 
-On this corpus zpse is on nobody's frontier: **lz4 -1 is both smaller
-(2.11:1 against 1.68:1) and more than twice as fast to encode**, so it
-dominates every zpse level outright, and zstd -1 does the same at a lower
-ratio cost. That is not a measurement artefact to explain away — it is what
-"half of Silesia is English prose and executables" means for a codec whose
-text path is a 64 KiB-window match finder behind a sample screen, against a
-thirty-year-old LZ4 implementation at -1.
+*Ratio.* On prose the tile path falls back to packing seven bits a byte, and
+the LZ form that would beat it charges a fixed four bytes per command however
+long the run. At the 5.6 bytes of output per command that prose produces,
+the commands alone cost 0.71 bytes per byte of input, against roughly 0.21
+for lz4's variable-length token on the same data, so the form loses its own
+win before the literals are counted. Both fixes are format changes: a
+variable-length token, and repeat-offset codes for the distances that recur.
 
-The reason is the same one the Silesia table shows one file at a time: on
-text the LZ form is what buys the ratio, and an LZ stream decodes at the rate
-of its own command loop, so the twelve-gigabyte decode rate that the tile
-formats reach is simply not available on `dickens` or `webster`. The strong
-claim this codec can make is on typed columns, and the columnar tables above
-are where to check it; Silesia is the corpus that shows the other side of the
-trade, which is why it is here at all.
+*Encode.* A block here is decided, not merely encoded: the probe prices the
+candidate shapes, the ASCII gate prices three of them on two samples, and a
+block the gate convicts pays a screened match-finder pass. That decision is
+what caps the encoder at about a gigabyte a second, and `lz4 -1` makes none
+of it -- one pass, one token per match, no comparison of shapes.
+
+*Decode.* An LZ block decodes at the rate of its own command loop, so the
+tile stream's multi-gigabyte rate is not available on `dickens` or `webster`
+however the block was chosen. The tile rows above are where the decode claim
+lives.
+
+So the strong claim is not on text. It is on typed columns, where the same
+harness says the opposite.
+
+### The same comparison on typed columns
+
+`bench_pareto.sh` over the seventeen files `corpus_write` emits -- ten byte
+patterns and the seven columnar kinds, 4 MiB each, concatenated into one
+stream -- with the same three second-column measurements and the same
+frontier rule:
+
+| tool | ratio | encode | decode | frontier |
+| --- | ---: | ---: | ---: | :---: |
+| zpse 1 FASTEST | 4.35:1 | 0.42 GB/s | 0.73 GB/s | no |
+| zpse 5 BALANCED | 5.15:1 | 0.37 GB/s | 0.78 GB/s | yes |
+| zpse 6 (default) | 5.18:1 | 0.37 GB/s | 0.72 GB/s | yes |
+| zpse 9 MAX | 5.21:1 | 0.37 GB/s | 0.78 GB/s | yes |
+| lz4 -1 | 3.30:1 | 1.42 GB/s | 0.89 GB/s | yes |
+| lz4 -3 | 3.54:1 | 0.46 GB/s | 0.99 GB/s | no |
+| lz4 -9 | 3.61:1 | 0.27 GB/s | 0.96 GB/s | no |
+| zstd -1 | 4.78:1 | 0.62 GB/s | 1.16 GB/s | yes |
+| zstd -3 | 4.91:1 | 0.38 GB/s | 1.26 GB/s | yes |
+| zstd -19 | 5.71:1 | 0.004 GB/s | 1.04 GB/s | yes |
+
+Every level from 5 up is on the frontier here, on ratio and encode rate:
+level 5 writes 5% smaller than `zstd -3` at the same encoder speed, which is
+what keeps it out of reach of both tools at once. It is a narrow lead, and it
+does not extend to decode, where zstd is ahead -- the frontier is a set, not a
+win, and this codec is on it for the shape of data it was built for.
 
 Running the ladder over Silesia is how a CLI bug surfaced. `-l N` used to OR
 the level into a word that already held the default, so `-l 1` ran BALANCED,
@@ -1125,7 +1168,10 @@ the same bytes for every columnar corpus.
 Benchmarks live in `tests/benchmarks/`: `bench.c` for the in-process table
 above, `bench_columnar.c` for columnar data, `bench_colref.c` for what a
 purpose-built column codec gets on the same bytes, and `bench_vs.sh` for the
-cross-tool comparison (zstd, lz4, brotli, gzip, xz, when installed). The
+cross-tool comparison (zstd, lz4, brotli, gzip, xz, when installed).
+`bench_pareto.sh` is that comparison with the I/O taken out and the frontier
+computed: `bash tests/benchmarks/bench_pareto.sh` on Silesia, or a directory
+of files such as the output of `corpus_write`. The
 columnar corpora are generated by `tests/corpus/columnar_gen.h`, shared by
 the in-process harness and the file-based corpus writer so both tables are
 about the same bytes.

@@ -60,6 +60,15 @@ jobs:
           SILESIA_DIR="$RUNNER_TEMP/silesia" KEEP=1 CC="${{ matrix.cc }}" \
             bash tests/benchmarks/silesia.sh 9 1 | tee max.txt
 
+      - name: Pareto against lz4 and zstd
+        # The frontier table: every output to /dev/null, so the rates are the
+        # codecs' and not the runner's disk. lz4 and zstd are optional -- the
+        # harness says which rows are missing and still runs.
+        run: |
+          set -o pipefail
+          SILESIA_DIR="$RUNNER_TEMP/silesia" REPS=1 CC="${{ matrix.cc }}" \
+            bash tests/benchmarks/bench_pareto.sh 2>&1 | tee pareto.txt
+
       - name: Gate on ratio
         run: |
           set -euo pipefail
@@ -89,4 +98,5 @@ jobs:
           path: |
             default.txt
             max.txt
+            pareto.txt
           if-no-files-found: warn
