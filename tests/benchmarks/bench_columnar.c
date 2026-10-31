@@ -537,10 +537,16 @@ static void load_all(void)
 }
 
 /* ---- main: same bytes, N x blk_kb blocks, best/med/max-of-reps ----
- * argv: [iters] [reps] [only_case] [only_codec] [blk_kb]; "all" = no filter
- * (empty strings cannot be passed through the wsl/powershell boundary).
+ * argv: [iters] [reps] [only_case] [only_codec] [blk_kb] [enc_flags] [dec];
+ * "all" = no filter (empty strings cannot be passed through the
+ * wsl/powershell boundary).
  * blk_kb (optional): 16/32/64/128/256, default 64. The corpus stays
  * 4 MiB; the block count scales (256/128/64/32/16).
+ * dec (optional): time the decode only. The repeated encode pass and its
+ * timing are skipped and the encode/eff cells print "-", so the decode
+ * rate is not charged for whatever the encoder leaves in cache and in the
+ * branch predictors. Ratio and every decode still come from the verified
+ * bytes, so the decode cell is comparable with a full run's.
  *
  * Presentation: ratios as input:output ("x:1"), rates as GB/s above
  * 1000 MB/s. Each encode/decode cell prints best (median/max) across
@@ -837,9 +843,12 @@ int main(int argc, char **argv)
     double sum_dec[5] = { 0, 0, 0, 0, 0 };
     int sum_n[5] = { 0, 0, 0, 0, 0 };
     int i, c, r;
+    int dec_only;
     long blk_kb = argc > 5 ? atol(argv[5]) : 64L;
     /* ZPSE_ENC_* options for the zpse rows; 0 is the default sweep. */
     g_enc_flags = argc > 6 ? (uint32_t)strtoul(argv[6], NULL, 0) : 0u;
+    /* argv[7] = "dec": decode-only timing (see the header comment). */
+    dec_only = argc > 7 && strncmp(argv[7], "dec", 3) == 0;
 
     if (iters < 1) iters = 1;
     if (reps < 1) reps = 1;
@@ -886,6 +895,10 @@ int main(int argc, char **argv)
            "best(med/max)-of-%d reps\n", g_nb, g_blk / 1024u, reps);
     printf("levels: zpse default, zstd -3, lz4 fast, zlib -6, brotli q5; "
            "identical bytes per codec, every decode verified\n");
+    if (dec_only) {
+        printf("mode: decode only -- encode pass and its timing skipped, "
+               "encode/eff cells are '-'\n");
+    }
     printf("zpse encoder: enc_flags=0x%lx speed=%s%s\n",
            (unsigned long)g_enc_flags,
            zpse_enc_speed(g_enc_flags) == 9u    ? "MAX"
@@ -964,18 +977,23 @@ int main(int argc, char **argv)
                 free(clens); continue;
             }
             for (r = 0; r < reps; r++) {
-                double t0 = now_ns(), t1, e_ns;
+                double t0 = now_ns(), t1, e_ns = 0.0;
                 double s0, s1, dsum = 0.0;
                 int dmul = myiters * (slow ? 3 : 10);
-                for (b = 0; b < g_nb; b++)
-                    for (int t = 0; t < myiters; t++)
-                        k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
-                t1 = now_ns();
-                e_ns = (t1 - t0) / ((double)g_nb * myiters);
+                if (!dec_only) {
+                    for (b = 0; b < g_nb; b++)
+                        for (int t = 0; t < myiters; t++)
+                            k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
+                    t1 = now_ns();
+                    e_ns = (t1 - t0) / ((double)g_nb * myiters);
+                }
                 for (b = 0; b < g_nb; b++) {
-                    /* re-encode to restore the verified bytes, then time
-                     * the decode of exactly those bytes */
-                    k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
+                    /* Re-encode to restore the verified bytes, then time
+                     * the decode of exactly those bytes. A decode-only run
+                     * skips that too: the verification pass above left
+                     * exactly those bytes in g_comp. */
+                    if (!dec_only)
+                        k->comp(g_in + b * g_blk, g_blk, g_comp, worst);
                     s0 = now_ns();
                     for (int t = 0; t < dmul; t++)
                         k->decomp(g_comp, clens[b], g_out, g_blk);
@@ -999,22 +1017,30 @@ int main(int argc, char **argv)
             {
                 char rb[16], eb[32], mb_e[24], xb_e[24];
                 char db[32], mb_d[24], xb_d[24], fb[24];
-                enc_mb = (double)g_blk * 1000.0 / be_ns;
-                med_enc_mb = (double)g_blk * 1000.0 / med_e;
-                max_enc_mb = (double)g_blk * 1000.0 / max_e;
                 dec_mb = (double)g_blk * 1000.0 / bd_ns;
                 med_dec_mb = (double)g_blk * 1000.0 / med_d;
                 max_dec_mb = (double)g_blk * 1000.0 / max_d;
                 ratio = ratio_of(CSIZE, tot_c);
-                eff = ratio * enc_mb;
                 fmt_ratio(rb, sizeof rb, CSIZE, tot_c);
-                fmt_rate(eb, sizeof eb, enc_mb);
-                fmt_rate(mb_e, sizeof mb_e, med_enc_mb);
-                fmt_rate(xb_e, sizeof xb_e, max_enc_mb);
+                if (dec_only) {
+                    enc_mb = 0.0;
+                    snprintf(eb, sizeof eb, "-");
+                    snprintf(mb_e, sizeof mb_e, "-");
+                    snprintf(xb_e, sizeof xb_e, "-");
+                    snprintf(fb, sizeof fb, "-");
+                } else {
+                    enc_mb = (double)g_blk * 1000.0 / be_ns;
+                    med_enc_mb = (double)g_blk * 1000.0 / med_e;
+                    max_enc_mb = (double)g_blk * 1000.0 / max_e;
+                    eff = ratio * enc_mb;
+                    fmt_rate(eb, sizeof eb, enc_mb);
+                    fmt_rate(mb_e, sizeof mb_e, med_enc_mb);
+                    fmt_rate(xb_e, sizeof xb_e, max_enc_mb);
+                    snprintf(fb, sizeof fb, "%.0f", eff);
+                }
                 fmt_rate(db, sizeof db, dec_mb);
                 fmt_rate(mb_d, sizeof mb_d, med_dec_mb);
                 fmt_rate(xb_d, sizeof xb_d, max_dec_mb);
-                snprintf(fb, sizeof fb, "%.0f", eff);
                 printf("| %s | %s %s | %s | %s (%s/%s) | %s (%s/%s) | %s |\n",
                        cases[i].name, k->name, k->level, rb,
                        eb, mb_e, xb_e, db, mb_d, xb_d, fb);
@@ -1051,7 +1077,10 @@ int main(int argc, char **argv)
             char rb[16], eb[24], db[24];
             double mr = sum_ratio[c] / sum_n[c];
             snprintf(rb, sizeof rb, "%.2f:1", mr);
-            fmt_rate(eb, sizeof eb, sum_enc[c] / sum_n[c]);
+            if (dec_only)
+                snprintf(eb, sizeof eb, "-");
+            else
+                fmt_rate(eb, sizeof eb, sum_enc[c] / sum_n[c]);
             fmt_rate(db, sizeof db, sum_dec[c] / sum_n[c]);
             printf("| %s %s | %d | %s | %s | %s |\n",
                    codecs[c].name, codecs[c].level, sum_n[c], rb, eb, db);

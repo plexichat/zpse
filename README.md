@@ -112,6 +112,13 @@ the ratio on the whole corpus and the one to quote -- a case running at
 tests/benchmarks/ab.sh -e 6 -r 8 /path/to/before /path/to/after
 ```
 
+`bench_columnar.c` takes a trailing `dec` argument (`... 64 0 dec`) that times
+the decode alone: the repeated encode pass and its timing are skipped and the
+encode/eff cells print `-`, so a decode profile or A/B is not charged for what
+the encoder left in cache and in the branch predictors. The ratio and every
+decoded byte come from the verified stream either way, which is what makes a
+decode-only cell comparable with a full run's.
+
 Four checks decide whether a change is worth keeping, in this order:
 
 1. **The output has to be the same bytes.** `bench_levels.c` prints every
@@ -478,9 +485,11 @@ the prefix sum's last lane is the exception count that advances the unit
 index, so no popcount is needed.
 
 Stride 1 and stride 8 have vector kernels of their own (one chain, and the
-eight-lane recurrence respectively); strides 2, 3 and 4 take this one. The
-head before the first sixteen positions stays scalar, as does the rest of the
-tile when the unit window would read past the 256-unit array. On the rows that
+eight-lane recurrence respectively); strides 2, 3 and 4 take this one.The head before the first sixteen positions stays scalar, as does the rest of the
+tile when the unit window would read past the 256-unit array. In the head the two
+sources below the stride -- the initial literal, then the segment's earlier bytes
+-- are split into ranges rather than selected per position, because the test that
+picks between them is loop-invariant over each range. On the rows that
 depend on it, decode over 64 KiB blocks:
 
 | column | ratio | decode |
@@ -503,6 +512,23 @@ arrive in ascending position, which is the only thing the record depends on.
 `residual_copy_bytes` -- the mode-0/mode-1 payload copy, k bytes with k at most
 256 -- moves thirty-two bytes a step, which is two 16-byte moves and the half
 loop that implies, with the eight-byte loop finishing the last partial step.
+
+The other half of the decode is the inverse transform: the width-4 and width-8
+delta transposes come back through one merge kernel each, a plane per input
+register, a chain per plane to undo the delta, then three levels of byte
+interleave to rebuild the rows. The chain was the part paying for memory. It
+ended every 32-byte chunk by extracting the chunk's total into a GPR, adding it
+to one byte of `carry[]`, storing that and broadcasting it back at the top of
+the next iteration -- a store-to-load round trip inside the loop, with two
+shuffle-port ops either side of it. Keeping each carry as a broadcast in a
+vector register instead, the running value in all 32 bytes and advanced by one
+`pshufb` of the chunk's own last byte, removes the round trip and the GPR
+entirely; the eight bytes are written back once, after the loop, for the 16-row
+form that continues the chain. Width 4 already worked that way and width 8,
+where `ts_us`, `ts_ns`, `ts_seq`, `i64_mixed` and `sorted_near` spend their
+decode, did not: 2.0% time-weighted (1.9% geomean) over the corpus, of 4 to 17%
+on the width-8 rows -- `i64_mixed` 16.6%, `ts_seq` 8.8%, `ts_ns` 8.5%, `ts_us`
+4.3% -- with encode unmoved, since it never runs this kernel.
 
 The LZ command loop is bound per command, not per byte: a command emits five to
 eleven bytes and costs about twelve cycles whatever its shape, so the copy

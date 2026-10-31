@@ -1636,6 +1636,82 @@ zpse_chain_xor32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
                             _mm256_permute2x128_si256(r6, r7, 0x31));          \
     }
 
+/* One de-chained plane of a 32-row group: `T` the plane, `USE` the carry
+ * register zpse_chain_add32v/zpse_chain_xor32v advances. */
+#define ZPSE_MERGE8_UNDO(UNDO, T, USE)                                        \
+    UNDO(ctl, ctl_all,                                                        \
+         _mm256_loadu_si256(                                                  \
+             (const __m256i *)(const void *)(segs[T] + (g))),                  \
+         &(USE))
+
+/* merge8's chain-carrying form, the eight-plane twin of
+ * ZPSE_MERGE4_CARRY_BODY: the planes and their eight carries are named
+ * scalars rather than an indexed array, and the carries are the vector ones
+ * from above, so no plane's carry crosses to a GPR inside the loop. Same
+ * eight loads, same twenty-four unpacks, same eight permutes and same eight
+ * stores as ZPSE_MERGE8_BODY. */
+#define ZPSE_MERGE8_CARRY_BODY(UNDO)                                          \
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {                  \
+        __m256i s0, s1, s2, s3, s4, s5, s6, s7;                               \
+        __m256i p0, p1, p2, p3, p4, p5, p6, p7;                                \
+        __m256i ev01, ev23, ev45, ev67, od01, od23, od45, od67;               \
+        __m256i r0, r1, r2, r3, r4, r5, r6, r7;                               \
+        uint8_t *d = out + (size_t)g * 8u;                                    \
+                                                                              \
+        /* Level 0 and 1 together: the de-chained plane and the byte pair it
+         * shares at the first level are the only two live at a time, so the
+         * eight carries are the loop's whole steady-state state. */            \
+        s0 = ZPSE_MERGE8_UNDO(UNDO, 0, c0);                                    \
+        s4 = ZPSE_MERGE8_UNDO(UNDO, 4, c4);                                    \
+        p0 = _mm256_unpacklo_epi8(s0, s4);                                     \
+        p1 = _mm256_unpackhi_epi8(s0, s4);                                     \
+        s1 = ZPSE_MERGE8_UNDO(UNDO, 1, c1);                                    \
+        s5 = ZPSE_MERGE8_UNDO(UNDO, 5, c5);                                    \
+        p2 = _mm256_unpacklo_epi8(s1, s5);                                     \
+        p3 = _mm256_unpackhi_epi8(s1, s5);                                     \
+        s2 = ZPSE_MERGE8_UNDO(UNDO, 2, c2);                                    \
+        s6 = ZPSE_MERGE8_UNDO(UNDO, 6, c6);                                    \
+        p4 = _mm256_unpacklo_epi8(s2, s6);                                     \
+        p5 = _mm256_unpackhi_epi8(s2, s6);                                     \
+        s3 = ZPSE_MERGE8_UNDO(UNDO, 3, c3);                                    \
+        s7 = ZPSE_MERGE8_UNDO(UNDO, 7, c7);                                    \
+        p6 = _mm256_unpacklo_epi8(s3, s7);                                     \
+        p7 = _mm256_unpackhi_epi8(s3, s7);                                     \
+        /* Level 2, undone. */                                                 \
+        ev01 = _mm256_unpacklo_epi8(p0, p4);                                  \
+        ev23 = _mm256_unpackhi_epi8(p0, p4);                                  \
+        ev45 = _mm256_unpacklo_epi8(p1, p5);                                  \
+        ev67 = _mm256_unpackhi_epi8(p1, p5);                                  \
+        od01 = _mm256_unpacklo_epi8(p2, p6);                                  \
+        od23 = _mm256_unpackhi_epi8(p2, p6);                                  \
+        od45 = _mm256_unpacklo_epi8(p3, p7);                                  \
+        od67 = _mm256_unpackhi_epi8(p3, p7);                                  \
+        r0 = _mm256_unpacklo_epi8(ev01, od01);                                \
+        r1 = _mm256_unpackhi_epi8(ev01, od01);                                \
+        r2 = _mm256_unpacklo_epi8(ev23, od23);                                \
+        r3 = _mm256_unpackhi_epi8(ev23, od23);                                \
+        r4 = _mm256_unpacklo_epi8(ev45, od45);                                \
+        r5 = _mm256_unpackhi_epi8(ev45, od45);                                \
+        r6 = _mm256_unpacklo_epi8(ev67, od67);                                \
+        r7 = _mm256_unpackhi_epi8(ev67, od67);                                \
+        _mm256_storeu_si256((__m256i *)(void *)d,                             \
+                            _mm256_permute2x128_si256(r0, r1, 0x20));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),                     \
+                            _mm256_permute2x128_si256(r2, r3, 0x20));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 64u),                     \
+                            _mm256_permute2x128_si256(r4, r5, 0x20));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 96u),                     \
+                            _mm256_permute2x128_si256(r6, r7, 0x20));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 128u),                    \
+                            _mm256_permute2x128_si256(r0, r1, 0x31));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 160u),                    \
+                            _mm256_permute2x128_si256(r2, r3, 0x31));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 192u),                    \
+                            _mm256_permute2x128_si256(r4, r5, 0x31));         \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 224u),                    \
+                            _mm256_permute2x128_si256(r6, r7, 0x31));         \
+    }
+
 /* Whole 32-row groups only: the caller runs the 16-row snake over what is
  * left, which is at most one group because `rows` arrives a multiple of 16.
  * These return the number of rows written. */
@@ -1707,11 +1783,35 @@ zpse_merge8_avx2(uint8_t *out, const uint8_t *const segs[16], uint32_t rows,
         ZPSE_MERGE8_BODY(ZPSE_CHAIN_NONE)
         return g;
     }
-    if (delta) {
-        ZPSE_MERGE8_BODY(ZPSE_CHAIN_ADD)
-        return g;
+    /* The chain forms keep each plane's carry as a broadcast in a vector
+     * register (see zpse_chain_add32v) and write the eight bytes back once,
+     * after the loop, for the 16-row snake that continues the chain. */
+    {
+        __m256i c0 = _mm256_set1_epi8((char)carry[0]);
+        __m256i c1 = _mm256_set1_epi8((char)carry[1]);
+        __m256i c2 = _mm256_set1_epi8((char)carry[2]);
+        __m256i c3 = _mm256_set1_epi8((char)carry[3]);
+        __m256i c4 = _mm256_set1_epi8((char)carry[4]);
+        __m256i c5 = _mm256_set1_epi8((char)carry[5]);
+        __m256i c6 = _mm256_set1_epi8((char)carry[6]);
+        __m256i c7 = _mm256_set1_epi8((char)carry[7]);
+        const __m256i ctl_all = _mm256_loadu_si256(
+            (const __m256i *)(const void *)zpse_avx2_ctl15_all);
+
+        if (delta) {
+            ZPSE_MERGE8_CARRY_BODY(zpse_chain_add32v)
+        } else {
+            ZPSE_MERGE8_CARRY_BODY(zpse_chain_xor32v)
+        }
+        carry[0] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c0));
+        carry[1] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c1));
+        carry[2] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c2));
+        carry[3] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c3));
+        carry[4] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c4));
+        carry[5] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c5));
+        carry[6] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c6));
+        carry[7] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c7));
     }
-    ZPSE_MERGE8_BODY(ZPSE_CHAIN_XOR)
     return g;
 }
 

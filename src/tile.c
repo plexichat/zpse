@@ -3838,9 +3838,19 @@ static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
         j += m_;                                                               \
     } while (0)
 
-    for (p = 0u; p < head; p++)
-        ZPSE_STRIDE_WIDE_STEP(
-            p, (seg_pos + p < s) ? init : seg_base[seg_pos + p - s]);
+    /* The two sources below the stride are chosen by range, not per
+     * position: `seg_pos + p < s` is loop-invariant over each of them, and
+     * the first sixteen positions are a sixth of a tile. */
+    {
+        uint32_t lit = (seg_pos < s) ? (s - seg_pos) : 0u;
+
+        if (lit > head)
+            lit = head;
+        for (; p < lit; p++)
+            ZPSE_STRIDE_WIDE_STEP(p, init);
+        for (; p < head; p++)
+            ZPSE_STRIDE_WIDE_STEP(p, seg_base[seg_pos + p - s]);
+    }
     for (; p < 16u; p++)
         ZPSE_STRIDE_WIDE_STEP(p, out[p - s]);
 
