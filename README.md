@@ -835,6 +835,36 @@ but not its offset.
 N bytes of each one, which is how a single case gets looked at without waiting
 for the rest of the corpus.
 
+### Typed columns from the command line
+
+A CSV is prose with commas in it: every number is decimal text, so the codec
+spends its matches on the formatting instead of on the values, and a column
+that is a monotone counter reads like noise.
+
+```
+zpse_cli col IN.csv OUT        type the columns, compress the column-major blob
+zpse_cli uncol IN OUT.csv      rebuild the CSV, byte for byte
+zpse_cli colcheck IN.csv       both, verified, with the two ratios side by side
+```
+
+A column is `INT` only when every field is the canonical text of its value,
+`DOUBLE` only when every field is exactly what `%.*f` at the column's own
+decimal count prints back from the stored double, and `STR` otherwise -- so an
+empty field, a leading zero, an exponent and a quoted name all survive, and
+the round trip is exact rather than approximate. `colcheck` asserts that with
+a `memcmp` over the whole file, not on a sample.
+
+| file | bytes | text | typed columns | gain |
+| --- | ---: | ---: | ---: | ---: |
+| `titanic.csv` (891 × 12, real export) | 60 302 | 55 213 (1.09:1) | 40 071 (1.50:1) | 27.4% |
+
+The typed form itself is *larger* than the CSV (104 180 bytes: eight bytes per
+int and per double, against `33.9732`). That is the point -- fixed-width
+columns of the same meaning compress like a columnar file instead of like
+prose, which is why the packed size falls while the intermediate grows. On a
+60 KiB file the frame overhead is still a large share of the result; the win
+grows with the file.
+
 ### Using more than one core
 
 Blocks are independent, so a frame can be encoded by several workers at once.

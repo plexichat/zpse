@@ -719,7 +719,20 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 return PSE_BAD_LZ;
             }
             if (lit != 0u) {
-                lz_copy_literals(op, lp, lit, op_rem, 0);
+                /* `lit_safe16` is "there are sixteen readable bytes past
+                 * this run", and the call used to pass 0 -- "the run ends
+                 * at the end of the payload" -- which was true of the
+                 * pre-inline layout and is false of this one: what follows
+                 * a run here is its distance word plus the rest of the
+                 * stream. Passing 0 made EVERY run take the byte loop, and
+                 * the common run on text is under sixteen bytes, so the
+                 * narrow path was the whole literal copy. The bytes a wide
+                 * store writes past the run are output the next command
+                 * overwrites (the decoder fills the block from zero up),
+                 * and `room` inside the copy already proves they are inside
+                 * the block. */
+                lz_copy_literals(op, lp, lit, op_rem,
+                                 (uint32_t)(tend - lp) >= 16u ? 1 : 0);
                 op += lit;
                 lp += lit;
                 op_rem -= lit;

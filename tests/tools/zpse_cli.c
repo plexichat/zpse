@@ -5,6 +5,13 @@
  *   zpse_cli d IN OUT            decompress a frame file
  *   zpse_cli x FILE BLOCK OUT    decode one block through the frame index
  *   zpse_cli dir FILE            print the frame's random-access directory
+ *   zpse_cli col [opts] IN OUT   type a CSV's columns and compress the
+ *                                typed, column-major blob (its own column
+ *                                widths are what makes a text export
+ *                                compress like the data it holds)
+ *   zpse_cli uncol IN OUT        the inverse: rebuild the CSV, byte for byte
+ *   zpse_cli colcheck [opts] IN  both, verified, with the text and columnar
+ *                                ratios side by side
  *   zpse_cli bench [opts] FILE...  compress and decompress each file IN
  *                                MEMORY (nothing written), verify the
  *                                round trip, report ratio and throughput
@@ -756,6 +763,961 @@ static int cmd_bench(int argc, char **argv)
     return 0;
 }
 
+/* ---- typed-column path ------------------------------------------------
+ * A CSV export is prose with commas in it: every number is decimal text, so
+ * the codec sees digits where the data has integers and doubles and spends
+ * its matches on the formatting instead of on the values. This path splits
+ * such a file into columns, types each column, and stores the values in
+ * their own form -- 8-byte integers, 8-byte IEEE doubles, exact bytes for
+ * anything else -- column by column, behind a header that lets `uncol`
+ * rebuild the file byte for byte.
+ *
+ * Exactness is a property of the typing rule rather than a hope. A column
+ * is INT only when every field is the canonical text of its value, and
+ * DOUBLE only when every field is exactly what "%.*f" at the column's own
+ * decimal count prints from the stored double. Everything else stays STR
+ * and keeps its bytes, so an empty field, a leading zero, "1e6" or
+ * "33.97320" all survive the round trip. `colcheck` proves it with a
+ * memcmp over the whole file rather than a sample.
+ *
+ * Blob layout (little-endian throughout, 16-byte header):
+ *
+ *   'Z','C','O','L'  u8 version  u8 ncols  u8 flags  u8 reserved
+ *   u32 nrows        u32 header_len        header bytes
+ *   per column: u8 type, u8 decimals, u16 reserved, u32 data_len, data[]
+ *     INT:    nrows * 8, two's complement
+ *     DOUBLE: nrows * 8, IEEE bits
+ *     STR:    nrows * (u32 len + bytes)
+ *
+ * flags: 1 = row 0 is a header (its text is stored once), 2 = CRLF line
+ * endings, 4 = the file ends with a newline. */
+#define ZCOL_HDR_SIZE 16u
+#define ZCOL_T_INT 0u
+#define ZCOL_T_DBL 1u
+#define ZCOL_T_STR 2u
+#define ZCOL_FLAG_HEADER 1u
+#define ZCOL_FLAG_CRLF 2u
+#define ZCOL_FLAG_TRAIL 4u
+
+typedef struct ZColBuf {
+    uint8_t *p;
+    size_t len;
+    size_t cap;
+    int oom;
+} ZColBuf;
+
+static void zcb_room(ZColBuf *b, size_t extra)
+{
+    size_t want;
+    uint8_t *np;
+
+    if (b->oom || b->len + extra <= b->cap) {
+        return;
+    }
+    want = b->cap != 0u ? b->cap : (size_t)1u << 16;
+    while (want < b->len + extra) {
+        want *= 2u;
+    }
+    np = (uint8_t *)realloc(b->p, want);
+    if (np == NULL) {
+        b->oom = 1;
+        return;
+    }
+    b->p = np;
+    b->cap = want;
+}
+
+static void zcb_put(ZColBuf *b, const void *src, size_t n)
+{
+    zcb_room(b, n);
+    if (b->oom) {
+        return;
+    }
+    memcpy(b->p + b->len, src, n);
+    b->len += n;
+}
+
+static void zcb_u8(ZColBuf *b, unsigned v)
+{
+    uint8_t t = (uint8_t)v;
+
+    zcb_put(b, &t, 1u);
+}
+
+static void zcb_u16(ZColBuf *b, unsigned v)
+{
+    uint8_t t[2];
+
+    t[0] = (uint8_t)v;
+    t[1] = (uint8_t)(v >> 8);
+    zcb_put(b, t, 2u);
+}
+
+static void zcb_u32(ZColBuf *b, unsigned long v)
+{
+    uint8_t t[4];
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        t[i] = (uint8_t)(v >> (8 * i));
+    }
+    zcb_put(b, t, 4u);
+}
+
+static void zcb_u64(ZColBuf *b, unsigned long long v)
+{
+    uint8_t t[8];
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        t[i] = (uint8_t)(v >> (8 * i));
+    }
+    zcb_put(b, t, 8u);
+}
+
+/* Bounds-checked readers for the unpacker: a blob that does not decode is
+ * a corrupt frame, and it must be refused rather than read past. */
+static int zcr_u32(const uint8_t *b, size_t len, size_t *pos,
+                   unsigned long *out)
+{
+    if (*pos + 4u > len) {
+        return 0;
+    }
+    *out = (unsigned long)b[*pos] | ((unsigned long)b[*pos + 1u] << 8) |
+           ((unsigned long)b[*pos + 2u] << 16) |
+           ((unsigned long)b[*pos + 3u] << 24);
+    *pos += 4u;
+    return 1;
+}
+
+static int zcr_u64(const uint8_t *b, size_t len, size_t *pos,
+                   unsigned long long *out)
+{
+    unsigned long long v = 0u;
+    int i;
+
+    if (*pos + 8u > len) {
+        return 0;
+    }
+    for (i = 7; i >= 0; i--) {
+        v = (v << 8) | (unsigned long long)b[*pos + (size_t)i];
+    }
+    *pos += 8u;
+    *out = v;
+    return 1;
+}
+
+static int zc_digit(uint8_t c)
+{
+    return c >= (uint8_t)'0' && c <= (uint8_t)'9';
+}
+
+/* Canonical integer text: -?(0|[1-9][0-9]*), at most 18 digits (so the
+ * value cannot overflow the int64 it is stored in). */
+static int zc_parse_int(const uint8_t *p, uint32_t n, long long *out)
+{
+    uint32_t i = 0;
+    int neg = 0;
+    unsigned long long v = 0u;
+
+    if (n == 0u) {
+        return 0;
+    }
+    if (p[0] == (uint8_t)'-') {
+        neg = 1;
+        i = 1u;
+    }
+    if (i == n || n - i > 18u) {
+        return 0;
+    }
+    if (p[i] == (uint8_t)'0' && n - i > 1u) {
+        return 0;
+    }
+    for (; i < n; i++) {
+        if (!zc_digit(p[i])) {
+            return 0;
+        }
+        v = v * 10u + (unsigned long long)(p[i] - (uint8_t)'0');
+    }
+    *out = neg ? -(long long)v : (long long)v;
+    return 1;
+}
+
+/* Decimal text with a fixed number of fraction digits, accepted only when
+ * printing the parsed double back at that count reproduces the field. That
+ * check is what makes DOUBLE lossless: a field that would print differently
+ * (a trailing zero the file did not have, a value that needs 17 digits, a
+ * rounded form) is refused and the column stays STR. */
+static int zc_parse_dbl(const uint8_t *p, uint32_t n, uint32_t *dec_out,
+                        double *out)
+{
+    char text[64];
+    char back[512];
+    uint32_t i = 0, dec = 0, digits = 0;
+    int dot = 0;
+    char *end = NULL;
+    double v;
+    size_t blen;
+
+    if (n == 0u || n >= sizeof text) {
+        return 0;
+    }
+    if (p[0] == (uint8_t)'-') {
+        i = 1u;
+    }
+    for (; i < n; i++) {
+        if (p[i] == (uint8_t)'.') {
+            if (dot) {
+                return 0;
+            }
+            dot = 1;
+            continue;
+        }
+        if (!zc_digit(p[i])) {
+            return 0;
+        }
+        digits++;
+        if (dot) {
+            dec++;
+        }
+    }
+    if (!dot || digits == 0u || dec == 0u || dec > 17u) {
+        return 0;
+    }
+    memcpy(text, p, n);
+    text[n] = '\0';
+    v = strtod(text, &end);
+    if (end == NULL || *end != '\0') {
+        return 0;
+    }
+    snprintf(back, sizeof back, "%.*f", (int)dec, v);
+    blen = strlen(back);
+    if (blen != (size_t)n || memcmp(back, p, n) != 0) {
+        return 0;
+    }
+    *dec_out = dec;
+    *out = v;
+    return 1;
+}
+
+typedef struct ZCsvRow {
+    size_t off;
+    uint32_t len;
+    size_t next; /* where the following row starts */
+} ZCsvRow;
+
+/* The row that starts at `off`, with its terminating CR (if any) already
+ * removed from `len`, and the offset of the next row in `next`. `next` is
+ * not `off + len + 1` on a CRLF file: `len` excludes the CR, so advancing
+ * from it lands on the LF and the following row starts with an empty line.
+ * That is what made every CRLF export read as ragged. */
+static void zc_row_at(const uint8_t *p, size_t n, size_t off, ZCsvRow *r)
+{
+    size_t end = off;
+
+    while (end < n && p[end] != (uint8_t)'\n') {
+        end++;
+    }
+    r->off = off;
+    r->len = (uint32_t)(end - off);
+    r->next = (end < n) ? end + 1u : n;
+    if (r->len > 0u && p[off + r->len - 1u] == (uint8_t)'\r') {
+        r->len--;
+    }
+}
+
+/* Field ranges of one row, in O(1) per field for the caller.
+ *
+ * Quote-aware: a comma inside a "..." field belongs to the field, and a
+ * doubled quote inside one is an escaped quote. The quotes are KEPT in the
+ * stored bytes, so a STR column reproduces them and `uncol` is byte-exact.
+ * Without this, a real export -- a name like "Braund, Mr. Owen Harris" is
+ * in the very first public CSV anyone tries -- reads as a different field
+ * count on that row and the whole file is refused. */
+static uint32_t zc_split(const uint8_t *p, const ZCsvRow *r, uint32_t *off,
+                         uint32_t *flen, uint32_t maxcols)
+{
+    uint32_t c = 0, i = 0, start = 0;
+
+    while (i <= r->len) {
+        if (i < r->len && p[r->off + i] == (uint8_t)'"') {
+            i++;
+            while (i < r->len) {
+                if (p[r->off + i] == (uint8_t)'"') {
+                    if (i + 1u < r->len &&
+                        p[r->off + i + 1u] == (uint8_t)'"') {
+                        i += 2u;
+                        continue;
+                    }
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (i == r->len || p[r->off + i] == (uint8_t)',') {
+            if (c < maxcols) {
+                off[c] = start;
+                flen[c] = i - start;
+            }
+            c++;
+            start = i + 1u;
+        }
+        i++;
+    }
+    return c;
+}
+
+typedef struct ZCsv {
+    const uint8_t *p;
+    size_t n;
+    uint32_t ncols;
+    uint32_t nrows; /* body rows, header excluded */
+    int header;
+    int crlf;
+    int trail_nl;
+    size_t body; /* offset of the first body row */
+} ZCsv;
+
+/* Shape of the file: constant field count, one line ending style, and
+ * whether row 0 is a header (it is when any of its fields is not a number).
+ */
+static int zc_scan(const uint8_t *p, size_t n, ZCsv *z)
+{
+    size_t off = 0;
+    uint32_t cols = 0, rows = 0;
+    int first = 1, cr = 0, lf = 0;
+
+    if (n == 0u) {
+        return 0;
+    }
+    z->p = p;
+    z->n = n;
+    z->trail_nl = (p[n - 1u] == (uint8_t)'\n') ? 1 : 0;
+    while (off < n) {
+        uint32_t o[1], l[1];
+        ZCsvRow r;
+        uint32_t c;
+
+        zc_row_at(p, n, off, &r);
+        if (r.len > 0u && p[r.off + r.len] == (uint8_t)'\r') {
+            cr = 1;
+        } else {
+            lf = 1;
+        }
+        if (cr && lf) {
+            return 0;
+        }
+        /* maxcols 0: count only, the field ranges are not wanted here. */
+        c = zc_split(p, &r, o, l, 0u);
+        if (first) {
+            cols = c;
+            first = 0;
+        } else if (c != cols) {
+            return 0;
+        }
+        rows++;
+        off = r.next;
+    }
+    if (cols == 0u || rows == 0u) {
+        return 0;
+    }
+    z->ncols = cols;
+    z->crlf = cr;
+    z->header = 0;
+    z->body = 0u;
+    if (rows > 1u) {
+        ZCsvRow r0;
+        uint32_t fo[256], flr[256];
+        uint32_t c;
+
+        zc_row_at(p, n, 0u, &r0);
+        if (cols > 256u) {
+            return 0;
+        }
+        (void)zc_split(p, &r0, fo, flr, cols);
+        for (c = 0; c < cols; c++) {
+            const uint8_t *f = p + r0.off + fo[c];
+            uint32_t fl = flr[c];
+            long long iv;
+            uint32_t dv;
+            double fv;
+
+            if (!zc_parse_int(f, fl, &iv) &&
+                !zc_parse_dbl(f, fl, &dv, &fv)) {
+                z->header = 1;
+                break;
+            }
+        }
+        if (z->header) {
+            size_t e = 0u;
+
+            while (e < n && p[e] != (uint8_t)'\n') {
+                e++;
+            }
+            z->body = (e < n) ? e + 1u : n;
+        }
+    }
+    z->nrows = rows - (uint32_t)(z->header ? 1 : 0);
+    return 1;
+}
+
+/* Column type and, for DOUBLE, its decimal count. `n`/`body` come from the
+ * scan. INT is tried first: it is the smaller form and the check is cheap. */
+static int zc_type(const ZCsv *z, uint32_t col, uint32_t *dec_out)
+{
+    size_t off = z->body;
+    int all_int = 1, all_dbl = 1;
+    uint32_t dec = 0u;
+    int have_dec = 0;
+    uint32_t fo[256], flr[256];
+
+    while (off < z->n) {
+        ZCsvRow r;
+        const uint8_t *f;
+        uint32_t fl;
+        long long iv;
+        uint32_t dv = 0u;
+        double fv;
+
+        zc_row_at(z->p, z->n, off, &r);
+        if (zc_split(z->p, &r, fo, flr, z->ncols) <= col) {
+            return -1;
+        }
+        f = z->p + r.off + fo[col];
+        fl = flr[col];
+        off = r.next;
+        if (all_int && !zc_parse_int(f, fl, &iv)) {
+            all_int = 0;
+        }
+        if (!all_dbl) {
+            continue;
+        }
+        if (!zc_parse_dbl(f, fl, &dv, &fv) ||
+            (have_dec && dv != dec)) {
+            all_dbl = 0;
+        } else if (!have_dec) {
+            dec = dv;
+            have_dec = 1;
+        }
+    }
+    if (all_int) {
+        return ZCOL_T_INT;
+    }
+    if (all_dbl) {
+        *dec_out = dec;
+        return ZCOL_T_DBL;
+    }
+    return ZCOL_T_STR;
+}
+
+static int zc_build(const uint8_t *csv, size_t n, uint8_t **blob_out,
+                    size_t *blob_len, ZCsv *z_out)
+{
+    ZCsv z;
+    ZColBuf out;
+    uint32_t c;
+    uint32_t header_len = 0u;
+    size_t header_off = 0u;
+    uint32_t fo[256], flr[256];
+
+    if (!zc_scan(csv, n, &z)) {
+        fprintf(stderr, "zpse_cli: not a rectangular comma-separated file\n");
+        return 1;
+    }
+    if (z.nrows == 0u) {
+        fprintf(stderr, "zpse_cli: no data rows\n");
+        return 1;
+    }
+    out.p = NULL;
+    out.len = 0u;
+    out.cap = 0u;
+    out.oom = 0;
+    if (z.header) {
+        ZCsvRow r0;
+
+        zc_row_at(csv, n, 0u, &r0);
+        header_off = r0.off;
+        header_len = r0.len;
+    }
+    zcb_put(&out, "ZCOL", 4u);
+    zcb_u8(&out, 1u);
+    zcb_u8(&out, z.ncols);
+    zcb_u8(&out, (unsigned)((z.header ? ZCOL_FLAG_HEADER : 0u) |
+                            (z.crlf ? ZCOL_FLAG_CRLF : 0u) |
+                            (z.trail_nl ? ZCOL_FLAG_TRAIL : 0u)));
+    zcb_u8(&out, 0u);
+    zcb_u32(&out, z.nrows);
+    zcb_u32(&out, header_len);
+    if (header_len != 0u) {
+        zcb_put(&out, csv + header_off, header_len);
+    }
+    for (c = 0; c < z.ncols; c++) {
+        ZColBuf data;
+        uint32_t dec = 0u;
+        int type = zc_type(&z, c, &dec);
+        size_t off = z.body;
+
+        data.p = NULL;
+        data.len = 0u;
+        data.cap = 0u;
+        data.oom = 0;
+        if (type < 0) {
+            fprintf(stderr, "zpse_cli: column %u is short\n", (unsigned)c);
+            free(out.p);
+            return 1;
+        }
+        while (off < n) {
+            ZCsvRow r;
+            const uint8_t *f;
+            uint32_t fl;
+
+            zc_row_at(csv, n, off, &r);
+            if (zc_split(csv, &r, fo, flr, z.ncols) <= c) {
+                break;
+            }
+            f = csv + r.off + fo[c];
+            fl = flr[c];
+            off = r.next;
+            if (type == ZCOL_T_INT) {
+                long long iv = 0;
+
+                (void)zc_parse_int(f, fl, &iv);
+                zcb_u64(&data, (unsigned long long)iv);
+            } else if (type == ZCOL_T_DBL) {
+                uint32_t dv = 0u;
+                double fv = 0.0;
+                unsigned long long bits = 0u;
+
+                (void)zc_parse_dbl(f, fl, &dv, &fv);
+                memcpy(&bits, &fv, 8u);
+                zcb_u64(&data, bits);
+            } else {
+                zcb_u32(&data, (unsigned long)fl);
+                zcb_put(&data, f, fl);
+            }
+        }
+        if (data.oom || out.oom) {
+            fprintf(stderr, "zpse_cli: out of memory\n");
+            free(data.p);
+            free(out.p);
+            return 1;
+        }
+        zcb_u8(&out, (unsigned)type);
+        zcb_u8(&out, dec);
+        zcb_u16(&out, 0u);
+        zcb_u32(&out, (unsigned long)data.len);
+        zcb_put(&out, data.p, data.len);
+        free(data.p);
+    }
+    if (out.oom) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        free(out.p);
+        return 1;
+    }
+    *blob_out = out.p;
+    *blob_len = out.len;
+    if (z_out != NULL) {
+        *z_out = z;
+    }
+    return 0;
+}
+
+/* Rebuild the CSV from a blob. Returns 0 on success. */
+static int zc_unpack(const uint8_t *b, size_t len, uint8_t **csv_out,
+                     size_t *csv_len)
+{
+    ZColBuf out;
+    size_t pos = ZCOL_HDR_SIZE;
+    unsigned long nrows = 0u, header_len = 0u;
+    unsigned cols, flags, version;
+    const uint8_t *header = NULL;
+    const uint8_t *data[256];
+    size_t dlen[256];
+    uint32_t dec[256];
+    uint8_t type[256];
+    size_t cur[256];
+    const char *nl;
+    size_t nl_len;
+    unsigned long row;
+    unsigned c;
+
+    if (len < ZCOL_HDR_SIZE || memcmp(b, "ZCOL", 4u) != 0) {
+        fprintf(stderr, "zpse_cli: not a typed-column blob\n");
+        return 1;
+    }
+    version = b[4];
+    cols = b[5];
+    flags = b[6];
+    if (version != 1u || cols == 0u || cols > 256u || b[7] != 0u) {
+        fprintf(stderr, "zpse_cli: unsupported blob version\n");
+        return 1;
+    }
+    pos = 8u;
+    if (!zcr_u32(b, len, &pos, &nrows)) {
+        fprintf(stderr, "zpse_cli: truncated blob\n");
+        return 1;
+    }
+    if (!zcr_u32(b, len, &pos, &header_len)) {
+        fprintf(stderr, "zpse_cli: truncated blob\n");
+        return 1;
+    }
+    if (header_len > len - pos) {
+        fprintf(stderr, "zpse_cli: truncated header\n");
+        return 1;
+    }
+    header = b + pos;
+    pos += header_len;
+    for (c = 0; c < cols; c++) {
+        unsigned long d = 0u;
+
+        if (pos + 8u > len) {
+            fprintf(stderr, "zpse_cli: truncated column table\n");
+            return 1;
+        }
+        type[c] = b[pos];
+        dec[c] = b[pos + 1u];
+        pos += 4u;
+        if (!zcr_u32(b, len, &pos, &d) || d > len - pos) {
+            fprintf(stderr, "zpse_cli: truncated column data\n");
+            return 1;
+        }
+        data[c] = b + pos;
+        dlen[c] = (size_t)d;
+        cur[c] = 0u;
+        pos += (size_t)d;
+        if (type[c] > ZCOL_T_STR) {
+            fprintf(stderr, "zpse_cli: bad column type\n");
+            return 1;
+        }
+    }
+    nl = (flags & ZCOL_FLAG_CRLF) ? "\r\n" : "\n";
+    nl_len = (flags & ZCOL_FLAG_CRLF) ? 2u : 1u;
+    out.p = NULL;
+    out.len = 0u;
+    out.cap = 0u;
+    out.oom = 0;
+    if ((flags & ZCOL_FLAG_HEADER) != 0u && header_len != 0u) {
+        zcb_put(&out, header, (size_t)header_len);
+        zcb_put(&out, nl, nl_len);
+    }
+    for (row = 0; row < nrows; row++) {
+        for (c = 0; c < cols; c++) {
+            if (c != 0u) {
+                zcb_put(&out, ",", 1u);
+            }
+            if (type[c] == ZCOL_T_INT) {
+                unsigned long long bits = 0u;
+                long long iv;
+                char text[24];
+
+                size_t p2 = cur[c];
+
+                if (!zcr_u64(data[c], dlen[c], &p2, &bits)) {
+                    goto trunc;
+                }
+                cur[c] = p2;
+                iv = (long long)bits;
+                snprintf(text, sizeof text, "%lld", iv);
+                zcb_put(&out, text, strlen(text));
+            } else if (type[c] == ZCOL_T_DBL) {
+                unsigned long long bits = 0u;
+                double v;
+                char text[512];
+
+                size_t p2 = cur[c];
+
+                if (!zcr_u64(data[c], dlen[c], &p2, &bits)) {
+                    goto trunc;
+                }
+                cur[c] = p2;
+                memcpy(&v, &bits, 8u);
+                snprintf(text, sizeof text, "%.*f", (int)dec[c], v);
+                zcb_put(&out, text, strlen(text));
+            } else {
+                unsigned long fl = 0u;
+
+                size_t p2 = cur[c];
+
+                if (!zcr_u32(data[c], dlen[c], &p2, &fl) ||
+                    fl > dlen[c] - p2) {
+                    goto trunc;
+                }
+                cur[c] = p2 + (size_t)fl;
+                zcb_put(&out, data[c] + p2, (size_t)fl);
+            }
+        }
+        if (row + 1u < nrows || (flags & ZCOL_FLAG_TRAIL) != 0u) {
+            zcb_put(&out, nl, nl_len);
+        }
+    }
+    if (out.oom) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        free(out.p);
+        return 1;
+    }
+    *csv_out = out.p;
+    *csv_len = out.len;
+    return 0;
+
+trunc:
+    fprintf(stderr, "zpse_cli: column data ran out\n");
+    free(out.p);
+    return 1;
+}
+
+/* compress IN to OUT through the frame encoder, at the given level. */
+static int col_compress(const uint8_t *in, size_t n, uint8_t **out,
+                        size_t *out_len, uint32_t block, uint32_t enc_flags)
+{
+    size_t cap = frame_bound(n, block, 0);
+    void **arenas = alloc_arenas(1u, ZPSE_ENC_ARENA_SIZE);
+    uint8_t *buf = (uint8_t *)malloc(cap + 1u);
+    int rc;
+
+    if (arenas == NULL || buf == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        free_arenas(arenas, 1u);
+        free(buf);
+        return 1;
+    }
+    rc = compress_mem(in, n, buf, cap, out_len, block, enc_flags, 0, arenas,
+                      1u);
+    free_arenas(arenas, 1u);
+    if (rc != 0) {
+        fprintf(stderr, "zpse_cli: compress failed rc=%d\n", rc);
+        free(buf);
+        return 1;
+    }
+    *out = buf;
+    return 0;
+}
+
+static int col_decompress(const uint8_t *in, size_t in_len, uint8_t **out,
+                          size_t *out_len, size_t cap)
+{
+    void **arenas = alloc_arenas(1u, ZPSE_DEC_ARENA_SIZE);
+    uint8_t *buf = (uint8_t *)malloc(cap + 1u);
+    int rc;
+
+    if (arenas == NULL || buf == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        free_arenas(arenas, 1u);
+        free(buf);
+        return 1;
+    }
+    rc = zpse_decompress_frame_parallel(in, in_len, buf, cap, out_len, 1u,
+                                        arenas, 1u);
+    free_arenas(arenas, 1u);
+    if (rc != 0) {
+        fprintf(stderr, "zpse_cli: decompress failed rc=%d\n", rc);
+        free(buf);
+        return 1;
+    }
+    *out = buf;
+    return 0;
+}
+
+/* `col IN.csv OUT`: type the columns, then compress the typed blob. */
+static int cmd_col(int argc, char **argv)
+{
+    uint32_t enc_flags = 0u;
+    uint32_t block = ZPSE_MAX_BLOCK_SIZE;
+    uint8_t *csv;
+    uint8_t *blob = NULL;
+    uint8_t *packed = NULL;
+    size_t csv_len = 0u;
+    size_t blob_len = 0u;
+    size_t packed_len = 0u;
+    ZCsv z;
+    int i = 2;
+
+    for (; i < argc && argv[i][0] == '-'; i++) {
+        if (argv[i][1] == 'l' && ++i < argc) {
+            if (!parse_level(argv[i], &enc_flags)) {
+                return 2;
+            }
+        } else if (argv[i][1] == 'b' && ++i < argc) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[i], &end, 10);
+
+            if (end == argv[i] || *end != '\0' || v < 1u ||
+                v > (unsigned long)ZPSE_MAX_BLOCK_SIZE) {
+                fprintf(stderr, "zpse_cli: bad block size '%s'\n", argv[i]);
+                return 2;
+            }
+            block = (uint32_t)v;
+        } else {
+            fprintf(stderr, "zpse_cli: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+    if (argc - i != 2) {
+        fprintf(stderr, "usage: zpse_cli col [opts] IN.csv OUT\n");
+        return 2;
+    }
+    csv = read_file(argv[i], &csv_len);
+    if (csv == NULL) {
+        return 1;
+    }
+    if (zc_build(csv, csv_len, &blob, &blob_len, &z) != 0) {
+        free(csv);
+        return 1;
+    }
+    if (col_compress(blob, blob_len, &packed, &packed_len, block,
+                     enc_flags) != 0) {
+        free(blob);
+        free(csv);
+        return 1;
+    }
+    printf("%s: %u rows x %u columns%s, csv %lu -> typed %lu -> packed %lu "
+           "(%.2f:1 on the typed form, %.2f:1 against the csv)\n",
+           argv[i], (unsigned)z.nrows, (unsigned)z.ncols,
+           z.header ? ", with header" : "", (unsigned long)csv_len,
+           (unsigned long)blob_len, (unsigned long)packed_len,
+           packed_len ? (double)blob_len / (double)packed_len : 0.0,
+           packed_len ? (double)csv_len / (double)packed_len : 0.0);
+    i = write_file(argv[argc - 1], packed, packed_len);
+    free(packed);
+    free(blob);
+    free(csv);
+    return i;
+}
+
+/* `uncol IN OUT`: decompress, then rebuild the CSV from the typed blob. */
+static int cmd_uncol(int argc, char **argv)
+{
+    uint8_t *packed;
+    uint8_t *blob = NULL;
+    uint8_t *csv = NULL;
+    size_t packed_len = 0u;
+    size_t blob_len = 0u;
+    size_t csv_len = 0u;
+    int rc;
+
+    if (argc != 4) {
+        fprintf(stderr, "usage: zpse_cli uncol IN OUT.csv\n");
+        return 2;
+    }
+    packed = read_file(argv[2], &packed_len);
+    if (packed == NULL) {
+        return 1;
+    }
+    /* The frame header carries the uncompressed size, so the blob never has
+     * to be sized by guesswork. */
+    if (col_decompress(packed, packed_len, &blob, &blob_len,
+                       ((packed_len * 64u) + ((size_t)1u << 20))) != 0) {
+        free(packed);
+        return 1;
+    }
+    rc = zc_unpack(blob, blob_len, &csv, &csv_len);
+    free(blob);
+    free(packed);
+    if (rc != 0) {
+        return 1;
+    }
+    rc = write_file(argv[3], csv, csv_len);
+    free(csv);
+    return rc;
+}
+
+/* `colcheck IN.csv`: the round trip and the two ratios, in one pass. The
+ * text frame is the same bytes through the same encoder, so the difference
+ * between the two packed sizes is the whole value of typing the columns. */
+static int cmd_colcheck(int argc, char **argv)
+{
+    uint32_t enc_flags = 0u;
+    uint32_t block = ZPSE_MAX_BLOCK_SIZE;
+    uint8_t *csv;
+    uint8_t *blob = NULL;
+    uint8_t *packed = NULL;
+    uint8_t *text_packed = NULL;
+    uint8_t *back_blob = NULL;
+    uint8_t *back_csv = NULL;
+    size_t csv_len = 0u, blob_len = 0u, packed_len = 0u, text_len = 0u;
+    size_t back_blob_len = 0u, back_csv_len = 0u;
+    ZCsv z;
+    int i = 2;
+    int rc = 0;
+    double t0, enc_ns = 0.0, dec_ns = 0.0;
+
+    for (; i < argc && argv[i][0] == '-'; i++) {
+        if (argv[i][1] == 'l' && ++i < argc) {
+            if (!parse_level(argv[i], &enc_flags)) {
+                return 2;
+            }
+        } else {
+            fprintf(stderr, "zpse_cli: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+    if (argc - i != 1) {
+        fprintf(stderr, "usage: zpse_cli colcheck [opts] IN.csv\n");
+        return 2;
+    }
+    csv = read_file(argv[i], &csv_len);
+    if (csv == NULL) {
+        return 1;
+    }
+    if (zc_build(csv, csv_len, &blob, &blob_len, &z) != 0) {
+        free(csv);
+        return 1;
+    }
+    t0 = now_ns();
+    if (col_compress(blob, blob_len, &packed, &packed_len, block,
+                     enc_flags) != 0) {
+        free(blob);
+        free(csv);
+        return 1;
+    }
+    enc_ns = now_ns() - t0;
+    if (col_compress(csv, csv_len, &text_packed, &text_len, block,
+                     enc_flags) != 0) {
+        free(packed);
+        free(blob);
+        free(csv);
+        return 1;
+    }
+    t0 = now_ns();
+    if (col_decompress(packed, packed_len, &back_blob, &back_blob_len,
+                       blob_len + 4096u) != 0) {
+        free(text_packed);
+        free(packed);
+        free(blob);
+        free(csv);
+        return 1;
+    }
+    dec_ns = now_ns() - t0;
+    if (back_blob_len != blob_len || memcmp(back_blob, blob, blob_len) != 0) {
+        fprintf(stderr, "zpse_cli: typed blob did not round-trip\n");
+        rc = 1;
+    } else if (zc_unpack(back_blob, back_blob_len, &back_csv,
+                         &back_csv_len) != 0) {
+        rc = 1;
+    } else if (back_csv_len != csv_len || memcmp(back_csv, csv, csv_len) != 0) {
+        fprintf(stderr, "zpse_cli: rebuilt csv differs from the input\n");
+        rc = 1;
+    }
+    printf("%-24s %10lu %10lu %6.2f %10lu %6.2f %6.1f%% %8.1f %8.1f %s\n",
+           argv[i], (unsigned long)csv_len, (unsigned long)text_len,
+           text_len ? (double)csv_len / (double)text_len : 0.0,
+           (unsigned long)packed_len,
+           packed_len ? (double)csv_len / (double)packed_len : 0.0,
+           text_len ? 100.0 * (1.0 - (double)packed_len / (double)text_len)
+                    : 0.0,
+           enc_ns > 0.0 ? (double)blob_len / enc_ns * 1e3 : 0.0,
+           dec_ns > 0.0 ? (double)blob_len / dec_ns * 1e3 : 0.0,
+           rc == 0 ? "ok" : "FAIL");
+    free(back_csv);
+    free(back_blob);
+    free(text_packed);
+    free(packed);
+    free(blob);
+    free(csv);
+    return rc;
+}
+
 /* `dir`: print the frame's random-access directory. The index is the thing
  * that makes a zpse frame seekable -- block n's offset and packed size, one
  * entry each, checksummed as a table -- and nothing in the CLI surfaced it
@@ -879,6 +1841,9 @@ int main(int argc, char **argv)
                         "       zpse_cli d IN OUT\n"
                         "       zpse_cli x FILE BLOCK OUT\n"
                         "       zpse_cli dir FILE\n"
+                        "       zpse_cli col [opts] IN.csv OUT\n"
+                        "       zpse_cli uncol IN OUT.csv\n"
+                        "       zpse_cli colcheck [opts] IN.csv\n"
                         "       zpse_cli bench [opts] FILE...\n"
                         "       zpse_cli --version\n");
         return 2;
@@ -895,6 +1860,15 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "x") == 0) {
         return cmd_seek(argc, argv);
+    }
+    if (strcmp(argv[1], "col") == 0) {
+        return cmd_col(argc, argv);
+    }
+    if (strcmp(argv[1], "uncol") == 0) {
+        return cmd_uncol(argc, argv);
+    }
+    if (strcmp(argv[1], "colcheck") == 0) {
+        return cmd_colcheck(argc, argv);
     }
     if (argc >= 2 && argv[1][1] == '\0' &&
         (argv[1][0] == 'c' || argv[1][0] == 'd')) {
