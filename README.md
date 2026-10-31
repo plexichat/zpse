@@ -920,6 +920,61 @@ byte for byte with the one-worker frame (that is the `identical frames` column
 
 Every **other** figure in this file is one core and one thread.
 
+### Silesia
+
+The synthetic corpus above is 25 generators and no real data. Silesia is the
+other direction: twelve files, 202 MiB, from English prose to executables to
+medical images, and every one of them a file somebody actually compressed. It
+is also the corpus where this codec's weak spot shows, because half of it is
+text:
+
+| file | bytes | ratio | encode | decode |
+| --- | ---: | ---: | ---: | ---: |
+| dickens | 10,192,446 | 1.09 | 0.95 GB/s | 1.55 GB/s |
+| mozilla | 51,220,480 | 1.60 | 0.28 | 1.16 |
+| mr | 9,970,564 | 2.32 | 0.31 | 1.10 |
+| nci | 33,553,445 | 3.75 | 0.23 | 1.09 |
+| ooffice | 6,152,192 | 1.15 | 0.29 | 1.76 |
+| osdb | 10,085,684 | 1.00 | 1.04 | 3.16 |
+| reymont | 6,627,202 | 1.10 | 1.45 | 14.53 |
+| samba | 21,606,400 | 1.77 | 0.39 | 1.32 |
+| sao | 7,251,944 | 1.00 | 1.42 | 14.36 |
+| webster | 41,458,703 | 1.36 | 0.44 | 1.38 |
+| x-ray | 8,474,240 | 1.72 | 0.51 | 2.99 |
+| xml | 5,345,280 | 2.99 | 0.66 | 3.60 |
+| **total** | **211,938,580** | **1.60** | **0.36** | **1.42** |
+
+`zpse_cli bench -r 2`, default level, 64 KiB blocks, one pinned core. The
+`osdb` and `sao` rows are the raw fallback doing its job -- 1.00:1 and decodes
+at copy speed -- and `dickens`, `ooffice`, `reymont` and `webster` are the
+text problem in one line each: 1.09 to 1.36 on data that a general-purpose
+LZ at the same speed reaches in the twos.
+
+Running the ladder over Silesia also breaks a property the level table claims:
+
+| level | dickens + webster | encode |
+| --- | ---: | ---: |
+| 1 FASTEST | 1.30 | 0.43 GB/s |
+| 2 | 1.47 | 0.34 |
+| 3 FASTER | 1.47 | 0.36 |
+| 4 | 1.30 | 0.49 |
+| 5 BALANCED (default) | 1.30 | 0.50 |
+| 6 | 1.47 | 0.32 |
+| 7 | 1.47 | 0.31 |
+| 8 | 1.51 | 0.30 |
+| 9 MAX | 1.51 | 0.30 |
+
+Level 4 writes the same total as level 1 and 5 writes the same as level 4,
+while level 3 is 12% smaller than all three. The table's own contract is that
+a deeper level chooses from a superset of the shapes above it -- more trials,
+looser screen, wider decode bill -- so this cannot happen if the trial cap
+really keeps the cheapest `cap` survivors. Two changes have been measured
+against it and neither is the cause: cutting the default level's field to its
+best two on price (its `tie_field`) moves the total by 0.09%, and sizing the
+LZ screen's table to its sample is a 17% encode regression. Until the cap's
+order is instrumented, the ladder is what it measures on Silesia and not what
+it documents, and the default level sits on the wrong side of the 3/4 step.
+
 ### What the compiler adds, and what the tags are worth
 
 Every number in this README is an `-O2` number: the CI matrix and
