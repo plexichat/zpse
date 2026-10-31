@@ -757,6 +757,15 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
          * end of the payload that there is no padding behind it. */
         const int lit_safe16 =
             ((uint32_t)(in_len - 4u - lit_bytes) >= 16u) ? 1 : 0;
+        /* One of the two one-shot bounds is about the block, not the
+         * command: whether an eight-byte literal load stays inside the
+         * input at all. Folding it into the output-room bound turns two
+         * tests into one on every command of the fast path -- a block
+         * without the padding asks for more output room than the block can
+         * have, so its commands fall through to the general path, which
+         * makes its own bounds and refuses the same streams. */
+        const uint32_t fast_min_rem =
+            (lit_safe16 != 0) ? 40u : 0xFFFFFFFFu;
 
         while (op_rem != 0u) {
             uint32_t cw;
@@ -797,9 +806,12 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * `out` are the ones the general path writes, and a stream the
              * general path would refuse is refused here too (every test it
              * makes is in this condition, or already made above). */
-            /* The output test is `op_rem >= 40`, not `lit + mlen + 16 <=
-             * op_rem`: with lit <= 8 and mlen <= 16 the two are the same
-             * bound, and a compare is one op where the sum is three. The
+            /* The output test is `op_rem >= fast_min_rem`, not `lit + mlen
+             * + 16 <= op_rem`: with lit <= 8 and mlen <= 16 the two are the
+             * same bound, and a compare is one op where the sum is three.
+             * `fast_min_rem` carries the block-wide half of the old
+             * condition (`lit_safe16`) as well, so the padding question is
+             * folded into that one compare rather than asked again. The
              * distance test is `off <= op_done`, one literal's worth
              * stricter than the general path's after the literals are
              * placed -- a match that starts within the first eight bytes of
@@ -815,8 +827,8 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * taken and moves it out of line, which costs more than the
              * tests it saves. */
             if (ZPSE_LIKELY(lit <= 8u && lit <= lit_rem && off >= 16u &&
-                            mlen <= 16u && lit_safe16 != 0 &&
-                            off <= op_done && op_rem >= 40u)) {
+                            mlen <= 16u && off <= op_done &&
+                            op_rem >= fast_min_rem)) {
                 memcpy(op, lp, 8u);
                 memcpy(op + lit, op + lit - (ptrdiff_t)off, 16u);
                 op += lit + mlen;
@@ -850,8 +862,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * command that fails them still reaches the general path below,
              * which accepts and rejects exactly what it did. */
             if (lit <= 8u && lit <= lit_rem && off >= 32u &&
-                mlen <= 32u && lit_safe16 != 0 && off <= op_done &&
-                op_rem >= 40u) {
+                mlen <= 32u && off <= op_done && op_rem >= fast_min_rem) {
                 memcpy(op, lp, 8u);
                 memcpy(op + lit, op + lit - (ptrdiff_t)off, 32u);
                 op += lit + mlen;

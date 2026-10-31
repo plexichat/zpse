@@ -528,6 +528,22 @@ the corpus, LZ decode alone: `log_lines` 4.57 -> 4.99 GB/s, `var_string`
 5.71 -> 5.95, `json_rows` 4.56 -> 4.60, and the whole decoder 1.0%
 time-weighted (0.5% geomean), with no other case moved by more than noise.
 
+Two of the one-shot bound's terms are questions about the block rather than
+the command: whether an eight-byte literal load stays inside the input, and
+whether the output has room for the widest pair of stores. The block-wide
+half is answered once, before the loop, by folding it into the room bound --
+a block without that padding asks for more room than the block can have, so
+the test stays one compare instead of two. Between them the two branches then
+ask five things where they asked six: `json_rows` 3.2%, `var_string` 3.1%,
+`log_lines` 1.2% and `sorted_near` 0.7% of decode, 0.8% time-weighted over
+the corpus. That is also the loop's whole budget. Keeping `min(lit_rem, 8)`
+in a register instead of recomputing it -- one instruction cheaper, one value
+more live, the same idea one step further -- measured 20-27% *slower* on those
+same cases: at six live counters the loop spills, and the spill costs more
+than the min did. The same arithmetic in the other direction (folding the
+command-count test into the loop condition) is worth nothing on the JSON and
+log rows, so the counter stays where it is.
+
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this
 kernel writes exactly the bytes the scalar loop writes.
