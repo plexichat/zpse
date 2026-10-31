@@ -949,6 +949,14 @@ same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
 that function with its `-O2` neighbours, which is why the last row is slower
 than leaving the function untagged.
 
+The `-O3` row is the one the release uses, and it is worth checking against the
+level corpus's caution: on the 17-file corpus `zpse_cli bench` reads (68 MiB,
+from random to all-zeros, at the default level) the same two builds run the
+same files end to end in 410.2 ms at `-O2` and 365.5 ms at `-O3` -- encode 14%
+faster, decode 6%, every compressed size identical, byte for byte. The mean
+over that corpus is dominated by `zeros.bin`, so the encode side moves per file
+and not uniformly; the total time is the number to trust.
+
 `ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 18 functions it
 marks were measured together, and a tag put on a function whose callees are
 untagged reproduces that last row. The set is measured best of seven
