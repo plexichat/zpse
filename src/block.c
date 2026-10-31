@@ -1617,10 +1617,10 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
 #define ZPSE_LZ_ACCEL_MAX 24u
 #endif
 #ifndef ZPSE_LZ_ACCEL_BALANCED
-#define ZPSE_LZ_ACCEL_BALANCED 12u /* levels 5-6: 8 bytes per command */
+#define ZPSE_LZ_ACCEL_BALANCED 12u /* level 5: 8 bytes per command */
 #endif
 #ifndef ZPSE_LZ_ACCEL_L7
-#define ZPSE_LZ_ACCEL_L7 16u       /* level 7: 6 bytes per command */
+#define ZPSE_LZ_ACCEL_L7 16u       /* levels 6-7: 6 bytes per command */
 #endif
 #ifndef ZPSE_LZ_ACCEL_L8
 #define ZPSE_LZ_ACCEL_L8 20u       /* level 8: 4.8 bytes per command */
@@ -1711,10 +1711,15 @@ static const ZpseLevel zpse_level[10] = {
      * guarded field cut to its best two on price. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_BALANCED, 2u,
       (uint8_t)ZPSE_LZ_ACCEL_BALANCED, 1u },
-    /* 6: the screen loosened to 1.1875x, same decode bill. */
-    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L6, 2u,
-      (uint8_t)ZPSE_LZ_ACCEL_BALANCED, 1u },
-    /* 7: 1.125x, 6 B/command. */
+    /* 6 (default): the screen loosened to 1.1875x and level 7's decode bill,
+     * 6 B/command. The bill is free on the encode side -- it only filters
+     * streams the pass has already produced, so it cannot make a block pay
+     * for a pass it would not have paid -- and on Silesia it is 0.64%
+     * smaller at the same encode rate (126,090,987 against 126,902,432
+     * bytes, 315 against 316 MB/s over six interleaved rounds). The default
+     * therefore takes it; the alternative was giving it up for nothing. */
+    { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L6, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7, 1u },
+    /* 7: the margin loosened to 1.125x, the decode bill unchanged. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L7, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7, 1u },
     /* 8: MAX's 1.0625x margin, two samples, 5 B/command. The deepest rungs
      * keep every survivor the price could not separate. */

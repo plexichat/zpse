@@ -91,11 +91,14 @@
  *                              of the block is coded first and the pass is
  *                              paid for only when that sample shows the form
  *                              winning by 1.25x.
- *  6                          the LZ sample margin loosened to 1.1875x; every
- *                              other knob as BALANCED
- *  7                          margin 1.125x, and the decode bill raised to an
- *                              acceleration factor of 16 (6 output bytes per
- *                              command, against BALANCED's 8)
+ *  6                          the LZ sample margin loosened to 1.1875x, and
+ *                              the decode bill raised to an acceleration
+ *                              factor of 16 (6 output bytes per command).
+ *                              The bill is free on the encode side: it only
+ *                              filters streams the pass has already produced,
+ *                              so it can never make a block pay for a pass.
+ *  7                          the margin loosened to 1.125x; the decode bill
+ *                              unchanged from 6.
  *  8                          margin 1.0625x with an acceleration factor of
  *                              20 (4.8 bytes per command), and the field cut
  *                              back to a tied tail only: the deepest rungs
@@ -137,16 +140,24 @@
  * level 6, one rung below BALANCED.
  *
  * BALANCED (5) was the default, and level 6 is a superset of its trade rather
- * than a step away from it: the only difference is the LZ screen margin
- * (1.1875x against 1.25x), so level 6 offers the match finder to blocks level
- * 5 refuses, and a stream the finder offers can only be kept when it is
- * smaller. Measured over Silesia (202 MiB of real data, one pinned core,
- * `tests/benchmarks/silesia.sh`): 132,691,893 packed bytes at level 5 against
- * 126,902,432 at level 6, i.e. 4.4% smaller, while encode is 352 against 344
- * MB/s -- inside the run-to-run spread -- and decode is 18% FASTER (1371
- * against 1625 MB/s), because a block the LZ form takes is a copy loop to
- * decode rather than a tile reconstruction. That is not a ratio/speed trade
- * to argue about; every measured axis moves the right way or does not move.
+ * than a step away from it: the screen margin goes from 1.25x to 1.1875x and
+ * the decode bill from 8 to 6 bytes per command, and neither can refuse a
+ * block BALANCED would have taken -- a stream the finder offers can only be
+ * kept when it is smaller, and a bill that accepts shorter runs only admits
+ * more of them. Measured over Silesia (202 MiB of real data, one pinned core,
+ * `tests/benchmarks/silesia.sh`, six interleaved rounds): 132,691,893 packed
+ * bytes at level 5 against 126,090,987 at level 6, i.e. 5.0% smaller, encode
+ * 329 against 311 MB/s and decode 1384 against 1494 MB/s. That is a little
+ * encode rate for a smaller stream that also decodes faster.
+ *
+ * The two knobs are not equal in cost, which is what the level table's row 6
+ * is built from: raising the bill alone is free -- it only filters streams the
+ * match-finder pass has already produced, so it cannot add a pass -- and is
+ * worth 0.64% on its own (126,902,432 -> 126,090,987 bytes at 316 against 315
+ * MB/s over six interleaved rounds). The margin alone is worth the remaining
+ * 4.4%, and costs 15% of the encode rate (119,841,369 bytes at 283 against
+ * 332 MB/s), because it buys match-finder passes. So the default takes the
+ * free knob and leaves the paid one to level 7.
  *
  * What it costs is the ladder's cheapest rung below it: level 5 still exists
  * and still writes what it wrote, so a caller who wants that exact stream can

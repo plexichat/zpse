@@ -41,18 +41,18 @@ WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 
 | pattern | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| `zeros` | 0.004 | 36 300 | **98 100** |
-| `const5A` | 0.004 | 35 400 | **98 900** |
-| `random` | 1.000 | 2 090 | **66 200** |
-| `lowentropy` (4-bit alphabet) | 0.508 | 840 | 46 700 |
-| `incr` (0..255 ramp) | 0.040 | 3 150 | 17 200 |
-| `strided` | 0.040 | 960 | 17 200 |
-| `alt00FF` | 0.004 | 13 100 | 34 200 |
-| `sparse2` | 0.018 | 1 590 | 18 600 |
-| `sparse` (1 byte per 97) | 0.052 | 330 | 18 100 |
-| `sawtooth` | 0.041 | 860 | 12 400 |
+| `zeros` | 0.004 | 35 570 | **71 300** |
+| `const5A` | 0.004 | 35 660 | **70 360** |
+| `random` | 1.000 | 2 560 | **66 220** |
+| `lowentropy` (4-bit alphabet) | 0.508 | 860 | 50 210 |
+| `incr` (0..255 ramp) | 0.040 | 3 880 | 17 240 |
+| `strided` | 0.040 | 1 180 | 17 150 |
+| `alt00FF` | 0.004 | 13 330 | 32 280 |
+| `sparse2` | 0.018 | 1 720 | 17 920 |
+| `sparse` (1 byte per 97) | 0.052 | 370 | 14 970 |
+| `sawtooth` | 0.041 | 1 300 | 14 370 |
 
-The encode column is the default level (5), which prices every plane of every
+The encode column is the default level (6), which prices every plane of every
 candidate and also offers the intra-block LZ form. On these patterns the price
 buys the ratios and the finder finds nothing, so the sweep is most of the
 encode: the one-value rows are 36 GB/s against 98 to decode them, and they are
@@ -333,22 +333,28 @@ each run the harness's own best of three timed reps, on one host,
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 1.77 GB/s | 16.2 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
-| 2 | 4.06:1 | 1.66 GB/s | 16.6 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.62 GB/s | 17.2 GB/s | the same prescreen, three full trials |
-| 4 | 4.06:1 | 1.60 GB/s | 16.9 GB/s | four full trials, still no match finder |
-| 5 `ZPSE_ENC_SPEED_BALANCED` | 4.47:1 | 1.02 GB/s | 13.9 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
-| 6 (default) | 4.48:1 | 974 MB/s | 13.8 GB/s | the LZ sample margin loosened to 1.1875x; the decode bill unchanged. The default: smaller and faster to decode than level 5 on real data, see the Silesia section |
-| 7 | 4.50:1 | 963 MB/s | 13.6 GB/s | the margin loosened to 1.125x and the acceleration factor raised to 16 (6 bytes per command) |
-| 8 | 4.51:1 | 909 MB/s | 13.5 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
-| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 852 MB/s | 11.7 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 2.25 GB/s | 18.8 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
+| 2 | 4.06:1 | 1.99 GB/s | 18.5 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.89 GB/s | 19.2 GB/s | the same prescreen, three full trials |
+| 4 | 4.06:1 | 1.81 GB/s | 19.4 GB/s | four full trials, still no match finder |
+| 5 `ZPSE_ENC_SPEED_BALANCED` | 4.47:1 | 1.25 GB/s | 15.4 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
+| 6 (default) | 4.49:1 | 1.13 GB/s | 15.3 GB/s | the margin loosened to 1.1875x and the decode bill raised to 6 bytes per command — the bill is free on the encode side, so the default takes it; see the Silesia section for what the two knobs are each worth |
+| 7 | 4.50:1 | 1.13 GB/s | 14.5 GB/s | the margin loosened to 1.125x, the decode bill unchanged from 6 |
+| 8 | 4.51:1 | 1.07 GB/s | 14.1 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
+| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 1.03 GB/s | 14.7 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
 
 Levels 3 and 4 read as the same mean ratio because on this corpus a third or
-fourth candidate almost never wins: the extra trials cost encode time (1.62 to
-1.60 GB/s) and buy the odd block, which is worth a rung to the caller who
+fourth candidate almost never wins: the extra trials cost encode time (1.89 to
+1.81 GB/s) and buy the odd block, which is worth a rung to the caller who
 wants it and worth nothing to the average. Level 2 is the visible step in that
 tier, because the prescreen it switches to is what changes which shape the
 winner is.
+
+Levels 6 and 7 read the same mean encode rate as each other on this corpus
+because it has almost nothing for the match finder to win: the accel knob that
+level 6 took from 7 filters streams that were already produced, so it costs
+nothing here, and the margin that is still 7's alone is measured on Silesia,
+where there is text for it to buy.
 
 One shape of block is the exception to "every survivor is encoded in full": a
 full 64 KiB block whose field the window price has already ordered. The
@@ -894,25 +900,30 @@ one.
 
 This is the one table in this file that is not one core and one thread. Six
 worker counts on the mixed columnar corpus, 64 KiB blocks, indexed frames,
-best of four, pinned to the host's six logical CPUs (`bench_parallel.c`); the
+best of six, pinned to the host's six logical CPUs (`bench_parallel.c`); the
 host reports three cores with two threads each, so the six-worker column is
-three cores with SMT. GB/s of uncompressed bytes; `—` is a frame small enough
-that the queue threshold keeps it on one worker.
+three cores with SMT. GB/s of uncompressed bytes, at the default level.
 
 | frame | encode 1 | 2 | 3 | 6 | decode 1 | 2 | 3 | 6 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 MiB | 1.22 | 2.44 | 3.15 | 3.00 | — | — | — | — |
-| 4 MiB | 1.29 | 2.66 | 3.80 | 4.33 | 5.67 | 8.70 | 8.96 | 8.69 |
-| 16 MiB | 0.63 | 1.22 | 1.72 | 2.34 | 4.10 | 6.87 | 9.86 | 12.25 |
-| 64 MiB | 0.61 | 1.14 | 1.68 | 3.04 | 4.21 | 7.68 | 10.26 | 14.82 |
+| 1 MiB | 1.59 | 2.55 | 2.07 | 2.26 | 5.87 | 5.83 | 5.74 | 5.88 |
+| 4 MiB | 1.15 | 2.58 | 2.71 | 3.42 | 5.76 | 7.95 | 8.95 | 9.03 |
+| 16 MiB | 0.50 | 0.88 | 1.42 | 2.04 | 3.51 | 6.18 | 9.27 | 10.97 |
+| 64 MiB | 0.52 | 1.06 | 1.51 | 2.30 | 4.10 | 7.36 | 9.77 | 13.43 |
 
-Encode scales better than decode because it has five times more to do: the
-encode column is the sweep and the match finder on four different column
-shapes, and the decode column is a block reconstruction that already runs at
-four to six gigabytes a second on one core. A 64 MiB frame goes from one
-worker to six at a little under five times on encode and three and a half on
-decode (its last row above), and the frames below about four megabytes stay
-serial in both directions.
+Encode scales better than decode because it has more to do: the encode column
+is the sweep and the match finder on four different column shapes, and the
+decode column is a block reconstruction that already runs at four to six
+gigabytes a second on one core. A 64 MiB frame goes from one worker to six at
+four and a half times on encode and three and a quarter on decode (its last
+row above), and a frame of a megabyte stays essentially serial in both
+directions.
+
+Two workers on the 4 MiB and 16 MiB frames beat three on this host, which has
+three cores with SMT rather than six: a pair lands on two real cores, while
+three of six workers can share one. The scheduler is the noise floor here, not
+the codec — the one-worker column is the number to trust for scaling and every
+other table in this file is a single-core measurement for that reason.
 
 Every frame in that table was checked twice: the workers' frame is compared
 byte for byte with the one-worker frame (that is the `identical frames` column
@@ -930,25 +941,65 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.09 | 1.57 GB/s | 2.45 GB/s |
-| mozilla | 51,220,480 | 1.64 | 0.28 | 1.59 |
-| mr | 9,970,564 | 2.32 | 0.31 | 1.13 |
-| nci | 33,553,445 | 4.00 | 0.24 | 1.60 |
-| ooffice | 6,152,192 | 1.22 | 0.25 | 1.72 |
-| osdb | 10,085,684 | 1.02 | 0.93 | 2.28 |
-| reymont | 6,627,202 | 1.10 | 0.62 | 11.90 |
-| samba | 21,606,400 | 1.92 | 0.36 | 1.64 |
-| sao | 7,251,944 | 1.00 | 1.34 | 10.73 |
-| webster | 41,458,703 | 1.50 | 0.36 | 1.25 |
-| x-ray | 8,474,240 | 1.72 | 0.47 | 2.94 |
-| xml | 5,345,280 | 3.13 | 0.61 | 3.04 |
-| **total** | **211,938,580** | **1.67** | **0.34** | **1.68** |
+| dickens | 10,192,446 | 1.09 | 1.37 GB/s | 2.16 GB/s |
+| mozilla | 51,220,480 | 1.64 | 0.23 GB/s | 0.94 GB/s |
+| mr | 9,970,564 | 2.32 | 0.29 GB/s | 0.87 GB/s |
+| nci | 33,553,445 | 4.00 | 0.22 GB/s | 1.48 GB/s |
+| ooffice | 6,152,192 | 1.22 | 0.23 GB/s | 1.45 GB/s |
+| osdb | 10,085,684 | 1.02 | 0.89 GB/s | 2.72 GB/s |
+| reymont | 6,627,202 | 1.26 | 0.60 GB/s | 4.73 GB/s |
+| samba | 21,606,400 | 1.93 | 0.33 GB/s | 1.23 GB/s |
+| sao | 7,251,944 | 1.00 | 1.18 GB/s | 7.84 GB/s |
+| webster | 41,458,703 | 1.50 | 0.33 GB/s | 1.04 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.43 GB/s | 2.17 GB/s |
+| xml | 5,345,280 | 3.13 | 0.40 GB/s | 2.98 GB/s |
+| **total** | **211,938,580** | **1.68** | **0.30 GB/s** | **1.27 GB/s** |
 
 `zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core. The
 `sao` row is the raw fallback doing its job -- 1.00:1 at copy speed -- and
 `osdb` is almost there; `dickens`, `ooffice`, `reymont` and `webster` are the
 text problem in one line each: 1.09 to 1.50 on data that a general-purpose LZ
 at the same speed reaches in the twos.
+
+### Against lz4 and zstd, on the same bytes
+
+A ratio is only half a claim, so here are the two tools anyone would reach
+for, on exactly the corpus above, through the same interface: one 202 MiB
+frame per tool, one process per run, best of two, one pinned core, in
+`/dev/shm`. `zpse` is the in-tree CLI at its default level and at MAX.
+
+| tool | ratio | encode | decode |
+| --- | ---: | ---: | ---: |
+| zpse level 6 (default) | 1.68:1 | 0.19 GB/s | 0.57 GB/s |
+| zpse level 9 (MAX) | 1.85:1 | 0.18 GB/s | 0.57 GB/s |
+| lz4 -1 | 2.11:1 | 0.44 GB/s | 1.10 GB/s |
+| lz4 -9 | 2.72:1 | 0.04 GB/s | 1.19 GB/s |
+| zstd -1 | 2.89:1 | 0.21 GB/s | 0.96 GB/s |
+| zstd -3 | 3.20:1 | 0.17 GB/s | 0.82 GB/s |
+| zstd -9 | 3.58:1 | 0.05 GB/s | 0.84 GB/s |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.84 GB/s |
+
+Every round trip was compared whole against the input before it was timed.
+The rates include reading the input and writing the output through the page
+cache, so they are lower than the in-process numbers above for every tool;
+`/dev/shm` copies at about a gigabyte a second on this host, which is why the
+fast decoders bunch up.
+
+On this corpus zpse is on nobody's frontier: **lz4 -1 is both smaller
+(2.11:1 against 1.68:1) and more than twice as fast to encode**, so it
+dominates every zpse level outright, and zstd -1 does the same at a lower
+ratio cost. That is not a measurement artefact to explain away — it is what
+"half of Silesia is English prose and executables" means for a codec whose
+text path is a 64 KiB-window match finder behind a sample screen, against a
+thirty-year-old LZ4 implementation at -1.
+
+The reason is the same one the Silesia table shows one file at a time: on
+text the LZ form is what buys the ratio, and an LZ stream decodes at the rate
+of its own command loop, so the twelve-gigabyte decode rate that the tile
+formats reach is simply not available on `dickens` or `webster`. The strong
+claim this codec can make is on typed columns, and the columnar tables above
+are where to check it; Silesia is the corpus that shows the other side of the
+trade, which is why it is here at all.
 
 Running the ladder over Silesia is how a CLI bug surfaced. `-l N` used to OR
 the level into a word that already held the default, so `-l 1` ran BALANCED,
@@ -1017,13 +1068,20 @@ same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
 that function with its `-O2` neighbours, which is why the last row is slower
 than leaving the function untagged.
 
-The `-O3` row is the one the release uses, and it is worth checking against the
-level corpus's caution: on the 17-file corpus `zpse_cli bench` reads (68 MiB,
-from random to all-zeros, at the default level) the same two builds run the
-same files end to end in 410.2 ms at `-O2` and 365.5 ms at `-O3` -- encode 14%
-faster, decode 6%, every compressed size identical, byte for byte. The mean
-over that corpus is dominated by `zeros.bin`, so the encode side moves per file
-and not uniformly; the total time is the number to trust.
+The `-O3` row is the one the release uses, and re-checking it at the current
+default is worth the warning it produces: the 7% is the amalgamation's, and it
+is not reproducible on every corpus. Same two builds, same sources, sizes
+identical byte for byte, best of interleaved rounds, one pinned core: on the
+17-file corpus `zpse_cli bench` reads (68 MiB, from random to all-zeros) the
+encode medians are 838 MB/s at `-O2` and 844 at `-O3`, which is the noise
+floor and no more. On Silesia, where the encode has actual text to work on,
+the same pair reads 330 and 341 MB/s -- about 3%, and decode is unchanged
+within the same spread.
+
+So the release is built at `-O3` because it is not slower, not because it is
+7% faster: that figure belongs to the level corpus in the table above, and the
+honest reading of the two measurements together is that `-O3` pays for the
+inliner on a corpus of generators and gets nothing back on real data.
 
 `ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 18 functions it
 marks were measured together, and a tag put on a function whose callees are
