@@ -1015,13 +1015,13 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.30 GB/s | 0.58 GB/s | no |
-| zpse 5 BALANCED | 1.87:1 | 0.21 GB/s | 0.52 GB/s | no |
-| zpse 6 (default) | 2.00:1 | 0.20 GB/s | 0.49 GB/s | no |
-| zpse 9 MAX | 2.18:1 | 0.18 GB/s | 0.51 GB/s | no |
-| lz4 -1 | 2.11:1 | 1.82 GB/s | 1.53 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.16 GB/s | 1.49 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.34 GB/s | 1.01 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.34 GB/s | 0.54 GB/s | no |
+| zpse 5 BALANCED | 1.87:1 | 0.21 GB/s | 0.55 GB/s | no |
+| zpse 6 (default) | 2.00:1 | 0.19 GB/s | 0.52 GB/s | no |
+| zpse 9 MAX | 2.18:1 | 0.18 GB/s | 0.41 GB/s | no |
+| lz4 -1 | 2.11:1 | 1.78 GB/s | 1.46 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.15 GB/s | 1.44 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.35 GB/s | 1.04 GB/s | yes |
 | zstd -3 | 3.20:1 | 0.23 GB/s | 0.91 GB/s | yes |
 | zstd -19 | 4.01:1 | 0.002 GB/s | 0.85 GB/s | yes |
 
@@ -1032,8 +1032,14 @@ still off the frontier, for two reasons rather than three.
 *Encode.* A block here is decided, not merely encoded: the probe prices the
 candidate shapes, the ASCII gate prices three of them on two samples, and a
 block the gate convicts pays a screened match-finder pass. That decision is
-what caps the encoder near a fifth of `lz4 -1`'s rate, and lz4 makes none of
-it -- one pass, one token per match, no comparison of shapes. `zstd -1` is the
+what caps the encoder at a ninth of `lz4 -1`'s rate, and lz4 makes none of
+it -- one pass, one token per match, no comparison of shapes. The probe alone
+is 14.7% of the encode time over the twelve files, weighted by each file's
+share of the work: 2% on `dickens`, where the tiles win immediately, and 74%
+on `sao`, every block of which ends raw. So the decision is not one cost but
+ten small ones -- a full transform staging and an exact price per candidate --
+and removing it entirely would lift the corpus from 0.27 to 0.32 GB/s, not to
+`lz4`'s rate. The trials are the rest. `zstd -1` is the
 same story at a smaller multiple.
 
 *Decode.* An LZ block decodes at the rate of its own command loop, so the
