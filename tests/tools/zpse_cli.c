@@ -237,17 +237,17 @@ static int compress_mem(const uint8_t *in, size_t n, uint8_t *out,
                                         threads);
 }
 
-/* One encode arena per worker, 64-byte aligned, allocated once. */
-static void **alloc_enc_arenas(unsigned threads)
+/* One arena per worker, 64-byte aligned, allocated once. */
+static void **alloc_arenas(unsigned count, size_t size)
 {
-    void **a = (void **)malloc(sizeof(void *) * (size_t)threads);
+    void **a = (void **)malloc(sizeof(void *) * (size_t)count);
     unsigned i;
 
     if (a == NULL) {
         return NULL;
     }
-    for (i = 0; i < threads; i++) {
-        a[i] = ZPSE_CLI_ALIGNED(64u, ZPSE_ENC_ARENA_SIZE);
+    for (i = 0; i < count; i++) {
+        a[i] = ZPSE_CLI_ALIGNED(64u, size);
         if (a[i] == NULL) {
             while (i > 0u) {
                 ZPSE_CLI_FREE(a[--i]);
@@ -259,7 +259,7 @@ static void **alloc_enc_arenas(unsigned threads)
     return a;
 }
 
-static void free_enc_arenas(void **a, unsigned threads)
+static void free_arenas(void **a, unsigned threads)
 {
     unsigned i;
 
@@ -287,7 +287,8 @@ static int cmd_codec(int argc, char **argv)
     size_t out_len = 0u;
     size_t out_cap;
     void **enc_arenas = NULL;
-    void *dec_arena = NULL;
+    void **dec_arenas = NULL;
+    uint8_t *stage = NULL;
     int rc;
     int i = 2;
 
@@ -362,7 +363,7 @@ static int cmd_codec(int argc, char **argv)
          * afterwards, so it wants the larger buffer; the compaction never
          * costs a byte of the result. */
         out_cap = par > ser ? par : ser;
-        enc_arenas = alloc_enc_arenas(threads);
+        enc_arenas = alloc_arenas(threads, ZPSE_ENC_ARENA_SIZE);
     } else {
         ZpseFrameHeader h;
 
@@ -380,20 +381,26 @@ static int cmd_codec(int argc, char **argv)
             return 1;
         }
         out_cap = (size_t)h.content_size;
-        dec_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
+        dec_arenas = alloc_arenas(threads, ZPSE_DEC_ARENA_SIZE);
+        /* One staging block per worker: a block decode may write a few bytes
+         * past its own end, which must not land in the next block. */
+        stage = (uint8_t *)malloc((size_t)threads *
+                                  ((size_t)ZPSE_MAX_BLOCK_SIZE + 64u));
     }
-    if (compress ? (enc_arenas == NULL) : (dec_arena == NULL)) {
+    if (compress ? (enc_arenas == NULL)
+                 : (dec_arenas == NULL || stage == NULL)) {
         fprintf(stderr, "zpse_cli: arena allocation failed\n");
-        free_enc_arenas(enc_arenas, threads);
-        ZPSE_CLI_FREE(dec_arena);
+        free_arenas(enc_arenas, threads);
+        free_arenas(dec_arenas, threads);
+        free(stage);
         free(in);
         return 1;
     }
     out = (uint8_t *)malloc(out_cap + 1u);
     if (out == NULL) {
         fprintf(stderr, "zpse_cli: out of memory\n");
-        free_enc_arenas(enc_arenas, threads);
-        ZPSE_CLI_FREE(dec_arena);
+        free_arenas(enc_arenas, threads);
+        free_arenas(dec_arenas, threads);
         free(in);
         return 1;
     }
@@ -402,20 +409,26 @@ static int cmd_codec(int argc, char **argv)
         rc = compress_mem(in, in_len, out, out_cap, &out_len, block, enc_flags,
                           indexed, enc_arenas, threads);
     } else {
-        rc = zpse_decompress_frame(in, in_len, out, out_cap, &out_len,
-                                  dec_arena);
+        /* Frames written with -x decode block by block, so -t applies here
+         * too; a frame without an index decodes sequentially inside the same
+         * call, which is why the thread count is not an error there. */
+        rc = zpse_decompress_frame_parallel(in, in_len, out, out_cap,
+                                           &out_len, threads, dec_arenas,
+                                           threads, stage);
     }
     if (rc != 0) {
         fprintf(stderr, "zpse_cli: codec failed rc=%d\n", rc);
-        free_enc_arenas(enc_arenas, threads);
-        ZPSE_CLI_FREE(dec_arena);
+        free_arenas(enc_arenas, threads);
+        free_arenas(dec_arenas, threads);
+        free(stage);
         free(out);
         free(in);
         return 1;
     }
     rc = write_file(out_path, out, out_len);
-    free_enc_arenas(enc_arenas, threads);
-    ZPSE_CLI_FREE(dec_arena);
+    free_arenas(enc_arenas, threads);
+    free_arenas(dec_arenas, threads);
+    free(stage);
     free(out);
     free(in);
     return rc;
@@ -484,7 +497,8 @@ static int cmd_bench(int argc, char **argv)
     double tot_enc_ns = 0.0;
     double tot_dec_ns = 0.0;
     void **enc_arenas;
-    void *dec_arena;
+    void **dec_arenas;
+    uint8_t *stage;
 
     for (; i < argc && argv[i][0] == '-'; i++) {
         switch (argv[i][1]) {
@@ -566,17 +580,26 @@ static int cmd_bench(int argc, char **argv)
             return 2;
         }
     }
+    /* The parallel decoder finds a block through the index, so a threaded
+     * bench measures an indexed frame. It costs 8 bytes per block in the
+     * ratio column, and the header line says which frame was measured. */
+    if (threads > 1u) {
+        indexed = 1;
+    }
     files = argc - i;
     if (files < 1) {
         fprintf(stderr, "usage: zpse_cli bench [opts] FILE...\n");
         return 2;
     }
-    enc_arenas = alloc_enc_arenas(threads);
-    dec_arena = ZPSE_CLI_ALIGNED(64u, ZPSE_DEC_ARENA_SIZE);
-    if (enc_arenas == NULL || dec_arena == NULL) {
+    enc_arenas = alloc_arenas(threads, ZPSE_ENC_ARENA_SIZE);
+    dec_arenas = alloc_arenas(threads, ZPSE_DEC_ARENA_SIZE);
+    stage = (uint8_t *)malloc((size_t)threads *
+                              ((size_t)ZPSE_MAX_BLOCK_SIZE + 64u));
+    if (enc_arenas == NULL || dec_arenas == NULL || stage == NULL) {
         fprintf(stderr, "zpse_cli: arena allocation failed\n");
-        free_enc_arenas(enc_arenas, threads);
-        ZPSE_CLI_FREE(dec_arena);
+        free_arenas(enc_arenas, threads);
+        free_arenas(dec_arenas, threads);
+        free(stage);
         return 1;
     }
     if (!quiet) {
@@ -662,7 +685,8 @@ static int cmd_bench(int argc, char **argv)
             failures++;
             continue;
         }
-        if (indexed && !check_seek(comp, comp_len, in, n, block, dec_arena)) {
+        if (indexed &&
+            !check_seek(comp, comp_len, in, n, block, dec_arenas[0])) {
             free(in);
             free(comp);
             free(out);
@@ -671,8 +695,9 @@ static int cmd_bench(int argc, char **argv)
         }
         t0 = now_ns();
         for (r = 0; r < reps; r++) {
-            if (zpse_decompress_frame(comp, comp_len, out, n, &out_len,
-                                      dec_arena) != 0) {
+            if (zpse_decompress_frame_parallel(comp, comp_len, out, n,
+                                               &out_len, threads, dec_arenas,
+                                               threads, stage) != 0) {
                 fprintf(stderr, "zpse_cli: decompress failed on %s\n", path);
                 ok = 0;
                 break;
@@ -713,8 +738,9 @@ static int cmd_bench(int argc, char **argv)
                (double)tot_passed / tot_dec_ns * 1e3,
                (tot_enc_ns + tot_dec_ns) / 1e6);
     }
-    ZPSE_CLI_FREE(dec_arena);
-    free_enc_arenas(enc_arenas, threads);
+    free_arenas(enc_arenas, threads);
+    free_arenas(dec_arenas, threads);
+    free(stage);
     if (failures) {
         fprintf(stderr, "zpse_cli: %d file(s) failed\n", failures);
         return 1;

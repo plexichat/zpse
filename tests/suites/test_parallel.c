@@ -33,11 +33,23 @@
  * layout of the worker path, whichever is larger. */
 #define COMP_CAP (MAXN + MAXN / 8u + 65536u)
 
-static unsigned char ea[MAXTHREADS][ZPSE_ENC_ARENA_SIZE]
-    __attribute__((aligned(64)));
-static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
+/* MSVC has no __attribute__; the arenas have to be 64-byte aligned either
+ * way, so the spelling is the only thing that differs. */
+#if defined(_MSC_VER)
+#define ZPSE_ALIGN64 __declspec(align(64))
+#else
+#define ZPSE_ALIGN64 __attribute__((aligned(64)))
+#endif
+
+static unsigned char ea[MAXTHREADS][ZPSE_ENC_ARENA_SIZE] ZPSE_ALIGN64;
+static unsigned char da[ZPSE_DEC_ARENA_SIZE] ZPSE_ALIGN64;
+static unsigned char dmt[MAXTHREADS][ZPSE_DEC_ARENA_SIZE] ZPSE_ALIGN64;
 
 static void *arenas[MAXTHREADS] = { ea[0], ea[1], ea[2], ea[3], ea[4], ea[5] };
+static void *decs[MAXTHREADS] = { dmt[0], dmt[1], dmt[2],
+                                  dmt[3], dmt[4], dmt[5] };
+
+static unsigned char stage[MAXTHREADS * (BLKMAX + 64u)];
 
 static uint8_t in[MAXN];
 static uint8_t ref[COMP_CAP];
@@ -108,6 +120,7 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     size_t plen = 0u;
     size_t qlen = 0u;
     size_t got = 0u;
+    size_t pgot = 0u;
     uint32_t nblocks = n / block + (n % block != 0u ? 1u : 0u);
     int rc;
 
@@ -161,6 +174,20 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     CHECK(rc == PSE_OK && got == n && memcmp(out, in, n) == 0,
           "%u workers: decoded bytes (n %u, block %u, flags %u)", threads, n,
           block, enc_flags);
+
+    /* The read side, on the same frame. A frame without the index cannot be
+     * decoded in parallel -- block k's offset is only in the table -- so the
+     * call falls back to the sequential decoder there, and either way the
+     * output has to be the input. */
+    memset(out, 0, n);
+    rc = zpse_decompress_frame_parallel(par, plen, out, sizeof out, &pgot,
+                                        threads, (void *const *)decs,
+                                        MAXTHREADS, stage);
+    CHECK(rc == PSE_OK, "%u workers: parallel decode (n %u, index %d): %s",
+          threads, n, indexed, zpse_status_name(rc));
+    CHECK(rc == PSE_OK && pgot == n && memcmp(out, in, n) == 0,
+          "%u workers: parallel decoded bytes (n %u, block %u, index %d)",
+          threads, n, block, indexed);
 
     if (indexed) {
         uint32_t count = 0u;

@@ -769,7 +769,9 @@ gcc -std=c11 -O2 -Iinclude src/zpse_unity.c your_program.c -o your_program
 The parallel frame encoder is the one part behind a switch: add `-DZPSE_MT
 -pthread` (POSIX; the Win32 path uses `CreateThread` instead) to compile it in.
 `tests/runners/run.sh` builds `test_parallel` both ways and requires the same
-frames from each.
+frames from each, and `tests/benchmarks/bench_parallel.c` -- the source of the
+scaling table above -- refuses to run without the switch rather than print a
+flat table that measures one core.
 
 Portable C11, no compiler-specific code outside `#if defined(__GNUC__)`
 guards; AVX2 paths are selected at runtime (`zpse_cpu_caps()`), and the scalar
@@ -853,12 +855,57 @@ blocks per worker is encoded serially too: spawning a thread costs more than
 the tenth of a millisecond it would save, and the bytes are the same either
 way.
 
-`zpse_cli c -t N` and `zpse_cli bench -t N` are that call, one arena per
-worker. `dir` and `x` are unchanged, because they are the read side and the
-index is built by the same pass whichever encoder wrote the blocks. Every
-figure in this file is one core and one thread: the parallel path exists so a
-caller with cores to spare does not have to split blocks itself, not to make a
-single decode faster.
+`zpse_cli c -t N`, `zpse_cli d -t N` and `zpse_cli bench -t N` are that call,
+one arena per worker. `dir` and `x` are unchanged, because they are the read
+side and the index is built by the same pass whichever encoder wrote the
+blocks.
+
+The read side has its own function, `zpse_decompress_frame_parallel()`, and it
+needs the index for the same reason `x` does: block *k*'s offset is only in the
+table. A frame without one decodes sequentially inside the same call. What it
+adds over the serial decoder is a per-worker **staging block** of
+`nominal_block_size + 64` bytes, and that is not caution: the LZ decoder's
+one-shot command paths write up to sixteen bytes past the match they copy, on
+the argument that the next command overwrites them. In one sequential buffer
+that is true and free; in a parallel decode block *k*'s tail is block *k+1*'s
+head, so each worker decodes into its staging block -- which has the slack --
+and copies the bytes it produced into place. One copy per block at memory
+speed, against a block decode several times slower.
+
+Both directions stay serial on small frames, because a thread start costs more
+than the queue: encode wants four blocks per worker and decode thirty-two (a
+block decodes in about five microseconds). The bytes are the same either way,
+which is what makes the threshold a scheduling decision rather than a format
+one.
+
+### Scaling across workers
+
+This is the one table in this file that is not one core and one thread. Six
+worker counts on the mixed columnar corpus, 64 KiB blocks, indexed frames,
+best of four, pinned to the host's six logical CPUs (`bench_parallel.c`); the
+host reports three cores with two threads each, so the six-worker column is
+three cores with SMT. GB/s of uncompressed bytes; `—` is a frame small enough
+that the queue threshold keeps it on one worker.
+
+| frame | encode 1 | 2 | 3 | 6 | decode 1 | 2 | 3 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 MiB | 1.64 | 2.26 | 2.62 | 3.00 | — | — | — | — |
+| 4 MiB | 1.56 | 2.55 | 3.52 | 4.58 | 5.58 | 7.39 | 8.77 | 8.73 |
+| 16 MiB | 0.62 | 1.02 | 1.63 | 2.77 | 4.01 | 5.44 | 8.48 | 11.09 |
+| 64 MiB | 0.58 | 1.11 | 1.61 | 2.58 | 4.04 | 5.83 | 7.79 | 10.88 |
+
+Encode scales better than decode because it has five times more to do: the
+encode column is the sweep and the match finder on four different column
+shapes, and the decode column is a block reconstruction that already runs at
+four to six gigabytes a second on one core. A 64 MiB frame goes from 0.58 to
+2.58 GB/s of encode and from 4.04 to 10.88 GB/s of decode, and the frames
+below about four megabytes stay serial in both directions.
+
+Every frame in that table was checked twice: the workers' frame is compared
+byte for byte with the one-worker frame (that is the `identical frames` column
+`bench_parallel` prints), and every decode is compared whole with the input.
+
+Every **other** figure in this file is one core and one thread.
 
 ### What the compiler adds, and what the tags are worth
 

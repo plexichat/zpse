@@ -76,6 +76,22 @@ jobs:
           ${{ matrix.cc }} -std=c11 -O2 -Wall -Wextra -Iinclude tests/tools/enc_profile.c src/zpse_unity.c -o /tmp/enc_profile
           /tmp/enc_profile 1 zeros | head -20
 
+  windows-msvc:
+    name: windows / msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Parallel encoder suite (MSVC, Win32 threads)
+        shell: cmd
+        # The MSYS2 job builds with gcc, so this is the only place the
+        # CreateThread / InterlockedIncrement half of the parallel encoder
+        # is compiled and run by the compiler it ships to.
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
+          cl /nologo /std:c11 /O2 /W4 /DZPSE_MT /Iinclude tests\suites\test_parallel.c src\zpse_unity.c /Fe:test_parallel.exe
+          test_parallel.exe
+
   windows:
     name: windows / msys2 gcc
     runs-on: windows-latest
