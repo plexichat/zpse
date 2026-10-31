@@ -523,16 +523,18 @@ static ZPSE_ASCII_BMI2 uint32_t tile_ascii_pack_bmi2_body(const uint8_t *in,
     return p;
 }
 
-/* One seven-byte group back to eight ASCII bytes: the low 56 bits of the
- * load are the seven-bit fields, and pdep puts each in the low seven bits of
- * its own byte. The caller guarantees eight readable bytes at p. */
+/* One seven-byte group back to eight ASCII bytes: the seven-bit fields are
+ * the low 56 bits of the load, and pdep puts each in the low seven bits of
+ * its own byte. The caller guarantees eight readable bytes at p. The load is
+ * not masked first: pdep reads only the low popcount(mask) == 56 source bits,
+ * so the eighth byte the load brings in is ignored by the instruction itself
+ * -- four `and`s per 28-byte step that produced nothing. */
 static ZPSE_ASCII_BMI2 uint64_t tile_ascii_load7(const uint8_t *p)
 {
     uint64_t v;
 
     memcpy(&v, p, sizeof v);
-    return _pdep_u64(v & UINT64_C(0x00FFFFFFFFFFFFFF),
-                     UINT64_C(0x7F7F7F7F7F7F7F7F));
+    return _pdep_u64(v, UINT64_C(0x7F7F7F7F7F7F7F7F));
 }
 
 static ZPSE_ASCII_BMI2 void tile_ascii_unpack_bmi2_body(const uint8_t *in,
@@ -571,8 +573,9 @@ static ZPSE_ASCII_BMI2 void tile_ascii_unpack_bmi2_body(const uint8_t *in,
         uint64_t w;
 
         if (p + 8u <= in_len) {
+            /* Unmasked for the same reason as tile_ascii_load7: pdep takes
+             * only the low 56 bits. */
             memcpy(&v, in + p, sizeof v);
-            v &= UINT64_C(0x00FFFFFFFFFFFFFF);
         } else {
             v = tile_ascii_gather(in + p, 7u);
         }
@@ -3702,14 +3705,36 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
 #define ZPSE_STRIDE_WIDE_COND                                                  \
     (p + 16u <= (uint32_t)nt && j + 16u <= 256u)
 
+/* Repetition pattern for one group of stride s with no exceptions in it: the
+ * group's byte i is the byte s positions before it, so it is the s-byte run
+ * that precedes the group repeated, i.e. prev_[16 - s + (i mod s)]. These are
+ * that index vector for the three strides this kernel handles. */
+static const uint8_t zpse_stride_pat2[16] = {
+    14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15
+};
+static const uint8_t zpse_stride_pat3[16] = {
+    13, 14, 15, 13, 14, 15, 13, 14, 15, 13, 14, 15, 13, 14, 15, 13
+};
+static const uint8_t zpse_stride_pat4[16] = {
+    12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15
+};
+
 /* `prev_` is the sixteen bytes before the group, which is exactly the vector
  * the previous group stored, so it lives in a register across the loop
  * instead of being loaded back from `out`: that load is a store-to-load
  * forward of the store one iteration ago, a ~5 cycle stall the loop can
  * simply not have. On the regular columns this kernel exists for, the load
  * was the single busiest instruction in the whole decoder (measured: 19% of
- * ts_gapped's decode samples on it). */
-#define ZPSE_STRIDE_WIDE_GROUP(S_)                                             \
+ * ts_gapped's decode samples on it).
+ *
+ * `PAT_` is the group's repetition pattern for stride `S_` (see
+ * zpse_stride_pat2 and friends). The no-exception group used to build its
+ * sixteen bytes from ceil(16/S_) dependent `palignr`s -- each one waiting on
+ * the previous, 8 of them for stride 2 -- when the bytes they produce are
+ * just that pattern repeated: one `pshufb`. The exception path still walks
+ * the recurrence, because an exception changes what the following positions
+ * predict. */
+#define ZPSE_STRIDE_WIDE_GROUP(S_, PAT_)                                       \
     do {                                                                       \
         const uint32_t sh_ = p & 31u;                                          \
         const uint32_t bits_ = (mw[p >> 5u] >> sh_) & 0xFFFFu;                 \
@@ -3720,16 +3745,13 @@ static uint16_t tile_stride1_recon(uint8_t *out, uint16_t nt,
             /* Every position in the group takes the prediction, which is     \
              * the common case on the regular columns this kernel exists     \
              * for. There is no exception value, no unit to gather and no    \
-             * unit index to advance, so the group is the bare recurrence:   \
-             * `ceil(16/s)` shifts of the group in progress, and nothing on  \
-             * the shuffle or gather ports. The recurrence is the same one   \
-             * the full path runs -- blend(t, anything, 0) is t -- so the    \
-             * bytes are identical either way. */                          \
-            v_ = prev_;                                                        \
-            for (n_ = 0u;                                                   \
-                 n_ < (16u + (uint32_t)(S_) - 1u) / (uint32_t)(S_); n_++) { \
-                v_ = _mm_alignr_epi8(v_, prev_, 16 - (int)(S_));            \
-            }                                                                  \
+             * unit index to advance, so the group is the s-byte pattern     \
+             * before it repeated -- one shuffle, and nothing on the gather  \
+             * port. The shuffle produces the same bytes the `ceil(16/s)`    \
+             * dependent `palignr` chain produced (byte i is prev_[16-s+     \
+             * (i mod s)] either way), so this is the same recurrence the    \
+             * full path runs with the exception blend removed. */           \
+            v_ = _mm_shuffle_epi8(prev_, PAT_);                               \
             _mm_storeu_si128((__m128i *)(void *)(out + p), v_);                \
             prev_ = v_;                                                        \
             p += 16u;                                                          \
@@ -3827,14 +3849,23 @@ static ZPSE_TILE_AVX2 uint16_t tile_stride_recon_wide(
     prev_ = _mm_loadu_si128((const __m128i *)(const void *)out);
 
     if (s == 2u) {
+        const __m128i pat_ = _mm_loadu_si128(
+            (const __m128i *)(const void *)zpse_stride_pat2);
+
         while (ZPSE_STRIDE_WIDE_COND)
-            ZPSE_STRIDE_WIDE_GROUP(2);
+            ZPSE_STRIDE_WIDE_GROUP(2, pat_);
     } else if (s == 3u) {
+        const __m128i pat_ = _mm_loadu_si128(
+            (const __m128i *)(const void *)zpse_stride_pat3);
+
         while (ZPSE_STRIDE_WIDE_COND)
-            ZPSE_STRIDE_WIDE_GROUP(3);
+            ZPSE_STRIDE_WIDE_GROUP(3, pat_);
     } else {
+        const __m128i pat_ = _mm_loadu_si128(
+            (const __m128i *)(const void *)zpse_stride_pat4);
+
         while (ZPSE_STRIDE_WIDE_COND)
-            ZPSE_STRIDE_WIDE_GROUP(4);
+            ZPSE_STRIDE_WIDE_GROUP(4, pat_);
     }
 
     for (; p < (uint32_t)nt; p++)

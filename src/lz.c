@@ -826,6 +826,41 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 op_done += lit + mlen;
                 continue;
             }
+            /* The same one-shot shape, one width up: a match of 17..32
+             * bytes at a distance of at least thirty-two is still one
+             * overlapping store, and a command whose literal run is at most
+             * eight bytes still fits it in the same forty bytes of output
+             * the sixteen-byte form proves it has (8 + 32). It is a second
+             * branch rather than a width chosen inside the first one
+             * because the first one's shape -- eight literals and a match
+             * that fits in sixteen -- is most commands of a JSON block, and
+             * a select in front of it cost that path two compares it never
+             * needed (json_rows 4570 -> 4340 MB/s). Here nothing is paid
+             * unless the sixteen-byte form has already declined, which is
+             * one command in twenty-five on json_rows and one in three on
+             * log_lines -- where 2.33M of 4.98M commands are matches of
+             * 17..32 bytes at a distance over 32 and used to fall through to
+             * lz_copy_match's width ladder and doubling loop for them.
+             *
+             * The bytes are the ladder's own: at distance d >= w the w bytes
+             * before a match position are exactly the bytes it repeats, and
+             * a store past the match is reclaimed by the next command
+             * (lz_copy_match's slack argument). The conditions are the first
+             * branch's with the wider pair, tested in the same order, and a
+             * command that fails them still reaches the general path below,
+             * which accepts and rejects exactly what it did. */
+            if (lit <= 8u && lit <= lit_rem && off >= 32u &&
+                mlen <= 32u && lit_safe16 != 0 && off <= op_done &&
+                op_rem >= 40u) {
+                memcpy(op, lp, 8u);
+                memcpy(op + lit, op + lit - (ptrdiff_t)off, 32u);
+                op += lit + mlen;
+                lp += lit;
+                lit_rem -= lit;
+                op_rem -= lit + mlen;
+                op_done += lit + mlen;
+                continue;
+            }
             if (lit > lit_rem || lit > op_rem) {
                 return PSE_BAD_LZ;
             }

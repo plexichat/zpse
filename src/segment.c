@@ -29,11 +29,30 @@
 /* Every header byte of that exact record, so the shortcut below cannot
  * accept a record the general path would reject: flags, CONST_ZERO, a
  * 256-byte length, no exceptions, an empty mask and a 224-byte payload.
- * rs is the length prefix the caller already read. */
+ * rs is the length prefix the caller already read.
+ *
+ * The eight header bytes are one wire word, so they are compared as one:
+ * the test used to be seven loads and seven compares per record, and the
+ * run scan below makes it once per record of a run (256 times per 64 KiB
+ * on text). The word is little-endian by construction --
+ *
+ *   [0] ZPSE_ASCII_FLAGS  [1] CONST_ZERO   [2] 255
+ *   [3] 0                 [4..5] mask size 0 (u16le)
+ *   [6..7] ZPSE_ASCII_REC - 8 = 224 (u16le)
+ *
+ * -- which is the order the encoder's own stores produce, so the compare
+ * is exact on every host whose byte order the format already names. The
+ * load is only reached with rs == ZPSE_ASCII_REC, i.e. with eight bytes
+ * of record in front of it, so it reads exactly what the byte tests did. */
+#define ZPSE_ASCII_PAT UINT64_C(0x00E0000000FF0087)
+
+/* Defined below: one unaligned 64-bit load. Declared here so the head
+ * test above it can be a word compare rather than eight byte compares. */
+static uint64_t seg_load_u64(const uint8_t *p);
+
 #define ZPSE_ASCII_HEAD_OK(p, rs)                                          \
-    ((rs) == (uint32_t)ZPSE_ASCII_REC && (p)[0] == ZPSE_ASCII_FLAGS &&      \
-     (p)[1] == 0u && (p)[2] == 255u && (p)[3] == 0u && (p)[4] == 0u &&      \
-     (p)[5] == 0u && (p)[6] == 224u && (p)[7] == 0u)
+    ((rs) == (uint32_t)ZPSE_ASCII_REC &&                                   \
+     seg_load_u64(p) == ZPSE_ASCII_PAT)
 
 #if defined(ZPSE_TRIAL_STATS)
 /* Which (mask_mode, res_mode) the mode search actually picks, indexed
@@ -88,6 +107,22 @@ static uint64_t seg_load_u64(const uint8_t *p)
     memcpy(&w, p, sizeof w);
     return w;
 }
+
+/* The predictor ids the batched all-hit run accepts: every id except
+ * ORDER1 (3), ORDER2 (4) and TILE_CONSTANT (9) -- the three whose tile is
+ * not a pure prediction from the segment literal. One range test and one
+ * shift-and-test, where the chain it replaces was up to five compares on
+ * every tile that reached this point (i.e. on every tile of a stream whose
+ * records are not eight-byte all-hit ones). */
+static int seg_all_hit_pred(uint8_t pid)
+{
+    return pid < 12u && ((UINT32_C(0xDE7) >> pid) & 1u) != 0u;
+}
+
+/* The eight-byte header of that record, with byte 1 (the predictor, which
+ * seg_all_hit_pred tests) masked out: flags == RESET, exception count 255,
+ * and both payload sizes zero. */
+#define ZPSE_ALLHIT_PAT UINT64_C(0x0000000000FF0080)
 
 /* ---- 256-byte fill for a full constant tile ------------------------- *
  * A const tile's prediction is one byte, so the tile is that byte
@@ -525,15 +560,18 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
          * every byte before the run -- in-place is what the per-tile path
          * relies on as well), then the same repeated doubling the per-tile
          * path uses to expand a seed to a whole tile. */
-        if ((rec[1] <= (uint8_t)ZPSE_P_LANE_DELTA ||
-             rec[1] == (uint8_t)ZPSE_P_LANE_AVERAGE ||
-             rec[1] == (uint8_t)ZPSE_P_STRIDE_3 ||
-             (rec[1] >= (uint8_t)ZPSE_P_STRIDE_1 &&
-              rec[1] <= (uint8_t)ZPSE_P_STRIDE_8)) &&
-            rsz == 8u && nt_exp == 256u &&
-            rec[0] == (uint8_t)ZPSE_TILE_FLAG_RESET &&
-            rec[2] == 255u && rec[3] == 0u && rec[4] == 0u &&
-            rec[5] == 0u && rec[6] == 0u && rec[7] == 0u) {
+        /* The record length is tested FIRST, because it is the field that
+         * separates this shape from every other one: an all-hit record is
+         * exactly ten bytes (a two-byte length plus the eight-byte header),
+         * while a dense or palette tile's record is tens to hundreds. Before
+         * this the predictor chain ran first and every non-all-hit tile paid
+         * its five compares to learn nothing; now such a tile is rejected by
+         * one compare, and the eight-byte load below is safe because rsz is
+         * known to be 8 by the time it is taken. The remaining header bytes
+         * are compared as one masked word instead of six more loads. */
+        if (rsz == 8u && nt_exp == 256u &&
+            (seg_load_u64(rec) & ~UINT64_C(0xFF00)) == ZPSE_ALLHIT_PAT &&
+            seg_all_hit_pred(rec[1]) != 0) {
             uint32_t run = 1u;
             uint32_t rpos = pos + 10u;
             uint32_t rprod = produced + 256u;
@@ -545,7 +583,9 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
              * covers the whole header (reset flag, predictor, both payload
              * sizes), which is exactly what those comparisons test, and the
              * run's first record has already passed them, so a record whose
-             * word matches is a member for the same reason it was. */
+             * word matches is a member for the same reason it was. It is the
+             * same load the gate above took; kept in a named local so the
+             * steps below read as a membership test rather than a mask. */
             uint64_t pat = seg_load_u64(rec);
 
             /* Two records per step, and only while the scalar loop below
@@ -598,10 +638,18 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                     break;
                 }
                 r2 = payload + rpos + 2u;
+                /* Same membership test as the two-at-a-time step above,
+                 * which already compared one word: the three checks it
+                 * makes beyond the record's own bytes are all implied by
+                 * this loop's own conditions (see the note there), so a
+                 * matching word plus the same predictor byte is a member
+                 * for the same reason. One load and two compares replace
+                 * eight byte loads and compares per record of the run. The
+                 * eight bytes are in bounds because the loop broke above
+                 * unless payload_len - rpos - 2 >= 8. */
                 if (r2[1] != rec[1] ||
-                    r2[0] != (uint8_t)ZPSE_TILE_FLAG_RESET ||
-                    r2[2] != 255u || r2[3] != 0u || r2[4] != 0u ||
-                    r2[5] != 0u || r2[6] != 0u || r2[7] != 0u) {
+                    (seg_load_u64(r2) & ~UINT64_C(0xFF00)) !=
+                        ZPSE_ALLHIT_PAT) {
                     break;
                 }
                 run++;
@@ -723,11 +771,21 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                 (rec[0] & ZPSE_TILE_FLAG_RESET) != 0u &&
                 rec[1] != (uint8_t)ZPSE_P_ORDER1 &&
                 rec[1] != (uint8_t)ZPSE_P_ORDER2 &&
+                /* A record that matches the previous one's header reaches
+                 * the full compare below; on a plane whose tiles repeat
+                 * (the copy path is the whole of a homogeneous block's
+                 * decode) it also matches the eight payload bytes behind
+                 * the header, so testing those first costs two loads on the
+                 * accepted path and saves the `memcmp` call on every tile
+                 * that merely shares a form. rsz == prev_rsz with rsz >= 16
+                 * is what makes both loads stay inside the records. */
+                (rsz < 16u ||
+                 seg_load_u64(rec + 8u) == seg_load_u64(prev_rec + 8u)) &&
                 memcmp(rec, prev_rec, (size_t)rsz) == 0 &&
                 (rec[1] < (uint8_t)ZPSE_P_STRIDE_1 ||
                  rec[1] > (uint8_t)ZPSE_P_STRIDE_8 ||
-                 memcmp(decoded_out + produced - 8u,
-                        decoded_out + produced - 264u, 8u) == 0)) {
+                 seg_load_u64(decoded_out + produced - 8u) ==
+                     seg_load_u64(decoded_out + produced - 264u))) {
                 memcpy(decoded_out + produced, decoded_out + produced - 256u,
                        256u);
                 produced += 256u;

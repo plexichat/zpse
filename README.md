@@ -402,7 +402,7 @@ speed, and that is what the level's **acceleration factor** decides: an LZ strea
 speed of its command loop, one 4-byte command per output run, so its rate
 follows the average run length. Over 64 KiB blocks, at six bytes per command
 prose decodes at about 2.5 GB/s, at eleven bytes JSON at 4.5, at twenty bytes
-variable strings at 5.7, and at a hundred or more the long-run patterns at 5
+variable strings at 5.9, and at a hundred or more the long-run patterns at 5
 to 6.5 -- against 5-13 GB/s for a tile stream. The match copy described below
 is what keeps the short end of that range from costing more than one command
 per match.
@@ -514,6 +514,19 @@ fall through to the general path when a bound misses. Every bound the general
 path tests is in that one condition, so a stream it refuses is refused there
 too, and both stores over-copy into bytes a later command writes -- the slack
 argument the literal and match copies already make.
+
+The same shape one width up -- at most eight literals and a match of 17..32
+bytes at a distance of at least thirty-two -- is a second branch rather than a
+width selected inside the first, because a select in front of the first path
+cost `json_rows` 5% of the rate it had (4.57 -> 4.34 GB/s) for a branch it used
+to take one time in twenty-five, and nothing is paid for the second unless the
+first has already declined. It is not a rare tail: on `log_lines`
+2.33M of its 4.98M one-shot commands are matches of exactly that shape, a
+third of the block, and each of them used to fall through to `lz_copy_match`'s
+width ladder and doubling loop for what is still one overlapping store. Over
+the corpus, LZ decode alone: `log_lines` 4.57 -> 4.99 GB/s, `var_string`
+5.71 -> 5.95, `json_rows` 4.56 -> 4.60, and the whole decoder 1.0%
+time-weighted (0.5% geomean), with no other case moved by more than noise.
 
 The parity, fuzz and least-effort suites report identical digests in the
 default and `-DZPSE_FORCE_SCALAR` builds, which is the statement that this

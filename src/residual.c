@@ -168,9 +168,12 @@ static int residual_delta(uint8_t x, uint8_t pred)
 
 /* True when any of the first n bytes is exactly 0xFF.
  *
- * The per-byte rejection loop below (mode 0) is a branch inside the
- * loop body, which is what stops the compiler from vectorising or
- * unrolling it; the same question can be asked of eight bytes at once.
+ * The per-byte form of this test (a branch inside the loop body, which is
+ * what stops the compiler from vectorising or unrolling it) is what mode 0
+ * of the encoder and the mode-2 palette check used to be; the same question
+ * can be asked of eight bytes at once. The decoder's mode-0 copy asks it
+ * while it copies -- see residual_copy_u8_checked below -- which is the
+ * other half of the same idea.
  * `~w` turns a 0xFF byte into a zero byte, and the classic "has zero
  * byte" idiom then reports it: (x - 0x01..01) & ~x & 0x80..80 is
  * non-zero exactly when x has a zero byte. Byte order is irrelevant here
@@ -196,6 +199,74 @@ static int residual_has_ff(const uint8_t *p, uint32_t n)
         }
     }
     return 0;
+}
+
+/* The mode-0 decode test and the copy it guards, in one pass.
+ *
+ * The decoder asks two questions of the same k payload bytes: "is any of
+ * them 0xFF" (which an exclusion residual cannot be) and "copy them into
+ * the tile's `resid[]` scratch". Asked separately that walks the payload
+ * twice -- k bytes read twice, k bytes stored once -- and on a dense
+ * exclusion plane the copy is already the whole cost of the tile, so the
+ * first walk is pure overhead. One step that stores the eight-byte word it
+ * has just loaded and applies the same "has a zero byte" idiom to its
+ * complement asks both questions at once: the loads, which are the memory
+ * traffic half of the pass, happen once instead of twice.
+ *
+ * The answer is the has-FF one, so the caller's status is unchanged. A
+ * rejecting payload can leave more bytes in `dst` than the per-byte loop
+ * had written before it stopped; no caller can observe that, for the
+ * reason recorded at the mode-0 branch of zpse_residual_decode (the status
+ * is checked first, and `exc_out` is the tile's `resid[]` scratch, which
+ * is never read after a rejection). `residual_has_ff` stays for the
+ * encoder, which needs the answer without the copy. */
+static int residual_copy_u8_checked(uint8_t *dst, const uint8_t *src,
+                                    uint32_t n)
+{
+    uint32_t i = 0;
+    int bad = 0;
+
+    while (i + 32u <= n) {
+        uint64_t w0, w1, w2, w3;
+
+        memcpy(&w0, src + i, sizeof w0);
+        memcpy(&w1, src + i + 8u, sizeof w1);
+        memcpy(&w2, src + i + 16u, sizeof w2);
+        memcpy(&w3, src + i + 24u, sizeof w3);
+        memcpy(dst + i, &w0, sizeof w0);
+        memcpy(dst + i + 8u, &w1, sizeof w1);
+        memcpy(dst + i + 16u, &w2, sizeof w2);
+        memcpy(dst + i + 24u, &w3, sizeof w3);
+        w0 = ~w0;
+        w1 = ~w1;
+        w2 = ~w2;
+        w3 = ~w3;
+        bad |= (int)(((w0 - UINT64_C(0x0101010101010101)) & ~w0 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        bad |= (int)(((w1 - UINT64_C(0x0101010101010101)) & ~w1 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        bad |= (int)(((w2 - UINT64_C(0x0101010101010101)) & ~w2 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        bad |= (int)(((w3 - UINT64_C(0x0101010101010101)) & ~w3 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        i += 32u;
+    }
+    for (; i + 8u <= n; i += 8u) {
+        uint64_t w;
+
+        memcpy(&w, src + i, sizeof w);
+        memcpy(dst + i, &w, sizeof w);
+        w = ~w;
+        bad |= (int)(((w - UINT64_C(0x0101010101010101)) & ~w &
+                      UINT64_C(0x8080808080808080)) != 0u);
+    }
+    for (; i < n; i++) {
+        uint8_t v = src[i];
+
+        dst[i] = v;
+        bad |= (v == 255u) ? 1 : 0;
+    }
+    return bad;
 }
 
 /* Forward byte copy, a word at a time. Produces exactly the bytes the
@@ -365,12 +436,17 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     uint8_t pal[16];
     __m128i palv;
     __m128i limv;
+    uint32_t caps;
 
     /* m is in [2,16], so b is in [1,4] and every width has a path below. */
     if (b < 1u || b > 4u) {
         return 0u;
     }
-    if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
+    /* One query, not two: this function is entered once per tile, and the
+     * SSSE3 answer it needs first is the same word the AVX2 test below
+     * needs a few lines later. */
+    caps = ZPSE_CPU_CAPS_FAST();
+    if ((caps & (uint32_t)ZPSE_CPU_SSSE3) == 0u) {
         return 0u;
     }
 #if ZPSE_RES_HAVE_AVX2
@@ -380,13 +456,24 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
      * scalar tail below finishes whatever it leaves, exactly as it does
      * for the 128-bit loop. */
     if (b == 4u && m == 16u && k >= 64u &&
-        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        (caps & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         i = residual_decode_mode2_avx2_m16(palette, src, k, exc_out);
     }
 #endif
-    memcpy(pal, palette, (size_t)m);
-    memset(pal + m, 0, sizeof pal - (size_t)m);
-    palv = _mm_loadu_si128((const __m128i *)(const void *)pal);
+    /* A full palette needs no staging copy: sixteen entries fill the
+     * register exactly, and the caller has already proved payload_len ==
+     * 1 + m + packed, so all sixteen bytes past the mode byte are readable
+     * from the payload. The copy and its zero fill exist for the shorter
+     * palettes, where a payload with m < 16 has no readable bytes after the
+     * palette to load with -- and m == 16 is the shape every nine-to-
+     * sixteen-value plane (i.e. every dense palette record) has. */
+    if (m == 16u) {
+        palv = _mm_loadu_si128((const __m128i *)(const void *)palette);
+    } else {
+        memcpy(pal, palette, (size_t)m);
+        memset(pal + m, 0, sizeof pal - (size_t)m);
+        palv = _mm_loadu_si128((const __m128i *)(const void *)pal);
+    }
     limv = _mm_set1_epi8((char)(uint8_t)(m - 1u));
 
     /* A 3-bit field does not tile a byte, so this width takes eight values
@@ -777,10 +864,15 @@ static int residual_decode_mode2(const uint8_t *payload,
     if ((uint32_t)payload_len != expect) {
         return PSE_BAD_RESIDUAL;
     }
-    for (i = 0; i < m; i++) {
-        if (payload[1 + i] > 254u) {
-            return PSE_BAD_RESIDUAL;
-        }
+    /* `payload[1 + i] > 254` on a byte is `== 255`, which is the question
+     * residual_has_ff already answers eight bytes at a time (the mode-0
+     * path uses it for the same reason). m is at most sixteen, so this is
+     * two word loads instead of m byte loads and compares, once per palette
+     * tile -- and a dense palette plane is 256 of them. The status and its
+     * order are unchanged: the first such byte still rejects the payload,
+     * and nothing has been written by the time the check runs. */
+    if (residual_has_ff(payload + 1, (uint32_t)m)) {
+        return PSE_BAD_RESIDUAL;
     }
     if (packed > 0u) {
         total_bits = (uint32_t)k * b;
@@ -1631,18 +1723,17 @@ int zpse_residual_decode(uint8_t mode, const uint8_t *payload,
         }
         /* Every unit must be <= 254 -- 255 is not a legal exclusion
          * residual -- and `payload[i] > 254` is exactly `payload[i] ==
-         * 255` for a byte, so the same rejection can be answered for eight
-         * units at a time and the payload then copied. The status is
-         * identical; the only difference is that on the rejecting path
-         * exc_out may hold fewer units than the per-byte loop had already
-         * written, which no caller can observe: every one of them returns
-         * immediately on a non-OK status and exc_out (the tile's `resid[]`
-         * scratch) is never read afterwards. */
+         * 255` for a byte. The answer and the copy that follows it are
+         * asked of the payload by one walk (residual_copy_u8_checked), for
+         * the reason given there; the status is identical, and on the
+         * rejecting path exc_out may hold more units than the per-byte loop
+         * had already written, which no caller can observe -- every one of
+         * them returns immediately on a non-OK status and exc_out (the
+         * tile's `resid[]` scratch) is never read afterwards. */
         if (k > 0u) {
-            if (residual_has_ff(payload, (uint32_t)k)) {
+            if (residual_copy_u8_checked(exc_out, payload, (uint32_t)k)) {
                 return PSE_BAD_RESIDUAL;
             }
-            residual_copy_bytes(exc_out, payload, (uint32_t)k);
         }
         return PSE_OK;
     case ZPSE_R_PALETTE_BITS:

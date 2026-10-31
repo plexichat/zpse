@@ -528,7 +528,16 @@ static ZPSE_T_AVX2 void zpse_t16x16_avx2(const uint8_t *const in[16],
 
     /* w[k] carries column k in its two first 64-bit halves, one per row
      * group, so column k is their low-low join and column k+8 their
-     * high-high join. */
+     * high-high join.
+     *
+     * The vpermq form of this emit -- two `_mm256_permute4x64_epi64` per w[k]
+     * (qwords (q0,q2) and (q1,q3)) with the low half read back by a cast --
+     * is one shuffle-port op fewer than the three below, and was measured
+     * *slower*: 3499 vs 2911 ns for one 64 KiB transpose-16 inverse, with the
+     * whole-benchmark decode of a low-cardinality plane 4-5% behind. Two
+     * vpermq are 3-4 cycle latency each and both stores wait on one, where
+     * the extract and the two unpacks below issue independently for the two
+     * 16-byte stores. Kept as it was. */
 #define ZPSE_T16_EMIT(WK, IDX)                                                \
     do {                                                                      \
         const __m128i lo_ = _mm256_castsi256_si128(WK);                       \
@@ -1413,6 +1422,54 @@ zpse_chain_xor32(__m256i ctl, __m256i x, uint8_t *carry)
     return x;
 }
 
+/* The same two chains with the carry kept in the vector domain.
+ *
+ * The scalar forms above update `*carry` through memory on every 32 bytes:
+ * vpextrw the chunk's total out to a GPR, add it to the scalar carry, store
+ * it, then vpbroadcastb it back on the next iteration. That is 2 shuffle-port
+ * ops plus a store, a load and a scalar add per plane per chunk -- and the
+ * store/load pair sits on the chain's critical path. Here the carry is a
+ * broadcast of the running value in every byte, so rebasing the next chunk is
+ * one op, and the chunk's own total comes from zpse_avx2_bcast_hi_byte (the
+ * other 2-op broadcast the file already uses for the prefix scans): nothing
+ * crosses to a GPR until the loop ends. `old` is folded in AFTER the total is
+ * taken, exactly as the scalar form adds the carry to the prefix and then
+ * advances it, so the bytes are the same ones.
+ *
+ * Always inlined: `c` then lives in a register across iterations, which is
+ * the whole point. */
+ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
+zpse_chain_add32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
+{
+    __m256i tot;
+    __m256i old = *c;
+
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 1));
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 2));
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 4));
+    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 8));
+    x = _mm256_add_epi8(x, zpse_avx2_lane_total(ctl, x));
+    tot = zpse_avx2_bcast_hi_byte(ctl_all, x);
+    *c = _mm256_add_epi8(old, tot);
+    return _mm256_add_epi8(x, old);
+}
+
+ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
+zpse_chain_xor32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
+{
+    __m256i tot;
+    __m256i old = *c;
+
+    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 1));
+    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 2));
+    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 4));
+    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 8));
+    x = _mm256_xor_si256(x, zpse_avx2_lane_total(ctl, x));
+    tot = zpse_avx2_bcast_hi_byte(ctl_all, x);
+    *c = _mm256_xor_si256(old, tot);
+    return _mm256_xor_si256(x, old);
+}
+
 /* `delta` and `carry != 0` are loop-invariant, so testing them inside a
  * merge loop was a branch per 32 bytes on the file's hottest path, and the
  * `carry == 0` shapes (the identity and plain-transpose inverses, i.e. most
@@ -1474,6 +1531,52 @@ zpse_chain_xor32(__m256i ctl, __m256i x, uint8_t *carry)
                             _mm256_permute2x128_si256(r[0], r[1], 0x31));      \
         _mm256_storeu_si256((__m256i *)(void *)(d + 96u),                      \
                             _mm256_permute2x128_si256(r[2], r[3], 0x31));      \
+    }
+
+/* merge4's two chain-carrying forms: the four planes and their four carries
+ * are named scalars rather than arrays, so nothing in the loop is indexed and
+ * every value stays in a register, and the carries are the vector ones from
+ * above. Same four loads, same eight unpacks, same four permutes, same four
+ * stores as ZPSE_MERGE4_BODY. */
+#define ZPSE_MERGE4_CARRY_BODY(UNDO)                                          \
+    for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {                   \
+        __m256i p0, p1, p2, p3;                                                \
+        __m256i lo0, lo1, hi0, hi1;                                            \
+        __m256i r0, r1, r2, r3;                                                \
+        uint8_t *d = out + (size_t)g * 4u;                                     \
+                                                                              \
+        p0 = UNDO(ctl, ctl_all,                                                \
+                  _mm256_loadu_si256(                                         \
+                      (const __m256i *)(const void *)(segs[0] + g)),          \
+                  &c0);                                                       \
+        p1 = UNDO(ctl, ctl_all,                                                \
+                  _mm256_loadu_si256(                                         \
+                      (const __m256i *)(const void *)(segs[1] + g)),          \
+                  &c1);                                                       \
+        p2 = UNDO(ctl, ctl_all,                                                \
+                  _mm256_loadu_si256(                                         \
+                      (const __m256i *)(const void *)(segs[2] + g)),          \
+                  &c2);                                                       \
+        p3 = UNDO(ctl, ctl_all,                                                \
+                  _mm256_loadu_si256(                                         \
+                      (const __m256i *)(const void *)(segs[3] + g)),          \
+                  &c3);                                                       \
+        lo0 = _mm256_unpacklo_epi8(p0, p1);                                    \
+        hi0 = _mm256_unpackhi_epi8(p0, p1);                                    \
+        lo1 = _mm256_unpacklo_epi8(p2, p3);                                    \
+        hi1 = _mm256_unpackhi_epi8(p2, p3);                                    \
+        r0 = _mm256_unpacklo_epi16(lo0, lo1);                                  \
+        r1 = _mm256_unpackhi_epi16(lo0, lo1);                                  \
+        r2 = _mm256_unpacklo_epi16(hi0, hi1);                                  \
+        r3 = _mm256_unpackhi_epi16(hi0, hi1);                                  \
+        _mm256_storeu_si256((__m256i *)(void *)d,                              \
+                            _mm256_permute2x128_si256(r0, r1, 0x20));          \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32u),                      \
+                            _mm256_permute2x128_si256(r2, r3, 0x20));          \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 64u),                      \
+                            _mm256_permute2x128_si256(r0, r1, 0x31));          \
+        _mm256_storeu_si256((__m256i *)(void *)(d + 96u),                      \
+                            _mm256_permute2x128_si256(r2, r3, 0x31));          \
     }
 
 #define ZPSE_MERGE8_BODY(UNDO)                                                 \
@@ -1568,11 +1671,27 @@ zpse_merge4_avx2(uint8_t *out, const uint8_t *const segs[16], uint32_t rows,
         ZPSE_MERGE4_BODY(ZPSE_CHAIN_NONE)
         return g;
     }
-    if (delta) {
-        ZPSE_MERGE4_BODY(ZPSE_CHAIN_ADD)
-        return g;
+    /* The chain forms keep each plane's carry as a broadcast in a vector
+     * register (see zpse_chain_add32v) and write the four bytes back once,
+     * after the loop, for the 16-row snake that continues the chain. */
+    {
+        __m256i c0 = _mm256_set1_epi8((char)carry[0]);
+        __m256i c1 = _mm256_set1_epi8((char)carry[1]);
+        __m256i c2 = _mm256_set1_epi8((char)carry[2]);
+        __m256i c3 = _mm256_set1_epi8((char)carry[3]);
+        const __m256i ctl_all = _mm256_loadu_si256(
+            (const __m256i *)(const void *)zpse_avx2_ctl15_all);
+
+        if (delta) {
+            ZPSE_MERGE4_CARRY_BODY(zpse_chain_add32v)
+        } else {
+            ZPSE_MERGE4_CARRY_BODY(zpse_chain_xor32v)
+        }
+        carry[0] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c0));
+        carry[1] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c1));
+        carry[2] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c2));
+        carry[3] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c3));
     }
-    ZPSE_MERGE4_BODY(ZPSE_CHAIN_XOR)
     return g;
 }
 
