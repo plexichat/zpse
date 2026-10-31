@@ -922,10 +922,11 @@ Every **other** figure in this file is one core and one thread.
 
 ### What the compiler adds, and what the tags are worth
 
-Every number in this README is an `-O2` number: the CI matrix,
-`tests/runners/run.sh` and the release CLI all build at `-O2`. The compiler
-still has something to add at `-O3`, and the two ways to ask for it are not
-interchangeable. Both were measured on the level corpus (`bench_levels.c`, 25
+Every number in this README is an `-O2` number: the CI matrix and
+`tests/runners/run.sh` build at `-O2`. The one binary that ships at `-O3` is
+the released CLI, because it is the one nobody can rebuild -- and the compiler
+still has something to add at `-O3`, which the third row below is the
+measurement of. The two ways to ask for it are not interchangeable. Both were measured on the level corpus (`bench_levels.c`, 25
 cases x 4 MiB in 64 KiB blocks; A/B/A/B runs interleaved with the order swapped
 every round, median of the per-case throughput ratios, one pinned core):
 

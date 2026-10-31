@@ -20,10 +20,16 @@ jobs:
           sudo apt-get install -y -qq zip
 
       - name: Build binaries
+        # -O3 for the two artifacts a user actually runs: the amalgamation is
+        # a single translation unit, so -O3 reaches the inliner across every
+        # module, and it is worth a few percent of encode (README, "What the
+        # compiler adds") with byte-identical output and sizes. The tree still
+        # builds and measures at -O2 everywhere else, so every number in the
+        # README stays an -O2 number.
         run: |
-          gcc-15 -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+          gcc-15 -std=c11 -O3 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/tools/zpse_cli.c src/zpse_unity.c -o zpse_cli_linux
-          gcc-15 -std=c11 -O2 -DNDEBUG -Iinclude tests/tools/zpse_cli.c src/zpse_unity.c \
+          gcc-15 -std=c11 -O3 -DNDEBUG -Iinclude tests/tools/zpse_cli.c src/zpse_unity.c \
             -o zpse_cli_linux_fast
 
       - name: Generate GitHub Release
