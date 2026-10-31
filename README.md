@@ -485,7 +485,7 @@ the prefix sum's last lane is the exception count that advances the unit
 index, so no popcount is needed.
 
 Stride 1 and stride 8 have vector kernels of their own (one chain, and the
-eight-lane recurrence respectively); strides 2, 3 and 4 take this one.The head before the first sixteen positions stays scalar, as does the rest of the
+eight-lane recurrence respectively); strides 2, 3 and 4 take this one. The head before the first sixteen positions stays scalar, as does the rest of the
 tile when the unit window would read past the 256-unit array. In the head the two
 sources below the stride -- the initial literal, then the segment's earlier bytes
 -- are split into ranges rather than selected per position, because the test that
@@ -494,11 +494,11 @@ depend on it, decode over 64 KiB blocks:
 
 | column | ratio | decode |
 | --- | ---: | ---: |
-| `ts_gapped` (timestamp with gaps) | 2.06:1 | 2.4 GB/s |
-| `float_sparse` (f32 readings) | 2.72:1 | 3.3 GB/s |
-| `ts_us` (i64 µs timestamps) | 5.09:1 | 3.6 GB/s |
-| `sorted_near` | 3.82:1 | 4.0 GB/s |
-| `ts_seq` (i64 µs timestamps) | 5.38:1 | 4.8 GB/s |
+| `ts_gapped` (timestamp with gaps) | 2.06:1 | 2.5 GB/s |
+| `float_sparse` (f32 readings) | 2.72:1 | 3.5 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.09:1 | 4.2 GB/s |
+| `sorted_near` | 3.82:1 | 4.8 GB/s |
+| `ts_seq` (i64 µs timestamps) | 5.38:1 | 5.8 GB/s |
 
 Two of the group's costs are the same lesson: a value the loop has already
 produced should not be read back out of memory. A group's `prev` -- the sixteen

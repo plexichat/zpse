@@ -818,6 +818,68 @@ static ZPSE_T_AVX2 void zpse_delta16_inverse_avx2(const uint8_t *const segs[16],
 
 #endif /* ZPSE_T_HAVE_AVX2 */
 
+/* The 32-byte form of the in-place chain, and the one the widths 2, 4, 8 and
+ * 16 encode paths take when AVX2 is present.
+ *
+ * A prefix sum over 64 bytes is six shift-add steps, but the byte that
+ * crosses a 128-bit lane boundary is not one of them: `vpslldq` is lane-local,
+ * so byte 16 of a 32-byte chunk has to be filled from byte 15 by hand. Two
+ * shuffle-port ops do it -- permute lane 0 into both lanes, shift right
+ * fifteen so both lane byte 0s hold byte 15, then blend lane 0's byte 0 back
+ * to the carried byte -- and the same value is what the next chunk's carry
+ * becomes after one more shift. Per 32 bytes that is eight instructions
+ * against the sixteen-byte form's twelve or so per 32, and the loop's carried
+ * dependency stays in the vector domain. */
+static ZPSE_T_AVX2 void zpse_plane_chain32(uint8_t *p, uint32_t n,
+                                           uint8_t seed, int delta)
+{
+    __m256i inc = _mm256_castsi128_si256(_mm_cvtsi32_si128((int)seed));
+    uint32_t q;
+
+    for (q = 0; (size_t)q + 32u <= (size_t)n; q += 32u) {
+        __m256i x = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(p + q));
+        __m256i top = _mm256_srli_si256(
+            _mm256_permute2x128_si256(x, x, 0x00), 15);
+        __m256i prv = _mm256_or_si256(_mm256_slli_si256(x, 1),
+                                      _mm256_blend_epi32(inc, top, 0xF0));
+
+        _mm256_storeu_si256((__m256i *)(void *)(p + q),
+                            delta ? _mm256_sub_epi8(x, prv)
+                                  : _mm256_xor_si256(x, prv));
+        /* Byte 31 of the chunk, which is lane 1's byte 15, becomes the next
+         * chunk's incoming byte. */
+        inc = _mm256_castsi128_si256(
+            _mm_srli_si128(_mm256_extracti128_si256(x, 1), 15));
+    }
+    {
+        uint8_t prev =
+            (uint8_t)_mm_extract_epi8(_mm256_castsi256_si128(inc), 0);
+
+        /* 16-byte remainder, then the byte tail -- the same two loops the
+         * scalar form finishes with. */
+        for (; (size_t)q + 16u <= (size_t)n; q += 16u) {
+            __m128i cur =
+                _mm_loadu_si128((const __m128i *)(const void *)(p + q));
+            __m128i prv =
+                _mm_or_si128(_mm_slli_si128(cur, 1),
+                             _mm_cvtsi32_si128((int)prev));
+            uint8_t carry = p[q + 15u];
+
+            _mm_storeu_si128((__m128i *)(void *)(p + q),
+                             delta ? _mm_sub_epi8(cur, prv)
+                                   : _mm_xor_si128(cur, prv));
+            prev = carry;
+        }
+        for (; q < n; q++) {
+            uint8_t raw = p[q];
+
+            p[q] = delta ? (uint8_t)(raw - prev) : (uint8_t)(raw ^ prev);
+            prev = raw;
+        }
+    }
+}
+
 /* In-place delta/xor over one contiguous plane: p[j] = p[j] - p[j-1]
  * (delta) or p[j] ^ p[j-1] (xor), with p[-1] == seed. The stride-16
  * gather the transposed delta used to do per byte alongside the chain is
@@ -830,6 +892,12 @@ static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
     uint8_t prev = seed;
     uint32_t q;
 
+#if ZPSE_T_HAVE_AVX2
+    if (zpse_t_avx2()) {
+        zpse_plane_chain32(p, n, seed, delta);
+        return;
+    }
+#endif
 #if ZPSE_T_HAVE_SSE2
     /* Four chunks per iteration. Each chunk's incoming byte is the last
      * byte of the PREVIOUS chunk's original content, which is a byte of a
@@ -1451,6 +1519,17 @@ zpse_chain_add32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
     __m256i tot;
     __m256i old = *c;
 
+    /* A chunk of zeros leaves the chain exactly where it was: its prefix
+     * sum is zero, so the plane's bytes are the carry itself and the carry
+     * does not move. The ladder below is five shuffle-port steps plus the
+     * cross-link and the broadcast, and a delta plane is all zeros wherever
+     * its source plane is constant -- an i64 column's four high bytes, a
+     * flag or padding byte, a string table's padding. One testz (no vector
+     * port) decides it. */
+    if (_mm256_testz_si256(x, x)) {
+        return old;
+    }
+
     x = _mm256_add_epi8(x, _mm256_slli_si256(x, 1));
     x = _mm256_add_epi8(x, _mm256_slli_si256(x, 2));
     x = _mm256_add_epi8(x, _mm256_slli_si256(x, 4));
@@ -1466,6 +1545,12 @@ zpse_chain_xor32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
 {
     __m256i tot;
     __m256i old = *c;
+
+    /* As zpse_chain_add32v: a zero chunk's prefix is zero in either
+     * algebra, so the plane is the carry and the carry stands. */
+    if (_mm256_testz_si256(x, x)) {
+        return old;
+    }
 
     x = _mm256_xor_si256(x, _mm256_slli_si256(x, 1));
     x = _mm256_xor_si256(x, _mm256_slli_si256(x, 2));
