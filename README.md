@@ -857,13 +857,17 @@ a `memcmp` over the whole file, not on a sample.
 | file | bytes | text | typed columns | gain |
 | --- | ---: | ---: | ---: | ---: |
 | `titanic.csv` (891 × 12, real export) | 60 302 | 55 213 (1.09:1) | 40 071 (1.50:1) | 27.4% |
+| `uber-rides-data1.csv` (1 511 443 × 3) | 58 604 196 | 16 363 309 (3.58:1) | 15 188 805 (3.86:1) | 7.2% |
 
-The typed form itself is *larger* than the CSV (104 180 bytes: eight bytes per
-int and per double, against `33.9732`). That is the point -- fixed-width
-columns of the same meaning compress like a columnar file instead of like
-prose, which is why the packed size falls while the intermediate grows. On a
-60 KiB file the frame overhead is still a large share of the result; the win
-grows with the file.
+The typed form itself is *larger* than the CSV (104 180 bytes on `titanic`:
+eight bytes per int and per double, against `33.9732`). That is the point --
+fixed-width columns of the same meaning compress like a columnar file instead
+of like prose, which is why the packed size falls while the intermediate grows.
+The gain shrinks as the file grows: `titanic` is 60 KiB, where the frame
+overhead is a large share of a 40 KiB result, and 891 rows of a 12-column table
+is not what the path is for; on the 58 MB export it is still 7.2% (and 1.4 s for
+the whole typed-and-verified round trip), which is a narrow win on a format
+whose numbers are dominated by the timestamp column staying text.
 
 ### Using more than one core
 
@@ -977,21 +981,22 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.72 GB/s | 1.72 GB/s |
-| mozilla | 51,220,480 | 1.96 | 0.22 GB/s | 0.90 GB/s |
-| mr | 9,970,564 | 2.32 | 0.31 GB/s | 1.14 GB/s |
-| nci | 33,553,445 | 5.14 | 0.21 GB/s | 1.14 GB/s |
-| ooffice | 6,152,192 | 1.47 | 0.16 GB/s | 0.69 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.55 GB/s | 1.89 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.27 GB/s | 0.91 GB/s |
-| samba | 21,606,400 | 2.48 | 0.29 GB/s | 0.83 GB/s |
-| sao | 7,251,944 | 1.01 | 1.13 GB/s | 9.76 GB/s |
-| webster | 41,458,703 | 1.95 | 0.25 GB/s | 0.65 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.50 GB/s | 3.08 GB/s |
-| xml | 5,345,280 | 3.83 | 0.49 GB/s | 1.30 GB/s |
-| **total** | **211,938,580** | **2.00** | **0.27 GB/s** | **0.89 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.74 GB/s | 2.25 GB/s |
+| mozilla | 51,220,480 | 1.96 | 0.22 GB/s | 1.18 GB/s |
+| mr | 9,970,564 | 2.32 | 0.32 GB/s | 1.34 GB/s |
+| nci | 33,553,445 | 5.14 | 0.21 GB/s | 1.46 GB/s |
+| ooffice | 6,152,192 | 1.47 | 0.18 GB/s | 1.03 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.58 GB/s | 3.10 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.27 GB/s | 0.90 GB/s |
+| samba | 21,606,400 | 2.48 | 0.28 GB/s | 1.22 GB/s |
+| sao | 7,251,944 | 1.01 | 0.99 GB/s | 4.36 GB/s |
+| webster | 41,458,703 | 1.95 | 0.26 GB/s | 0.90 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.46 GB/s | 2.06 GB/s |
+| xml | 5,345,280 | 3.83 | 0.47 GB/s | 1.45 GB/s |
+| **total** | **211,938,580** | **2.00** | **0.27 GB/s** | **1.26 GB/s** |
 
-`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core. The
+`zpse_cli bench -r 4`, default level (6), 64 KiB blocks, one pinned core, best
+of two runs. The
 `sao` row is the raw fallback doing its job at copy speed, and `osdb` is close
 behind it. The prose rows are the ones the token form moved: `dickens` from
 1.09 to 1.16 and `webster` from 1.50 to 1.95 at the default, and the pair at
@@ -1066,12 +1071,17 @@ not a win, and this codec is on it for the shape of data it was built for.
 
 One check on that claim belongs here, because it is the difference between a
 corpus and a format. A *real* table export in CSV form is not typed columns:
-on 58 MB of ride-hailing trips (`uber-rides-data1.csv`, the same harness and
-the same rule) zpse reads 3.58:1 at 144 MB/s against `lz4 -1`'s 3.69:1 at
-1.25 GB/s -- a hair behind on ratio and an order of magnitude behind on rate,
-because a CSV is prose with separator punctuation. The typed-column shape the
-table above measures is what a binary table format stores, not what a text
-export of the same rows contains.
+on 58 MB of ride-hailing trips (`uber-rides-data1.csv`, 1 511 443 rows, three
+columns) zpse reads 3.58:1 at 236 MB/s against `lz4 -1`'s 3.69:1 at 1.25 GB/s
+-- a hair behind on ratio and an order of magnitude behind on rate, because a
+CSV is prose with separator punctuation. The typed-column shape the table above
+measures is what a binary table format stores, not what a text export of the
+same rows contains.
+
+`zpse_cli col` is what closes the ratio part of that: the same export, typed
+into columns first, packs to 3.86:1 -- past `lz4 -1`, 7.2% under the text form,
+and rebuilt byte for byte by `uncol`. It does not close it to `zstd -3`, which
+reads 5.47:1 on the same bytes.
 
 Running the ladder over Silesia is how a CLI bug surfaced. `-l N` used to OR
 the level into a word that already held the default, so `-l 1` ran BALANCED,
