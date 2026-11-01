@@ -7,7 +7,9 @@
  *
  *   alternating 0x00/0xFF  split into its two byte phases, each phase is
  *                          one byte value, and the dense record form writes
- *                          them at twelve bytes per 4 KiB: 272.
+ *                          them at twelve bytes per 4 KiB: 272 as tiles. The
+ *                          v2 LZ+tiles form compresses that body and writes
+ *                          83, and that is what the pin now holds.
  *   two-byte spikes        at width 8, seven of the phases are constant and
  *                          are written in the dense form at twelve bytes per
  *                          4 KiB: 1211. The width-16 shape of the same block
@@ -18,7 +20,8 @@
  *   4-bit noise            one palette stream is cheaper than any predictor
  *                          search per tile, so the tile loop stops as soon
  *                          as the palette is priced and 33288 is written.
- *   zeros                  nothing may ever cost less than the floor, 248.
+ *   zeros                  the tile floor is 248; the v2 LZ+tiles form
+ *                          takes the constant body down to 69.
  *
  * A change that regresses one of these still round-trips, so nothing else in
  * the suite would notice; that is why the sizes are pinned. Links
@@ -74,7 +77,7 @@ int main(void)
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
     }
-    check("alt00FF", 65536u, 272u);
+    check("alt00FF", 65536u, 83u);
 
     memset(in, 0, sizeof in);
     for (i = 0; i < 65536u; i += 256u) {
@@ -94,7 +97,7 @@ int main(void)
     check("4-bit noise", 65536u, 33288u);
 
     memset(in, 0, sizeof in);
-    check("zeros", 65536u, 248u);
+    check("zeros", 65536u, 69u);
 
     if (fails != 0) {
         printf("DECIDE: %d FAILED\n", fails);

@@ -86,8 +86,15 @@ int main(void) {
         CHECK(zpse_block_header_parse(&h, comp, cl) == 0 &&
               (h.block_flags & ZPSE_B_CRC) == 0,
               "default block carries no payload CRC");
+        /* FASTEST on purpose: this sub-test is about the dense record form's
+         * arithmetic CRC, so it pins the level that cannot reach for a
+         * compressed form and leaves the block in the shape whose records it
+         * then mutates. At the default level that block is now taken by the
+         * v2 LZ+tiles form, whose payload is not a record list at all. */
         rc = zpse_compress_block_ex(in, sizeof in, comp, sizeof comp, &cl, 0,
-                                    1, ZPSE_ENC_CHECKSUM, ea);
+                                    1, (uint32_t)(ZPSE_ENC_CHECKSUM |
+                                                  ZPSE_ENC_SPEED_FASTEST),
+                                    ea);
         CHECK(rc == PSE_OK, "const block encodes with a CRC (rc=%d)", rc);
         CHECK(cl < sizeof comp && zpse_block_header_parse(&h, comp, cl) == 0,
               "const block header parses");

@@ -44,6 +44,7 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
     d->o2 = base + ZPSE_D_OFF_O2;
     d->comb = base + ZPSE_D_OFF_COMB;
     d->shuf = base + ZPSE_D_OFF_SHUF;
+    d->lzbuf = base + ZPSE_D_OFF_LZBUF;
     d->seg_const = 0u;
     d->seg_const_byte = 0u;
     return PSE_OK;

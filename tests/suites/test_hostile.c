@@ -91,9 +91,9 @@ int main(void) {
     }
 
     /* Reserved block flag bit with repaired CRC -> UNSUPPORTED_FEATURE.
-     * Bits 6 and 7 are the two the format reserves; bit 5 is the LZ form
-     * and is covered by its own check below. */
-    memcpy(work, comp, clen); work[3] |= 0x40;
+     * Bit 7 is the one the format still reserves; bit 6 is the v2 LZ+tiles
+     * form and bit 5 the LZ form, and each has its own check below. */
+    memcpy(work, comp, clen); work[3] |= 0x80;
     zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc == PSE_UNSUPPORTED_FEATURE, "reserved block bit rejected");

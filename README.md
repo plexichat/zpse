@@ -27,9 +27,11 @@ rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen, dec_arena);
 ```
 
 Both arenas are 64-byte aligned and owned by the caller; nothing inside the
-library ever allocates. They are 448 KiB (encode) and 320 KiB (decode) —
+library ever allocates. They are 448 KiB (encode) and 384 KiB (decode) —
 `ZPSE_ENC_ARENA_SIZE` and `ZPSE_DEC_ARENA_SIZE` say so, and the sizes are
-in the names of the parameters the API takes. `rc` is negative on failure —
+in the names of the parameters the API takes. The decode arena grew by the
+64 KiB a `ZPSE_B_LZ_TILE` block's body is unpacked into before the tile path
+reads it. `rc` is negative on failure —
 every status in `include/zpse/status.h` is reachable from a corrupt stream
 and is tested that way.
 
@@ -730,11 +732,21 @@ On high-cardinality text it is the difference between falling back to raw and
 compressing at all -- the case the tile model cannot see, because nothing in
 it repeats four bytes apart, only further back.
 
-A block is written in one of three forms, and the block flags say which: the
-tile form above (`ZPSE_B_RAW` and `ZPSE_B_LZ` clear), a verbatim copy
-(`ZPSE_B_RAW`), or intra-block LZ (`ZPSE_B_LZ`). All three carry the same
-32-byte header, and all three decode on their own, which is what makes a
-block the unit of random access.
+A block is written in one of four forms, and the block flags say which: the
+tile form above (every form flag clear), a verbatim copy (`ZPSE_B_RAW`),
+intra-block LZ (`ZPSE_B_LZ`), or **LZ over the tile body** (`ZPSE_B_LZ_TILE`).
+
+The last one is the two forms together rather than a choice between them: the
+payload is `[u32 body_len][LZ stream]`, the stream expands to exactly the body
+the tile form would have written after its 32-byte header, and the header's
+transform, segment count and metadata length stay the tile form's own, so the
+decoder unpacks the body once and then runs the ordinary tile path over it. It
+is taken only when it is at least 1/32 smaller than the tile stream alone,
+because the decode pays a match-finder pass before the tile reconstruction.
+On Silesia at the default level it takes 2.1% off the corpus (106,140,388 to
+103,927,201 bytes) and 248 to 69 on a constant block, and no case in the size
+corpus grows. All four forms carry the same 32-byte header, and all four decode
+on their own, which is what makes a block the unit of random access.
 
 A frame encoded with `zpse_compress_frame_indexed()` ends with a
 **FrameIndex** -- a 16-byte header (magic `PXI1`, entry count, CRC32-C of the

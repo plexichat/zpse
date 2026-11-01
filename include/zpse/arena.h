@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ZPSE_DEC_ARENA_SIZE (320u * 1024u) /* 0x50000 */
+#define ZPSE_DEC_ARENA_SIZE (384u * 1024u) /* 0x60000 */
 #define ZPSE_ENC_ARENA_SIZE (448u * 1024u) /* 0x70000 */
 #define ZPSE_ARENA_ALIGN    64u
 
@@ -20,6 +20,11 @@
 #define ZPSE_D_OFF_COMB     0x41800u
 #define ZPSE_D_OFF_SHUF     0x43800u
 #define ZPSE_D_OFF_GUARD    0x44800u
+/* Where a ZPSE_B_LZ_TILE block's body is unpacked: the tile path reads it
+ * from here exactly as it would read it from the block, so the 64 KiB a
+ * block body can take has to be its own region rather than borrowed from
+ * recon/out_stage, which the segment decoder is using at the same time. */
+#define ZPSE_D_OFF_LZBUF    0x50000u
 
 #define ZPSE_D_SZ_CTRL      0x01000u
 #define ZPSE_D_SZ_RECON     0x10000u
@@ -29,6 +34,7 @@
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
 #define ZPSE_D_SZ_GUARD     0x0B800u
+#define ZPSE_D_SZ_LZBUF     0x10000u
 
 /* Padding block decode leaves between the segment planes it writes for a
  * 16-wide interleave, so that the inverse transpose can read them in
@@ -80,6 +86,7 @@ typedef struct ZpseDecoder {
     uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
     uint8_t *comb;        /* 8 KiB combinadic scratch */
     uint8_t *shuf;        /* 4 KiB shuffle/CRC consts */
+    uint8_t *lzbuf;       /* 64 KiB: unpacked body of an LZ_TILE block */
     /* The plane the last zpse_segment_decode produced was one byte value
      * end to end, and which value. Set only by the dense constant form and
      * cleared by every segment decode, so a block whose single segment

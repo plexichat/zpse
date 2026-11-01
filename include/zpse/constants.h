@@ -53,7 +53,20 @@
  * rather than transform + segments + tiles. Mutually exclusive with
  * ZPSE_B_RAW; transform_id 0, segment_count 1, no transform metadata. */
 #define ZPSE_B_LZ               (UINT8_C(1) << 5)
-#define ZPSE_B_RESERVED_MASK    (UINT8_C(0xC0))
+/* v2: LZ *and* tiles, in one block. The payload is
+ *   [u32 body_len][intra-block LZ stream]
+ * where the LZ stream expands to exactly the body the tile form would have
+ * written after its 32-byte header (transform metadata, segment directory,
+ * segment payloads). The transform, segment count and metadata length in
+ * the header are the tile form's own, so the decoder unpacks the body once
+ * and then runs the ordinary tile path over it.
+ *
+ * Mutually exclusive with ZPSE_B_RAW and ZPSE_B_LZ: a block is still one
+ * form, it is just a form that carries the other one inside it. There is no
+ * compatibility shim -- a v1 reader sees bit 6 in the reserved mask and
+ * refuses the block, which is what the reserved bits were for. */
+#define ZPSE_B_LZ_TILE          (UINT8_C(1) << 6)
+#define ZPSE_B_RESERVED_MASK    (UINT8_C(0x80))
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 

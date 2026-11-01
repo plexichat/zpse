@@ -189,6 +189,8 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     uint32_t n, c, meta_size, scount;
     uint64_t dir_end, area;
     const uint8_t *dir, *payloads;
+    const uint8_t *body;
+    uint32_t body_off, body_len;
     uint32_t seg_lens[16];
     const uint8_t *csegs[16];
     uint32_t cum, s;
@@ -262,7 +264,8 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     /* RAW fallback path: exactly N raw bytes at offset 32. */
     if ((h.block_flags & ZPSE_B_RAW) != 0) {
         uint32_t calc;
-        if (h.transform_id != 0 || h.segment_count != 1 || meta_size != 0) {
+        if (h.transform_id != 0 || h.segment_count != 1 || meta_size != 0 ||
+            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
             return PSE_BAD_HEADER;
         }
         if (c != (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
@@ -292,7 +295,8 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
      * the two apart by flag alone, and every reference it carries is a
      * distance inside this block. */
     if ((h.block_flags & ZPSE_B_LZ) != 0) {
-        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u) {
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
+            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
             return PSE_BAD_HEADER;
         }
         if (c <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
@@ -317,21 +321,55 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     }
 
     /* Coded path: structural directory checks (PHASE1). */
+    body = in;
+    body_off = (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+    body_len = c;
+    /* v2: the body below is itself an intra-block LZ stream. Unpack it once
+     * into the decoder's own buffer and let the tile path read it as if it
+     * had been written plainly -- the unpacked bytes are byte for byte what
+     * that path was built against, so nothing below needs a second shape.
+     * The length comes first because zpse_lz_decode has to be told the exact
+     * output size: a stream is only accepted when it fills it exactly. */
+    if ((h.block_flags & ZPSE_B_LZ_TILE) != 0) {
+        uint32_t blen;
+
+        if (d->lzbuf == 0) {
+            return PSE_BAD_ARG;
+        }
+        if (c < (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) +
+                    (uint32_t)ZPSE_LZ_MIN_PAYLOAD) {
+            return PSE_BAD_BLOCK_SIZE;
+        }
+        blen = zpse_load_u32le(in + ZPSE_BLOCK_HEADER_SIZE);
+        if (blen < (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE ||
+            blen > (uint32_t)ZPSE_D_SZ_LZBUF) {
+            return PSE_BAD_BLOCK_SIZE;
+        }
+        rc = zpse_lz_decode(in + ZPSE_BLOCK_HEADER_SIZE + 4u,
+                            c - (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u),
+                            d->lzbuf, blen);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+        body = d->lzbuf;
+        body_off = 0u;
+        body_len = blen;
+    }
     scount = h.segment_count;
-    dir_end = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)meta_size +
+    dir_end = (uint64_t)body_off + (uint64_t)meta_size +
               (uint64_t)scount * (uint64_t)ZPSE_SEG_DIR_ENTRY_SIZE;
-    if (dir_end > (uint64_t)c) {
+    if (dir_end > (uint64_t)body_len) {
         return PSE_BAD_SEGMENT_DIRECTORY;
     }
     rc = zpse_transform_meta_parse(&meta, h.transform_id,
-                                   in + ZPSE_BLOCK_HEADER_SIZE,
+                                   body + body_off,
                                    (uint16_t)meta_size, h.segment_count);
     if (rc != PSE_OK) {
         return rc;
     }
-    dir = in + ZPSE_BLOCK_HEADER_SIZE + meta_size;
-    payloads = in + dir_end;
-    area = (uint64_t)c - dir_end;
+    dir = body + body_off + meta_size;
+    payloads = body + dir_end;
+    area = (uint64_t)body_len - dir_end;
 
     {
         uint32_t expect = 0;
@@ -3342,6 +3380,55 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     best_idx = 15u;
                     have_best = 1;
                 }
+            }
+        }
+    }
+
+    /* ---- v2: LZ *and* tiles ----------------------------------------- *
+     * The two forms have been alternatives since v1: the encoder computes
+     * both and keeps the smaller, so the tile stream of a block LZ wins was
+     * built and thrown away. This keeps it and compresses it, which is the
+     * arrangement that pays on both sides: the body is what the tiles won
+     * with, and what is left in it is the repetition the tile records still
+     * carry -- repeated records, mask and residual patterns that the tile
+     * codecs write verbatim.
+     *
+     * Only taken when the result is at least 1/32 smaller than the tile
+     * stream alone. The decode pays a match-finder pass over the body before
+     * the tile reconstruction, so a few bytes is the wrong trade; measured
+     * over Silesia at the default level, the stage takes 13.3% off the tile
+     * payload of exactly the blocks where tiles beat LZ. */
+    if (!direct_out && have_best && e->lz != 0 &&
+        zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+                            e->ascii_gate) &&
+        best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u + 64u) &&
+        best_total <= (uint32_t)ZPSE_E_SZ_TSTAGE) {
+        ZpseBlockHeader wh;
+
+        if (zpse_block_header_parse(&wh, e->best, ZPSE_BLOCK_HEADER_SIZE) ==
+                PSE_OK &&
+            (wh.block_flags &
+             (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE)) == 0u) {
+            uint32_t blen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+            uint32_t pl = zpse_lz_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
+                                         blen, e->tstage,
+                                         (uint32_t)ZPSE_E_SZ_TSTAGE, e->lz,
+                                         (uint32_t)ZPSE_LZ_HASH_BITS);
+            uint32_t tot = (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) + pl;
+
+            if (pl != 0u && tot + tot / 32u <= best_total &&
+                tot <= out_cap) {
+                wh.block_flags = (uint8_t)((wh.block_flags &
+                                            ~(uint8_t)(ZPSE_B_RAW |
+                                                       ZPSE_B_LZ)) |
+                                           ZPSE_B_LZ_TILE);
+                wh.compressed_block_size = tot;
+                zpse_block_header_serialize(out, &wh);
+                zpse_block_fix_header_crc(out);
+                zpse_store_u32le(out + ZPSE_BLOCK_HEADER_SIZE, blen);
+                memcpy(out + ZPSE_BLOCK_HEADER_SIZE + 4u, e->tstage, pl);
+                best_total = tot;
+                direct_out = 1;
             }
         }
     }
