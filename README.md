@@ -1063,16 +1063,16 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.40 GB/s | 0.55 GB/s | no |
-| zpse 5 BALANCED | 1.92:1 | 0.20 GB/s | 0.55 GB/s | no |
-| zpse 6 (default) | 2.04:1 | 0.20 GB/s | 0.56 GB/s | no |
-| zpse 9 MAX | 2.20:1 | 0.18 GB/s | 0.49 GB/s | no |
-| lz4 -1 | 2.10:1 | 1.36 GB/s | 1.57 GB/s | yes |
-| lz4 -3 | 2.60:1 | 0.37 GB/s | 1.50 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.16 GB/s | 1.46 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.33 GB/s | 0.96 GB/s | yes |
-| zstd -3 | 3.20:1 | 0.21 GB/s | 0.83 GB/s | yes |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.83 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.37 GB/s | 0.96 GB/s | no |
+| zpse 5 BALANCED | 1.92:1 | 0.21 GB/s | 0.89 GB/s | no |
+| zpse 6 (default) | 2.04:1 | 0.19 GB/s | 0.85 GB/s | no |
+| zpse 9 MAX | 2.20:1 | 0.18 GB/s | 0.86 GB/s | no |
+| lz4 -1 | 2.10:1 | 1.36 GB/s | 1.55 GB/s | yes |
+| lz4 -3 | 2.60:1 | 0.39 GB/s | 1.54 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.16 GB/s | 1.53 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.36 GB/s | 1.04 GB/s | yes |
+| zstd -3 | 3.20:1 | 0.23 GB/s | 0.88 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.82 GB/s | yes |
 
 This table is the one the earlier version of this section did not have: no lz4
 was installed on the machine that produced it, and with every row measured in
@@ -1092,11 +1092,15 @@ not, because that parse finds longer matches on the same bytes. Widening the
 parse would buy size and speed at once, and it is the one change that can
 move this row.
 
-The second is the frame path, and it is the cheap one. The block-level decode
-of these twelve files is 1.31 GB/s (the table above); the CLI's frame decode
-of the same bytes is 0.56 GB/s. lz4's CLI reads and writes the same way and
-holds 1.57 GB/s through this harness, so the 2.3x is not the harness and not
-the read floor -- it is per-block overhead in the frame loop.
+The second was the frame path, and it was a bug rather than a trade. The
+block-level decode of these twelve files is 1.31 GB/s (the table above) and
+the CLI's frame decode of the same bytes was 0.56 GB/s, because it held the
+whole output in memory before writing a byte of it: a 202 MiB allocation
+faulted in a page at a time, on a path that does not need one. Blocks are
+independent, so a sequential decode writes each one out of a single reused
+buffer, and it now does -- 0.23 s for the 202 MiB where the buffer took 0.38 s.
+What is left of the difference to lz4 is the read itself: 104 MiB of frame at
+the 0.9 GB/s this host reads at, which lz4 pays too.
 
 *Encode.* A block here is decided, not merely encoded: the probe prices the
 candidate shapes, the ASCII gate prices three of them on two samples, and a
@@ -1128,21 +1132,31 @@ frontier rule:
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 5 BALANCED | 5.29:1 | 0.40 GB/s | 0.92 GB/s | yes |
-| zpse 6 (default) | 5.32:1 | 0.42 GB/s | 0.86 GB/s | yes |
-| zpse 9 MAX | 5.34:1 | 0.40 GB/s | 0.90 GB/s | yes |
-| lz4 -1 | 3.30:1 | 1.63 GB/s | 1.22 GB/s | yes |
-| lz4 -3 | 3.54:1 | 0.49 GB/s | 1.13 GB/s | no |
-| lz4 -9 | 3.61:1 | 0.33 GB/s | 1.17 GB/s | no |
-| zstd -1 | 4.80:1 | 0.68 GB/s | 1.41 GB/s | yes |
-| zstd -3 | 4.88:1 | 0.45 GB/s | 1.37 GB/s | yes |
-| zstd -19 | 5.75:1 | 0.006 GB/s | 1.24 GB/s | yes |
+| zpse 1 FASTEST | 4.36:1 | 0.60 GB/s | 0.92 GB/s | no |
+| zpse 5 BALANCED | 5.65:1 | 0.41 GB/s | 0.87 GB/s | no |
+| zpse 6 (default) | 5.66:1 | 0.41 GB/s | 0.89 GB/s | **yes** |
+| zpse 9 MAX | 5.66:1 | 0.41 GB/s | 0.89 GB/s | **yes** |
+| lz4 -1 | 3.29:1 | 1.01 GB/s | 1.18 GB/s | yes |
+| lz4 -3 | 3.54:1 | 0.45 GB/s | 1.09 GB/s | no |
+| lz4 -9 | 3.61:1 | 0.34 GB/s | 1.05 GB/s | no |
+| zstd -1 | 4.78:1 | 0.68 GB/s | 1.33 GB/s | yes |
+| zstd -3 | 4.91:1 | 0.46 GB/s | 1.50 GB/s | yes |
+| zstd -19 | 5.71:1 | 0.006 GB/s | 1.23 GB/s | yes |
 
-Every level from 5 up is on the frontier here, on ratio and encode rate:
-level 5 writes 8% smaller than `zstd -3` at the same encoder speed, which is
-what keeps it out of reach of both tools at once. It is a narrow lead, and it
-does not extend to decode, where zstd is still ahead -- the frontier is a set,
-not a win, and this codec is on it for the shape of data it was built for.
+This is the one corpus where zpse is on the frontier, at two levels: 5.66:1 at
+0.41 GB/s in and 0.89 GB/s out. `zstd -3` reaches 4.91:1 at a similar encode
+rate, so the default trades 15% of rate for 15% of size against it and comes
+out ahead; nothing else is at 5.66:1 at any rate. `lz4 -1` is on the frontier
+too, but for a different trade -- 3.29:1, which is 42% larger than the default
+-- so the two do not compete for the same row. Level 5 is *below* level 6 on
+both ratio and rate here, which is why it is marked off the frontier: on this
+corpus the level ladder's extra trial buys its keep.
+
+The gap to `zstd -3` is on the decode side rather than at either end: 0.89
+against 1.50 GB/s at the same size, which is the per-command decode cost the
+Silesia section measures. The corpus is `tests/corpus/corpus_write.c`'s output
+(17 cases at 4 MiB, 71,303,168 bytes) passed to `bench_pareto.sh` as a directory,
+which is how the 25-case columnar corpus is meant to be measured.
 
 One check on that claim belongs here, because it is the difference between a
 corpus and a format. A *real* table export in CSV form is not typed columns:

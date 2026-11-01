@@ -291,6 +291,114 @@ static void free_arenas(void **a, unsigned threads)
     free(a);
 }
 
+/* Decode a frame block by block, writing each block out as it is finished.
+ *
+ * The whole-frame path has to hold the entire output in memory before it can
+ * write a byte of it, and on this corpus that is a 202 MiB allocation faulted
+ * in one page at a time -- measured at about a third of the decode's wall
+ * time, against an in-memory decode of the same bytes that reuses one buffer.
+ * On a large file it also means a resident set as large as the file.
+ *
+ * The blocks are independent by construction (that is what the 64 KiB
+ * framing is for), so a sequential decode can walk them and write each one
+ * out of a single reused buffer. Nothing is validated less: every block goes
+ * through zpse_decompress_block, a block that does not decode to the length
+ * its header claims is refused, the block count and content size still have
+ * to agree with the frame header, and a frame that carries no index is the
+ * only kind that takes this path (see the caller).
+ *
+ * Returns 0 on success, 1 on any failure, matching write_file. */
+static int decode_stream(const uint8_t *in, size_t in_len, const char *out_path,
+                         const ZpseFrameHeader *fh, void *dec_arena)
+{
+    FILE *f;
+    uint8_t out[ZPSE_MAX_BLOCK_SIZE];
+    size_t pos = ZPSE_FRAME_HEADER_SIZE;
+    size_t out_pos = 0u;
+    size_t nblocks = 0u;
+    int have_last = 0;
+    int has_count = (fh->frame_flags & (uint16_t)ZPSE_F_BLOCK_COUNT) != 0u;
+    int has_content = (fh->frame_flags & (uint16_t)ZPSE_F_CONTENT_SIZE) != 0u;
+
+    f = fopen(out_path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "zpse_cli: cannot write %s\n", out_path);
+        return 1;
+    }
+    while (pos < in_len) {
+        size_t rem = in_len - pos;
+        uint32_t avail = rem > (size_t)UINT32_MAX ? UINT32_MAX : (uint32_t)rem;
+        uint32_t comp_sz = 0u;
+        uint32_t uncomp_sz = 0u;
+        uint32_t blk_out = 0u;
+        int is_last;
+
+        if (zpse_block_probe(in + pos, avail, &comp_sz, &uncomp_sz) != PSE_OK ||
+            comp_sz < ZPSE_BLOCK_HEADER_SIZE || (size_t)comp_sz > rem ||
+            uncomp_sz < ZPSE_MIN_BLOCK_SIZE ||
+            uncomp_sz > ZPSE_MAX_BLOCK_SIZE) {
+            fprintf(stderr, "zpse_cli: bad block at offset %zu\n", pos);
+            fclose(f);
+            return 1;
+        }
+        /* comp_sz >= 32 and <= rem, so in[pos + 3] is in bounds. */
+        is_last = (in[pos + 3] & ZPSE_B_LAST) != 0;
+        if (zpse_decompress_block(in + pos, comp_sz, out,
+                                  (uint32_t)sizeof out, &blk_out,
+                                  dec_arena) != PSE_OK ||
+            blk_out != uncomp_sz) {
+            fprintf(stderr, "zpse_cli: block at offset %zu does not decode\n",
+                    pos);
+            fclose(f);
+            return 1;
+        }
+        if (blk_out > 0u && fwrite(out, 1u, blk_out, f) != blk_out) {
+            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+            fclose(f);
+            return 1;
+        }
+        out_pos += (size_t)blk_out;
+        pos += (size_t)comp_sz;
+        nblocks++;
+        if (is_last) {
+            have_last = 1;
+            break;
+        }
+        if (has_count && (uint64_t)nblocks > (uint64_t)fh->block_count) {
+            fprintf(stderr, "zpse_cli: more blocks than the frame declares\n");
+            fclose(f);
+            return 1;
+        }
+    }
+    if (!have_last) {
+        if (pos != in_len) {
+            fprintf(stderr, "zpse_cli: frame ends mid-block\n");
+            fclose(f);
+            return 1;
+        }
+        if (!has_count || (uint64_t)nblocks != (uint64_t)fh->block_count) {
+            fprintf(stderr, "zpse_cli: block count disagrees with the frame\n");
+            fclose(f);
+            return 1;
+        }
+    }
+    if (has_count && (uint64_t)nblocks != (uint64_t)fh->block_count) {
+        fprintf(stderr, "zpse_cli: block count disagrees with the frame\n");
+        fclose(f);
+        return 1;
+    }
+    if (has_content && (uint64_t)out_pos != (uint64_t)fh->content_size) {
+        fprintf(stderr, "zpse_cli: content size disagrees with the frame\n");
+        fclose(f);
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "zpse_cli: close failed on %s\n", out_path);
+        return 1;
+    }
+    return 0;
+}
+
 static int cmd_codec(int argc, char **argv)
 {
     int compress = (argv[1][0] == 'c');
@@ -313,6 +421,8 @@ static int cmd_codec(int argc, char **argv)
     void **enc_arenas = NULL;
     void **dec_arenas = NULL;
     int rc;
+    int stream_dec = 0;
+    ZpseFrameHeader dhead;
     int i = 2;
 
     for (; i < argc && argv[i][0] == '-'; i++) {
@@ -404,6 +514,17 @@ static int cmd_codec(int argc, char **argv)
             return 1;
         }
         out_cap = (size_t)h.content_size;
+        /* A frame without an index decodes sequentially, and that needs no
+         * output buffer at all: decode_stream writes each block as it is
+         * finished. A frame that declares an index still takes the
+         * whole-frame path, which is what validates the index against the
+         * stream it describes. */
+        if (threads == 1u &&
+            (h.frame_flags & (uint16_t)ZPSE_F_FRAME_INDEX) == 0u) {
+            stream_dec = 1;
+            dhead = h;
+            out_cap = 1u;
+        }
         dec_arenas = alloc_arenas(threads, ZPSE_DEC_ARENA_SIZE);
     }
     if (compress ? (enc_arenas == NULL) : (dec_arenas == NULL)) {
@@ -425,6 +546,14 @@ static int cmd_codec(int argc, char **argv)
     if (compress) {
         rc = compress_mem(in, in_len, out, out_cap, &out_len, block, enc_flags,
                           indexed, enc_arenas, threads);
+    } else if (stream_dec != 0) {
+        /* decode_stream opens, writes and closes the output itself. */
+        int drc = decode_stream(in, in_len, out_path, &dhead, dec_arenas[0]);
+
+        free(out);
+        free_arenas(dec_arenas, threads);
+        free(in);
+        return drc;
     } else {
         /* Frames written with -x decode block by block, so -t applies here
          * too; a frame without an index decodes sequentially inside the same
