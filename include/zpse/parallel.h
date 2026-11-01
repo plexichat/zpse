@@ -13,14 +13,15 @@
  * of this codec (1-2 GB/s against 13 GB/s decode), so that is where the
  * cores go.
  *
- * The blocks are the serial encoder's own on every level whose decision is
- * order-free. From level 5 up the encoder carries a cross-block history, and
- * each worker carries its own, so a block encoded by a worker that has just
- * seen different neighbours can start from a different first trial: the same
- * 20 MB at level 6 packs to 15,098,769 bytes on one worker and 15,101,233 on
- * four. That is a ratio choice and not a format one -- either stream is valid
- * and decodes identically -- but it means the byte-identity claim is about
- * the blocks, not about the worker count.
+ * The blocks are the serial encoder's own at every level. From level 5 up the
+ * encoder carries a cross-block history, and each worker carries its own, but
+ * that history only chooses which survivor is attempted first: the winner, the
+ * flat-block cap and the tied-field cut are all decided from prices the block
+ * computes for itself, so a block is a pure function of its own bytes and the
+ * worker count cannot change the stream. That used to be untrue -- with the
+ * history hint promoted to the winner, the same 20 MB at level 6 packed to
+ * 15,098,769 bytes on one worker and 15,101,233 on four -- and it is the one
+ * property here that is checked by comparing bytes rather than by argument.
  *
  * Threading is compiled in only when ZPSE_MT is defined (POSIX: add
  * -pthread). Without it this is the serial encoder behind a different
@@ -85,21 +86,25 @@ typedef int (*ZpseBlockEmit)(void *ctx, uint32_t seq, const uint8_t *block,
  * flag; a caller that has the whole input passes 1 with everything in one
  * call and gets the buffered encoder's stream, block for block.
  *
- * The workers write into a ring of `slot_cap / (nominal_block_size + 32)`
- * slots in `slot_mem`, so only that much of the output is ever resident;
- * `ready` and `lens` are caller-owned `int` and `uint32_t` scratch of the
- * same count, and `ready` is cleared here. The library still never
- * allocates. Emitting blocks in order is what makes the stream writable
- * while the last blocks are still being encoded.
+ * The workers write into `slot_mem`, which holds one (nominal_block_size + 32)
+ * byte slot per worker, so only that much of the output is ever resident;
+ * `ready` and `lens` are caller-owned `int` and `uint32_t` scratch of at least
+ * that many entries, and `ready` is cleared here. The library still never
+ * allocates. Worker `w` owns slot `w` and encodes blocks `w`, `w + n`,
+ * `w + 2n`, ... in that order, so a slot has exactly one writer and the
+ * writer thread frees a slot only after emitting it. Emitting blocks in order
+ * is what makes the stream writable while the last blocks are still being
+ * encoded; the static assignment is what makes the handoff provable, and an
+ * earlier version that claimed blocks from a shared counter instead did hand
+ * one block's bytes over under another block's length.
  *
- * Returns PSE_OK, or a negative status. This serves ONE worker: with the
- * history reorder off (the default) a block is a pure function of its own
- * bytes, so a slab with one worker is the serial stream by construction. The
- * multi-worker ring that used to be taken here is withheld -- see the note in
- * src/parallel.c. It produced a different stream on each of three consecutive
- * six-worker runs of one input, the same length every time, and a path that
- * can put one block's bytes out under another block's length is not something
- * a caller should be handed. */
+ * `threads` above is the ceiling: the worker count is the smallest of it, the
+ * arena count and the number of slots in `slot_mem`, and a slab shorter than
+ * four blocks per worker is encoded serially. Returns PSE_OK, or a negative
+ * status. The stream is block for block the one zpse_compress_frame_parallel()
+ * writes at the same thread count, and that call's stream at one worker is the
+ * serial one, so a caller may switch between the three without changing a
+ * byte. */
 int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
                                uint32_t nominal_block_size,
                                uint32_t enc_flags, unsigned threads,

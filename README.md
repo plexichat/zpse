@@ -799,10 +799,11 @@ match table below: the fast path is the only shape that never touches the
 encoder's 128 KiB of candidate staging, so the table lives there. On the prose
 files it is still a real trade --
 `dickens` goes from 1.18:1 at the default level to 1.57:1 -- because that is
-where the tile model has nothing and a match finder has everything. It is
-`lz4 -1`'s operating point now: 0.60 GB/s here against 0.46 in the frontier
-table, at a slightly better ratio (2.06:1 against 2.10:1), and 2.35 GB/s of
-decode against lz4's 1.38 on the same warm-buffer basis. The finder is most of the encode in this mode --
+where the tile model has nothing and a match finder has everything. It is `lz4 -1`'s operating point
+on ratio -- 2.06:1 against 2.10:1 -- and behind it on rate, which is the
+single-core comparison below; on this table's warm-buffer basis its decode is
+the fastest row here, because the whole point of the form is that the command
+loop is all that is left. The finder is most of the encode in this mode --
 455 MB/s on `dickens`, 624 on `mozilla` and 1070 on `xml`, timed a block at a
 time -- so what is left is the block wrapper and the read, not the command
 writing. Three changes got it there, every one of them byte-identical:
@@ -1030,25 +1031,25 @@ result is byte-identical to the serial call -- same blocks, same header, same
 index -- which is what `tests/suites/test_parallel.c` asserts at every worker
 count it tries.
 
-The CLI streams a single-threaded frame and uses the buffered call for `-t`:
-`zpse_compress_frame_stream()` hands finished blocks to a writer callback in
-order, so a file needs a slab of input and one slot of output rather than the
-input and the whole frame, and `zpse c -l 6 -t 4` takes 627 ms on the 202 MiB
-corpus against 942 ms for one streamed thread -- the workers still want a
-frame-sized buffer to fill and walk, and a streamed thread needs neither. On
-`bench` the same file is 975 MB/s of encode and 5.1 GB/s of decode at four
-workers against 281 and 1.58 at one.
+The CLI streams every frame, workers included: `zpse_compress_frame_stream()`
+hands finished blocks to a writer callback in order, so a file needs a slab of
+input and one slot of output per worker rather than the input and the whole
+frame. On the 202 MiB corpus at level 6, `zpse c -t 6` takes 688 ms wall --
+1007 ms at one worker -- and 419 ms of that is the encode with the output sent
+to `/dev/null`, the rest being the write. On `bench` the same file is 975 MB/s
+of encode and 5.1 GB/s of decode at four workers against 281 and 1.58 at one.
 
-The streamed *worker* path exists and is withheld. It rings worker + 2 slots
-and hands the writer blocks in order, and it passed byte-identity at two and
-four workers -- then wrote three different streams in three consecutive
-six-worker runs of the same 3 MB input, at the same length every time, and an
-8 KiB-block run differed at two, four and six workers as well. Same length
-with different bytes is one block's bytes going out under another block's
-length, so a slot is being handed over twice somewhere, and a path that can do
-that is not offered to a caller until it is found.
-`zpse_compress_frame_stream()` therefore serves one worker, which is the
-serial stream by construction.
+The ring is what made that work, and the first version of it was wrong. It
+claimed blocks from a shared counter, so which block landed in which slot was
+decided by timing; it passed byte-identity at two and four workers, then wrote
+three different streams in three consecutive six-worker runs of the same 3 MB
+input, at the same length every time. Same length with different bytes means
+one block's bytes were emitted under another block's length. The assignment is
+now static -- worker `w` owns slot `w` and encodes blocks `w`, `w + n`,
+`w + 2n` -- so a slot has one writer, its generations are strictly increasing,
+and the writer frees a slot only after emitting it. `t=1,2,3,4,6` now produce
+one digest at levels 1, 5, 6 and 9, on `-F`, and on 8 KiB blocks, and three
+consecutive six-worker runs of the same input produce the same digest.
 
 Threading is compiled in only under `ZPSE_MT`. Without it the call is the
 serial encoder, so a caller ships one build and gets cores only where it asked
@@ -1176,29 +1177,33 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.82 GB/s | 0.82 GB/s | **yes** |
-| zpse 3 FASTER | 1.30:1 | 0.49 GB/s | 0.78 GB/s | **yes** |
-| zpse 5 BALANCED | 1.92:1 | 0.23 GB/s | 0.68 GB/s | no |
-| zpse 6 (default) | 2.04:1 | 0.24 GB/s | 0.77 GB/s | no |
-| zpse 9 MAX | 2.20:1 | 0.15 GB/s | 0.72 GB/s | no |
-| zpse `LZ_FAST` | 2.02:1 | 0.45 GB/s | 0.82 GB/s | no |
-| lz4 -1 | 2.10:1 | 0.46 GB/s | 1.38 GB/s | yes |
-| lz4 -3 | 2.60:1 | 0.09 GB/s | 1.31 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.03 GB/s | 1.45 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.32 GB/s | 0.91 GB/s | yes |
-| zstd -3 | 3.20:1 | 0.20 GB/s | 0.80 GB/s | yes |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.58 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.74 GB/s | 0.94 GB/s | **yes** |
+| zpse 3 FASTER | 1.29:1 | 0.51 GB/s | 0.98 GB/s | no |
+| zpse 5 BALANCED | 1.92:1 | 0.26 GB/s | 0.86 GB/s | no |
+| zpse 6 (default) | 2.04:1 | 0.26 GB/s | 0.88 GB/s | no |
+| zpse 9 MAX | 2.20:1 | 0.17 GB/s | 0.85 GB/s | no |
+| zpse `LZ_FAST` | 2.06:1 | 0.50 GB/s | 1.13 GB/s | no |
+| lz4 -1 | 2.10:1 | 0.52 GB/s | 1.62 GB/s | yes |
+| lz4 -3 | 2.60:1 | 0.11 GB/s | 1.54 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.04 GB/s | 1.59 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.24 GB/s | 1.02 GB/s | yes |
+| zstd -3 | 3.20:1 | 0.19 GB/s | 0.95 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.86 GB/s | yes |
 
-Every row here was measured in one run, lz4 and zstd included. Two zpse rows
-are on the frontier -- level 1 at 1.25:1 and 0.82 GB/s, level 3 at 1.30:1 and
-0.49 -- because the CLI stopped buffering the file: nothing else in the table
-encodes as fast at any ratio, and `zstd -1` needs 2.89:1 before it gets to
-0.32. The fast form is not on it. `lz4 -1` matches its encode rate to within
-1% and decodes 1.7 times as fast, for a ratio 4% worse, so the two are the
-same operating point with different sides of it. What the fast form did move
-is zpse's own frontier: at 2:1 it is the cheapest row the codec has (0.45
-GB/s against the default's 0.24, and 0.82 GB/s of decode against 0.77), so it
-is the mode to reach for once that trade has been made. `ZPSE_LEVELS="1 3 5 6
+Every row here was measured in one run, pinned to one core, lz4 and zstd
+included. One zpse row is on the frontier: level 1 at 1.25:1, which nothing
+else reaches at any rate -- the nearest competitor needs 2.89:1 before it gets
+to a comparable one. Everything else zpse offers here is dominated. Level 3 is
+behind `lz4 -1` at almost the same ratio, which is a change from what this
+table claimed before its rows were measured on the same basis, and level 6 and
+MAX lose on rate to tools that give up a third of the size -- the trade a
+shape-deciding encoder makes. The fast form is the closest row zpse has to
+`lz4 -1`: 2% larger output at 96% of its encode rate, and still behind on both
+rates, so it is not on the frontier either. What it does move is zpse's own
+frontier: at 2:1 it is the cheapest row the codec has, twice the default
+level's encode rate for a third more decode rate and 1% less output. So on
+this corpus the frontier claim is level 1 only, and the honest summary of the
+rest is a ratio advantage that no other tool matches at any rate. `ZPSE_LEVELS="1 3 5 6
 9 F"` reproduces the table, `F` being `ZPSE_ENC_LZ_FAST`.
 
 The two measurements below say where that gap is, and neither of them is the
@@ -1206,9 +1211,9 @@ format.
 
 The first is encode. One block at a time over the same 202 MiB, the match
 finder runs at 554 MB/s -- 378 on `dickens`, 435 on `webster`, 544 on
-`mozilla`, 1.2 GB/s on `nci` -- and the streamed CLI reaches 0.45 GB/s, which
-is 82% of it. The same measurement on the buffered CLI was 0.25 GB/s, and the
-missing fifth was not the codec: that path read the whole 202 MiB into fresh
+`mozilla`, 1.2 GB/s on `nci` -- and the streamed CLI reaches 497 MB/s, which
+is 90% of it. The buffered CLI this replaced measured 250 MB/s, and the
+missing half was not the codec: that path read the whole 202 MiB into fresh
 pages and allocated a 424 MiB frame to write 105 MiB into, faulting both in a
 page at a time. `lz4`'s CLI streams four megabytes at a time and never pays it,
 which is most of why its row read twice as fast. Beyond that, a Silesia prose
@@ -1219,7 +1224,7 @@ parse finds longer matches on the same bytes.
 The second is decode, and the framing is most of it. The command loop decodes
 these twelve files at 1.98 GB/s a block -- 1.30 on `dickens`, 1.54 on
 `webster`, 2.01 on `mozilla`, 4.5 on `x-ray` -- and the CLI's frame decode of
-the same bytes is 0.82. That path already writes each block out as it finishes,
+the same bytes is 0.88. That path already writes each block out as it finishes,
 so the difference is what surrounds the loop: a `zpse_block_probe` per block to
 find its length, a one-shot decoder init, and a 105 MiB input that is still read
 whole before the first block is touched.

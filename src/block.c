@@ -68,15 +68,20 @@
 #endif
 
 /* Whether the previous block's winning shape may be moved to the front of the
- * trial list. Off by default: moving it changes which of two equally priced
- * candidates is tried first, and the price of the rest depends on where the
- * aborts land, so a block encoded after different neighbours can come out a
- * few bytes different. That is invisible on one thread and not invisible on
- * several -- the same 20 MB at level 6 packed to 15,098,769 bytes on one worker
- * and 15,101,233 on four -- so the worker count was choosing the stream. With
- * the reorder off a block is a pure function of its own bytes, which is what
- * makes `-t N` write the serial stream and what lets a slab or worker boundary
- * be invisible by construction rather than by argument. */
+ * trial list, once the set and every price-driven decision are final (see the
+ * block in zpse_block_encode; it is a permutation of attempt order and nothing
+ * else).
+ *
+ * Off by default, and now for a measured reason rather than a correctness one.
+ * While the hint was promoted to `pick` it also fed the flat-block cap and the
+ * tied-field cut, so a block encoded after different neighbours could come out
+ * a few bytes different -- the same 20 MB at level 6 packed to 15,098,769
+ * bytes on one worker and 15,101,233 on four -- and dropping it recovered
+ * 0.016% of the corpus (104,050,674 against 104,066,700 on 202 MiB). Moved
+ * behind those decisions it is byte-identical to the canonical order on the
+ * whole 202 MiB corpus at levels 6 and 9, and the speed it buys is inside the
+ * noise of this host: 437.3 ms against 441.0 ms per 103 MB, best-of-three,
+ * single core, so there is nothing left to recover by turning it on. */
 #ifndef ZPSE_HIST_REORDER
 #define ZPSE_HIST_REORDER 0u
 #endif
@@ -3083,44 +3088,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
             }
         }
-        /* ---- Order-n first trial: the block's own history -------------- *
-         * A file is not 3234 independent blocks: they come from one source,
-         * and the transform that won the last one usually wins the next. The
-         * sweep's own first choice is a 16 KiB price, and measurement on
-         * Silesia at the default level says that choice is wrong on a quarter
-         * of blocks -- when it is wrong it is wrong by 17.5 KB a block, which
-         * is what the later trials are for.
-         *
-         * So when the price cannot separate the previous block's shape from
-         * its own winner (within 1/16), the previous winner goes first. That
-         * is the case where the price has no information and the history has
-         * some.
-         *
-         * This is a reorder, not a cut: ncand is untouched, every survivor is
-         * still priced and encoded, and the tie-break still uses the original
-         * list index in idx[], so the block the sweep writes is the same one --
-         * tests/suites/test_sizes.c proves no case grows and the parity suite
-         * proves the swapped-order build writes the same streams. */
-        if (ZPSE_HIST_REORDER != 0u && pick >= 0 && e->hist_valid != 0u &&
-            ncand > 1) {
-            int h = -1;
-            int hi;
-
-            for (hi = 0; hi < ncand; hi++) {
-                if (tids[hi] == e->hist_tid && scounts[hi] == e->hist_sc) {
-                    h = hi;
-                    break;
-                }
-            }
-            if (h >= 0 && h != pick && ex[h] != UINT32_MAX &&
-                ex[pick] != UINT32_MAX &&
-                ex[h] <= ex[pick] + (ex[pick] >> 4)) {
-                pick = h;
-#if ZPSE_HIST_STOP_STREAK > 0u
-                hist_first = 1;
-#endif
-            }
-        }
         if (pick >= 0 && pick != 0) {
             /* Move the exact-probe winner to slot 0 so the trial loop tries
              * the most likely winner first: its total becomes best_total and
@@ -3227,6 +3194,75 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * between 1, 2, 3 and 4. */
             if (pick >= 0 && cap != 0u && (uint32_t)ncand > cap) {
                 ncand = (int)cap;
+            }
+        }
+        /* ---- Order-n first trial: the block's own history -------------- *
+         * A file is not 3234 independent blocks: they come from one source,
+         * and the transform that won the last one usually wins the next. The
+         * sweep's own first choice is a 16 KiB price, and measurement on
+         * Silesia at the default level says that choice is wrong on a quarter
+         * of blocks -- when it is wrong it is wrong by 17.5 KB a block, which
+         * is what the later trials are for. So when the price cannot separate
+         * the previous block's shape from this block's winner (within 1/16),
+         * the previous winner is attempted first: the price has no information
+         * there and the history has some.
+         *
+         * It is applied HERE -- after the set is decided and after every
+         * decision that reads a price -- and that is the whole point.
+         * Promoting the hint to `pick`, which is where this used to live, let
+         * a candidate 1/16 worse by price decide how many trials the block
+         * got, because `pick` feeds the flat-block cap and the tied-field cut.
+         * The same bytes encoded after different neighbours then came out a
+         * few bytes different -- 15,098,769 on one worker against 15,101,233
+         * on four for the same 20 MB -- so the worker count was choosing the
+         * stream, and turning the hint off cost 0.016% of the corpus
+         * (104,050,674 against 104,066,700 on 202 MiB). Here the caps, the cut
+         * and the winner are all the price's and the hint only changes which
+         * survivor is ATTEMPTED first. ncand is untouched, every survivor is
+         * still priced and encoded, the price and floor move with the slot,
+         * and the tie-break still uses the original list index in idx[], so
+         * the block is the same with the hint on and off (test_sizes holds the
+         * size, the parity suite the bytes). */
+        if (ZPSE_HIST_REORDER != 0u && e->hist_valid != 0u && ncand > 1) {
+            int h = -1;
+            int hi;
+
+            for (hi = 1; hi < ncand; hi++) {
+                if (tids[hi] == e->hist_tid && scounts[hi] == e->hist_sc) {
+                    h = hi;
+                    break;
+                }
+            }
+            if (h > 0 && ex[h] != UINT32_MAX && ex[0] != UINT32_MAX &&
+                ex[h] <= ex[0] + (ex[0] >> 4)) {
+                uint8_t  st = tids[0],  ss = scounts[0],  si = idx[0];
+                uint16_t sl = meta_lens[0];
+                uint32_t sx = ex[0];
+                uint8_t  sb[ZPSE_MAX_CAND_META];
+                unsigned m;
+
+                for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                    sb[m] = meta_bufs[0][m];
+                }
+                tids[0] = tids[h];
+                scounts[0] = scounts[h];
+                idx[0] = idx[h];
+                meta_lens[0] = meta_lens[h];
+                ex[0] = ex[h];
+                for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                    meta_bufs[0][m] = meta_bufs[h][m];
+                }
+                tids[h] = st;
+                scounts[h] = ss;
+                idx[h] = si;
+                meta_lens[h] = sl;
+                ex[h] = sx;
+                for (m = 0; m < ZPSE_MAX_CAND_META; m++) {
+                    meta_bufs[h][m] = sb[m];
+                }
+#if ZPSE_HIST_STOP_STREAK > 0u
+                hist_first = 1;
+#endif
             }
         }
     }
