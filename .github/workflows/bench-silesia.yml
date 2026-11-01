@@ -107,8 +107,10 @@ jobs:
           done
           # 60 MB/s is a collapsed-finder detector, not a performance target:
           # runners here measure 150-400 MB/s on these files, so only a real
-          # regression trips it.
-          ZPSE_LZ_MIN_MBPS=60 "$RUNNER_TEMP/bench_lz2" $files | tee lz.txt
+          # regression trips it. The decode floor is the same idea for the
+          # command loop, which measures 1.3-4.5 GB/s here.
+          ZPSE_LZ_MIN_MBPS=60 ZPSE_LZ_MIN_DEC_MBPS=200 \
+            "$RUNNER_TEMP/bench_lz2" $files | tee lz.txt
 
       - name: Keep the tables
         if: always()

@@ -11,14 +11,18 @@
  *   Files:    every complete 64 KiB block of each file, which is the unit the
  *             block encoder actually hands the finder.
  *
- *   ZPSE_LZ_MIN_MBPS  exit non-zero when any row's rate is below this, for a
- *                     job that wants a floor (0 = report only). A floor has to
- *                     be loose -- CI hosts differ by 2-4x -- so it catches a
- *                     codec that collapsed, not a few percent.
+ *   ZPSE_LZ_MIN_MBPS      exit non-zero when any row's encode rate is below
+ *                         this, for a job that wants a floor (0 = report
+ *                         only). A floor has to be loose -- CI hosts differ by
+ *                         2-4x -- so it catches a codec that collapsed, not a
+ *                         few percent.
+ *   ZPSE_LZ_MIN_DEC_MBPS  the same floor for the fast form's decode rate.
  *
  * Both codecs get the same table, cleared before each call the way the
- * encoder clears it, and the same best-of-3 timing of whole-block calls.
- * Links src/zpse_unity.c.
+ * encoder clears it, and the same best-of-3 timing of whole-block calls. The
+ * last column is the fast form's decode rate over payloads packed once, so a
+ * regression in the command loop is a row that moved rather than a claim
+ * nobody re-measured. Links src/zpse_unity.c.
  */
 /* clock_gettime needs POSIX >= 199309 on glibc when -std=c11 is used
  * strictly, which is how CI builds this file. */
@@ -41,9 +45,14 @@
 #include "zpse/lz2.h"
 
 #define BLOCK 65536u
+/* One block's payload ceiling: the fast form codes a token per four bytes at
+ * worst, which is 16 KiB over the block, and every payload is held so the
+ * decode is timed on its own. */
+#define PAYCAP 70000u
 
 static uint8_t in[BLOCK];
 static uint8_t payload[200000];
+static uint8_t outbuf[BLOCK];
 static uint16_t tab[ZPSE_LZ_TABLE_ENTRIES];
 static uint8_t *filebuf;
 
@@ -109,17 +118,79 @@ static double rate(int which, const uint8_t *data, uint32_t blocks,
     return best;
 }
 
+/* The fast form's decode rate: every block packed once, then decoded best of
+ * three out of one reused block buffer. The payloads are held so the clock
+ * covers the decoder alone -- packing inside it would time the finder, which
+ * is the column to the left. *packed_out reports the total payload, so a row
+ * says which stream was decoded. Returns -1.0 when a codec refuses a block. */
+static double dec_rate(const uint8_t *data, uint32_t blocks,
+                       uint32_t *packed_out)
+{
+    uint8_t *packed = (uint8_t *)malloc((size_t)blocks * PAYCAP);
+    uint32_t *lens = (uint32_t *)malloc((size_t)blocks * sizeof(uint32_t));
+    double best = 0.0;
+    uint32_t total = 0u;
+    uint32_t b;
+    int rep;
+
+    *packed_out = 0u;
+    if (packed == 0 || lens == 0) {
+        free(packed);
+        free(lens);
+        return -1.0;
+    }
+    for (b = 0; b < blocks; b++) {
+        memset(tab, 0xFF, sizeof tab);
+        lens[b] = zpse_lz2_encode(data + (size_t)b * BLOCK, BLOCK,
+                                  packed + (size_t)b * PAYCAP, PAYCAP, tab,
+                                  ZPSE_LZ_HASH_BITS);
+        if (lens[b] == 0u) {
+            free(packed);
+            free(lens);
+            return -1.0;
+        }
+        total += lens[b];
+    }
+    for (rep = 0; rep < 3; rep++) {
+        double t0 = now_ns();
+        double ns;
+
+        for (b = 0; b < blocks; b++) {
+            if (zpse_lz2_decode(packed + (size_t)b * PAYCAP, lens[b], outbuf,
+                                BLOCK) != 0) {
+                free(packed);
+                free(lens);
+                return -1.0;
+            }
+        }
+        ns = now_ns() - t0;
+        if (ns > 0.0) {
+            double mb = (double)blocks * (double)BLOCK / (ns / 1e9) / 1e6;
+
+            if (mb > best) {
+                best = mb;
+            }
+        }
+    }
+    *packed_out = total;
+    free(packed);
+    free(lens);
+    return best;
+}
+
 int main(int argc, char **argv)
 {
     const char *floor_env = getenv("ZPSE_LZ_MIN_MBPS");
+    const char *dec_env = getenv("ZPSE_LZ_MIN_DEC_MBPS");
     double floor_mb = floor_env != 0 ? atof(floor_env) : 0.0;
+    double dec_floor = dec_env != 0 ? atof(dec_env) : 0.0;
     int bad = 0;
     int arg;
 
     printf("block=%u B, best of 3 passes, one thread, table %u entries\n",
            (unsigned)BLOCK, (unsigned)ZPSE_LZ_TABLE_ENTRIES);
-    printf("%-14s %7s %10s %10s %8s\n", "input", "blocks", "lz1 MB/s",
-           "lz2 MB/s", "lz2 B");
+    printf("%-14s %7s %10s %10s %8s %10s\n", "input", "blocks", "lz1 MB/s",
+           "lz2 MB/s", "lz2 B", "dec MB/s");
 
     if (argc > 1) {
         for (arg = 1; arg < argc; arg++) {
@@ -127,8 +198,8 @@ int main(int argc, char **argv)
             long sz;
             size_t got;
             uint32_t blocks;
-            uint32_t b1 = 0u, b2 = 0u;
-            double r1, r2;
+            uint32_t b1 = 0u, b2 = 0u, dp = 0u;
+            double r1, r2, d2;
 
             if (f == 0) {
                 fprintf(stderr, "bench_lz2: cannot open %s\n", argv[arg]);
@@ -153,17 +224,21 @@ int main(int argc, char **argv)
             blocks = (uint32_t)(got / BLOCK);
             r1 = rate(0, filebuf, blocks, &b1);
             r2 = rate(1, filebuf, blocks, &b2);
+            d2 = dec_rate(filebuf, blocks, &dp);
             free(filebuf);
             filebuf = 0;
-            if (r1 < 0.0 || r2 < 0.0) {
+            if (r1 < 0.0 || r2 < 0.0 || d2 < 0.0) {
                 printf("%-14s %7u   codec refused a block\n", argv[arg],
                        (unsigned)blocks);
                 bad = 1;
                 continue;
             }
-            printf("%-14s %7u %10.1f %10.1f %8u\n", argv[arg],
-                   (unsigned)blocks, r1, r2, (unsigned)b2);
+            printf("%-14s %7u %10.1f %10.1f %8u %10.1f\n", argv[arg],
+                   (unsigned)blocks, r1, r2, (unsigned)b2, d2);
             if ((floor_mb > 0.0) && (r1 < floor_mb || r2 < floor_mb)) {
+                bad = 1;
+            }
+            if ((dec_floor > 0.0) && (d2 < dec_floor)) {
                 bad = 1;
             }
         }
@@ -186,8 +261,8 @@ int main(int argc, char **argv)
         int k;
 
         for (k = 0; k < 3; k++) {
-            uint32_t i, b1 = 0u, b2 = 0u;
-            double r1, r2;
+            uint32_t i, b1 = 0u, b2 = 0u, dp = 0u;
+            double r1, r2, d2;
 
             if (k == 0) {
                 size_t pl = strlen(prose);
@@ -205,16 +280,20 @@ int main(int argc, char **argv)
             memcpy(filebuf = (uint8_t *)malloc(BLOCK), in, BLOCK);
             r1 = rate(0, filebuf, 1u, &b1);
             r2 = rate(1, filebuf, 1u, &b2);
+            d2 = dec_rate(filebuf, 1u, &dp);
             free(filebuf);
             filebuf = 0;
-            if (r1 < 0.0 || r2 < 0.0) {
+            if (r1 < 0.0 || r2 < 0.0 || d2 < 0.0) {
                 printf("%-14s %7u   codec refused the block\n", names[k], 1u);
                 bad = 1;
                 continue;
             }
-            printf("%-14s %7u %10.1f %10.1f %8u\n", names[k], 1u, r1, r2,
-                   (unsigned)b2);
+            printf("%-14s %7u %10.1f %10.1f %8u %10.1f\n", names[k], 1u, r1, r2,
+                   (unsigned)b2, d2);
             if ((floor_mb > 0.0) && (r1 < floor_mb || r2 < floor_mb)) {
+                bad = 1;
+            }
+            if ((dec_floor > 0.0) && (d2 < dec_floor)) {
                 bad = 1;
             }
         }

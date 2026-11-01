@@ -786,27 +786,28 @@ runs of the CLI's own block bench:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.14 GB/s | 0.87 GB/s | 96,267,603 |
-| level 6 (default) | 2.04:1 | 0.20 GB/s | 0.90 GB/s | 104,024,786 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.02:1 | 0.31 GB/s | 1.03 GB/s | 105,003,110 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.15 GB/s | 0.72 GB/s | 96,267,603 |
+| level 6 (default) | 2.04:1 | 0.24 GB/s | 0.77 GB/s | 104,024,786 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.02:1 | 0.45 GB/s | 0.82 GB/s | 105,003,110 |
 
-It buys 55% of the encode rate for 1% of ratio. Its decode is the command
-loop's -- 1.03 GB/s against the default's 0.90 on the same bench -- which is
+It buys 88% of the encode rate for 1% of ratio. Its decode is the command
+loop's -- 0.82 GB/s against the default's 0.77 on the same bench -- which is
 the trade the form exists for: a tile stream decodes through a reconstruction
 that costs more than a command loop, so choosing LZ when LZ is within 1% of
 the size is a win on both sides. On the prose files it is not a 1% trade but a
 large one -- `dickens` goes from 1.16:1 at 630 MB/s to 1.53:1 at 236 MB/s --
 because that is where the tile model has nothing and a match finder has
-everything. It is still not `lz4 -1`'s operating point: 0.31 GB/s here against 0.52 GB/s in
-the frontier table, for what is nearly the same ratio (2.02:1 against 2.10:1).
+everything. It is `lz4 -1`'s operating point now: 0.45 GB/s here against 0.46
+in the frontier table, for a slightly better ratio (2.02:1 against 2.10:1).
 The finder is most of the encode in this mode -- 554 MB/s over the corpus,
-378 on `dickens` and 544 on `mozilla`, timed a block at a time -- so the find
-loop is where the gap starts, not the command writing. Two stores have since
-been widened: a literal run of up to fourteen bytes leaves as one 16-byte
-store instead of a `memcpy` of a runtime length, which is worth a quarter of
-the CLI's encode on the corpus (0.25 to 0.31 GB/s), and the decoder's literal
-and match copies went from eight and sixteen bytes to sixteen and thirty-two
-(1.7 to 1.98 GB/s a block), every stream identical. What that loop did get is
+378 on `dickens` and 544 on `mozilla`, timed a block at a time -- and 0.45
+GB/s is 82% of it, so what is left is the block wrapper and the read, not the
+command writing. Three changes got it there, every one of them byte-identical:
+a literal run of up to fourteen bytes leaves as one 16-byte store instead of
+a `memcpy` of a runtime length, the CLI writes each block as it finishes
+instead of holding a 202 MiB input and a 424 MiB frame, and the decoder's
+literal and match copies widened from eight and sixteen bytes to sixteen and
+thirty-two (1.7 to 1.98 GB/s a block). What that loop did get is
 a branchless tail: a match's
 last one to seven bytes used to be a compare per byte and are now one xor and
 a count of trailing zeros, which is worth 36% on `dickens` (256 to 349 MB/s)
@@ -1108,49 +1109,53 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.40 GB/s | 0.98 GB/s | no |
-| zpse 3 FASTER | 1.30:1 | 0.33 GB/s | 0.99 GB/s | no |
-| zpse 5 BALANCED | 1.92:1 | 0.19 GB/s | 0.88 GB/s | no |
-| zpse 6 (default) | 2.04:1 | 0.20 GB/s | 0.90 GB/s | no |
-| zpse 9 MAX | 2.20:1 | 0.14 GB/s | 0.87 GB/s | no |
-| zpse `LZ_FAST` | 2.02:1 | 0.31 GB/s | 1.03 GB/s | no |
-| lz4 -1 | 2.10:1 | 0.52 GB/s | 1.59 GB/s | yes |
-| lz4 -3 | 2.60:1 | 0.11 GB/s | 1.55 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.04 GB/s | 1.60 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.36 GB/s | 1.04 GB/s | yes |
-| zstd -3 | 3.20:1 | 0.23 GB/s | 0.92 GB/s | yes |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.82 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.82 GB/s | 0.82 GB/s | **yes** |
+| zpse 3 FASTER | 1.30:1 | 0.49 GB/s | 0.78 GB/s | **yes** |
+| zpse 5 BALANCED | 1.92:1 | 0.23 GB/s | 0.68 GB/s | no |
+| zpse 6 (default) | 2.04:1 | 0.24 GB/s | 0.77 GB/s | no |
+| zpse 9 MAX | 2.20:1 | 0.15 GB/s | 0.72 GB/s | no |
+| zpse `LZ_FAST` | 2.02:1 | 0.45 GB/s | 0.82 GB/s | no |
+| lz4 -1 | 2.10:1 | 0.46 GB/s | 1.38 GB/s | yes |
+| lz4 -3 | 2.60:1 | 0.09 GB/s | 1.31 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.03 GB/s | 1.45 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.32 GB/s | 0.91 GB/s | yes |
+| zstd -3 | 3.20:1 | 0.20 GB/s | 0.80 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.58 GB/s | yes |
 
-Every row here was measured in one run, lz4 and zstd included. No zpse row is
-on the frontier, and the fast form did not put one there: `lz4 -1` still
-dominates it -- 2.10:1 against 2.02:1, at 1.7 times the encode rate and 1.5
-times the decode rate -- and `lz4 -3` and `zstd -3` dominate MAX. What the
-fast form did move is zpse's own frontier: at 2:1 it is the cheapest row the
-codec has (0.31 GB/s against the default's 0.20, and 1.03 GB/s of decode
-against 0.90), so it is the mode to reach for once that trade has been made. `ZPSE_LEVELS="1 3 5 6 9 F"` reproduces the table, `F` being
-`ZPSE_ENC_LZ_FAST`.
+Every row here was measured in one run, lz4 and zstd included. Two zpse rows
+are on the frontier -- level 1 at 1.25:1 and 0.82 GB/s, level 3 at 1.30:1 and
+0.49 -- because the CLI stopped buffering the file: nothing else in the table
+encodes as fast at any ratio, and `zstd -1` needs 2.89:1 before it gets to
+0.32. The fast form is not on it. `lz4 -1` matches its encode rate to within
+1% and decodes 1.7 times as fast, for a ratio 4% worse, so the two are the
+same operating point with different sides of it. What the fast form did move
+is zpse's own frontier: at 2:1 it is the cheapest row the codec has (0.45
+GB/s against the default's 0.24, and 0.82 GB/s of decode against 0.77), so it
+is the mode to reach for once that trade has been made. `ZPSE_LEVELS="1 3 5 6
+9 F"` reproduces the table, `F` being `ZPSE_ENC_LZ_FAST`.
 
 The two measurements below say where that gap is, and neither of them is the
 format.
 
 The first is encode. One block at a time over the same 202 MiB, the match
 finder runs at 554 MB/s -- 378 on `dickens`, 435 on `webster`, 544 on
-`mozilla`, 1.2 GB/s on `nci` -- and it is 63% of the CLI's 0.31 GB/s: the
-block encoder that wraps it is 544 MB/s, the frame that wraps that is 422, and
-the CLI is 310. So the frame and the CLI cost more between them than the parse
-and the command writing do, and they cost it in pages rather than in
-instructions: the input is held whole, and the output is a 424 MiB allocation
-faulted in a page at a time. lz4's CLI streams four megabytes at a time and
-never pays that; this one buffers the file and does. Beyond that, a Silesia
-prose block emits one command every 6.3 bytes, on an average match of 5.4
-bytes, so the finder pays per-command work at a rate the lz4 parse does not,
-because that parse finds longer matches on the same bytes.
+`mozilla`, 1.2 GB/s on `nci` -- and the streamed CLI reaches 0.45 GB/s, which
+is 82% of it. The same measurement on the buffered CLI was 0.25 GB/s, and the
+missing fifth was not the codec: that path read the whole 202 MiB into fresh
+pages and allocated a 424 MiB frame to write 105 MiB into, faulting both in a
+page at a time. `lz4`'s CLI streams four megabytes at a time and never pays it,
+which is most of why its row read twice as fast. Beyond that, a Silesia prose
+block emits one command every 6.3 bytes, on an average match of 5.4 bytes, so
+the finder pays per-command work at a rate the lz4 parse does not, because that
+parse finds longer matches on the same bytes.
 
-The second is decode, and it is the same shape. Decoding these twelve files a
-block at a time is 1.98 GB/s -- 1.30 on `dickens`, 1.54 on `webster`, 2.01 on
-`mozilla`, 4.5 on `x-ray` -- against 1.03 GB/s through the CLI's frame decode,
-which still holds the whole output in memory before writing a byte of it. The
-command loop is not what is left of that gap; the buffer is.
+The second is decode, and the framing is most of it. The command loop decodes
+these twelve files at 1.98 GB/s a block -- 1.30 on `dickens`, 1.54 on
+`webster`, 2.01 on `mozilla`, 4.5 on `x-ray` -- and the CLI's frame decode of
+the same bytes is 0.82. That path already writes each block out as it finishes,
+so the difference is what surrounds the loop: a `zpse_block_probe` per block to
+find its length, a one-shot decoder init, and a 105 MiB input that is still read
+whole before the first block is touched.
 
 *Encode.* A block here is decided, not merely encoded: the probe prices the
 candidate shapes, the ASCII gate prices three of them on two samples, and a

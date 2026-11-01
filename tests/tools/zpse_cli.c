@@ -35,7 +35,14 @@
  *
  * Throughputs are decimal (1 MB = 1e6 bytes) and measure the codec only:
  * a bench reads each input once, before the clock starts, and keeps every
- * buffer in memory. */
+ * buffer in memory.
+ *
+ * A frame written without -x and with one worker is streamed, not buffered:
+ * the input is read a block at a time and each block is written to the output
+ * as it is finished, so neither the file nor the frame is ever resident
+ * whole. `-x` needs the buffered path -- its table is built by walking the
+ * blocks that are already written -- and `-t` needs it too, because its
+ * workers fill a fixed slot per block before the frame is compacted. */
 /* clock_gettime is POSIX, and a strict -std=c11 hides it unless the
  * feature-test macro asks for it (the in-tree benchmarks do the same). */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
@@ -52,6 +59,7 @@
 #endif
 
 #include "zpse/zpse.h"
+#include "zpse/block.h"
 #include "zpse/frame.h"
 
 #if defined(_MSC_VER)
@@ -399,6 +407,141 @@ static int decode_stream(const uint8_t *in, size_t in_len, const char *out_path,
     return 0;
 }
 
+/* Encode a frame block by block, writing each block as it is finished.
+ *
+ * One encoder is initialised for the whole run and handed every block, as
+ * the frame path does: levels 5 and up carry an order-n history of the shapes
+ * that won the last blocks to decide which trial runs first, and a one-shot
+ * call per block would reset it and write a different (larger) stream. The
+ * stream here is the buffered path's, byte for byte.
+ *
+ * The buffered path holds the input and a frame-sized output buffer at once:
+ * on the 202 MiB Silesia corpus that is a 202 MiB read into fresh pages plus
+ * a 424 MiB allocation, and against the same encode with both already
+ * resident it costs a quarter of the wall time. Nothing about the format
+ * needs it -- each block is independent and carries its own compressed size
+ * in its header -- so this walks the blocks and writes them out of one reused
+ * buffer, exactly as the decoder's decode_stream already does.
+ *
+ * The frame header is written first and is the same one zpse_frame_encode
+ * writes: the content size and the block count are known from the input's
+ * size, so nothing has to be patched afterwards. A frame written here is
+ * byte for byte the frame the buffered path writes.
+ *
+ * Returns 0 on success, 1 on any failure, matching write_file. */
+static int encode_stream(const char *in_path, const char *out_path,
+                         uint32_t block, uint32_t enc_flags, void *enc_arena)
+{
+    ZpseFrameHeader fh;
+    ZpseEncoder enc;
+    FILE *fi;
+    FILE *fo = NULL;
+    uint8_t *in_buf = NULL;
+    uint8_t *out_buf = NULL;
+    uint8_t hdr[ZPSE_FRAME_HEADER_SIZE];
+    /* A block's worst case is its own bytes plus the 32-byte header, and the
+     * encoder falls back to a verbatim copy inside that: twice the block plus
+     * a kilobyte covers every form with room to spare. */
+    size_t out_cap = (size_t)block * 2u + 1024u;
+    long end;
+    size_t n;
+    size_t off = 0u;
+    size_t nblocks;
+    size_t b;
+    int rc = 1;
+
+    fi = fopen(in_path, "rb");
+    if (fi == NULL) {
+        fprintf(stderr, "zpse_cli: cannot open %s\n", in_path);
+        return 1;
+    }
+    if (fseek(fi, 0, SEEK_END) != 0 || (end = ftell(fi)) < 0 ||
+        fseek(fi, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "zpse_cli: cannot size %s\n", in_path);
+        fclose(fi);
+        return 1;
+    }
+    n = (size_t)end;
+    if (n == 0u) {
+        fprintf(stderr, "zpse_cli: %s is empty\n", in_path);
+        fclose(fi);
+        return 1;
+    }
+    nblocks = n / (size_t)block + ((n % (size_t)block) != 0u ? 1u : 0u);
+    if (nblocks > (size_t)UINT32_MAX ||
+        zpse_frame_header_build(&fh, block, (uint64_t)n, 1,
+                                (uint32_t)nblocks, 1, 0) != PSE_OK ||
+        zpse_frame_header_write(&fh, hdr) != PSE_OK) {
+        fprintf(stderr, "zpse_cli: cannot build the frame header\n");
+        fclose(fi);
+        return 1;
+    }
+    fo = fopen(out_path, "wb");
+    if (fo == NULL) {
+        fprintf(stderr, "zpse_cli: cannot write %s\n", out_path);
+        fclose(fi);
+        return 1;
+    }
+    in_buf = (uint8_t *)malloc((size_t)block);
+    out_buf = (uint8_t *)malloc(out_cap);
+    if (in_buf == NULL || out_buf == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        goto done;
+    }
+    if (zpse_encoder_init(&enc, enc_arena, (size_t)ZPSE_ENC_ARENA_SIZE) !=
+        PSE_OK) {
+        fprintf(stderr, "zpse_cli: encoder init failed\n");
+        goto done;
+    }
+    enc.enc_flags = enc_flags;
+    if (fwrite(hdr, 1u, sizeof hdr, fo) != sizeof hdr) {
+        fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+        goto done;
+    }
+    for (b = 0; b < nblocks; b++) {
+        size_t chunk = n - off;
+        uint32_t clen = 0u;
+        int is_last = ((b + 1u) == nblocks) ? 1 : 0;
+        int brc;
+
+        if (chunk > (size_t)block) {
+            chunk = (size_t)block;
+        }
+        if (fread(in_buf, 1u, chunk, fi) != chunk) {
+            fprintf(stderr, "zpse_cli: short read on %s\n", in_path);
+            goto done;
+        }
+        brc = zpse_block_encode(&enc, in_buf, (uint32_t)chunk, (uint32_t)b,
+                               is_last, out_buf, (uint32_t)out_cap);
+        if (brc <= 0) {
+            fprintf(stderr, "zpse_cli: block %zu does not encode rc=%d\n", b,
+                    brc);
+            goto done;
+        }
+        clen = (uint32_t)brc;
+        if (fwrite(out_buf, 1u, clen, fo) != clen) {
+            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+            goto done;
+        }
+        off += chunk;
+    }
+    if (fclose(fo) != 0) {
+        fo = NULL;
+        fprintf(stderr, "zpse_cli: close failed on %s\n", out_path);
+        goto done;
+    }
+    fo = NULL;
+    rc = 0;
+done:
+    if (fo != NULL) {
+        fclose(fo);
+    }
+    free(in_buf);
+    free(out_buf);
+    fclose(fi);
+    return rc;
+}
+
 static int cmd_codec(int argc, char **argv)
 {
     int compress = (argv[1][0] == 'c');
@@ -490,6 +633,22 @@ static int cmd_codec(int argc, char **argv)
     }
     in_path = argv[i];
     out_path = argv[i + 1];
+    /* A frame that asks for neither the index nor a second worker is written
+     * block by block straight to the output file (see encode_stream): the
+     * input, the frame and the page faults for both are what the buffered
+     * path spends a quarter of its time on. The buffered path stays for -x,
+     * whose table is a walk over the written blocks, and for -t, whose
+     * workers fill a fixed slot per block before the frame is compacted. */
+    if (compress && threads == 1u && indexed == 0) {
+        enc_arenas = alloc_arenas(1u, ZPSE_ENC_ARENA_SIZE);
+        if (enc_arenas == NULL) {
+            fprintf(stderr, "zpse_cli: arena allocation failed\n");
+            return 1;
+        }
+        rc = encode_stream(in_path, out_path, block, enc_flags, enc_arenas[0]);
+        free_arenas(enc_arenas, 1u);
+        return rc;
+    }
     in = read_file(in_path, &in_len);
     if (in == NULL) {
         return 1;

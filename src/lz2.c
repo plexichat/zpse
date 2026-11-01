@@ -128,28 +128,37 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             h = lz2_hash(cur, hash_bits);
             continue;
         }
-        /* Extend forward, eight bytes at a time. This is the only work a
-         * match does: no lookahead at pos+1, no walk back into the pending
-         * literals, and no distance cache to update. */
-        while (pos + len + 8u <= n && cand + len + 8u <= n &&
-               lz2_load64(in + pos + len) == lz2_load64(in + cand + len)) {
-            len += 8u;
-        }
-        /* The tail is at most seven bytes, and a byte loop over it is the
-         * most executed code in the finder on prose, where the average match
-         * is 5.4 bytes: two loads, an xor and a count of trailing zeros give
-         * the same length the loop would count, with no branch per byte. The
-         * loop's exit condition guarantees the eight bytes are readable here
-         * and that they differ, so the xor is never zero. The byte loop stays
-         * for the end of the block, where eight bytes are not readable. */
-        if (pos + len + 8u <= n && cand + len + 8u <= n) {
-            uint64_t x = lz2_load64(in + pos + len) ^
-                         lz2_load64(in + cand + len);
+        /* Extend forward one eight-byte xor at a time. This is the only work
+         * a match does: no lookahead at pos+1, no walk back into the pending
+         * literals, and no distance cache to update.
+         *
+         * The xor is the length as well as the test: its lowest set bit is
+         * the first byte that differs, so one pair of loads answers both "is
+         * this step equal" and "how far in does it stop". The loop used to
+         * compare a pair and then load the same pair again to count its tail,
+         * which on prose -- average match 5.4 bytes, so it exits on its first
+         * test -- was two loads and a branch for one length. */
+        {
+            int tail = 0;
 
-            len += (uint32_t)(__builtin_ctzll(x) >> 3);
-        } else {
-            while (pos + len < n && in[pos + len] == in[cand + len]) {
-                len++;
+            while (pos + len + 8u <= n && cand + len + 8u <= n) {
+                uint64_t x = lz2_load64(in + pos + len) ^
+                             lz2_load64(in + cand + len);
+
+                if (x != 0u) {
+                    len += zpse_ctz64(x) >> 3;
+                    tail = 1;
+                    break;
+                }
+                len += 8u;
+            }
+            /* Only the end of the block reaches this: eight bytes are not
+             * readable there and the length has to be counted one at a
+             * time. */
+            if (tail == 0) {
+                while (pos + len < n && in[pos + len] == in[cand + len]) {
+                    len++;
+                }
             }
         }
         {
