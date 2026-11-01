@@ -786,23 +786,23 @@ runs of the CLI's own block bench:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.15 GB/s | 0.72 GB/s | 96,267,603 |
-| level 6 (default) | 2.04:1 | 0.24 GB/s | 0.77 GB/s | 104,024,786 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.02:1 | 0.45 GB/s | 0.82 GB/s | 105,003,110 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.15 GB/s | 0.79 GB/s | 96,293,491 |
+| level 6 (default) | 2.04:1 | 0.26 GB/s | 0.84 GB/s | 104,050,674 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.52 GB/s | 1.07 GB/s | 103,049,623 |
 
-It buys 88% of the encode rate for 1% of ratio. Its decode is the command
-loop's -- 0.82 GB/s against the default's 0.77 on the same bench -- which is
-the trade the form exists for: a tile stream decodes through a reconstruction
-that costs more than a command loop, so choosing LZ when LZ is within 1% of
-the size is a win on both sides. On the prose files it is not a 1% trade but a
-large one -- `dickens` goes from 1.16:1 at 630 MB/s to 1.53:1 at 236 MB/s --
-because that is where the tile model has nothing and a match finder has
-everything. It is `lz4 -1`'s operating point now: 0.45 GB/s here against 0.46
-in the frontier table, for a slightly better ratio (2.02:1 against 2.10:1).
-The finder is most of the encode in this mode -- 554 MB/s over the corpus,
-378 on `dickens` and 544 on `mozilla`, timed a block at a time -- and 0.45
-GB/s is 82% of it, so what is left is the block wrapper and the read, not the
-command writing. Three changes got it there, every one of them byte-identical:
+What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
+close to a free lunch, because the fast form is *smaller* than the default
+level as well as twice as fast (103,049,623 against 104,050,674). That is the
+match table below: the fast path is the only shape that never touches the
+encoder's 128 KiB of candidate staging, so the table lives there. On the prose files it is still a real trade --
+`dickens` goes from 1.18:1 at the default level to 1.57:1 -- because that is
+where the tile model has nothing and a match finder has everything. It is
+`lz4 -1`'s operating point now: 0.52 GB/s here against 0.46 in the frontier
+table, at a slightly better ratio (2.06:1 against 2.10:1), and 1.07 GB/s of
+decode against lz4's 1.38. The finder is most of the encode in this mode --
+455 MB/s on `dickens`, 624 on `mozilla` and 1070 on `xml`, timed a block at a
+time -- so what is left is the block wrapper and the read, not the command
+writing. Three changes got it there, every one of them byte-identical:
 a literal run of up to fourteen bytes leaves as one 16-byte store instead of
 a `memcpy` of a runtime length, the CLI writes each block as it finishes
 instead of holding a 202 MiB input and a 424 MiB frame, and the decoder's
@@ -813,24 +813,32 @@ last one to seven bytes used to be a compare per byte and are now one xor and
 a count of trailing zeros, which is worth 36% on `dickens` (256 to 349 MB/s)
 and 31% on `webster` with every stream identical. The weekly Silesia job runs
 that benchmark with a floor, next to the ratio gate, so the next regression in
-the finder is a row that moved rather than a claim nobody re-measured. Two
-shapes are measured and rejected: a 2^15 table (0.4% worse ratio and 7% slower
-than 2^16 on `dickens`) and 2^17 (no ratio gain worth the 256 KiB — 0.2% on
-`dickens`, nothing on `mozilla`), and folding the candidate compare and the
-first length step into one eight-byte xor, which is 12-17% *slower* on prose,
-columnar XML and the binary members because misses outnumber hits and a miss is
-the common case.
+the finder is a row that moved rather than a claim nobody re-measured. The
+table size is the lever that worked: the fast form runs a 2^16-entry table in
+the 128 KiB of candidate staging it never touches, which is 9% faster *and*
+2.4% smaller on `dickens` than the 16 KiB table every other caller keeps. A
+small table is not a cheap one here: 16 KiB does not stay in L1 beside a 64 KiB
+block streaming past, so it was paying L2 latency for the privilege of missing
+more. Below that, 2^15 is 6% slower and 0.4% larger; above it, 2^17 buys 0.2%
+for a 256 KiB table. Folding the candidate compare and the first length step
+into one eight-byte xor is 12-17% *slower* on prose, columnar XML and the
+binary members, because misses outnumber hits and a miss is the common case.
 
 The frame layer costs a decode nothing measurable. Walking a frame's block
 headers without decoding — parse, header CRC, size checks — runs at thousands
 of GB/s, and decoding an LZ2 frame block by block lands within noise of the
-bare command loop on the same payloads (1.12 against 1.03 GB/s on `dickens`,
-1.64 against 1.61 on `mozilla`), so the envelope and the probe are not where a
-decode's time goes. What sits above the loop's rate is the output write:
-decoding the 51 MiB `mozilla` frame into a reused buffer runs at 1.64 GB/s and
-into a fresh allocation at 0.78, because the second one faults a page every
-4 KiB of output. That is also why the CLI decodes block by block into one
-reused buffer instead of holding the whole output.
+bare command loop on the same payloads, so the envelope and the probe are not
+where a decode's time goes. What the command loop did spend was validation:
+three bounds tests, two escape chains and an output-room test per command, and
+on prose four commands in five carry no escape at all. The decoder now runs a
+fast region while the payload has eighteen bytes left and the output has
+nineteen — no room test, no escape branch, one sixteen-byte literal store, and
+the match copy's own wide stores still guarded — for 1162 to 2017 MB/s on
+`dickens`, 1649 to 2521 on `mozilla` and 2391 to 2823 on `xml`, against a
+1.98 GB/s ceiling per block. Above the loop's rate is the output write: the
+51 MiB `mozilla` frame decodes at 1.64 GB/s into a reused buffer and 0.78 into
+a fresh allocation, because the second one faults a page every 4 KiB of output.
+That is why the CLI decodes block by block into one reused buffer.
 
 The last one is the two forms together rather than a choice between them: the
 payload is `[u32 body_len][LZ stream]`, the stream expands to exactly the body
@@ -1016,13 +1024,23 @@ result is byte-identical to the serial call -- same blocks, same header, same
 index -- which is what `tests/suites/test_parallel.c` asserts at every worker
 count it tries.
 
-That reservation is the whole of the worker path's memory, and through a file
-it shows: on the 202 MiB corpus `zpse c -l 6 -t 4` takes 2.0 s of wall clock
-against 1.2 s for one thread, because the workers want a frame-sized buffer to
-fill and then walk, and a streamed single-thread encode needs neither. The
-scaling table below is measured in memory, where the buffer is already there
-and the workers are the only variable; through a file the streamed path is the
-one to measure against.
+The CLI does not use that layout at all. `zpse_compress_frame_stream()` hands
+finished blocks to a writer callback in order, out of a ring of worker + 2
+slots, so a file needs a slab of input and a few slots of output rather than
+the input and the whole frame: `zpse c -l 6 -t 4` takes 0.39-0.49 s on the
+202 MiB corpus against 1.10 s for one streamed thread. A worker may only fill a
+slot that has been *emptied* by the writer, not one the writer is merely not
+looking at — with two states it could refill the slot holding the block the
+writer was about to emit, and the two wrote over each other. The buffered call
+above stays for callers that want a whole frame in memory, which is what
+`bench` and the scaling table below measure.
+
+One caveat: from level 5 up the encoder carries a cross-block history and each
+worker carries its own, so the worker count can change which trial a block
+starts with — the same 20 MB at level 6 packs to 15,098,769 bytes on one worker
+and 15,101,233 on four. Both streams are valid and decode identically, and no
+stream is wrong, but a caller that needs one particular stream asks for one
+worker.
 
 Threading is compiled in only under `ZPSE_MT`. Without it the call is the
 serial encoder, so a caller ships one build and gets cores only where it asked

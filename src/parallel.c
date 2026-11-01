@@ -28,11 +28,22 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
 #endif
 /* Worker count ceiling: beyond this the compaction pass, not the encode,
  * is the run. It also sizes the thread-handle array below. */
 #define ZPSE_MT_MAX_THREADS 64u
 #endif
+
+/* A ring slot has three states, and all three are needed: a worker may only
+ * fill a slot that has been emptied, which is not the same as one that no
+ * writer is looking at. With only "free" and "ready" a worker could refill
+ * the slot that holds the block the writer is about to emit -- the block is
+ * older, so the counter has already handed out its successor -- and the two
+ * would write over each other. */
+#define ZPSE_MT_SLOT_EMPTY  0
+#define ZPSE_MT_SLOT_FILLING 1
+#define ZPSE_MT_SLOT_READY  2
 
 /* A block's reserved slot: the block itself plus its 32-byte header, which
  * is what the raw form costs and therefore the most any form can cost. */
@@ -244,6 +255,363 @@ static int zpse_mt_close(ZpseMtJob *j, int with_index, size_t *out_len_out)
     *out_len_out = pos;
     return PSE_OK;
 }
+
+/* ---- streamed encode -----------------------------------------------
+ *
+ * The buffered worker path reserves a slot for every block of the frame in
+ * the caller's buffer and compacts afterwards, which through a file means a
+ * frame-sized buffer to fill and then walk -- more memory than the input, and
+ * page faults for all of it. Nothing about the format needs it: a block is
+ * independent, and the writer only needs them in order, not at once.
+ *
+ * So the workers write into a ring of a few slots, the calling thread emits
+ * the blocks in order as they become ready, and the slot that has just been
+ * written is released for the next block. A worker that finds its slot still
+ * held waits for the writer, which is always making progress on an earlier
+ * block, so no worker waits on the writer to wait on it.
+ *
+ * One encoder per worker, as in the buffered path, and the same block
+ * content: the history an encoder carries chooses which trial runs first and
+ * cannot change a byte (test_parallel's -DZPSE_FORCE_TRIAL_SWAP build holds
+ * that down), so a slab boundary is invisible in the stream. */
+
+typedef struct ZpseMtStream {
+    const uint8_t *in;
+    size_t n;
+    size_t nblocks;
+    size_t stride;
+    uint32_t block;
+    uint32_t enc_flags;
+    uint32_t first_block;
+    int final_slab;
+    unsigned ring;
+    uint8_t *slots;
+    int *ready;
+    uint32_t *lens;
+    volatile long next;
+    volatile int failed;
+} ZpseMtStream;
+
+typedef struct ZpseMtStreamArg {
+    ZpseMtStream *job;
+    void *arena;
+} ZpseMtStreamArg;
+
+/* A release/acquire pair over the slot state. The block's bytes and length
+ * are written before the state says ready, and the writer reads the state
+ * before it reads either. On x86 a volatile access plus a compiler barrier is
+ * enough; the GCC builtins are used where they exist because they also make
+ * the ordering explicit for a reader of this file. */
+#if defined(__GNUC__)
+#define ZPSE_MT_FLAG_GET(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define ZPSE_MT_FLAG_SET(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#else
+#define ZPSE_MT_FLAG_GET(p) ((p)[0])
+#define ZPSE_MT_FLAG_SET(p, v) ((p)[0] = (v))
+#endif
+
+/* Give the core up while waiting for a slot. A worker can only be waiting
+ * for the writer, and the writer can only be waiting for a block, so the
+ * wait is always short -- but with more workers than cores a tight spin
+ * keeps the writer off a core and the ring stalls, which is a livelock, not
+ * a slow path. */
+static void zpse_mt_relax(void)
+{
+#if defined(_WIN32)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+static void zpse_mt_stream_fail(ZpseMtStream *j, int rc)
+{
+    if (j->failed == 0) {
+        j->failed = (rc < 0) ? rc : PSE_BAD_HEADER;
+    }
+}
+
+static void zpse_mt_stream_worker(ZpseMtStream *j, void *arena)
+{
+    ZpseEncoder enc;
+    int rc;
+
+    rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
+    if (rc != PSE_OK) {
+        zpse_mt_stream_fail(j, rc);
+        return;
+    }
+    enc.enc_flags = j->enc_flags;
+    for (;;) {
+        size_t i;
+        size_t slot;
+        size_t off;
+        size_t chunk;
+        int wrc;
+
+        if (j->failed != 0) {
+            return;
+        }
+        i = zpse_mt_claim(&j->next, j->nblocks);
+        if (i == SIZE_MAX) {
+            return;
+        }
+        slot = i % (size_t)j->ring;
+        while (ZPSE_MT_FLAG_GET(&j->ready[slot]) != ZPSE_MT_SLOT_EMPTY) {
+            if (j->failed != 0) {
+                return;
+            }
+            zpse_mt_relax();
+        }
+        ZPSE_MT_FLAG_SET(&j->ready[slot], ZPSE_MT_SLOT_FILLING);
+        off = i * (size_t)j->block;
+        chunk = j->n - off;
+        if (chunk > (size_t)j->block) {
+            chunk = (size_t)j->block;
+        }
+        wrc = zpse_block_encode(&enc, j->in + off, (uint32_t)chunk,
+                                j->first_block + (uint32_t)i,
+                                (j->final_slab && (i + 1u) == j->nblocks) ? 1 : 0,
+                                j->slots + slot * j->stride,
+                                (uint32_t)j->stride);
+        if (wrc <= 0 || (size_t)wrc > j->stride) {
+            zpse_mt_stream_fail(j, wrc);
+            return;
+        }
+        j->lens[slot] = (uint32_t)wrc;
+        ZPSE_MT_FLAG_SET(&j->ready[slot], ZPSE_MT_SLOT_READY);
+    }
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI zpse_mt_stream_entry(LPVOID p)
+{
+    ZpseMtStreamArg *a = (ZpseMtStreamArg *)p;
+
+    zpse_mt_stream_worker(a->job, a->arena);
+    return 0;
+}
+#else
+static void *zpse_mt_stream_entry(void *p)
+{
+    ZpseMtStreamArg *a = (ZpseMtStreamArg *)p;
+
+    zpse_mt_stream_worker(a->job, a->arena);
+    return 0;
+}
+#endif
+
+/* Returns PSE_OK, a negative status, or 1 when no worker thread could be
+ * started (nothing encoded, the caller runs it serially). */
+static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
+                              uint32_t block, uint32_t enc_flags,
+                              unsigned threads, uint32_t first_block,
+                              int final_slab, void *const arenas[],
+                              uint8_t *slots, unsigned ring, int *ready,
+                              uint32_t *lens, ZpseBlockEmit emit,
+                              void *emit_ctx)
+{
+    ZpseMtStream job;
+    ZpseMtStreamArg args[ZPSE_MT_MAX_THREADS];
+#if defined(_WIN32)
+    HANDLE handles[ZPSE_MT_MAX_THREADS];
+#else
+    pthread_t handles[ZPSE_MT_MAX_THREADS];
+#endif
+    unsigned started = 0u;
+    unsigned w;
+    size_t i;
+    int rc = PSE_OK;
+
+    job.in = in;
+    job.n = in_len;
+    job.nblocks = in_len / (size_t)block +
+                  ((in_len % (size_t)block) != 0u ? 1u : 0u);
+    job.stride = (size_t)block + ZPSE_MT_SLOT_OVERHEAD;
+    job.block = block;
+    job.enc_flags = enc_flags;
+    job.first_block = first_block;
+    job.final_slab = final_slab;
+    job.ring = ring;
+    job.slots = slots;
+    job.ready = ready;
+    job.lens = lens;
+    job.next = 0;
+    job.failed = 0;
+    for (w = 0u; w < ring; w++) {
+        ready[w] = ZPSE_MT_SLOT_EMPTY;
+    }
+    /* Every worker is spawned here: the calling thread is the writer, so it
+     * cannot be one of them. */
+    for (w = 0u; w < threads && w < (unsigned)ZPSE_MT_MAX_THREADS; w++) {
+        args[w].job = &job;
+        args[w].arena = arenas[w];
+#if defined(_WIN32)
+        handles[w] = CreateThread(NULL, 0, zpse_mt_stream_entry, &args[w], 0,
+                                  NULL);
+        if (handles[w] == NULL) {
+            break;
+        }
+#else
+        if (pthread_create(&handles[w], NULL, zpse_mt_stream_entry, &args[w]) !=
+            0) {
+            break;
+        }
+#endif
+        started++;
+    }
+    if (started == 0u) {
+        return 1;
+    }
+    for (i = 0; i < job.nblocks; i++) {
+        size_t slot = i % (size_t)ring;
+
+        while (ZPSE_MT_FLAG_GET(&ready[slot]) != ZPSE_MT_SLOT_READY) {
+            if (job.failed != 0) {
+                rc = job.failed < 0 ? job.failed : PSE_BAD_HEADER;
+                goto join;
+            }
+            zpse_mt_relax();
+        }
+        rc = emit(emit_ctx, first_block + (uint32_t)i,
+                  slots + slot * job.stride, (size_t)lens[slot]);
+        if (rc != 0) {
+            /* The emit failed (a short write, say): the workers have to stop
+             * rather than wait for a writer that is not coming. */
+            zpse_mt_stream_fail(&job, rc);
+            goto join;
+        }
+        ZPSE_MT_FLAG_SET(&ready[slot], ZPSE_MT_SLOT_EMPTY);
+    }
+join:
+    if (rc != PSE_OK) {
+        zpse_mt_stream_fail(&job, rc);
+    }
+    for (w = 0u; w < started; w++) {
+#if defined(_WIN32)
+        WaitForSingleObject(handles[w], INFINITE);
+        CloseHandle(handles[w]);
+#else
+        pthread_join(handles[w], NULL);
+#endif
+    }
+    if (rc == PSE_OK && job.failed != 0) {
+        rc = job.failed;
+    }
+    return rc;
+}
+
+#endif /* ZPSE_MT */
+
+/* Streamed encode: one slab at a time, blocks out in order. */
+static int zpse_mt_stream_serial(const uint8_t *in, size_t in_len,
+                                 uint32_t block, uint32_t enc_flags,
+                                 uint32_t first_block, int final_slab,
+                                 void *arena, uint8_t *slot, size_t stride,
+                                 ZpseBlockEmit emit, void *emit_ctx)
+{
+    ZpseEncoder enc;
+    size_t nblocks = in_len / (size_t)block +
+                     ((in_len % (size_t)block) != 0u ? 1u : 0u);
+    size_t i;
+    int rc;
+
+    rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    enc.enc_flags = enc_flags;
+    for (i = 0; i < nblocks; i++) {
+        size_t off = i * (size_t)block;
+        size_t chunk = in_len - off;
+        int wrc;
+
+        if (chunk > (size_t)block) {
+            chunk = (size_t)block;
+        }
+        wrc = zpse_block_encode(&enc, in + off, (uint32_t)chunk,
+                                first_block + (uint32_t)i,
+                                (final_slab && (i + 1u) == nblocks) ? 1 : 0,
+                                slot, (uint32_t)stride);
+        if (wrc <= 0 || (size_t)wrc > stride) {
+            return wrc < 0 ? wrc : PSE_BAD_HEADER;
+        }
+        rc = emit(emit_ctx, first_block + (uint32_t)i, slot, (size_t)wrc);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    return PSE_OK;
+}
+
+int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
+                               uint32_t nominal_block_size,
+                               uint32_t enc_flags, unsigned threads,
+                               uint32_t first_block, int is_final_slab,
+                               void *const enc_arenas[], unsigned arena_count,
+                               uint8_t *slot_mem, size_t slot_cap, int *ready,
+                               uint32_t *lens, ZpseBlockEmit emit,
+                               void *emit_ctx)
+{
+    size_t stride;
+    size_t nblocks;
+    unsigned workers;
+
+    if (in == 0 || in_len == 0u || emit == 0 || enc_arenas == 0 ||
+        slot_mem == 0 || ready == 0 || lens == 0) {
+        return PSE_BAD_ARG;
+    }
+    if (nominal_block_size < ZPSE_MIN_BLOCK_SIZE ||
+        nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
+        return PSE_BAD_ARG;
+    }
+    nblocks = in_len / (size_t)nominal_block_size +
+              ((in_len % (size_t)nominal_block_size) != 0u ? 1u : 0u);
+    if (nblocks > (size_t)UINT32_MAX ||
+        (uint64_t)first_block + (uint64_t)nblocks > (uint64_t)UINT32_MAX) {
+        return PSE_BAD_ARG;
+    }
+    stride = (size_t)nominal_block_size + ZPSE_MT_SLOT_OVERHEAD;
+    if (slot_cap < stride) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    workers = threads;
+    if (arena_count < workers) {
+        workers = arena_count;
+    }
+    if (workers == 0u) {
+        workers = 1u;
+    }
+    /* A slab too short to keep the workers busy is encoded serially: a thread
+     * start costs more than the block it would take. */
+    if (workers > 1u && nblocks >= (size_t)workers * 4u) {
+        unsigned ring = workers + 2u;
+        size_t hold = slot_cap / stride;
+
+        if (hold < ring) {
+            ring = (unsigned)hold;
+        }
+        if (ring < 2u) {
+            ring = 1u;
+        }
+#if defined(ZPSE_MT)
+        if (ring >= 2u) {
+            int rc = zpse_mt_stream_run(in, in_len, nominal_block_size,
+                                        enc_flags, workers, first_block,
+                                        is_final_slab, enc_arenas, slot_mem,
+                                        ring, ready, lens, emit, emit_ctx);
+            if (rc != 1) {
+                return rc;
+            }
+        }
+#endif
+    }
+    return zpse_mt_stream_serial(in, in_len, nominal_block_size, enc_flags,
+                                 first_block, is_final_slab, enc_arenas[0],
+                                 slot_mem, stride, emit, emit_ctx);
+}
+
+#if defined(ZPSE_MT)
 
 /* ---- the read side -------------------------------------------------
  *

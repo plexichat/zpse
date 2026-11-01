@@ -2097,9 +2097,34 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ2_MIN_PAYLOAD) {
         return PSE_OUTPUT_OVERFLOW;
     }
-    payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                              cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
-                              (uint32_t)ZPSE_LZ_HASH_BITS);
+    {
+        /* Which table the finder uses depends on who asked for it.
+         *
+         * The fast form is the finder and nothing else, so the 128 KiB of
+         * candidate staging (cand and best, contiguous at ZPSE_E_OFF_CAND)
+         * are untouched by it: they make a 2^16-entry table, four times the
+         * 16 KiB e->lz the arena normally carries. Measured over Silesia
+         * prose, columnar XML and the binaries, the bigger table is 9% FASTER
+         * as well as smaller (2.4% of the payload on `dickens`), because a
+         * 128 KiB table still fits L2 while 16 KiB of it does not fit L1
+         * beside a 64 KiB block streaming past -- so the smaller table was
+         * paying L2 latency for the privilege of missing more.
+         *
+         * Every other caller -- the LZ2 trial at the cheap levels and the
+         * last candidate at MAX -- is inside the sweep, where cand and best
+         * are the encoder's own staging, so those keep e->lz and the 13 bits
+         * the format has always used. Their streams are unchanged. */
+        void *tab = e->lz;
+        uint32_t hb = (uint32_t)ZPSE_LZ_HASH_BITS;
+
+        if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u) {
+            tab = e->cand;
+            hb = 16u;
+        }
+        payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                                  cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
+                                  hb);
+    }
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }

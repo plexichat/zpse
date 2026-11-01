@@ -22,6 +22,15 @@
  * to the exact sum only at the cap boundary. */
 #define LZ2_CMD_ROOM 260u
 
+/* How fast the finder gallops once a run of positions has found nothing: the
+ * step is 1 + (misses >> LZ2_SKIP_BITS). A parameter so the trade can be
+ * measured -- a smaller shift finds more matches (better ratio) and costs
+ * probes on data that has none -- and the default is the value the sweep of
+ * 5..9 chose, see the README. */
+#ifndef ZPSE_LZ2_SKIP_BITS
+#define ZPSE_LZ2_SKIP_BITS 5u
+#endif
+
 static uint32_t lz2_hash(uint32_t v, uint32_t hash_bits)
 {
     /* One multiply at the cursor, top bits kept: the four-byte compare at the
@@ -119,7 +128,7 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                              1)) {
             /* Two misses are a coincidence; a run of them means the data has
              * no match here, so the cursor accelerates. */
-            pos += 1u + (misses >> 5);
+            pos += 1u + (misses >> ZPSE_LZ2_SKIP_BITS);
             misses++;
             if (pos > limit) {
                 break;
@@ -278,6 +287,39 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     return out;
 }
 
+/* Copy one match: sixteen bytes for a short match at a long distance, two
+ * stores for the next shape up, then eight-byte steps and a byte tail. Each
+ * wide store is only taken when all of it lands inside the block, because a
+ * frame decoder hands a block exactly the room its bytes need and decodes
+ * blocks side by side, so a store past the end would land in a neighbour's
+ * output. */
+static void lz2_copy_match(uint8_t *out, uint32_t op, uint32_t n,
+                           uint32_t off, uint32_t mlen)
+{
+    uint8_t *d = out + op;
+    uint32_t left = mlen;
+
+    if (off >= 16u && mlen <= 16u && op + 16u <= n) {
+        memcpy(d, d - off, 16u);
+        left = 0u;
+    } else if (off >= 32u && mlen <= 32u && op + 32u <= n) {
+        memcpy(d, d - off, 16u);
+        memcpy(d + 16u, d - off + 16u, 16u);
+        left = 0u;
+    } else if (off >= 8u) {
+        while (left >= 8u) {
+            memcpy(d, d - off, 8u);
+            d += 8u;
+            left -= 8u;
+        }
+    }
+    while (left != 0u) {
+        *d = d[-(ptrdiff_t)off];
+        d++;
+        left--;
+    }
+}
+
 int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     uint32_t n)
 {
@@ -310,6 +352,41 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             return PSE_BAD_LZ;
         }
         cmd_left--;
+        /* Fast region: enough payload left for the largest command this path
+         * can take (a token, fourteen literals and the two offset bytes) and
+         * enough output for the longest match it can code, so a command whose
+         * two nibbles are both literal needs no room test of its own -- and
+         * that is four commands in five on prose. Everything else falls
+         * through to the careful path, which is what a truncated or hostile
+         * stream needs anyway. */
+        if ((size_t)(tend - lp) >= 18u && (n - op) >= 19u) {
+            tok = *lp;
+            if (((tok >> 4) != 15u) && ((tok & 15u) != 15u)) {
+                lit = tok >> 4;
+                lp++;
+                /* One store covers any run this token carries, and the bytes
+                 * past it are output a later command overwrites. */
+                memcpy(out + op, lp, 16u);
+                op += lit;
+                lp += lit;
+                lit_seen += lit;
+                off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
+                lp += 2;
+                mlen = (uint32_t)(tok & 15u) + ZPSE_LZ2_MIN_MATCH;
+                if (off == 0u) {
+                    if (lit == 0u) {
+                        return PSE_BAD_LZ;
+                    }
+                    continue;
+                }
+                if (off > op) {
+                    return PSE_BAD_LZ;
+                }
+                lz2_copy_match(out, op, n, off, mlen);
+                op += mlen;
+                continue;
+            }
+        }
         if (lp >= tend) {
             return PSE_BAD_LZ;
         }
@@ -369,39 +446,7 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         if (off > op || mlen > n - op) {
             return PSE_BAD_LZ;
         }
-        {
-            uint8_t *d = out + op;
-            uint32_t left = mlen;
-
-            if (off >= 16u && mlen <= 16u && op + 16u <= n) {
-                /* A short match at a long distance is one store. It is only
-                 * taken when all sixteen bytes land inside this block: a
-                 * frame decoder hands a block the exact room its bytes need
-                 * and decodes blocks side by side, so a store past the end
-                 * would land in a neighbour's output. */
-                memcpy(d, d - off, 16u);
-                left = 0u;
-            } else if (off >= 32u && mlen <= 32u && op + 32u <= n) {
-                /* The next shape up is two stores rather than a four-step
-                 * eight-byte loop. A distance of 32 is what keeps the second
-                 * store's source clear of the first store's destination, so
-                 * the two cannot feed each other. */
-                memcpy(d, d - off, 16u);
-                memcpy(d + 16u, d - off + 16u, 16u);
-                left = 0u;
-            } else if (off >= 8u) {
-                while (left >= 8u) {
-                    memcpy(d, d - off, 8u);
-                    d += 8u;
-                    left -= 8u;
-                }
-            }
-            while (left != 0u) {
-                *d = d[-(ptrdiff_t)off];
-                d++;
-                left--;
-            }
-        }
+        lz2_copy_match(out, op, n, off, mlen);
         op += mlen;
     }
     if (cmd_left != 0u || lit_seen != lit_total || lp != tend) {

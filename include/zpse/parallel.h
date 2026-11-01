@@ -13,10 +13,14 @@
  * of this codec (1-2 GB/s against 13 GB/s decode), so that is where the
  * cores go.
  *
- * The result is byte-identical to the serial call -- same blocks, same
- * header, same index -- because every block is encoded by the same encoder
- * with the same inputs. Threading changes when the work happens, never what
- * is written.
+ * The blocks are the serial encoder's own on every level whose decision is
+ * order-free. From level 5 up the encoder carries a cross-block history, and
+ * each worker carries its own, so a block encoded by a worker that has just
+ * seen different neighbours can start from a different first trial: the same
+ * 20 MB at level 6 packs to 15,098,769 bytes on one worker and 15,101,233 on
+ * four. That is a ratio choice and not a format one -- either stream is valid
+ * and decodes identically -- but it means the byte-identity claim is about
+ * the blocks, not about the worker count.
  *
  * Threading is compiled in only when ZPSE_MT is defined (POSIX: add
  * -pthread). Without it this is the serial encoder behind a different
@@ -63,6 +67,44 @@ int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
  * past its input plus its 32-byte header. */
 size_t zpse_parallel_bound(size_t n, uint32_t nominal_block_size,
                            int with_index);
+
+/* Called for each finished block, in block order, before the next one is
+ * handed over. `seq` is the block's index in the frame. Return 0 to carry
+ * on, or a negative status to abort the encode (it is returned as-is). */
+typedef int (*ZpseBlockEmit)(void *ctx, uint32_t seq, const uint8_t *block,
+                             size_t len);
+
+/* The same encode, streamed: one slab of a frame at a time, with every
+ * finished block handed to `emit` in order instead of being written into a
+ * frame-sized buffer.
+ *
+ * `in` holds the bytes of blocks `first_block` .. `first_block + count - 1`,
+ * where count covers `in_len` bytes at `nominal_block_size` and every block
+ * but the last of the slab is a full one. `is_final_slab` marks the call that
+ * owns the frame's last block, which is the one that carries the last-block
+ * flag; a caller that has the whole input passes 1 with everything in one
+ * call and gets the buffered encoder's stream, block for block.
+ *
+ * The workers write into a ring of `slot_cap / (nominal_block_size + 32)`
+ * slots in `slot_mem`, so only that much of the output is ever resident;
+ * `ready` and `lens` are caller-owned `int` and `uint32_t` scratch of the
+ * same count, and `ready` is cleared here. The library still never
+ * allocates. Emitting blocks in order is what makes the stream writable
+ * while the last blocks are still being encoded.
+ *
+ * Returns PSE_OK, or a negative status. Every block is encoded by an encoder
+ * of its own, exactly as the buffered call does, so a slab boundary inside a
+ * frame is invisible for the same reason a worker boundary is: what changes
+ * with either is at most the first trial a history picks, never the format.
+ * A caller that needs one particular stream should ask for one worker. */
+int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
+                               uint32_t nominal_block_size,
+                               uint32_t enc_flags, unsigned threads,
+                               uint32_t first_block, int is_final_slab,
+                               void *const enc_arenas[], unsigned arena_count,
+                               uint8_t *slot_mem, size_t slot_cap, int *ready,
+                               uint32_t *lens, ZpseBlockEmit emit,
+                               void *emit_ctx);
 
 /* Decode a frame's blocks on several workers.
  *
