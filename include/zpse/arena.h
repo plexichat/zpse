@@ -134,6 +134,17 @@ typedef struct ZpseEncoder {
      * known before the first tile, which is the whole of why the gate exists.
      * Never read by the decoder, and reset per block. */
     uint8_t ascii_gate;
+    /* The transform/segment shape the PREVIOUS block of this context chose,
+     * when that block was a tile form. zpse_block_encode tries it first
+     * whenever the probe cannot separate it from its own winner, which is
+     * what makes a run of blocks from one file cheaper to encode: the first
+     * block pays the full search and the rest start from its answer.
+     * Only zpse_encoder_init clears it, so a one-shot call starts blank and
+     * a frame keeps the history across its blocks. Never read by a decoder
+     * and never part of a stream. */
+    uint8_t hist_tid;
+    uint8_t hist_sc;
+    uint8_t hist_valid;
 } ZpseEncoder;
 
 int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len);

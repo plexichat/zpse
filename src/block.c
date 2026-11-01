@@ -2213,6 +2213,26 @@ static uint32_t zpse_block_ascii_total(uint32_t n)
     return total;
 }
 
+/* Remember which tile shape won, so the next block of this context can try
+ * it first. Only tile forms are remembered: RAW and the two LZ forms say
+ * nothing about which transform the data wants, and a predictor that carried
+ * them back would spend its next first trial re-learning that. */
+static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
+                                uint32_t len)
+{
+    ZpseBlockHeader h;
+
+    if (zpse_block_header_parse(&h, blk, len) != PSE_OK ||
+        (h.block_flags &
+         (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0u) {
+        e->hist_valid = 0u;
+        return;
+    }
+    e->hist_tid = h.transform_id;
+    e->hist_sc = h.segment_count;
+    e->hist_valid = 1u;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -2845,6 +2865,40 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
             }
         }
+        /* ---- Order-n first trial: the block's own history -------------- *
+         * A file is not 3234 independent blocks: they come from one source,
+         * and the transform that won the last one usually wins the next. The
+         * sweep's own first choice is a 16 KiB price, and measurement on
+         * Silesia at the default level says that choice is wrong on a quarter
+         * of blocks -- when it is wrong it is wrong by 17.5 KB a block, which
+         * is what the later trials are for.
+         *
+         * So when the price cannot separate the previous block's shape from
+         * its own winner (within 1/16), the previous winner goes first. That
+         * is the case where the price has no information and the history has
+         * some.
+         *
+         * This is a reorder, not a cut: ncand is untouched, every survivor is
+         * still priced and encoded, and the tie-break still uses the original
+         * list index in idx[], so the block the sweep writes is the same one --
+         * tests/suites/test_sizes.c proves no case grows and the parity suite
+         * proves the swapped-order build writes the same streams. */
+        if (pick >= 0 && e->hist_valid != 0u && ncand > 1) {
+            int h = -1;
+            int hi;
+
+            for (hi = 0; hi < ncand; hi++) {
+                if (tids[hi] == e->hist_tid && scounts[hi] == e->hist_sc) {
+                    h = hi;
+                    break;
+                }
+            }
+            if (h >= 0 && h != pick && ex[h] != UINT32_MAX &&
+                ex[pick] != UINT32_MAX &&
+                ex[h] <= ex[pick] + (ex[pick] >> 4)) {
+                pick = h;
+            }
+        }
         if (pick >= 0 && pick != 0) {
             /* Move the exact-probe winner to slot 0 so the trial loop tries
              * the most likely winner first: its total becomes best_total and
@@ -3454,6 +3508,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_block_header_serialize(out, &h);
         zpse_block_fix_header_crc(out);
         memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
+        zpse_block_hist_set(e, out, total);
 #if defined(ZPSE_BLOCK_STATS)
         /* The RAW fallback won, but it is not a transform win: the sweep
          * found nothing that paid, and the block went out raw. */
@@ -3468,6 +3523,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (!direct_out) {
         memcpy(out, e->best, best_total);
     }
+    zpse_block_hist_set(e, out, best_total);
 #if defined(ZPSE_BLOCK_STATS)
     {
         /* The winner's transform id: the candidate that carried best_total.

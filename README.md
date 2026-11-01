@@ -337,15 +337,21 @@ each run the harness's own best of three timed reps, on one host,
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 2.25 GB/s | 18.8 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
-| 2 | 4.06:1 | 1.99 GB/s | 18.5 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.89 GB/s | 19.2 GB/s | the same prescreen, three full trials |
-| 4 | 4.06:1 | 1.81 GB/s | 19.4 GB/s | four full trials, still no match finder |
-| 5 `ZPSE_ENC_SPEED_BALANCED` | 4.47:1 | 1.25 GB/s | 15.4 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
-| 6 (default) | 4.49:1 | 1.13 GB/s | 15.3 GB/s | the margin loosened to 1.1875x and the decode bill raised to 6 bytes per command — the bill is free on the encode side, so the default takes it; see the Silesia section for what the two knobs are each worth |
-| 7 | 4.50:1 | 1.13 GB/s | 14.5 GB/s | the margin loosened to 1.125x, the decode bill unchanged from 6 |
-| 8 | 4.51:1 | 1.07 GB/s | 14.1 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
-| 9 `ZPSE_ENC_SPEED_MAX` | 4.52:1 | 1.03 GB/s | 14.7 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 2.26 GB/s | 19.0 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
+| 2 | 4.06:1 | 1.99 GB/s | 19.5 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.93 GB/s | 19.4 GB/s | the same prescreen, three full trials |
+| 4 | 4.06:1 | 1.88 GB/s | 19.4 GB/s | four full trials, still no match finder |
+| 5 `ZPSE_ENC_SPEED_BALANCED` | 5.07:1 | 0.88 GB/s | 13.9 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
+| 6 (default) | 5.11:1 | 0.87 GB/s | 14.4 GB/s | the margin loosened to 1.1875x and the decode bill raised to 6 bytes per command — the bill is free on the encode side, so the default takes it; see the Silesia section for what the two knobs are each worth |
+| 7 | 5.11:1 | 0.88 GB/s | 14.4 GB/s | the margin loosened to 1.125x, the decode bill unchanged from 6 |
+| 8 | 5.14:1 | 0.83 GB/s | 12.9 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
+| 9 `ZPSE_ENC_SPEED_MAX` | 5.14:1 | 0.84 GB/s | 13.8 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
+
+Levels 5 to 9 are the v2 form's rows: `ZPSE_B_LZ_TILE` lifts the corpus mean
+from 4.49:1 to 5.11:1 at the default level and costs about a fifth of the
+encode rate, because every block it wins pays a full match-finder pass over
+the tile body that the tile form alone never needed. Raising the 1/32
+threshold in `src/block.c` trades straight back along that line.
 
 Levels 3 and 4 read as the same mean ratio because on this corpus a third or
 fourth candidate almost never wins: the extra trials cost encode time (1.89 to
@@ -993,22 +999,25 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.74 GB/s | 2.25 GB/s |
-| mozilla | 51,220,480 | 1.96 | 0.22 GB/s | 1.18 GB/s |
-| mr | 9,970,564 | 2.32 | 0.32 GB/s | 1.34 GB/s |
-| nci | 33,553,445 | 5.14 | 0.21 GB/s | 1.46 GB/s |
-| ooffice | 6,152,192 | 1.47 | 0.18 GB/s | 1.03 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.58 GB/s | 3.10 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.27 GB/s | 0.90 GB/s |
-| samba | 21,606,400 | 2.48 | 0.28 GB/s | 1.22 GB/s |
-| sao | 7,251,944 | 1.01 | 0.99 GB/s | 4.36 GB/s |
-| webster | 41,458,703 | 1.95 | 0.26 GB/s | 0.90 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.46 GB/s | 2.06 GB/s |
-| xml | 5,345,280 | 3.83 | 0.47 GB/s | 1.45 GB/s |
-| **total** | **211,938,580** | **2.00** | **0.27 GB/s** | **1.26 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.64 GB/s | 1.69 GB/s |
+| mozilla | 51,220,480 | 2.05 | 0.21 GB/s | 0.96 GB/s |
+| mr | 9,970,564 | 2.49 | 0.24 GB/s | 0.99 GB/s |
+| nci | 33,553,445 | 5.34 | 0.20 GB/s | 1.14 GB/s |
+| ooffice | 6,152,192 | 1.48 | 0.17 GB/s | 0.88 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.58 GB/s | 1.97 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.26 GB/s | 0.94 GB/s |
+| samba | 21,606,400 | 2.55 | 0.25 GB/s | 1.00 GB/s |
+| sao | 7,251,944 | 1.01 | 1.19 GB/s | 9.17 GB/s |
+| webster | 41,458,703 | 1.95 | 0.26 GB/s | 0.80 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.38 GB/s | 3.02 GB/s |
+| xml | 5,345,280 | 3.94 | 0.50 GB/s | 1.91 GB/s |
+| **total** | **211,938,580** | **2.04** | **0.25 GB/s** | **1.07 GB/s** |
 
-`zpse_cli bench -r 4`, default level (6), 64 KiB blocks, one pinned core, best
-of two runs. The
+`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
+of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
+corpus from 106,140,388 to 103,921,535 bytes, which cost ~6% of encode and
+bought ~8% of decode (the tile bodies it compresses are shorter than the plain
+LZ streams they replace, so the command loop runs over fewer bytes). The
 `sao` row is the raw fallback doing its job at copy speed, and `osdb` is close
 behind it. The prose rows are the ones the token form moved: `dickens` from
 1.09 to 1.16 and `webster` from 1.50 to 1.95 at the default, and the pair at
