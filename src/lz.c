@@ -98,6 +98,11 @@ typedef struct LzOut {
     uint32_t lit_total; /* literal bytes written so far */
     uint32_t cmds;      /* tokens written */
     uint32_t rep[4];    /* recent distances, most recent first */
+    /* The last position whose sixteen following bytes are all inside the
+     * input. A literal run that starts at or before it can be copied with
+     * one 16-byte load whose tail the copy never stores, which is what a
+     * short run wants; past it the copy has to be exact. */
+    const uint8_t *lit_wide;
     int fail;
 } LzOut;
 
@@ -151,12 +156,54 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
  * The distance goes through the four-entry repeat cache, and the decoder
  * updates it identically (see lz.h), so the two sides agree on which value
  * means which distance without a byte being spent on it. */
-static void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
-                        uint32_t off, uint32_t mlen)
+/* The largest number of bytes one command can write: the token, a
+ * one-byte escape for the literal count, the run itself (at most
+ * ZPSE_LZ_MAX_LITERALS), a three-byte distance and a one-byte escape for
+ * the match length. With `lit` bytes of run the command needs at most
+ * LZ_CMD_ROOM + lit, and the room test below is what lets the writer
+ * below skip working out the exact size first. */
+#define LZ_CMD_ROOM 8u
+
+/* The four most recent distances, most recent first. This used to be a
+ * `for` loop with a `break`, which is what the profiler found: on prose a
+ * command repeats a distance often enough that the branch is a coin toss
+ * and it mispredicts, and it is paid once per command -- about 4% of the
+ * whole encode. The comparisons are branchless selects, so which index
+ * wins is still the most recent one, byte for byte. */
+static uint32_t lz_rep_index(const uint32_t *rep, uint32_t off)
+{
+    uint32_t m0 = (rep[0] == off);
+    uint32_t m1 = (rep[1] == off);
+    uint32_t m2 = (rep[2] == off);
+    uint32_t m3 = (rep[3] == off);
+
+    return m0 ? 0u : (m1 ? 1u : (m2 ? 2u : (m3 ? 3u : 4u)));
+}
+
+/* `lit` bytes from `lit_src` to `dst`. A run of two commands' worth takes
+ * one 16-byte load and two 8-byte stores, which the caller has already
+ * proved has the input and the output room it needs; the sub-9 tail is the
+ * byte loop every run used to pay. */
+static inline void lz_put_literals(uint8_t *dst, const uint8_t *lit_src,
+                                   uint32_t lit, int wide)
+{
+    if (wide && lit <= 16u) {
+        if (lit <= 8u) {
+            memcpy(dst, lit_src, 8u);
+        } else {
+            memcpy(dst, lit_src, 8u);
+            memcpy(dst + lit - 8u, lit_src + lit - 8u, 8u);
+        }
+        return;
+    }
+    memcpy(dst, lit_src, lit);
+}
+
+static inline void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
+                               uint32_t off, uint32_t mlen)
 {
     uint32_t offv;
-    uint32_t sz;
-    uint32_t idx;
+    uint32_t ml;
     uint8_t *t;
 
     if (o->fail) {
@@ -164,13 +211,11 @@ static void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
     }
     if (off == 0u) {
         offv = 0u;
-        mlen = ZPSE_LZ_MIN_MATCH; /* ignored by the decoder; keep it legal */
+        ml = 0u; /* ignored by the decoder; keep the token legal */
     } else {
-        for (idx = 0u; idx < 4u; idx++) {
-            if (o->rep[idx] == off) {
-                break;
-            }
-        }
+        uint32_t idx = lz_rep_index(o->rep, off);
+
+        ml = mlen - ZPSE_LZ_MIN_MATCH;
         if (idx < 4u) {
             offv = idx + 1u;
             while (idx > 0u) {
@@ -185,28 +230,37 @@ static void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
         }
         o->rep[0] = off;
     }
-    sz = 1u + lz_esc_len(lit, 15u) + lit + lz_varint_len(offv) +
-         lz_esc_len(mlen - ZPSE_LZ_MIN_MATCH, 15u);
-    if (o->pos > o->cap || sz > o->cap - o->pos) {
-        o->fail = 1;
-        return;
+    /* No command this writer can be asked for is longer than LZ_CMD_ROOM
+     * plus its literal run, so room for that much is room for the exact
+     * size -- and the exact size, once computed, was only ever used for
+     * this test. Working it out (a divide and a shifting loop) was ~9% of
+     * the match finder on prose. The test stays for the boundary case, so
+     * which commands fit is unchanged. */
+    if (LZ_CMD_ROOM + lit > o->cap - o->pos) {
+        uint32_t sz = 1u + lz_esc_len(lit, 15u) + lit +
+                      lz_varint_len(offv) + lz_esc_len(ml, 15u);
+
+        if (sz > o->cap - o->pos) {
+            o->fail = 1;
+            return;
+        }
     }
     t = o->dst + o->pos;
     *t++ = (uint8_t)(((lit < 15u ? lit : 15u) << 4) |
-                     (uint8_t)(mlen - ZPSE_LZ_MIN_MATCH < 15u
-                                   ? mlen - ZPSE_LZ_MIN_MATCH
-                                   : 15u));
+                     (ml < 15u ? ml : 15u));
     if (lit >= 15u) {
         t = lz_put_esc(t, lit, 15u);
     }
     if (lit != 0u) {
-        memcpy(t, lit_src, lit);
+        lz_put_literals(t, lit_src, lit,
+                        lit_src <= o->lit_wide &&
+                                o->cap - o->pos >= LZ_CMD_ROOM + lit + 16u);
         t += lit;
         o->lit_total += lit;
     }
     t = lz_put_varint(t, offv);
-    if (mlen - ZPSE_LZ_MIN_MATCH >= 15u) {
-        t = lz_put_esc(t, mlen - ZPSE_LZ_MIN_MATCH, 15u);
+    if (ml >= 15u) {
+        t = lz_put_esc(t, ml, 15u);
     }
     o->pos = (uint32_t)(t - o->dst);
     o->cmds++;
@@ -217,8 +271,8 @@ static void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
  * the literals go in front of the first command and the rest carry none,
  * so the decoder's loop never needs an unbounded escape for a long run --
  * and after the first chunk the repeat code makes every command shorter. */
-static void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
-                    uint32_t off, uint32_t len)
+static inline void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
+                           uint32_t off, uint32_t len)
 {
     while (run > ZPSE_LZ_MAX_LITERALS) {
         lz_emit_cmd(o, lit_src, ZPSE_LZ_MAX_LITERALS, 0u, 0u);
@@ -273,6 +327,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     o.rep[1] = 1u;
     o.rep[2] = 1u;
     o.rep[3] = 1u;
+    o.lit_wide = (n >= 16u) ? in + n - 16u : in;
     o.fail = 0;
 
     pos = 0u;
@@ -344,9 +399,14 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
              * 28 GB/s for the same shape -- to reach a position the
              * backward extension below pulls straight back to the anchor.
              * A self-reference is no match at all, so it is refused here. */
-            if (cand1 != LZ_EMPTY && cand1 != pos &&
-                zpse_load_u32le(in + cand1) == v1 &&
-                cand1 + 9u <= n &&
+            /* One compare, not two: the eight-byte word at the candidate
+             * carries the four bytes `v1` holds, so testing it makes the
+             * four-byte test redundant -- and on prose this probe fires
+             * almost never (it needs an eight-byte match one byte ahead;
+             * the average match is 5.4 bytes), so every instruction here
+             * is paid per hit for a decision that is usually "no". The
+             * order is the cheap tests first, then the load. */
+            if (cand1 != LZ_EMPTY && cand1 != pos && cand1 + 9u <= n &&
                 lz_load64(in + pos + 1u) == lz_load64(in + cand1)) {
                 pos++;
                 misses = 0;

@@ -741,6 +741,20 @@ LZ decode is per-command work rather than copying, which is why the loop is
 written for the shape the commands actually take: 88% of them are a short
 match at a distance over sixteen, which is one 16-byte store.
 
+Writing a command costs the encoder the same per-command shape, and on prose
+the commands are small enough that it is the whole hot path: at the default
+level a Silesia prose block emits 10,440 commands for 64 KiB, one every 6.3
+bytes, on an average match of 5.4 bytes. So the writer is written for the
+common command rather than the largest one. A bounded room test -- no run can
+need more than eight bytes of framing plus its literals -- replaces working
+out the exact size first, which cost a divide and a shifting loop per command.
+The four recent distances are four compares and selects rather than a loop
+with a `break`, because on prose that branch is a coin toss and mispredicts;
+it was 4% of the encode on its own. A run of up to sixteen literals leaves as
+one 8-byte pair instead of a `memcpy` whose size dispatch costs more than the
+bytes. All three are byte-exact: 254 to 280 MB/s over the corpus, same
+103,921,535 bytes, stream for stream.
+
 Levels 5 to 9 try that form as one more candidate and keep it only when it is
 smaller than the best tile stream. All of them screen it on a sample of the
 block first, because the match finder is a full pass at a quarter of the tile
@@ -1012,22 +1026,22 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.64 GB/s | 1.69 GB/s |
-| mozilla | 51,220,480 | 2.05 | 0.21 GB/s | 0.96 GB/s |
-| mr | 9,970,564 | 2.49 | 0.24 GB/s | 0.99 GB/s |
-| nci | 33,553,445 | 5.34 | 0.20 GB/s | 1.14 GB/s |
-| ooffice | 6,152,192 | 1.48 | 0.17 GB/s | 0.88 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.58 GB/s | 1.97 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.26 GB/s | 0.94 GB/s |
-| samba | 21,606,400 | 2.55 | 0.25 GB/s | 1.00 GB/s |
-| sao | 7,251,944 | 1.01 | 1.19 GB/s | 9.17 GB/s |
-| webster | 41,458,703 | 1.95 | 0.26 GB/s | 0.80 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.38 GB/s | 3.02 GB/s |
-| xml | 5,345,280 | 3.94 | 0.50 GB/s | 1.91 GB/s |
-| **total** | **211,938,580** | **2.04** | **0.25 GB/s** | **1.07 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.79 GB/s | 2.51 GB/s |
+| mozilla | 51,220,480 | 2.05 | 0.22 GB/s | 1.14 GB/s |
+| mr | 9,970,564 | 2.49 | 0.25 GB/s | 1.18 GB/s |
+| nci | 33,553,445 | 5.34 | 0.22 GB/s | 1.52 GB/s |
+| ooffice | 6,152,192 | 1.48 | 0.19 GB/s | 1.01 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.63 GB/s | 3.60 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.32 GB/s | 1.02 GB/s |
+| samba | 21,606,400 | 2.55 | 0.29 GB/s | 1.19 GB/s |
+| sao | 7,251,944 | 1.01 | 1.18 GB/s | 11.3 GB/s |
+| webster | 41,458,703 | 1.95 | 0.28 GB/s | 0.95 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.41 GB/s | 2.89 GB/s |
+| xml | 5,345,280 | 3.94 | 0.50 GB/s | 1.68 GB/s |
+| **total** | **211,938,580** | **2.04** | **0.28 GB/s** | **1.29 GB/s** |
 
-`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
-of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
+`zpse_cli bench -r 5`, default level (6), 64 KiB blocks, one pinned core, best
+of five runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
 corpus from 106,140,388 to 103,921,535 bytes, which cost ~6% of encode and
 bought ~8% of decode (the tile bodies it compresses are shorter than the plain
 LZ streams they replace, so the command loop runs over fewer bytes). The
