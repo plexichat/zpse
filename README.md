@@ -1026,19 +1026,19 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.79 GB/s | 2.51 GB/s |
-| mozilla | 51,220,480 | 2.05 | 0.22 GB/s | 1.14 GB/s |
-| mr | 9,970,564 | 2.49 | 0.25 GB/s | 1.18 GB/s |
-| nci | 33,553,445 | 5.34 | 0.22 GB/s | 1.52 GB/s |
-| ooffice | 6,152,192 | 1.48 | 0.19 GB/s | 1.01 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.63 GB/s | 3.60 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.32 GB/s | 1.02 GB/s |
-| samba | 21,606,400 | 2.55 | 0.29 GB/s | 1.19 GB/s |
-| sao | 7,251,944 | 1.01 | 1.18 GB/s | 11.3 GB/s |
-| webster | 41,458,703 | 1.95 | 0.28 GB/s | 0.95 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.41 GB/s | 2.89 GB/s |
-| xml | 5,345,280 | 3.94 | 0.50 GB/s | 1.68 GB/s |
-| **total** | **211,938,580** | **2.04** | **0.28 GB/s** | **1.29 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.77 GB/s | 2.61 GB/s |
+| mozilla | 51,220,480 | 2.05 | 0.22 GB/s | 1.17 GB/s |
+| mr | 9,970,564 | 2.49 | 0.24 GB/s | 1.10 GB/s |
+| nci | 33,553,445 | 5.34 | 0.21 GB/s | 1.39 GB/s |
+| ooffice | 6,152,192 | 1.48 | 0.19 GB/s | 1.08 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.66 GB/s | 3.70 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.31 GB/s | 1.02 GB/s |
+| samba | 21,606,400 | 2.55 | 0.29 GB/s | 1.32 GB/s |
+| sao | 7,251,944 | 1.01 | 1.24 GB/s | 9.05 GB/s |
+| webster | 41,458,703 | 1.95 | 0.29 GB/s | 0.97 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 2.96 GB/s |
+| xml | 5,345,280 | 3.94 | 0.49 GB/s | 1.67 GB/s |
+| **total** | **211,938,580** | **2.04** | **0.28 GB/s** | **1.31 GB/s** |
 
 `zpse_cli bench -r 5`, default level (6), 64 KiB blocks, one pinned core, best
 of five runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
@@ -1063,19 +1063,40 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.34 GB/s | 0.54 GB/s | no |
-| zpse 5 BALANCED | 1.87:1 | 0.21 GB/s | 0.55 GB/s | no |
-| zpse 6 (default) | 2.00:1 | 0.19 GB/s | 0.52 GB/s | no |
-| zpse 9 MAX | 2.18:1 | 0.18 GB/s | 0.41 GB/s | no |
-| lz4 -1 | 2.11:1 | 1.78 GB/s | 1.46 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.15 GB/s | 1.44 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.35 GB/s | 1.04 GB/s | yes |
-| zstd -3 | 3.20:1 | 0.23 GB/s | 0.91 GB/s | yes |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.85 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.40 GB/s | 0.55 GB/s | no |
+| zpse 5 BALANCED | 1.92:1 | 0.20 GB/s | 0.55 GB/s | no |
+| zpse 6 (default) | 2.04:1 | 0.20 GB/s | 0.56 GB/s | no |
+| zpse 9 MAX | 2.20:1 | 0.18 GB/s | 0.49 GB/s | no |
+| lz4 -1 | 2.10:1 | 1.36 GB/s | 1.57 GB/s | yes |
+| lz4 -3 | 2.60:1 | 0.37 GB/s | 1.50 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.16 GB/s | 1.46 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.33 GB/s | 0.96 GB/s | yes |
+| zstd -3 | 3.20:1 | 0.21 GB/s | 0.83 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.83 GB/s | yes |
 
-MAX is now smaller than `lz4 -1` -- 2.18:1 against 2.11 -- and the default is
-within 5% of it, so the ratio half of the comparison is settled. The rows are
-still off the frontier, for two reasons rather than three.
+This table is the one the earlier version of this section did not have: no lz4
+was installed on the machine that produced it, and with every row measured in
+one run no zpse level is on the frontier. `lz4 -1` dominates the default
+outright -- 2.10:1 against 2.04:1, at 6.6 times the encode rate and 2.8 times
+the decode rate -- and `lz4 -3` and `zstd -3` dominate MAX, the only level
+whose ratio is competitive at all.
+
+The two measurements below say where that gap is, and neither of them is the
+format.
+
+The first is encode. The match finder is 51% of it and runs at 271 MB/s on
+`dickens`, 189 to 322 MB/s across the prose files. A Silesia prose block emits
+one command every 6.3 bytes, on an average match of 5.4 bytes, so the finder
+and the command loop both pay per-command work at a rate the lz4 parse does
+not, because that parse finds longer matches on the same bytes. Widening the
+parse would buy size and speed at once, and it is the one change that can
+move this row.
+
+The second is the frame path, and it is the cheap one. The block-level decode
+of these twelve files is 1.31 GB/s (the table above); the CLI's frame decode
+of the same bytes is 0.56 GB/s. lz4's CLI reads and writes the same way and
+holds 1.57 GB/s through this harness, so the 2.3x is not the harness and not
+the read floor -- it is per-block overhead in the frame loop.
 
 *Encode.* A block here is decided, not merely encoded: the probe prices the
 candidate shapes, the ASCII gate prices three of them on two samples, and a
