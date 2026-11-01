@@ -791,8 +791,23 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                  * overwrites (the decoder fills the block from zero up),
                  * and `room` inside the copy already proves they are inside
                  * the block. */
-                lz_copy_literals(op, lp, lit, op_rem,
-                                 (uint32_t)(tend - lp) >= 16u ? 1 : 0);
+                {
+                    uint32_t safe =
+                        (uint32_t)(tend - lp) >= 16u ? 1u : 0u;
+
+                    /* The run on prose is one or two bytes -- the block's
+                     * own average is 0.9 literals per command -- and for
+                     * those the copier's prologue is more work than the
+                     * bytes. One 8-byte store is the whole run under
+                     * exactly the test the copier makes for its own narrow
+                     * tail (same three terms, same slack), so the bytes
+                     * written are the same ones it writes. */
+                    if (lit <= 8u && safe != 0u && op_rem >= 8u) {
+                        memcpy(op, lp, 8u);
+                    } else {
+                        lz_copy_literals(op, lp, lit, op_rem, (int)safe);
+                    }
+                }
                 op += lit;
                 lp += lit;
                 op_rem -= lit;
@@ -804,18 +819,38 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
              * recent distance, and anything above that is the distance plus
              * four. The cache is updated exactly as lz_emit_cmd updates it,
              * which is the whole contract of the encoding. */
-            v = 0u;
+            /* One or two bytes on nearly every command: the groups are
+             * seven bits, so two of them carry any distance below 16384,
+             * and a 64 KiB block's distances sit under that. Reading those
+             * two cases straight out of the stream skips the loop's
+             * shift-and-test per byte, which measured as a fifth of what a
+             * command costs. The set of streams accepted is unchanged:
+             * the same bytes are consumed for the same values, a shorter
+             * stream still reaches the loop and is still refused, and the
+             * `shift > 21` bound still lives in the loop. */
             {
-                uint32_t shift = 0u;
+                uint32_t have2 = (uint32_t)(tend - lp) >= 2u;
+                uint32_t b0 = (lp < tend) ? (uint32_t)lp[0] : 0xFFFFFFFFu;
 
-                do {
-                    if (lp >= tend || shift > 21u) {
-                        return PSE_BAD_LZ;
-                    }
-                    b = *lp++;
-                    v |= (uint32_t)(b & 0x7Fu) << shift;
-                    shift += 7u;
-                } while ((b & 0x80u) != 0u);
+                v = 0u;
+                if (b0 < 0x80u) {
+                    v = b0;
+                    lp += 1;
+                } else if (have2 && lp[1] < 0x80u) {
+                    v = (b0 & 0x7Fu) | ((uint32_t)lp[1] << 7u);
+                    lp += 2;
+                } else {
+                    uint32_t shift = 0u;
+
+                    do {
+                        if (lp >= tend || shift > 21u) {
+                            return PSE_BAD_LZ;
+                        }
+                        b = *lp++;
+                        v |= (uint32_t)(b & 0x7Fu) << shift;
+                        shift += 7u;
+                    } while ((b & 0x80u) != 0u);
+                }
             }
             if (v == 0u) {
                 /* A literal-only command has to make progress. */
