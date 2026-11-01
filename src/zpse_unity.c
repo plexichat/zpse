@@ -13,6 +13,7 @@
 #include "residual.c"
 #include "dense.c"
 #include "lz.c"
+#include "lz2.c"
 #include "tile.c"
 #include "segment.c"
 #include "block.c"

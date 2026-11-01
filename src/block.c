@@ -297,7 +297,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if ((h.block_flags & ZPSE_B_RAW) != 0) {
         uint32_t calc;
         if (h.transform_id != 0 || h.segment_count != 1 || meta_size != 0 ||
-            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
+            (h.block_flags & (ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) != 0) {
             return PSE_BAD_HEADER;
         }
         if (c != (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
@@ -336,6 +336,36 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         }
         rc = zpse_lz_decode(in + ZPSE_BLOCK_HEADER_SIZE,
                             c - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, output, n);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+        if ((h.block_flags & ZPSE_B_CRC) != 0) {
+            uint32_t calc = zpse_crc32c(output, n);
+
+            if (calc != h.decoded_crc32c) {
+                return PSE_BAD_PAYLOAD_CRC;
+            }
+        }
+        if (out_len_out != 0) {
+            *out_len_out = n;
+        }
+        return (int)n;
+    }
+
+    /* The fast LZ form: the same envelope as the block above -- transform 0,
+     * one segment, no metadata -- with a different command encoding (see
+     * include/zpse/lz2.h). It carries neither the repeat-distance cache nor
+     * the lookahead, which is what makes it cheap to write and to read. */
+    if ((h.block_flags & ZPSE_B_LZ2) != 0) {
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
+            (h.block_flags & (ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
+            return PSE_BAD_HEADER;
+        }
+        if (c <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+            return PSE_BAD_BLOCK_SIZE;
+        }
+        rc = zpse_lz2_decode(in + ZPSE_BLOCK_HEADER_SIZE,
+                             c - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, output, n);
         if (rc != PSE_OK) {
             return rc;
         }
@@ -2049,6 +2079,47 @@ static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
     return 1;
 }
 
+/* The fast LZ form's block: same header, same 'is_last' and CRC handling as
+ * zpse_block_try_lz, different payload codec. */
+static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                              uint32_t in_crc, int is_last, uint32_t seq,
+                              uint8_t *dst, uint32_t cap, uint32_t *total_out,
+                              uint32_t *cmds_out)
+{
+    ZpseBlockHeader h;
+    uint8_t flags;
+    uint32_t payload;
+    uint32_t total;
+
+    if (e->lz == 0 || dst == 0 || total_out == 0) {
+        return PSE_BAD_ARG;
+    }
+    if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ2_MIN_PAYLOAD) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                              cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
+                              (uint32_t)ZPSE_LZ_HASH_BITS);
+    if (payload == 0u) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    if (cmds_out != 0) {
+        *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
+    }
+    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
+    flags = (uint8_t)(ZPSE_B_LZ2 | ZPSE_B_RESET |
+                      (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+                           ? ZPSE_B_CRC : 0u));
+    if (is_last) {
+        flags |= ZPSE_B_LAST;
+    }
+    zpse_block_fill_header(&h, flags, n, total, 0u, 1u, 0u, seq, in_crc);
+    zpse_block_header_serialize(dst, &h);
+    zpse_block_fix_header_crc(dst);
+    *total_out = total;
+    return PSE_OK;
+}
+
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
                              uint8_t *dst, uint32_t cap, uint32_t *total_out,
@@ -2260,7 +2331,8 @@ static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
 
     if (zpse_block_header_parse(&h, blk, len) != PSE_OK ||
         (h.block_flags &
-         (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0u) {
+         (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
+                   ZPSE_B_LZ2)) != 0u) {
         e->hist_valid = 0u;
         e->hist_streak = 0u;
         return;
@@ -3563,7 +3635,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (zpse_block_header_parse(&wh, e->best, ZPSE_BLOCK_HEADER_SIZE) ==
                 PSE_OK &&
             (wh.block_flags &
-             (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE)) == 0u) {
+             (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
+                       ZPSE_B_LZ2)) == 0u) {
             uint32_t blen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
             uint32_t pl = zpse_lz_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
                                          blen, e->tstage,
@@ -3576,7 +3649,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 tot <= out_cap) {
                 wh.block_flags = (uint8_t)((wh.block_flags &
                                             ~(uint8_t)(ZPSE_B_RAW |
-                                                       ZPSE_B_LZ)) |
+                                                       ZPSE_B_LZ |
+                                                       ZPSE_B_LZ2)) |
                                            ZPSE_B_LZ_TILE);
                 wh.compressed_block_size = tot;
                 zpse_block_header_serialize(out, &wh);
@@ -3586,6 +3660,80 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 best_total = tot;
                 direct_out = 1;
             }
+        }
+    }
+
+    /* ---- The fast LZ form, priced last ------------------------------ *
+     *
+     * Same envelope and same screen as the form above, a different command
+     * encoding: fixed 16-bit distances, no lookahead, no backward walk, no
+     * repeat cache. It is not always the loser against the other form -- a
+     * fixed-width distance is cheaper than that one's codes when matches are
+     * short and far -- so it is offered as a candidate and kept only when its
+     * total is strictly smaller. The size corpus measures that: 577 of its
+     * 768 cases shrank and none grew.
+     *
+     * Placement is the whole of the correctness here. This has to run after
+     * the LZ-and-tiles stage, because that stage compresses the tile body and
+     * on periodic data it reaches a size neither LZ form can touch (a 300-byte
+     * period codes to 400 bytes against 1264 here); committing a merely
+     * smaller stream before it would skip the better one. Committing last, the
+     * candidate can only be reached when every other stage has had its say,
+     * and `t2 < best_total` makes it a strict improvement over whatever they
+     * produced.
+     *
+     * That stage can also write its winner straight into `out` (`direct_out`),
+     * and it is not always the better stream either: on a float column the
+     * same block comes out 20,501 bytes from here against its 21,092. So the
+     * candidate competes in that mode too, and overwrites the block already
+     * in `out` when it is strictly smaller -- which it can only be by
+     * `t2 < best_total`, and `t2 <= out_cap` keeps it inside the buffer.
+     *
+     * MAX offers it and no other level does, and the reason is measured
+     * rather than assumed. Offered from level 5 up -- the rungs that already
+     * pay a match finder on some blocks -- it took 915 bytes off the whole of
+     * Silesia and cost 19% of the default level's encode rate (275.6 to 223.5
+     * MB/s, same corpus, same host, same two runs each): a second pass over
+     * the blocks the first one's screen had already accepted, for a win the
+     * first form usually gets anyway. Offered from level 5 up it moved the
+     * size corpus by 4,056 bytes over its 768 blocks, so the form is real, if
+     * small -- and the rung that exists to buy ratio is where it belongs.
+     *
+     * The rungs below cannot take it at all. Levels 1-4 hold zero in the
+     * ladder's screen columns, which the screen reads as "accept everything":
+     * the pass would run on every block, including the ones level 5 then
+     * refuses -- a level-4 block of 20,501 bytes against a level-5 block of
+     * 21,092 on a float column, which is exactly the ordering
+     * tests/suites/test_levels.c pins. The screen's columns are what hold
+     * that ordering: its margin only loosens with depth and its sample count
+     * only rises, so a deeper rung accepts a superset of what the rung below
+     * accepts. Level 9 is the loosest screen on the ladder, so offering the
+     * form there and nowhere above keeps every level's stream at or below the
+     * one before it. */
+    if (have_best && e->lz != 0 &&
+        zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >= 9u &&
+        best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
+                                ZPSE_LZ2_MIN_PAYLOAD) &&
+        zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
+                             meta_lens[0] > 0 ? meta_bufs[0] : in,
+                             meta_lens[0],
+                             e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+                             1, best_total)) {
+        uint32_t t2 = 0u;
+        uint32_t cmds2 = 0u;
+
+        if (zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, e->cand,
+                               (uint32_t)ZPSE_E_SZ_CAND, &t2, &cmds2) ==
+                PSE_OK &&
+            t2 < best_total && (!direct_out || t2 <= out_cap)) {
+            if (direct_out) {
+                memcpy(out, e->cand, t2);
+            } else {
+                memcpy(e->best, e->cand, t2);
+            }
+            best_total = t2;
+            best_idx = 15u;
+            have_best = 1;
         }
     }
 

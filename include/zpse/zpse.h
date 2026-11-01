@@ -37,6 +37,7 @@
 #include "tile.h"
 #include "segment.h"
 #include "lz.h"
+#include "lz2.h"
 #include "block.h"
 #include "frame.h"
 #include "parallel.h"

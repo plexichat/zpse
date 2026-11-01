@@ -345,7 +345,7 @@ each run the harness's own best of three timed reps, on one host,
 | 6 (default) | 5.11:1 | 0.87 GB/s | 14.4 GB/s | the margin loosened to 1.1875x and the decode bill raised to 6 bytes per command — the bill is free on the encode side, so the default takes it; see the Silesia section for what the two knobs are each worth |
 | 7 | 5.11:1 | 0.88 GB/s | 14.4 GB/s | the margin loosened to 1.125x, the decode bill unchanged from 6 |
 | 8 | 5.14:1 | 0.83 GB/s | 12.9 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
-| 9 `ZPSE_ENC_SPEED_MAX` | 5.14:1 | 0.84 GB/s | 13.8 GB/s | the same 1.0625x margin with one screen sample instead of two, and acceleration factor 24 (4 bytes per command) |
+| 9 `ZPSE_ENC_SPEED_MAX` | 5.14:1 | 0.84 GB/s | 13.8 GB/s | the same 1.0625x margin with one screen sample instead of two, acceleration factor 24 (4 bytes per command), and the fast LZ form as a last candidate |
 
 Levels 5 to 9 are the v2 form's rows: `ZPSE_B_LZ_TILE` lifts the corpus mean
 from 4.49:1 to 5.11:1 at the default level and costs about a fifth of the
@@ -765,9 +765,16 @@ On high-cardinality text it is the difference between falling back to raw and
 compressing at all -- the case the tile model cannot see, because nothing in
 it repeats four bytes apart, only further back.
 
-A block is written in one of four forms, and the block flags say which: the
+A block is written in one of five forms, and the block flags say which: the
 tile form above (every form flag clear), a verbatim copy (`ZPSE_B_RAW`),
-intra-block LZ (`ZPSE_B_LZ`), or **LZ over the tile body** (`ZPSE_B_LZ_TILE`).
+intra-block LZ (`ZPSE_B_LZ`), **LZ over the tile body** (`ZPSE_B_LZ_TILE`), or
+the **fast LZ form** (`ZPSE_B_LZ2`) -- the same literal-and-command shape with
+a fixed 16-bit distance and no lookahead, no backward walk and no distance
+cache, which is what lz4 writes and why its decoder is a tight loop. MAX
+offers it as a last candidate, after the LZ-over-tiles stage: a fixed-width
+distance can beat the first form's variable-length codes when matches are
+short and far (a 300-byte period codes to 23,318 bytes against 23,449), and it
+is kept only when it is strictly smaller than everything already tried.
 
 The last one is the two forms together rather than a choice between them: the
 payload is `[u32 body_len][LZ stream]`, the stream expands to exactly the body

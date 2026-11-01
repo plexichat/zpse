@@ -66,7 +66,15 @@
  * compatibility shim -- a v1 reader sees bit 6 in the reserved mask and
  * refuses the block, which is what the reserved bits were for. */
 #define ZPSE_B_LZ_TILE          (UINT8_C(1) << 6)
-#define ZPSE_B_RESERVED_MASK    (UINT8_C(0x80))
+/* The fast LZ form (src/lz2.c): a token, its literals and a fixed 16-bit
+ * distance, with neither the repeat-distance cache nor the one-byte
+ * lookahead that ZPSE_B_LZ spends its per-position budget on. It exists as
+ * its own form because the two codecs want different rungs: the cheap levels
+ * take this one on every block, the deep ones keep the repeat cache where
+ * its size shows. Bit 7 was the reserved mask and is now the last form, so
+ * the mask is empty rather than wrong. */
+#define ZPSE_B_LZ2              (UINT8_C(1) << 7)
+#define ZPSE_B_RESERVED_MASK    (UINT8_C(0x00))
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 

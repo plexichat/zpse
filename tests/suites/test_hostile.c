@@ -90,13 +90,15 @@ int main(void) {
         refresh();
     }
 
-    /* Reserved block flag bit with repaired CRC -> UNSUPPORTED_FEATURE.
-     * Bit 7 is the one the format still reserves; bit 6 is the v2 LZ+tiles
-     * form and bit 5 the LZ form, and each has its own check below. */
+    /* Every block flag bit now names a form: 5 the LZ form, 6 LZ plus
+     * tiles, 7 the fast LZ form. So a bit set on a payload that is not that
+     * form has to be refused by the form's own envelope check rather than by
+     * a reserved-bit mask -- the flag alone must never be enough to read a
+     * tile payload as commands. Bit 7 first, then the LZ bit. */
     memcpy(work, comp, clen); work[3] |= 0x80;
     zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
-    CHECK(rc == PSE_UNSUPPORTED_FEATURE, "reserved block bit rejected");
+    CHECK(rc < 0, "fast LZ flag on a tile payload rejected");
 
     /* The LZ form on a stream that is not one: the flag alone must not be
      * enough to read a tile payload as commands. */
