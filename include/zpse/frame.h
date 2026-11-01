@@ -68,4 +68,18 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
                            uint32_t nominal_block_size, uint64_t content_size,
                            uint32_t block_count, size_t *out_len_out);
 
+/* The same tail for a writer that never holds the frame: blocks already
+ * streamed to a file, and the table recorded as they went. `offsets` and
+ * `sizes` hold block_count entries, `index_offset` is where the table will
+ * be written (the byte just past the last block), and the two outputs are
+ * the header to patch over the one already in the file and the table to
+ * append. The entries are checked to be contiguous and inside the blocks
+ * that precede the table, so a table built from the wrong offsets is
+ * refused here rather than by the reader that seeks by it. */
+int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
+                            size_t idx_cap, uint32_t nominal_block_size,
+                            uint64_t content_size, uint32_t block_count,
+                            uint32_t index_offset, const uint32_t *offsets,
+                            const uint32_t *sizes, size_t *idx_len_out);
+
 #endif /* ZPSE_FRAME_H */

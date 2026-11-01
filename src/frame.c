@@ -480,6 +480,79 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
     return PSE_OK;
 }
 
+int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
+                            size_t idx_cap, uint32_t nominal_block_size,
+                            uint64_t content_size, uint32_t block_count,
+                            uint32_t index_offset, const uint32_t *offsets,
+                            const uint32_t *sizes, size_t *idx_len_out)
+{
+    ZpseFrameHeader fh;
+    size_t need = (size_t)ZPSE_INDEX_HEADER_SIZE +
+                  (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count;
+    uint32_t crc;
+    uint32_t k;
+    int rc;
+
+    if (hdr_out == 0 || idx_out == 0 || offsets == 0 || sizes == 0 ||
+        idx_len_out == 0 || block_count == 0u) {
+        return PSE_BAD_ARG;
+    }
+    if (need > idx_cap) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    if ((size_t)index_offset < (size_t)ZPSE_FRAME_HEADER_SIZE) {
+        return PSE_BAD_HEADER;
+    }
+    /* The blocks have to start right after the header and follow each other
+     * with no gap, and the table has to start right after the last of them:
+     * that is what the sequential reader assumes when it walks the stream, and
+     * a table that says otherwise describes a different frame. */
+    if (offsets[0] != (uint32_t)ZPSE_FRAME_HEADER_SIZE) {
+        return PSE_BAD_HEADER;
+    }
+    for (k = 0; k < block_count; k++) {
+        uint32_t off = offsets[k];
+        uint32_t sz = sizes[k];
+        uint8_t *ent = idx_out + (size_t)ZPSE_INDEX_HEADER_SIZE +
+                       (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
+
+        if (sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+            return PSE_BAD_BLOCK_SIZE;
+        }
+        if ((uint64_t)off + (uint64_t)sz > (uint64_t)index_offset) {
+            return PSE_BAD_HEADER;
+        }
+        if (k + 1u < block_count && offsets[k + 1u] != off + sz) {
+            return PSE_BAD_HEADER;
+        }
+        zpse_store_u32le(ent, off);
+        zpse_store_u32le(ent + 4u, sz);
+    }
+    if ((uint32_t)(offsets[block_count - 1u] + sizes[block_count - 1u]) !=
+        index_offset) {
+        return PSE_BAD_HEADER;
+    }
+    crc = zpse_crc32c(idx_out + (size_t)ZPSE_INDEX_HEADER_SIZE,
+                      (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count);
+    zpse_store_u32le(idx_out, ZPSE_INDEX_MAGIC);
+    zpse_store_u32le(idx_out + 4u, block_count);
+    zpse_store_u32le(idx_out + 8u, crc);
+    zpse_store_u32le(idx_out + 12u, 0u);
+    rc = zpse_frame_header_build(&fh, nominal_block_size, content_size, 1,
+                                 block_count, 1, 1);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    fh.frame_index_offset = index_offset;
+    zpse_frame_reseal(&fh);
+    rc = zpse_frame_header_write(&fh, hdr_out);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    *idx_len_out = need;
+    return PSE_OK;
+}
+
 int zpse_frame_encode(ZpseEncoder *e, const uint8_t *in, size_t n,
                       uint32_t nominal_block_size,
                       uint8_t *out, size_t out_cap, size_t *out_len_out)

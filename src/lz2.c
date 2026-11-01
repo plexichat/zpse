@@ -137,11 +137,19 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * this step equal" and "how far in does it stop". The loop used to
          * compare a pair and then load the same pair again to count its tail,
          * which on prose -- average match 5.4 bytes, so it exits on its first
-         * test -- was two loads and a branch for one length. */
+         * test -- was two loads and a branch for one length.
+         *
+         * One four-byte compare for the candidate and one eight-byte xor for
+         * the length is the cheapest shape tried so far: folding them into a
+         * single eight-byte xor (so a miss pays a load pair and a ctz instead
+         * of a compare) measured 12-17% SLOWER on prose, columnar XML and the
+         * binary members, because misses outnumber hits and a miss is the
+         * common case. Only the forward bound is tested below: the candidate
+         * is behind the cursor, so a step that fits at pos fits at cand. */
         {
             int tail = 0;
 
-            while (pos + len + 8u <= n && cand + len + 8u <= n) {
+            while (pos + len + 8u <= n) {
                 uint64_t x = lz2_load64(in + pos + len) ^
                              lz2_load64(in + cand + len);
 

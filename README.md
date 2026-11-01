@@ -813,7 +813,24 @@ last one to seven bytes used to be a compare per byte and are now one xor and
 a count of trailing zeros, which is worth 36% on `dickens` (256 to 349 MB/s)
 and 31% on `webster` with every stream identical. The weekly Silesia job runs
 that benchmark with a floor, next to the ratio gate, so the next regression in
-the finder is a row that moved rather than a claim nobody re-measured.
+the finder is a row that moved rather than a claim nobody re-measured. Two
+shapes are measured and rejected: a 2^15 table (0.4% worse ratio and 7% slower
+than 2^16 on `dickens`) and 2^17 (no ratio gain worth the 256 KiB — 0.2% on
+`dickens`, nothing on `mozilla`), and folding the candidate compare and the
+first length step into one eight-byte xor, which is 12-17% *slower* on prose,
+columnar XML and the binary members because misses outnumber hits and a miss is
+the common case.
+
+The frame layer costs a decode nothing measurable. Walking a frame's block
+headers without decoding — parse, header CRC, size checks — runs at thousands
+of GB/s, and decoding an LZ2 frame block by block lands within noise of the
+bare command loop on the same payloads (1.12 against 1.03 GB/s on `dickens`,
+1.64 against 1.61 on `mozilla`), so the envelope and the probe are not where a
+decode's time goes. What sits above the loop's rate is the output write:
+decoding the 51 MiB `mozilla` frame into a reused buffer runs at 1.64 GB/s and
+into a fresh allocation at 0.78, because the second one faults a page every
+4 KiB of output. That is also why the CLI decodes block by block into one
+reused buffer instead of holding the whole output.
 
 The last one is the two forms together rather than a choice between them: the
 payload is `[u32 body_len][LZ stream]`, the stream expands to exactly the body
@@ -847,6 +864,16 @@ than followed. Without the index a frame is still decodable sequentially;
 what it cannot do is jump, because a block header carries its own size but
 not its own offset.
 
+The in-memory writer builds the table by walking the blocks it has just
+written, which needs the whole frame in one buffer. A writer that streams
+blocks to a file has no such buffer, so `zpse_frame_stream_index()` takes the
+`{offset, size}` pairs it recorded as it went and returns the index and the
+header that describes it -- the header is written last because the field it
+carries is where the table begins. The entries are checked to start right
+after the header, to follow each other with no gap, and to end exactly where
+the table starts, so a table built from the wrong offsets is refused there
+rather than by the reader that seeks by it. `zpse_cli c -x` is that path.
+
 Everything is bounds-checked on the way in, and the checks are the interesting
 half of the decoder: every length, count, mode and rank is validated before
 use, and the payload CRC32-C is verified whenever a stream carries one.
@@ -857,7 +884,13 @@ The payload CRC32-C is **optional and off by default** (block flag
 tagged. Emitting it costs both directions a full pass over the block — a
 quarter to a third of a decode on the fast rows, and on the raw path the
 difference between `memcpy` and a third of `memcpy` — which is why the default
-is to skip it, the same trade LZ4 makes for its frame checksum.
+is to skip it, the same trade LZ4 makes for its frame checksum. When the flag
+is not set the header's CRC field is written as 0 and no pass is made, in
+every form: nothing reads the field without the flag, and the general encoder
+has always skipped it (the fast form filled it regardless, which was a 64 KiB
+pass per block for a number no decoder would look at; measured on this host it
+was free either way, because its CRC32-C runs on the hardware instruction, but
+a build without SSE4.2 pays about a quarter of the encode for it).
 
 ## Building and testing
 
@@ -982,6 +1015,14 @@ memory speed against an encode that runs at one to two gigabytes a second. The
 result is byte-identical to the serial call -- same blocks, same header, same
 index -- which is what `tests/suites/test_parallel.c` asserts at every worker
 count it tries.
+
+That reservation is the whole of the worker path's memory, and through a file
+it shows: on the 202 MiB corpus `zpse c -l 6 -t 4` takes 2.0 s of wall clock
+against 1.2 s for one thread, because the workers want a frame-sized buffer to
+fill and then walk, and a streamed single-thread encode needs neither. The
+scaling table below is measured in memory, where the buffer is already there
+and the workers are the only variable; through a file the streamed path is the
+one to measure against.
 
 Threading is compiled in only under `ZPSE_MT`. Without it the call is the
 serial encoder, so a caller ships one build and gets cores only where it asked

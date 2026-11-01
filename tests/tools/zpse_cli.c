@@ -430,7 +430,8 @@ static int decode_stream(const uint8_t *in, size_t in_len, const char *out_path,
  *
  * Returns 0 on success, 1 on any failure, matching write_file. */
 static int encode_stream(const char *in_path, const char *out_path,
-                         uint32_t block, uint32_t enc_flags, void *enc_arena)
+                         uint32_t block, uint32_t enc_flags, int indexed,
+                         void *enc_arena)
 {
     ZpseFrameHeader fh;
     ZpseEncoder enc;
@@ -448,6 +449,11 @@ static int encode_stream(const char *in_path, const char *out_path,
     size_t off = 0u;
     size_t nblocks;
     size_t b;
+    /* Where each block landed and how long it is, so a frame that asks for
+     * an index can carry one without the blocks still being in memory. */
+    uint32_t *blk_off = NULL;
+    uint32_t *blk_len = NULL;
+    size_t out_pos = ZPSE_FRAME_HEADER_SIZE;
     int rc = 1;
 
     fi = fopen(in_path, "rb");
@@ -470,7 +476,7 @@ static int encode_stream(const char *in_path, const char *out_path,
     nblocks = n / (size_t)block + ((n % (size_t)block) != 0u ? 1u : 0u);
     if (nblocks > (size_t)UINT32_MAX ||
         zpse_frame_header_build(&fh, block, (uint64_t)n, 1,
-                                (uint32_t)nblocks, 1, 0) != PSE_OK ||
+                                (uint32_t)nblocks, 1, indexed) != PSE_OK ||
         zpse_frame_header_write(&fh, hdr) != PSE_OK) {
         fprintf(stderr, "zpse_cli: cannot build the frame header\n");
         fclose(fi);
@@ -494,6 +500,14 @@ static int encode_stream(const char *in_path, const char *out_path,
         goto done;
     }
     enc.enc_flags = enc_flags;
+    if (indexed) {
+        blk_off = (uint32_t *)malloc(sizeof(uint32_t) * nblocks);
+        blk_len = (uint32_t *)malloc(sizeof(uint32_t) * nblocks);
+        if (blk_off == NULL || blk_len == NULL) {
+            fprintf(stderr, "zpse_cli: out of memory\n");
+            goto done;
+        }
+    }
     if (fwrite(hdr, 1u, sizeof hdr, fo) != sizeof hdr) {
         fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
         goto done;
@@ -519,11 +533,54 @@ static int encode_stream(const char *in_path, const char *out_path,
             goto done;
         }
         clen = (uint32_t)brc;
+        if (indexed) {
+            blk_off[b] = (uint32_t)out_pos;
+            blk_len[b] = clen;
+        }
         if (fwrite(out_buf, 1u, clen, fo) != clen) {
             fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
             goto done;
         }
         off += chunk;
+        out_pos += clen;
+    }
+    if (indexed) {
+        size_t idx_len = 0u;
+        uint8_t *idx = (uint8_t *)malloc((size_t)ZPSE_INDEX_HEADER_SIZE +
+                                         (size_t)ZPSE_INDEX_ENTRY_SIZE *
+                                             nblocks);
+
+        if (idx == NULL) {
+            fprintf(stderr, "zpse_cli: out of memory\n");
+            goto done;
+        }
+        if (zpse_frame_stream_index(hdr, idx,
+                                    (size_t)ZPSE_INDEX_HEADER_SIZE +
+                                        (size_t)ZPSE_INDEX_ENTRY_SIZE *
+                                            nblocks,
+                                    block, (uint64_t)n, (uint32_t)nblocks,
+                                    (uint32_t)out_pos, blk_off, blk_len,
+                                    &idx_len) != PSE_OK) {
+            fprintf(stderr, "zpse_cli: cannot build the frame index\n");
+            free(idx);
+            goto done;
+        }
+        /* The header was written before the blocks, when the index offset
+         * was not yet known; it is rewritten over itself here, and the table
+         * is appended after the last block. Both are sealed by the helper. */
+        if (fseek(fo, 0, SEEK_SET) != 0 ||
+            fwrite(hdr, 1u, sizeof hdr, fo) != sizeof hdr) {
+            fprintf(stderr, "zpse_cli: cannot rewrite the frame header\n");
+            free(idx);
+            goto done;
+        }
+        if (fseek(fo, 0, SEEK_END) != 0 ||
+            fwrite(idx, 1u, idx_len, fo) != idx_len) {
+            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+            free(idx);
+            goto done;
+        }
+        free(idx);
     }
     if (fclose(fo) != 0) {
         fo = NULL;
@@ -538,6 +595,8 @@ done:
     }
     free(in_buf);
     free(out_buf);
+    free(blk_off);
+    free(blk_len);
     fclose(fi);
     return rc;
 }
@@ -633,19 +692,21 @@ static int cmd_codec(int argc, char **argv)
     }
     in_path = argv[i];
     out_path = argv[i + 1];
-    /* A frame that asks for neither the index nor a second worker is written
-     * block by block straight to the output file (see encode_stream): the
-     * input, the frame and the page faults for both are what the buffered
-     * path spends a quarter of its time on. The buffered path stays for -x,
-     * whose table is a walk over the written blocks, and for -t, whose
-     * workers fill a fixed slot per block before the frame is compacted. */
-    if (compress && threads == 1u && indexed == 0) {
+    /* One thread writes the frame block by block straight to the output file
+     * (see encode_stream): the input, the frame and the page faults for both
+     * are what the buffered path spends a quarter of its time on. The index
+     * rides along, because the streamed writer records where each block went
+     * as it writes it (see zpse_frame_stream_index). The buffered path stays
+     * for -t, whose workers fill a fixed slot per block before the frame is
+     * compacted, which needs the whole frame in one buffer. */
+    if (compress && threads == 1u) {
         enc_arenas = alloc_arenas(1u, ZPSE_ENC_ARENA_SIZE);
         if (enc_arenas == NULL) {
             fprintf(stderr, "zpse_cli: arena allocation failed\n");
             return 1;
         }
-        rc = encode_stream(in_path, out_path, block, enc_flags, enc_arenas[0]);
+        rc = encode_stream(in_path, out_path, block, enc_flags, indexed,
+                           enc_arenas[0]);
         free_arenas(enc_arenas, 1u);
         return rc;
     }

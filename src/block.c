@@ -2395,7 +2395,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * point: this is the option that exists to spend a block's encode budget
      * on one LZ parse instead of on choosing a shape. */
     if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u && e->lz != 0) {
-        uint32_t f_crc = zpse_crc32c(in, n);
+        /* The decoded CRC is only read by a decoder that sees the block's
+         * CRC flag, which is the checksum option. Computing it regardless
+         * was a whole extra pass over every 64 KiB block -- a quarter of
+         * this form's encode -- to fill a field nothing would look at. The
+         * general path below has always left it 0 in this case; this one
+         * now does the same. */
+        uint32_t f_crc = ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+                             ? zpse_crc32c(in, n)
+                             : 0u;
         uint32_t f_total = 0u;
         uint32_t f_cmds = 0u;
         int lrc = zpse_block_try_lz2(e, in, n, f_crc, is_last, seq, out,
