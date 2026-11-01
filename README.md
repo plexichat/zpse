@@ -1145,7 +1145,7 @@ frontier rule:
 
 This is the one corpus where zpse is on the frontier, at two levels: 5.66:1 at
 0.41 GB/s in and 0.89 GB/s out. `zstd -3` reaches 4.91:1 at a similar encode
-rate, so the default trades 15% of rate for 15% of size against it and comes
+rate, so the default trades 10% of rate for 15% of size against it and comes
 out ahead; nothing else is at 5.66:1 at any rate. `lz4 -1` is on the frontier
 too, but for a different trade -- 3.29:1, which is 42% larger than the default
 -- so the two do not compete for the same row. Level 5 is *below* level 6 on
