@@ -787,23 +787,28 @@ runs of the CLI's own block bench:
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
 | level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.15 GB/s | 0.92 GB/s | 96,435,311 |
-| level 6 (default) | 2.04:1 | 0.27 GB/s | 0.91 GB/s | 103,921,535 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.02:1 | 0.38 GB/s | 1.23 GB/s | 105,003,334 |
+| level 6 (default) | 2.04:1 | 0.27 GB/s | 1.00 GB/s | 103,921,535 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.02:1 | 0.47 GB/s | 1.23 GB/s | 105,003,334 |
 
-It buys 44% of encode rate and 35% of decode rate for 1% of ratio, which is
+It buys 75% of the encode rate for 1% of ratio. Its decode is the command
+loop's -- 1.23 GB/s against the default's 1.00 on the same block bench, and
+within noise of it end to end -- which is
 the trade the form exists for: a tile stream decodes through a reconstruction
 that costs more than a command loop, so choosing LZ when LZ is within 1% of
 the size is a win on both sides. On the prose files it is not a 1% trade but a
 large one -- `dickens` goes from 1.16:1 at 630 MB/s to 1.53:1 at 236 MB/s --
 because that is where the tile model has nothing and a match finder has
-everything.
-
-It is still not `lz4 -1`'s operating point: 0.38 GB/s against 1.36 GB/s for
-what is nearly the same ratio (2.02:1 against 2.10:1). The finder is the whole of the encode here -- 256 MB/s on
-`dickens`, 304 on `webster`, 408 on `mozilla` -- so the remaining gap is the
-find loop, not the command writing, which is why the writer only had the
-common-command path inlined (byte-identical: the size corpus writes the same
-bytes it did before).
+everything.It is still not `lz4 -1`'s operating point: 0.27 GB/s here against 0.52 GB/s in
+the frontier table, for what is nearly the same ratio (2.02:1 against 2.10:1).
+The finder is the whole of the encode in this mode -- 349 MB/s on `dickens`,
+397 on `webster`, 479 on `mozilla`, timed by
+`tests/benchmarks/bench_lz2.c` -- so the remaining gap is the find loop, not
+the command writing. What that loop did get is a branchless tail: a match's
+last one to seven bytes used to be a compare per byte and are now one xor and
+a count of trailing zeros, which is worth 36% on `dickens` (256 to 349 MB/s)
+and 31% on `webster` with every stream identical. The weekly Silesia job runs
+that benchmark with a floor, next to the ratio gate, so the next regression in
+the finder is a row that moved rather than a claim nobody re-measured.
 
 The last one is the two forms together rather than a choice between them: the
 payload is `[u32 body_len][LZ stream]`, the stream expands to exactly the body
@@ -1099,23 +1104,28 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.37 GB/s | 0.96 GB/s | no |
-| zpse 5 BALANCED | 1.92:1 | 0.21 GB/s | 0.89 GB/s | no |
-| zpse 6 (default) | 2.04:1 | 0.19 GB/s | 0.85 GB/s | no |
-| zpse 9 MAX | 2.20:1 | 0.18 GB/s | 0.86 GB/s | no |
-| lz4 -1 | 2.10:1 | 1.36 GB/s | 1.55 GB/s | yes |
-| lz4 -3 | 2.60:1 | 0.39 GB/s | 1.54 GB/s | yes |
-| lz4 -9 | 2.72:1 | 0.16 GB/s | 1.53 GB/s | yes |
-| zstd -1 | 2.89:1 | 0.36 GB/s | 1.04 GB/s | yes |
+| zpse 1 FASTEST | 1.25:1 | 0.33 GB/s | 0.97 GB/s | no |
+| zpse 3 FASTER | 1.30:1 | 0.29 GB/s | 0.98 GB/s | no |
+| zpse 5 BALANCED | 1.92:1 | 0.18 GB/s | 0.88 GB/s | no |
+| zpse 6 (default) | 2.04:1 | 0.21 GB/s | 0.89 GB/s | no |
+| zpse 9 MAX | 2.20:1 | 0.13 GB/s | 0.83 GB/s | no |
+| zpse `LZ_FAST` | 2.02:1 | 0.27 GB/s | 0.86 GB/s | no |
+| lz4 -1 | 2.10:1 | 0.52 GB/s | 1.55 GB/s | yes |
+| lz4 -3 | 2.60:1 | 0.11 GB/s | 1.55 GB/s | yes |
+| lz4 -9 | 2.72:1 | 0.04 GB/s | 1.51 GB/s | yes |
+| zstd -1 | 2.89:1 | 0.36 GB/s | 1.06 GB/s | yes |
 | zstd -3 | 3.20:1 | 0.23 GB/s | 0.88 GB/s | yes |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.82 GB/s | yes |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.83 GB/s | yes |
 
-This table is the one the earlier version of this section did not have: no lz4
-was installed on the machine that produced it, and with every row measured in
-one run no zpse level is on the frontier. `lz4 -1` dominates the default
-outright -- 2.10:1 against 2.04:1, at 6.6 times the encode rate and 2.8 times
-the decode rate -- and `lz4 -3` and `zstd -3` dominate MAX, the only level
-whose ratio is competitive at all.
+Every row here was measured in one run, lz4 and zstd included. No zpse row is
+on the frontier, and the fast form did not put one there: `lz4 -1` still
+dominates it -- 2.10:1 against 2.02:1, at 1.9 times the encode rate and 1.8
+times the decode rate -- and `lz4 -3` and `zstd -3` dominate MAX. What the
+fast form did move is zpse's own frontier: at 2:1 it is the cheapest row the
+codec has (0.27 GB/s against the default's 0.21, with the default's decode
+unchanged within 4%), so it is the mode to reach for once that trade has been
+made. `ZPSE_LEVELS="1 3 5 6 9 F"` reproduces the table, `F` being
+`ZPSE_ENC_LZ_FAST`.
 
 The two measurements below say where that gap is, and neither of them is the
 format.

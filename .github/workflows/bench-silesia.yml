@@ -90,6 +90,26 @@ jobs:
           check default.txt "$BASELINE_DEFAULT" 'default level'
           check max.txt "$BASELINE_MAX" 'MAX'
 
+      - name: Match finder rates
+        # The finder is what the fast LZ form (ZPSE_ENC_LZ_FAST) spends its
+        # whole encode on, and what the encoder's slowest candidate spends
+        # most of its. tests/suites/test_sizes.c pins what it writes; this
+        # pins how fast it does it, per corpus file, next to the ratio gate.
+        run: |
+          set -o pipefail
+          ${{ matrix.cc }} -std=c11 -O2 -Iinclude tests/benchmarks/bench_lz2.c \
+            src/zpse_unity.c -o "$RUNNER_TEMP/bench_lz2"
+          files=""
+          for n in dickens mozilla mr nci ooffice osdb reymont samba sao \
+                   webster x-ray xml; do
+            [ -f "$RUNNER_TEMP/silesia/$n" ] && \
+              files="$files $RUNNER_TEMP/silesia/$n"
+          done
+          # 60 MB/s is a collapsed-finder detector, not a performance target:
+          # runners here measure 150-400 MB/s on these files, so only a real
+          # regression trips it.
+          ZPSE_LZ_MIN_MBPS=60 "$RUNNER_TEMP/bench_lz2" $files | tee lz.txt
+
       - name: Keep the tables
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,4 +119,5 @@ jobs:
             default.txt
             max.txt
             pareto.txt
+            lz.txt
           if-no-files-found: warn

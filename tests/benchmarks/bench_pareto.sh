@@ -176,7 +176,15 @@ for l in $ZPSE_LEVELS; do tools+=("zpse:$l"); done
 # without the flag.
 enc_cmd() { # tool in out
     case "${1%%:*}" in
-    zpse) "$cli" c -l "${1##*:}" "$2" "$3" ;;
+    zpse)
+        # "F" is ZPSE_ENC_LZ_FAST: one match-finder pass and the fast LZ
+        # form, with no shape decision. It is an option rather than a level,
+        # so it has a row of its own here and ZPSE_LEVELS may name it.
+        if [ "${1##*:}" = "F" ]; then
+            "$cli" c -F "$2" "$3"
+        else
+            "$cli" c -l "${1##*:}" "$2" "$3"
+        fi ;;
     lz4) "$lz4" "-${1##*:}" -q -f "$2" "$3" ;;
     zstd) "$zstd" -q -f "-${1##*:}" "$2" -o "$3" ;;
     esac
