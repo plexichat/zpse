@@ -171,7 +171,20 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 dst[out] = (uint8_t)((run << 4) |
                                      (rem - ZPSE_LZ2_MIN_MATCH));
                 if (run != 0u) {
-                    memcpy(dst + out + 1u, ls, run);
+                    /* A run of up to fourteen literals leaves as one
+                     * 16-byte store when the buffer and the block both have
+                     * the bytes: `run` is a register value, so a memcpy of
+                     * it is a size dispatch per command, and this command
+                     * shape is four in five of them on prose. The bytes
+                     * past the run are the distance and the next token,
+                     * both written before anything reads them -- the store
+                     * is 16 bytes into a buffer with at least 17 left, so
+                     * it cannot leave the payload either. */
+                    if (cap - out >= 17u && anchor + 16u <= n) {
+                        memcpy(dst + out + 1u, ls, 16u);
+                    } else {
+                        memcpy(dst + out + 1u, ls, run);
+                    }
                 }
                 dst[out + 1u + run] = (uint8_t)(off & 0xFFu);
                 dst[out + 2u + run] = (uint8_t)((off >> 8) & 0xFFu);
@@ -299,10 +312,15 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             return PSE_BAD_LZ;
         }
         if (lit != 0u) {
-            if (lit <= 8u && n - op >= 8u && (uint32_t)(tend - lp) >= 16u) {
-                /* One store covers a short run; the bytes past it are output
-                 * a later command overwrites. */
-                memcpy(out + op, lp, 8u);
+            if (lit < 15u && n - op >= 16u && (uint32_t)(tend - lp) >= 16u) {
+                /* One store covers every run a token can carry without an
+                 * escape, not just the eight-byte ones: the size is data, so
+                 * the narrow form is a dispatch per command, and on prose the
+                 * run is five bytes on average. The bytes past the run are
+                 * output a later command overwrites, and both the output and
+                 * the payload are checked to have the sixteen before the
+                 * store is taken. */
+                memcpy(out + op, lp, 16u);
             } else {
                 memcpy(out + op, lp, lit);
             }
@@ -345,6 +363,14 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                  * and decodes blocks side by side, so a store past the end
                  * would land in a neighbour's output. */
                 memcpy(d, d - off, 16u);
+                left = 0u;
+            } else if (off >= 32u && mlen <= 32u && op + 32u <= n) {
+                /* The next shape up is two stores rather than a four-step
+                 * eight-byte loop. A distance of 32 is what keeps the second
+                 * store's source clear of the first store's destination, so
+                 * the two cannot feed each other. */
+                memcpy(d, d - off, 16u);
+                memcpy(d + 16u, d - off + 16u, 16u);
                 left = 0u;
             } else if (off >= 8u) {
                 while (left >= 8u) {
