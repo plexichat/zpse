@@ -92,11 +92,14 @@ typedef int (*ZpseBlockEmit)(void *ctx, uint32_t seq, const uint8_t *block,
  * allocates. Emitting blocks in order is what makes the stream writable
  * while the last blocks are still being encoded.
  *
- * Returns PSE_OK, or a negative status. Every block is encoded by an encoder
- * of its own, exactly as the buffered call does, so a slab boundary inside a
- * frame is invisible for the same reason a worker boundary is: what changes
- * with either is at most the first trial a history picks, never the format.
- * A caller that needs one particular stream should ask for one worker. */
+ * Returns PSE_OK, or a negative status. This serves ONE worker: with the
+ * history reorder off (the default) a block is a pure function of its own
+ * bytes, so a slab with one worker is the serial stream by construction. The
+ * multi-worker ring that used to be taken here is withheld -- see the note in
+ * src/parallel.c. It produced a different stream on each of three consecutive
+ * six-worker runs of one input, the same length every time, and a path that
+ * can put one block's bytes out under another block's length is not something
+ * a caller should be handed. */
 int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
                                uint32_t nominal_block_size,
                                uint32_t enc_flags, unsigned threads,

@@ -782,24 +782,27 @@ shape decision, with a verbatim copy as the only fallback. It is an option
 rather than a level for the same reason it cannot be one: it gives up the tile
 forms instead of trading against them, and on typed columns those forms are
 where the ratio is. Over Silesia, one pinned core, 64 KiB blocks, best of two
-runs of the CLI's own block bench:
+runs of the CLI's own block bench, whose input and output buffers are touched
+once before the clock starts and then reused -- the codec's rate, not the
+caller's page faults:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.15 GB/s | 0.79 GB/s | 96,293,491 |
-| level 6 (default) | 2.04:1 | 0.26 GB/s | 0.84 GB/s | 104,050,674 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.52 GB/s | 1.07 GB/s | 103,049,623 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.18 GB/s | 1.41 GB/s | 96,307,270 |
+| level 6 (default) | 2.04:1 | 0.28 GB/s | 1.58 GB/s | 104,066,700 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.60 GB/s | 2.35 GB/s | 103,049,623 |
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default
-level as well as twice as fast (103,049,623 against 104,050,674). That is the
+level as well as twice as fast (103,049,623 against 104,066,700). That is the
 match table below: the fast path is the only shape that never touches the
-encoder's 128 KiB of candidate staging, so the table lives there. On the prose files it is still a real trade --
+encoder's 128 KiB of candidate staging, so the table lives there. On the prose
+files it is still a real trade --
 `dickens` goes from 1.18:1 at the default level to 1.57:1 -- because that is
 where the tile model has nothing and a match finder has everything. It is
-`lz4 -1`'s operating point now: 0.52 GB/s here against 0.46 in the frontier
-table, at a slightly better ratio (2.06:1 against 2.10:1), and 1.07 GB/s of
-decode against lz4's 1.38. The finder is most of the encode in this mode --
+`lz4 -1`'s operating point now: 0.60 GB/s here against 0.46 in the frontier
+table, at a slightly better ratio (2.06:1 against 2.10:1), and 2.35 GB/s of
+decode against lz4's 1.38 on the same warm-buffer basis. The finder is most of the encode in this mode --
 455 MB/s on `dickens`, 624 on `mozilla` and 1070 on `xml`, timed a block at a
 time -- so what is left is the block wrapper and the read, not the command
 writing. Three changes got it there, every one of them byte-identical:
@@ -1006,7 +1009,10 @@ whose numbers are dominated by the timestamp column staying text.
 Blocks are independent, so a frame can be encoded by several workers at once.
 What forced a frame to be built front to back was never the format, only the
 output layout: block *k*'s offset depends on the sizes of blocks 0..k-1. That
-layout is computed, not searched, so it does not need the encoder. Each worker
+layout is computed, not searched, so it does not need the encoder. With the
+history reorder off (the default) a block is also a pure function of its own
+bytes, so the worker count cannot reach the stream: `-t N` writes what `-t 1`
+writes, at every level, byte for byte. Each worker
 writes its block into a reserved slot of `nominal_block_size + 32` bytes -- the
 raw form is the largest a block can be -- and one serial pass moves the blocks
 together and appends the index:
@@ -1024,23 +1030,25 @@ result is byte-identical to the serial call -- same blocks, same header, same
 index -- which is what `tests/suites/test_parallel.c` asserts at every worker
 count it tries.
 
-The CLI does not use that layout at all. `zpse_compress_frame_stream()` hands
-finished blocks to a writer callback in order, out of a ring of worker + 2
-slots, so a file needs a slab of input and a few slots of output rather than
-the input and the whole frame: `zpse c -l 6 -t 4` takes 0.39-0.49 s on the
-202 MiB corpus against 1.10 s for one streamed thread. A worker may only fill a
-slot that has been *emptied* by the writer, not one the writer is merely not
-looking at — with two states it could refill the slot holding the block the
-writer was about to emit, and the two wrote over each other. The buffered call
-above stays for callers that want a whole frame in memory, which is what
-`bench` and the scaling table below measure.
+The CLI streams a single-threaded frame and uses the buffered call for `-t`:
+`zpse_compress_frame_stream()` hands finished blocks to a writer callback in
+order, so a file needs a slab of input and one slot of output rather than the
+input and the whole frame, and `zpse c -l 6 -t 4` takes 627 ms on the 202 MiB
+corpus against 942 ms for one streamed thread -- the workers still want a
+frame-sized buffer to fill and walk, and a streamed thread needs neither. On
+`bench` the same file is 975 MB/s of encode and 5.1 GB/s of decode at four
+workers against 281 and 1.58 at one.
 
-One caveat: from level 5 up the encoder carries a cross-block history and each
-worker carries its own, so the worker count can change which trial a block
-starts with — the same 20 MB at level 6 packs to 15,098,769 bytes on one worker
-and 15,101,233 on four. Both streams are valid and decode identically, and no
-stream is wrong, but a caller that needs one particular stream asks for one
-worker.
+The streamed *worker* path exists and is withheld. It rings worker + 2 slots
+and hands the writer blocks in order, and it passed byte-identity at two and
+four workers -- then wrote three different streams in three consecutive
+six-worker runs of the same 3 MB input, at the same length every time, and an
+8 KiB-block run differed at two, four and six workers as well. Same length
+with different bytes is one block's bytes going out under another block's
+length, so a slot is being handed over twice somewhere, and a path that can do
+that is not offered to a caller until it is found.
+`zpse_compress_frame_stream()` therefore serves one worker, which is the
+serial stream by construction.
 
 Threading is compiled in only under `ZPSE_MT`. Without it the call is the
 serial encoder, so a caller ships one build and gets cores only where it asked

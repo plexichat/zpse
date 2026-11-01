@@ -67,6 +67,20 @@
 #define ZPSE_HIST_STOP_STREAK 0u
 #endif
 
+/* Whether the previous block's winning shape may be moved to the front of the
+ * trial list. Off by default: moving it changes which of two equally priced
+ * candidates is tried first, and the price of the rest depends on where the
+ * aborts land, so a block encoded after different neighbours can come out a
+ * few bytes different. That is invisible on one thread and not invisible on
+ * several -- the same 20 MB at level 6 packed to 15,098,769 bytes on one worker
+ * and 15,101,233 on four -- so the worker count was choosing the stream. With
+ * the reorder off a block is a pure function of its own bytes, which is what
+ * makes `-t N` write the serial stream and what lets a slab or worker boundary
+ * be invisible by construction rather than by argument. */
+#ifndef ZPSE_HIST_REORDER
+#define ZPSE_HIST_REORDER 0u
+#endif
+
 /* Block envelope codec.
  * No allocation; staging uses caller arenas. Helpers static. */
 
@@ -3087,7 +3101,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * list index in idx[], so the block the sweep writes is the same one --
          * tests/suites/test_sizes.c proves no case grows and the parity suite
          * proves the swapped-order build writes the same streams. */
-        if (pick >= 0 && e->hist_valid != 0u && ncand > 1) {
+        if (ZPSE_HIST_REORDER != 0u && pick >= 0 && e->hist_valid != 0u &&
+            ncand > 1) {
             int h = -1;
             int hi;
 

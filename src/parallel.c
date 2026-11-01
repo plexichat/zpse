@@ -582,6 +582,17 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
     if (workers == 0u) {
         workers = 1u;
     }
+    /* Multi-worker delivery is WITHHELD. The ring below gave byte-identical
+     * streams to the serial encoder at two and four workers, then produced a
+     * different stream on each of three consecutive six-worker runs of the
+     * same 3 MB input (same length, three digests), and an 8 KiB-block run
+     * differed at two, four and six workers as well while keeping the same
+     * length. Same length and different bytes is a slot handed over twice --
+     * one block's bytes going out under another's length -- so the handoff is
+     * not proven and no caller should get it until it is. A one-worker slab
+     * is the serial stream by construction, so that is all this serves; use
+     * zpse_compress_frame_parallel() when several workers are wanted. */
+    workers = 1u;
     /* A slab too short to keep the workers busy is encoded serially: a thread
      * start costs more than the block it would take. */
     if (workers > 1u && nblocks >= (size_t)workers * 4u) {

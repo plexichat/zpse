@@ -37,13 +37,14 @@
  * a bench reads each input once, before the clock starts, and keeps every
  * buffer in memory.
  *
- * Every frame this writes is streamed, not buffered: the input is read a
- * slab at a time and each block is written to the output as it is finished,
- * so neither the file nor the frame is ever resident whole. That holds for
- * -x (the table is recorded as the blocks go, not walked off the file
- * afterwards) and for -t (the workers hand blocks over in order out of a
- * ring of a few slots), which is why `bench` is the only mode here that
- * holds a whole frame -- it is measuring the codec, not writing a file. */
+ * A single-threaded frame is streamed, not buffered: the input is read a slab
+ * at a time and each block is written to the output as it is finished, so
+ * neither the file nor the frame is ever resident whole -- and that holds for
+ * -x too, because the table is recorded as the blocks go rather than walked
+ * off the file afterwards. -t and `bench` use the buffered worker call, which
+ * needs the whole frame: `bench` is measuring the codec rather than writing a
+ * file, and the streamed worker path is withheld until its slot handoff is
+ * proven (see src/parallel.c). */
 /* clock_gettime is POSIX, and a strict -std=c11 hides it unless the
  * feature-test macro asks for it (the in-tree benchmarks do the same). */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
@@ -741,21 +742,21 @@ static int cmd_codec(int argc, char **argv)
     }
     in_path = argv[i];
     out_path = argv[i + 1];
-    /* Both directions stream: the frame is written block by block straight to
-     * the output file, one thread or several, and the index rides along
-     * because the writer records where each block went as it writes it (see
-     * zpse_frame_stream_index). Nothing here holds the input, the frame or a
-     * slot for every block, which is what a whole-file encode spends a
-     * quarter of its time on. */
-    if (compress) {
-        enc_arenas = alloc_arenas(threads, ZPSE_ENC_ARENA_SIZE);
+    /* One thread streams: the frame is written block by block straight to the
+     * output file, and the index rides along because the writer records where
+     * each block went as it writes it (see zpse_frame_stream_index). Nothing
+     * here holds the input or the frame, which is what a whole-file encode
+     * spends a quarter of its time on. -t takes the buffered worker call: the
+     * streamed worker path is withheld, see the note in src/parallel.c. */
+    if (compress && threads == 1u) {
+        enc_arenas = alloc_arenas(1u, ZPSE_ENC_ARENA_SIZE);
         if (enc_arenas == NULL) {
             fprintf(stderr, "zpse_cli: arena allocation failed\n");
             return 1;
         }
-        rc = encode_stream(in_path, out_path, block, enc_flags, indexed,
-                           threads, (void *const *)enc_arenas);
-        free_arenas(enc_arenas, threads);
+        rc = encode_stream(in_path, out_path, block, enc_flags, indexed, 1u,
+                           (void *const *)enc_arenas);
+        free_arenas(enc_arenas, 1u);
         return rc;
     }
     in = read_file(in_path, &in_len);
@@ -1080,6 +1081,16 @@ static int cmd_bench(int argc, char **argv)
             failures++;
             continue;
         }
+        /* Both buffers are touched once before the clock starts. A codec
+         * benchmark measures the codec, and the first write into a fresh
+         * malloc is a page fault every 4 KiB of the buffer it produces -- on
+         * the 51 MiB `mozilla` frame that was the difference between 1.64
+         * GB/s into resident pages and 0.78 into untouched ones. That cost is
+         * the caller's allocation, not the decoder's work, and an embedder
+         * decoding into a buffer it has already used never pays it. The
+         * repetitions below reuse these two, which is exactly that shape. */
+        memset(out, 0, n);
+        memset(comp, 0, comp_cap);
         /* Enough repetitions for a 64 MiB sample per file, capped so the
          * big corpus members do not dominate the run. */
         reps = reps_arg;
