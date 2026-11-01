@@ -386,6 +386,40 @@ static void no_match_cases(void)
         CHECK(memcmp(out, plain, 65536u) == 0,
               "no-match block: bytes differ");
     }
+
+    /* ZPSE_ENC_LZ_FAST: the option that spends the block on one pass and
+     * writes this form whatever level was asked for. It has to produce the
+     * form's own envelope -- bit 7, transform 0, one segment -- and the block
+     * has to read back, because this is the one path that reaches a decoder
+     * without a sweep having priced it first. */
+    {
+        uint32_t cl = 0u;
+        uint32_t got = 0u;
+        ZpseBlockHeader h;
+        uint32_t k;
+
+        for (k = 0; k < 65536u; k++) {
+            plain[k] = (uint8_t)(k % 251u);
+        }
+        CHECK(zpse_compress_block_ex(plain, 65536u, comp, sizeof comp, &cl,
+                                     0u, 1,
+                                     (uint32_t)ZPSE_ENC_LZ_FAST |
+                                         (uint32_t)ZPSE_ENC_SPEED_FASTER,
+                                     ea) == PSE_OK,
+              "LZ_FAST: the block did not compress");
+        CHECK(cl < 65568u, "LZ_FAST: fell back to a verbatim copy (%u B)", cl);
+        CHECK(zpse_block_header_parse(&h, comp, cl) == PSE_OK,
+              "LZ_FAST: the header does not parse");
+        CHECK((h.block_flags & ZPSE_B_LZ2) != 0 && h.segment_count == 1u &&
+                  h.transform_id == 0u,
+              "LZ_FAST: not the fast LZ form (flags 0x%02x)",
+              (unsigned)h.block_flags);
+        CHECK(h.compressed_block_size == cl, "LZ_FAST: size in header");
+        CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
+                  PSE_OK &&
+              got == 65536u && memcmp(out, plain, 65536u) == 0,
+              "LZ_FAST: round-trip");
+    }
 }
 
 int main(void)

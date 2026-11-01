@@ -432,6 +432,12 @@ static int cmd_codec(int argc, char **argv)
                 return 2;
             }
             break;
+        case 'F':
+            /* The fast LZ form and nothing else: one match-finder pass per
+             * block, no shape decision. The stream is the one MAX offers as
+             * its last candidate, so any decoder reads it. */
+            enc_flags |= ZPSE_ENC_LZ_FAST;
+            break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;
             break;
@@ -654,6 +660,12 @@ static int cmd_bench(int argc, char **argv)
             if (++i >= argc || !parse_level(argv[i], &enc_flags)) {
                 return 2;
             }
+            break;
+        case 'F':
+            /* The fast LZ form and nothing else: one match-finder pass per
+             * block, no shape decision. The stream is the one MAX offers as
+             * its last candidate, so any decoder reads it. */
+            enc_flags |= ZPSE_ENC_LZ_FAST;
             break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;

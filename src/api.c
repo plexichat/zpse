@@ -15,17 +15,19 @@ const char *zpse_version_string(void)
     return ZPSE_VERSION_STRING;
 }
 
-/* Encoder options are ZPSE_ENC_CHECKSUM plus one of the nine levels in bits
- * 1-4, and an empty level field means the default level. Anything else is a
- * bad argument rather than a silent round to a neighbour: the level is the
- * caller's own speed/size trade, so a codec that cannot honour it must say
- * so. Bits outside the two fields are refused for the same reason. */
+/* Encoder options are ZPSE_ENC_CHECKSUM, ZPSE_ENC_LZ_FAST and one of the
+ * nine levels in bits 1-4, and an empty level field means the default level.
+ * Anything else is a bad argument rather than a silent round to a neighbour:
+ * the level is the caller's own speed/size trade, so a codec that cannot
+ * honour it must say so. Bits outside those fields are refused for the same
+ * reason. */
 static int enc_flags_ok(uint32_t enc_flags)
 {
     uint32_t lvl;
 
-    if ((enc_flags & ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK)) !=
-        0u) {
+    if ((enc_flags &
+         ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK |
+                     ZPSE_ENC_LZ_FAST)) != 0u) {
         return 0;
     }
     lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>

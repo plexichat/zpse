@@ -776,6 +776,35 @@ distance can beat the first form's variable-length codes when matches are
 short and far (a 300-byte period codes to 23,318 bytes against 23,449), and it
 is kept only when it is strictly smaller than everything already tried.
 
+`ZPSE_ENC_LZ_FAST` (bit 5 of `enc_flags`, `-F` on the CLI) asks for that form
+and nothing else: one match-finder pass per block, no probe, no trials, no
+shape decision, with a verbatim copy as the only fallback. It is an option
+rather than a level for the same reason it cannot be one: it gives up the tile
+forms instead of trading against them, and on typed columns those forms are
+where the ratio is. Over Silesia, one pinned core, 64 KiB blocks, best of two
+runs of the CLI's own block bench:
+
+| mode | ratio | encode | decode | packed |
+| --- | ---: | ---: | ---: | ---: |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.15 GB/s | 0.92 GB/s | 96,435,311 |
+| level 6 (default) | 2.04:1 | 0.27 GB/s | 0.91 GB/s | 103,921,535 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.02:1 | 0.38 GB/s | 1.23 GB/s | 105,003,334 |
+
+It buys 44% of encode rate and 35% of decode rate for 1% of ratio, which is
+the trade the form exists for: a tile stream decodes through a reconstruction
+that costs more than a command loop, so choosing LZ when LZ is within 1% of
+the size is a win on both sides. On the prose files it is not a 1% trade but a
+large one -- `dickens` goes from 1.16:1 at 630 MB/s to 1.53:1 at 236 MB/s --
+because that is where the tile model has nothing and a match finder has
+everything.
+
+It is still not `lz4 -1`'s operating point: 0.38 GB/s against 1.36 GB/s for
+what is nearly the same ratio (2.02:1 against 2.10:1). The finder is the whole of the encode here -- 256 MB/s on
+`dickens`, 304 on `webster`, 408 on `mozilla` -- so the remaining gap is the
+find loop, not the command writing, which is why the writer only had the
+common-command path inlined (byte-identical: the size corpus writes the same
+bytes it did before).
+
 The last one is the two forms together rather than a choice between them: the
 payload is `[u32 body_len][LZ stream]`, the stream expands to exactly the body
 the tile form would have written after its 32-byte header, and the header's

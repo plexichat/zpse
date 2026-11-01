@@ -2389,6 +2389,52 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return PSE_BAD_BLOCK_SIZE;
     }
 
+    /* ZPSE_ENC_LZ_FAST: the whole decision is the match finder. One pass
+     * writes the fast LZ form, and a block that pass cannot beat a verbatim
+     * copy on goes RAW. No probe, no candidate list, no trial -- which is the
+     * point: this is the option that exists to spend a block's encode budget
+     * on one LZ parse instead of on choosing a shape. */
+    if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u && e->lz != 0) {
+        uint32_t f_crc = zpse_crc32c(in, n);
+        uint32_t f_total = 0u;
+        uint32_t f_cmds = 0u;
+        int lrc = zpse_block_try_lz2(e, in, n, f_crc, is_last, seq, out,
+                                     out_cap, &f_total, &f_cmds);
+
+        (void)f_cmds;
+        if (lrc == PSE_OK &&
+            f_total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+            zpse_block_hist_set(e, out, f_total);
+            return (int)f_total;
+        }
+        if (lrc != PSE_OK && lrc != PSE_OUTPUT_OVERFLOW) {
+            return lrc;
+        }
+        {
+            uint32_t rtotal = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n;
+            ZpseBlockHeader h;
+            uint8_t flags = (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET |
+                                      (((e->enc_flags & ZPSE_ENC_CHECKSUM) !=
+                                        0u)
+                                           ? ZPSE_B_CRC
+                                           : 0u));
+
+            if (out_cap < rtotal) {
+                return PSE_OUTPUT_OVERFLOW;
+            }
+            if (is_last) {
+                flags |= ZPSE_B_LAST;
+            }
+            zpse_block_fill_header(&h, flags, n, rtotal, 0u, 1u, 0u, seq,
+                                   f_crc);
+            zpse_block_header_serialize(out, &h);
+            zpse_block_fix_header_crc(out);
+            memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
+            zpse_block_hist_set(e, out, rtotal);
+            return (int)rtotal;
+        }
+    }
+
     /* Trial-level noise probe threshold: a trial whose only way to win is
      * the RAW envelope is abandoned once it has covered this many input
      * bytes without one tile paying for itself (zpse_segment_encode,

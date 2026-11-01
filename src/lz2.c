@@ -88,7 +88,7 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     uint32_t entries = 1u << hash_bits;
     uint32_t pos, anchor, misses, i;
     uint32_t lit_total = 0u, cmds = 0u, out = LZ2_HDR;
-    uint32_t cur, h;
+    uint32_t cur, h, limit;
 
     if (in == 0 || dst == 0 || tab == 0) {
         return 0u;
@@ -105,20 +105,23 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     pos = 0u;
     anchor = 0u;
     misses = 0u;
+    limit = n - ZPSE_LZ2_MIN_MATCH;
     cur = zpse_load_u32le(in + pos);
     h = lz2_hash(cur, hash_bits);
 
-    while (pos + ZPSE_LZ2_MIN_MATCH <= n) {
+    while (pos <= limit) {
         uint32_t cand = tab[h];
         uint32_t len = ZPSE_LZ2_MIN_MATCH;
 
         tab[h] = (uint16_t)pos;
-        if (cand == LZ2_EMPTY || zpse_load_u32le(in + cand) != cur) {
+        if (__builtin_expect(cand == LZ2_EMPTY ||
+                                 zpse_load_u32le(in + cand) != cur,
+                             1)) {
             /* Two misses are a coincidence; a run of them means the data has
              * no match here, so the cursor accelerates. */
             pos += 1u + (misses >> 5);
             misses++;
-            if (pos + ZPSE_LZ2_MIN_MATCH > n) {
+            if (pos > limit) {
                 break;
             }
             cur = zpse_load_u32le(in + pos);
@@ -141,6 +144,29 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             uint32_t off = pos - cand;
             uint32_t rem = len;
 
+            /* The common command, written in place: a literal run and a match
+             * that both fit their nibbles, so the whole command is a token,
+             * the run and two distance bytes. On prose that is four commands
+             * in five, and the call plus its room arithmetic was a fifth of
+             * the writer's cost. The bytes are exactly lz2_put's, escapes and
+             * all, which is what keeps the stream identical -- `rem` is left
+             * at zero so the general path below does not emit a second
+             * command for the same match. */
+            if (run < 15u && rem < 15u + ZPSE_LZ2_MIN_MATCH &&
+                cap - out >= run + 3u) {
+                dst[out] = (uint8_t)((run << 4) |
+                                     (rem - ZPSE_LZ2_MIN_MATCH));
+                if (run != 0u) {
+                    memcpy(dst + out + 1u, ls, run);
+                }
+                dst[out + 1u + run] = (uint8_t)(off & 0xFFu);
+                dst[out + 2u + run] = (uint8_t)((off >> 8) & 0xFFu);
+                out += run + 3u;
+                lit_total += run;
+                cmds++;
+                run = 0u;
+                rem = 0u;
+            }
             while (run > ZPSE_LZ2_MAX_LIT) {
                 if (!lz2_put(dst, cap, &out, ls, ZPSE_LZ2_MAX_LIT, 0u, 0u,
                              &lit_total, &cmds)) {
@@ -172,7 +198,8 @@ uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 run = 0u;
                 rem -= take;
             }
-            if (!lz2_put(dst, cap, &out, ls, run, off, rem, &lit_total,
+            if (rem != 0u &&
+                !lz2_put(dst, cap, &out, ls, run, off, rem, &lit_total,
                          &cmds)) {
                 return 0u;
             }

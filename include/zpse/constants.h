@@ -78,6 +78,17 @@
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 
+/* Write the fast LZ form and nothing else. With this set the block is one
+ * greedy match-finder pass: no probe, no trial, no candidate list, no
+ * decision -- which is the trade lz4 makes, and the reason to ask for it.
+ * The streams it writes are the same ZPSE_B_LZ2 blocks the deepest level
+ * offers as its last candidate, so a decoder needs to know nothing about the
+ * option. What the caller gives up is the tile forms, and with them the ratio
+ * on typed columns, where a transpose plus a predictor beats any LZ parse;
+ * what it gets is one pass at the finder's own rate, with the literal and
+ * command writing as the only other work. */
+#define ZPSE_ENC_LZ_FAST        (UINT32_C(1) << 5)
+
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
  * 2,4,6,...,18. This trades compressed size for encode time and never
