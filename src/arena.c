@@ -87,5 +87,6 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     e->hist_tid = 0u;
     e->hist_sc = 0u;
     e->hist_valid = 0u;
+    e->hist_streak = 0u;
     return PSE_OK;
 }

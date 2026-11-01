@@ -145,6 +145,13 @@ typedef struct ZpseEncoder {
     uint8_t hist_tid;
     uint8_t hist_sc;
     uint8_t hist_valid;
+    /* Consecutive blocks whose winner was the same tile shape as the block
+     * before them: the run length of the homogeneous stretch the order-n
+     * predictor is extrapolating. Reset by any block the history cannot
+     * describe (RAW, either LZ form) and by any change of shape. Saturates
+     * rather than wrapping. See the history-confident stop in
+     * src/block.c. */
+    uint8_t hist_streak;
 } ZpseEncoder;
 
 int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len);

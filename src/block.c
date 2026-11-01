@@ -35,6 +35,38 @@
 #define ZPSE_MAX_CAND_META 16u
 #endif
 
+/* How much smaller the LZ-over-tile-body form has to be than the tile stream
+ * alone before it is taken (the v2 stage at the end of zpse_block_encode).
+ * The form costs the decoder a match-finder pass over the body before the
+ * tile reconstruction, and it costs the encoder a full match-finder pass to
+ * build, so a few bytes is the wrong trade: measured over Silesia at the
+ * default level, the stage takes 13.3% off the tile payload of exactly the
+ * blocks where tiles beat LZ. Raising this number trades ratio straight back
+ * for encode and decode speed -- every block it turns away is a block that
+ * skips the pass on both sides. */
+#ifndef ZPSE_LZ_TILE_DIV
+#define ZPSE_LZ_TILE_DIV 32u
+#endif
+
+/* History-confident stop for the trial sweep: when the order-n predictor
+ * chose the first trial AND its shape has won this many blocks in a row, the
+ * sweep stops after that one trial instead of encoding the rest in full.
+ *
+ * The run length is the signal because the survivor set cannot provide one:
+ * every survivor is already within 1/16 of the winner's price (that is what
+ * kept it), so no ratio of prices can separate "the winner is clearly right"
+ * from "the field is tied" -- measured, a price-ratio rule fired on zero
+ * blocks of Silesia and wrote byte-identical streams to a build without it.
+ * A shape that has been the winner for N consecutive 64 KiB blocks is a
+ * different order of evidence: it says the file is in a homogeneous stretch,
+ * which is the case the predictor exists for.
+ *
+ * 0 disables the rule (the sweep then always runs to its floor exits, which
+ * are exact). */
+#ifndef ZPSE_HIST_STOP_STREAK
+#define ZPSE_HIST_STOP_STREAK 0u
+#endif
+
 /* Block envelope codec.
  * No allocation; staging uses caller arenas. Helpers static. */
 
@@ -2216,7 +2248,11 @@ static uint32_t zpse_block_ascii_total(uint32_t n)
 /* Remember which tile shape won, so the next block of this context can try
  * it first. Only tile forms are remembered: RAW and the two LZ forms say
  * nothing about which transform the data wants, and a predictor that carried
- * them back would spend its next first trial re-learning that. */
+ * them back would spend its next first trial re-learning that.
+ *
+ * The same call scores the run: a block whose winner is the shape the
+ * previous block's winner had extends the stretch, anything else ends it.
+ * That run length is what the history-confident stop reads. */
 static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
                                 uint32_t len)
 {
@@ -2226,7 +2262,16 @@ static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
         (h.block_flags &
          (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0u) {
         e->hist_valid = 0u;
+        e->hist_streak = 0u;
         return;
+    }
+    if (e->hist_valid != 0u && e->hist_tid == h.transform_id &&
+        e->hist_sc == h.segment_count) {
+        if (e->hist_streak != 255u) {
+            e->hist_streak++;
+        }
+    } else {
+        e->hist_streak = 0u;
     }
     e->hist_tid = h.transform_id;
     e->hist_sc = h.segment_count;
@@ -2251,6 +2296,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int fails = 0;
     int sample;
     int sample_flat = 0;
+#if ZPSE_HIST_STOP_STREAK > 0u
+    /* The order-n predictor picked the trial order (the history match won the
+     * 1/16 band against the probe's own winner). Read by the confident-stop
+     * rule in the trial loop; the value is only meaningful once that
+     * predictor block has run. Guarded like its only reader, so a build with
+     * the rule off does not carry a set-but-unused variable. */
+    int hist_first = 0;
+#endif
     int oi;
     int rc;
 
@@ -2897,6 +2950,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 ex[pick] != UINT32_MAX &&
                 ex[h] <= ex[pick] + (ex[pick] >> 4)) {
                 pick = h;
+#if ZPSE_HIST_STOP_STREAK > 0u
+                hist_first = 1;
+#endif
             }
         }
         if (pick >= 0 && pick != 0) {
@@ -3279,6 +3335,51 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             first_trial_total = t;
         }
 #endif
+#if ZPSE_HIST_STOP_STREAK > 0u
+        /* ---- History-confident stop -------------------------------- *
+         * The user-facing shape of this rule: over a 200 MB file the encoder
+         * knows what it is encoding, so when it is sure of the first trial it
+         * should not spend three more full block encodes discovering that it
+         * was right.
+         *
+         * "Sure" is a run, not a margin. The price model cannot supply one --
+         * every survivor is already within 1/16 of the winner's price, since
+         * that is what kept it -- so the only independent evidence left is
+         * the file's own history: the shape that wins has been winning, block
+         * after block, for ZPSE_HIST_STOP_STREAK blocks running. At 64 KiB a
+         * block, an 8-block run is half a megabyte of one shape, which on a
+         * 200 MB file is 1/400th of the input: a stretch the encoder has no
+         * reason to keep re-deciding.
+         *
+         * The predictor has to have chosen the trial too (hist_first), because
+         * the run itself says nothing about whether the PRICE would have found
+         * the same shape -- and it is the predictor, not the run, that decided
+         * what to try first.
+         *
+         * This is a size trade and not a bug: the winner is still the smallest
+         * the sweep tried, the block it would have found is at most as good as
+         * the field the price left tied, and tests/suites/test_sizes.c fails
+         * any case that grows. A candidate EARLIER in the list than the winner
+         * can still tie it on list order, so one in the remaining field
+         * cancels the stop outright. */
+        if (hist_first && have_best && !direct_out && ntried == 1 &&
+            e->hist_streak >= (uint8_t)ZPSE_HIST_STOP_STREAK &&
+            tids[0] != 0u &&
+            best_total + 1u < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+            int clear = 1;
+            int oj;
+
+            for (oj = oi + 1; oj < ncand; oj++) {
+                if ((uint32_t)idx[oj] < best_idx) {
+                    clear = 0;
+                    break;
+                }
+            }
+            if (clear) {
+                break;
+            }
+        }
+#endif
         /* Early exit over the candidates that are LEFT, not over all of
          * them: a trial whose own envelope is bigger (16 segments, or a
          * metadata byte) cannot reach a size the identity trial can, so
@@ -3470,7 +3571,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                          (uint32_t)ZPSE_LZ_HASH_BITS);
             uint32_t tot = (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) + pl;
 
-            if (pl != 0u && tot + tot / 32u <= best_total &&
+            if (pl != 0u &&
+                tot + tot / (uint32_t)ZPSE_LZ_TILE_DIV <= best_total &&
                 tot <= out_cap) {
                 wh.block_flags = (uint8_t)((wh.block_flags &
                                             ~(uint8_t)(ZPSE_B_RAW |

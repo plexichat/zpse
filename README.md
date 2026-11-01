@@ -350,8 +350,9 @@ each run the harness's own best of three timed reps, on one host,
 Levels 5 to 9 are the v2 form's rows: `ZPSE_B_LZ_TILE` lifts the corpus mean
 from 4.49:1 to 5.11:1 at the default level and costs about a fifth of the
 encode rate, because every block it wins pays a full match-finder pass over
-the tile body that the tile form alone never needed. Raising the 1/32
-threshold in `src/block.c` trades straight back along that line.
+the tile body that the tile form alone never needed. Raising
+`ZPSE_LZ_TILE_DIV` (the 1/32 threshold in `src/block.c`) trades straight back
+along that line: at 16 the corpus grows 63 KB for no measurable speed.
 
 Levels 3 and 4 read as the same mean ratio because on this corpus a third or
 fourth candidate almost never wins: the extra trials cost encode time (1.89 to
@@ -723,10 +724,22 @@ in twelve bytes.
 A block may instead be coded as **intra-block LZ** (block flag `ZPSE_B_LZ`).
 That form is a literal stream, a command stream and nothing else: every
 reference is a 16-bit distance inside the same block, so a block is still
-independent and still decodes on its own. A command is one 32-bit word --
-offset, literal count, match length minus four -- and there are no escape
-words, so the decoder's inner loop is a copy loop with no length parsing. Long
-runs are written as repeated commands (4 bytes per 259 bytes of run).
+independent and still decodes on its own. A command is a token byte -- four bits of
+literal count, four of match length minus four, a nibble of 15 meaning "more
+follows" -- then the literals it names, then a variable-length distance
+(7-bit groups, so a repeated distance costs about a byte). The four most
+recent distances are numbered 1 to 4 and cost nothing to name again, which is
+worth a quarter of the matches on executable and archive data and almost
+nothing on prose; long runs are repeated commands, and every one after the
+first is a byte shorter.
+
+The decode is therefore a command loop, and measured over Silesia it costs
+**23 cycles per command plus half a cycle per byte** (fitted from the streams
+themselves: 0.084 commands per byte, 9.7 bytes per match, one stream or the
+other on 156 of the corpus's 194 MB). At that command rate four fifths of an
+LZ decode is per-command work rather than copying, which is why the loop is
+written for the shape the commands actually take: 88% of them are a short
+match at a distance over sixteen, which is one 16-byte store.
 
 Levels 5 to 9 try that form as one more candidate and keep it only when it is
 smaller than the best tile stream. All of them screen it on a sample of the
@@ -750,7 +763,7 @@ decoder unpacks the body once and then runs the ordinary tile path over it. It
 is taken only when it is at least 1/32 smaller than the tile stream alone,
 because the decode pays a match-finder pass before the tile reconstruction.
 On Silesia at the default level it takes 2.1% off the corpus (106,140,388 to
-103,927,201 bytes) and 248 to 69 on a constant block, and no case in the size
+103,921,535 bytes) and 248 to 69 on a constant block, and no case in the size
 corpus grows. All four forms carry the same 32-byte header, and all four decode
 on their own, which is what makes a block the unit of random access.
 
