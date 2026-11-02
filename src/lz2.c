@@ -47,20 +47,90 @@ static uint64_t lz2_load64(const uint8_t *p)
     return v;
 }
 
+/* The four most recent distances, most recent first.
+ *
+ * A repeat is coded as ONE byte -- 0xFC plus the slot -- instead of the two a
+ * fresh distance takes, which is the size the token form gets from its repeat
+ * cache and the reason this form was a trade rather than a win without it: on
+ * an executable, and on a block of spikes every 256 bytes, most matches land
+ * on a distance one of the last four commands used.
+ *
+ * The four codes sit at the top of the first distance byte, so the encoder
+ * cannot write an explicit distance whose low byte is 0xFC..0xFF. That is one
+ * distance value in sixty-four, and a match that needs one is coded as a
+ * literal instead (see the loop): a rare, bounded loss, rather than a second
+ * width for every command to test.
+ *
+ * The decoder's test is one compare on one byte, which is what keeps this
+ * form's decode loop the tight one the format exists for -- the varint this
+ * replaced cost it a third of its rate. */
+#define LZ2_REP_BASE 0xFCu
+
+static uint32_t lz2_rep_index(const uint32_t *rep, uint32_t off)
+{
+    uint32_t m0 = (rep[0] == off);
+    uint32_t m1 = (rep[1] == off);
+    uint32_t m2 = (rep[2] == off);
+    uint32_t m3 = (rep[3] == off);
+
+    return m0 ? 0u : (m1 ? 1u : (m2 ? 2u : (m3 ? 3u : 4u)));
+}
+
+/* Move the cache for a distance whose slot `idx` was just looked up (4 = an
+ * explicit distance). A hit promotes its slot to the front; an explicit
+ * distance pushes the front down and drops the oldest. The decoder moves it
+ * identically, which is the whole contract between the two sides. */
+static void lz2_rep_move(uint32_t *rep, uint32_t off, uint32_t idx)
+{
+    if (idx < 4u) {
+        while (idx > 0u) {
+            rep[idx] = rep[idx - 1u];
+            idx--;
+        }
+    } else {
+        rep[3] = rep[2];
+        rep[2] = rep[1];
+        rep[1] = rep[0];
+    }
+    rep[0] = off;
+}
+
+/* Decode side: resolve a distance value (1..4 = the k-th recent distance,
+ * 0 = a literal-only command) and move the cache the way the encoder did. */
+static uint32_t lz2_dist_take(uint32_t *rep, uint32_t v)
+{
+    uint32_t off;
+
+    if (v == 0u) {
+        return 0u;
+    }
+    if (v <= 4u) {
+        off = rep[v - 1u];
+        lz2_rep_move(rep, off, v - 1u);
+        return off;
+    }
+    off = v; /* unreachable: the encoder codes only 1..4 here */
+    lz2_rep_move(rep, off, 4u);
+    return off;
+}
+
 /* One command: the literal run before the match, the match length and the
  * distance. `off == 0` writes a literal-only command, which is how a run
  * longer than one token and a trailing run are coded. Returns 0 when the
  * command does not fit in cap. */
 static int lz2_put(uint8_t *dst, uint32_t cap, uint32_t *out,
                    const uint8_t *lit, uint32_t run, uint32_t off,
-                   uint32_t len, uint32_t *lit_total, uint32_t *cmds)
+                   uint32_t len, uint32_t *rep, uint32_t *lit_total,
+                   uint32_t *cmds)
 {
     uint32_t ml = len >= ZPSE_LZ2_MIN_MATCH ? len - ZPSE_LZ2_MIN_MATCH : 0u;
     uint32_t p = *out;
+    uint32_t ridx = (off != 0u) ? lz2_rep_index(rep, off) : 4u;
+    uint32_t dlen = (ridx < 4u) ? 1u : 2u;
     uint8_t *t;
 
     if (LZ2_CMD_ROOM > cap - p) {
-        uint32_t need = 1u + run + 2u + (run >= 15u ? 1u : 0u) +
+        uint32_t need = 1u + run + dlen + (run >= 15u ? 1u : 0u) +
                         (ml >= 15u ? 1u : 0u);
 
         if (need > cap - p) {
@@ -79,10 +149,20 @@ static int lz2_put(uint8_t *dst, uint32_t cap, uint32_t *out,
         t += run;
         *lit_total += run;
     }
-    /* The distance, little endian, both bytes always: a fixed-width field is
-     * what makes this form cheap to read back. */
-    *t++ = (uint8_t)(off & 0xFFu);
-    *t++ = (uint8_t)((off >> 8) & 0xFFu);
+    /* The distance: one byte for a recent one, two little endian for the
+     * rest, and two zero bytes for a literal-only command (which names no
+     * distance and leaves the cache alone). */
+    if (off == 0u) {
+        *t++ = 0u;
+        *t++ = 0u;
+    } else if (ridx < 4u) {
+        *t++ = (uint8_t)(LZ2_REP_BASE | ridx);
+        lz2_rep_move(rep, off, ridx);
+    } else {
+        *t++ = (uint8_t)(off & 0xFFu);
+        *t++ = (uint8_t)((off >> 8) & 0xFFu);
+        lz2_rep_move(rep, off, 4u);
+    }
     if (ml >= 15u) {
         *t++ = (uint8_t)(ml - 15u);
     }
@@ -102,6 +182,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     uint32_t pos, anchor, misses, i;
     uint32_t lit_total = 0u, cmds = 0u, out = LZ2_HDR;
     uint32_t cur, h, limit;
+    uint32_t rep[4] = { 1u, 1u, 1u, 1u };
 
     if (in == 0 || dst == 0 || tab == 0) {
         return 0u;
@@ -186,7 +267,23 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             uint32_t run = pos - anchor;
             const uint8_t *ls = in + anchor;
             uint32_t off = pos - cand;
+            uint32_t ridx = lz2_rep_index(rep, off);
             uint32_t rem = len;
+
+            /* A distance whose low byte is one of the four repeat codes cannot
+             * be written as itself, so this position is coded as a literal and
+             * the search resumes one byte on: the bytes are still in the
+             * stream, in the literal run that grows across them. */
+            if (ridx == 4u && (off & 0xFFu) >= LZ2_REP_BASE) {
+                pos++;
+                misses++;
+                if (pos + ZPSE_LZ2_MIN_MATCH > n) {
+                    break;
+                }
+                cur = zpse_load_u32le(in + pos);
+                h = lz2_hash(cur, hash_bits);
+                continue;
+            }
 
             /* The common command, written in place: a literal run and a match
              * that both fit their nibbles, so the whole command is a token,
@@ -197,7 +294,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
              * at zero so the general path below does not emit a second
              * command for the same match. */
             if (run < 15u && rem < 15u + ZPSE_LZ2_MIN_MATCH &&
-                cap - out >= run + 3u) {
+                cap - out >= run + (ridx < 4u ? 2u : 3u)) {
                 dst[out] = (uint8_t)((run << 4) |
                                      (rem - ZPSE_LZ2_MIN_MATCH));
                 if (run != 0u) {
@@ -216,17 +313,22 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                         memcpy(dst + out + 1u, ls, run);
                     }
                 }
-                dst[out + 1u + run] = (uint8_t)(off & 0xFFu);
-                dst[out + 2u + run] = (uint8_t)((off >> 8) & 0xFFu);
-                out += run + 3u;
+                if (ridx < 4u) {
+                    dst[out + 1u + run] = (uint8_t)(LZ2_REP_BASE | ridx);
+                    out += run + 2u;
+                } else {
+                    dst[out + 1u + run] = (uint8_t)(off & 0xFFu);
+                    dst[out + 2u + run] = (uint8_t)((off >> 8) & 0xFFu);
+                    out += run + 3u;
+                }
+                lz2_rep_move(rep, off, ridx);
                 lit_total += run;
                 cmds++;
                 run = 0u;
                 rem = 0u;
             }
             while (run > ZPSE_LZ2_MAX_LIT) {
-                if (!lz2_put(dst, cap, &out, ls, ZPSE_LZ2_MAX_LIT, 0u, 0u,
-                             &lit_total, &cmds)) {
+                if (!lz2_put(dst, cap, &out, ls, ZPSE_LZ2_MAX_LIT, 0u, 0u, rep, &lit_total, &cmds)) {
                     return 0u;
                 }
                 ls += ZPSE_LZ2_MAX_LIT;
@@ -247,8 +349,8 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 if (rem - take < ZPSE_LZ2_MIN_MATCH) {
                     take = rem - ZPSE_LZ2_MIN_MATCH;
                 }
-                if (!lz2_put(dst, cap, &out, ls, run, off, take, &lit_total,
-                             &cmds)) {
+                if (!lz2_put(dst, cap, &out, ls, run, off, take, rep,
+                             &lit_total, &cmds)) {
                     return 0u;
                 }
                 ls += run;
@@ -256,7 +358,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 rem -= take;
             }
             if (rem != 0u &&
-                !lz2_put(dst, cap, &out, ls, run, off, rem, &lit_total,
+                !lz2_put(dst, cap, &out, ls, run, off, rem, rep, &lit_total,
                          &cmds)) {
                 return 0u;
             }
@@ -275,14 +377,15 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         const uint8_t *ls = in + anchor;
 
         while (run > ZPSE_LZ2_MAX_LIT) {
-            if (!lz2_put(dst, cap, &out, ls, ZPSE_LZ2_MAX_LIT, 0u, 0u,
+            if (!lz2_put(dst, cap, &out, ls, ZPSE_LZ2_MAX_LIT, 0u, 0u, rep,
                          &lit_total, &cmds)) {
                 return 0u;
             }
             ls += ZPSE_LZ2_MAX_LIT;
             run -= ZPSE_LZ2_MAX_LIT;
         }
-        if (!lz2_put(dst, cap, &out, ls, run, 0u, 0u, &lit_total, &cmds)) {
+        if (!lz2_put(dst, cap, &out, ls, run, 0u, 0u, rep, &lit_total,
+                     &cmds)) {
             return 0u;
         }
     }
@@ -328,6 +431,7 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     uint32_t n)
 {
     uint32_t lit_total, cmd_count, cmd_left, lit_seen = 0u, op = 0u;
+    uint32_t rep[4] = { 1u, 1u, 1u, 1u };
     const uint8_t *lp, *tend;
 
     if (in == 0 || out == 0) {
@@ -374,8 +478,16 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 op += lit;
                 lp += lit;
                 lit_seen += lit;
-                off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
-                lp += 2;
+                if (lp[0] >= LZ2_REP_BASE) {
+                    off = lz2_dist_take(rep, (uint32_t)(lp[0] & 3u) + 1u);
+                    lp++;
+                } else {
+                    off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
+                    lp += 2;
+                    if (off != 0u) {
+                        lz2_rep_move(rep, off, 4u);
+                    }
+                }
                 mlen = (uint32_t)(tok & 15u) + ZPSE_LZ2_MIN_MATCH;
                 if (off == 0u) {
                     if (lit == 0u) {
@@ -426,11 +538,22 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             lp += lit;
             lit_seen += lit;
         }
-        if ((uint32_t)(tend - lp) < 2u) {
+        if (lp >= tend) {
             return PSE_BAD_LZ;
         }
-        off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
-        lp += 2;
+        if (lp[0] >= LZ2_REP_BASE) {
+            off = lz2_dist_take(rep, (uint32_t)(lp[0] & 3u) + 1u);
+            lp++;
+        } else {
+            if ((uint32_t)(tend - lp) < 2u) {
+                return PSE_BAD_LZ;
+            }
+            off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
+            lp += 2;
+            if (off != 0u) {
+                lz2_rep_move(rep, off, 4u);
+            }
+        }
         if (off == 0u) {
             /* A literal-only command has to make progress. */
             if (lit == 0u) {

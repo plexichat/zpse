@@ -12,12 +12,19 @@
  * runs at 256 MB/s on `dickens` against lz4's 429 on the same blocks, for a
  * payload within 2.6%.
  *
- * This form keeps none of them. One candidate per hash entry, no lookahead,
- * no backward walk, no distance cache: a command is a token, its literals and
- * a fixed little-endian 16-bit distance, which is what lz4 writes and why its
- * decoder is a tight loop. It exists as its own form because the two codecs
- * want different levels -- the cheap rungs take this one on every block, the
- * deep rungs keep the repeat cache where its size shows.
+ * This form keeps two of them: a four-slot repeat cache, because a repeat is
+ * a byte of distance where the token form spends one on its own code, and one
+ * candidate per hash entry with no lookahead and no backward walk. A command
+ * is a token, its literals and a distance that is one byte when it repeats
+ * and a fixed little-endian 16-bit field otherwise, which is what lz4 writes
+ * and why its decoder is a tight loop.
+ *
+ * The repeat code was added here after the varint that first tried it cost
+ * this decoder a third of its rate: the four codes sit at the top of the
+ * first distance byte, so the test is one compare against 0xFC and there is
+ * no loop to run. That is the size the token form's cache buys, for a branch
+ * instead of a parse -- and this form is now the finder at every level from
+ * 5 up, so its decode rate is the default level's decode rate.
  *
  * Payload layout, after the 32-byte block header:
  *
@@ -33,7 +40,10 @@
  *   escapes     one byte per escaped field: 255-chained, every 0xFF adds 255
  *               and the first byte below 255 ends the run
  *   literals    the run the token names, inline
- *   offset      u16, little endian; 0 means no match and literals only
+ *   distance    one byte 0xFC..0xFF for the first to fourth most recent
+ *               distance (the four-slot cache, seeded at 1), else u16 little
+ *               endian on whose low byte 0xFC..0xFF never appear; 0 means no
+ *               match and literals only
  *
  * The streams are self-checking the same way src/lz.c's are: the decode stops
  * when the output is full and then requires that the literal total, the
@@ -53,7 +63,7 @@
  * chunks after it would be read from the wrong place. */
 #define ZPSE_LZ2_MAX_LIT   255u
 #define ZPSE_LZ2_MAX_MATCH 273u
-#define ZPSE_LZ2_MIN_PAYLOAD 12u
+#define ZPSE_LZ2_MIN_PAYLOAD 10u
 
 /* Encode n <= 65536 bytes into dst[0..cap). `table` is the same
  * ZPSE_LZ_TABLE_BYTES scratch src/lz.c uses -- a plain 2^hash_bits array of
