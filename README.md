@@ -788,18 +788,17 @@ caller's page faults:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.18 GB/s | 1.41 GB/s | 96,307,270 |
-| level 6 (default) | 2.04:1 | 0.28 GB/s | 1.58 GB/s | 104,066,700 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.60 GB/s | 2.35 GB/s | 103,049,623 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.17 GB/s | 1.36 GB/s | 96,437,363 |
+| level 6 (default) | 2.04:1 | 0.27 GB/s | 1.51 GB/s | 103,927,201 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.60 GB/s | 2.23 GB/s | 103,022,280 |
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default
-level as well as twice as fast (103,049,623 against 104,066,700). That is the
+level as well as twice as fast (103,022,280 against 103,927,201). That is the
 match table below: the fast path is the only shape that never touches the
 encoder's 128 KiB of candidate staging, so the table lives there. On the prose
-files it is still a real trade --
-`dickens` goes from 1.18:1 at the default level to 1.57:1 -- because that is
-where the tile model has nothing and a match finder has everything. It is `lz4 -1`'s operating point
+files it is still a real trade, because that is where the tile model has
+nothing and a match finder has everything. It is `lz4 -1`'s operating point
 on ratio -- 2.06:1 against 2.10:1 -- and behind it on rate, which is the
 single-core comparison below; on this table's warm-buffer basis its decode is
 the fastest row here, because the whole point of the form is that the command
@@ -1101,28 +1100,29 @@ three cores with SMT. GB/s of uncompressed bytes, at the default level.
 
 | frame | encode 1 | 2 | 3 | 6 | decode 1 | 2 | 3 | 6 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 MiB | 1.59 | 2.55 | 2.07 | 2.26 | 5.87 | 5.83 | 5.74 | 5.88 |
-| 4 MiB | 1.15 | 2.58 | 2.71 | 3.42 | 5.76 | 7.95 | 8.95 | 9.03 |
-| 16 MiB | 0.50 | 0.88 | 1.42 | 2.04 | 3.51 | 6.18 | 9.27 | 10.97 |
-| 64 MiB | 0.52 | 1.06 | 1.51 | 2.30 | 4.10 | 7.36 | 9.77 | 13.43 |
+| 1 MiB | 1.40 | 1.71 | 2.28 | 2.58 | 5.36 | 5.46 | 5.44 | 5.51 |
+| 4 MiB | 1.31 | 1.70 | 3.00 | 3.99 | 4.56 | 6.06 | 7.78 | 7.70 |
+| 16 MiB | 0.43 | 0.84 | 1.18 | 2.59 | 3.02 | 4.90 | 6.55 | 12.29 |
+| 64 MiB | 0.49 | 0.89 | 1.27 | 2.18 | 3.50 | 5.97 | 8.13 | 11.91 |
 
 Encode scales better than decode because it has more to do: the encode column
 is the sweep and the match finder on four different column shapes, and the
 decode column is a block reconstruction that already runs at four to six
 gigabytes a second on one core. A 64 MiB frame goes from one worker to six at
-four and a half times on encode and three and a quarter on decode (its last
-row above), and a frame of a megabyte stays essentially serial in both
-directions.
+four and a half times on encode and three and a third on decode (its last
+row above), and a frame of a megabyte barely moves in either direction.
 
-The one row that does not rise with the worker count is the 1 MiB frame's
-encode, and the cause is the encoder's four-blocks-per-worker rule rather than
-the codec: sixteen blocks let three workers start, and a thread start costs
-more than the fifth of the frame it splits. Decode stays serial at that size
-(its rule asks for thirty-two blocks per worker), which is why its row is
-flat. The host is a six-core Ryzen 5 5600X, so the six-worker column is six
-real cores -- the one-worker column is still the number to trust for scaling,
-and every other table in this file is a single-core measurement for that
-reason.
+The row that flattens soonest is the 1 MiB frame's encode, and the cause is the
+encoder's four-blocks-per-worker rule rather than the codec: sixteen blocks is
+four per worker at four workers, so a fifth and a sixth have nothing left to
+hand out and their thread start costs more than the block it splits. Decode
+stays flat at that size (its rule asks for thirty-two blocks per worker),
+which is why its row barely moves. The host CPU is a six-core Ryzen 5 5600X,
+but the VM these were measured in is sliced to three physical cores with two
+threads each (cpu0/1, 2/3, 4/5 siblings), so the six-worker column is three
+cores with SMT and its useful ceiling is nearer four times than six -- the
+one-worker column is still the number to trust for scaling, and every other
+table in this file is a single-core measurement for that reason.
 
 Every frame in that table was checked twice: the workers' frame is compared
 byte for byte with the one-worker frame (that is the `identical frames` column
@@ -1140,22 +1140,22 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.77 GB/s | 2.61 GB/s |
-| mozilla | 51,220,480 | 2.05 | 0.22 GB/s | 1.17 GB/s |
-| mr | 9,970,564 | 2.49 | 0.24 GB/s | 1.10 GB/s |
-| nci | 33,553,445 | 5.34 | 0.21 GB/s | 1.39 GB/s |
-| ooffice | 6,152,192 | 1.48 | 0.19 GB/s | 1.08 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.66 GB/s | 3.70 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.31 GB/s | 1.02 GB/s |
-| samba | 21,606,400 | 2.55 | 0.29 GB/s | 1.32 GB/s |
-| sao | 7,251,944 | 1.01 | 1.24 GB/s | 9.05 GB/s |
-| webster | 41,458,703 | 1.95 | 0.29 GB/s | 0.97 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 2.96 GB/s |
-| xml | 5,345,280 | 3.94 | 0.49 GB/s | 1.67 GB/s |
-| **total** | **211,938,580** | **2.04** | **0.28 GB/s** | **1.31 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.82 GB/s | 3.25 GB/s |
+| mozilla | 51,220,480 | 2.05 | 0.22 GB/s | 1.33 GB/s |
+| mr | 9,970,564 | 2.49 | 0.24 GB/s | 1.39 GB/s |
+| nci | 33,553,445 | 5.34 | 0.22 GB/s | 1.77 GB/s |
+| ooffice | 6,152,192 | 1.48 | 0.18 GB/s | 1.24 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.53 GB/s | 4.54 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.30 GB/s | 0.90 GB/s |
+| samba | 21,606,400 | 2.55 | 0.28 GB/s | 1.55 GB/s |
+| sao | 7,251,944 | 1.01 | 1.13 GB/s | 7.41 GB/s |
+| webster | 41,458,703 | 1.95 | 0.29 GB/s | 1.12 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 2.92 GB/s |
+| xml | 5,345,280 | 3.94 | 0.51 GB/s | 1.82 GB/s |
+| **total** | **211,938,580** | **2.04** | **0.27 GB/s** | **1.51 GB/s** |
 
-`zpse_cli bench -r 5`, default level (6), 64 KiB blocks, one pinned core, best
-of five runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
+`zpse_cli bench -r 3`, default level (6), 64 KiB blocks, one pinned core, best
+of three runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
 corpus from 106,140,388 to 103,921,535 bytes, which cost ~6% of encode and
 bought ~8% of decode (the tile bodies it compresses are shorter than the plain
 LZ streams they replace, so the command loop runs over fewer bytes). The
@@ -1177,12 +1177,12 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.74 GB/s | 0.94 GB/s | **yes** |
-| zpse 3 FASTER | 1.29:1 | 0.51 GB/s | 0.98 GB/s | no |
-| zpse 5 BALANCED | 1.92:1 | 0.26 GB/s | 0.86 GB/s | no |
-| zpse 6 (default) | 2.04:1 | 0.26 GB/s | 0.88 GB/s | no |
-| zpse 9 MAX | 2.20:1 | 0.17 GB/s | 0.85 GB/s | no |
-| zpse `LZ_FAST` | 2.06:1 | 0.50 GB/s | 1.13 GB/s | no |
+| zpse 1 FASTEST | 1.25:1 | 0.73 GB/s | 0.94 GB/s | **yes** |
+| zpse 3 FASTER | 1.29:1 | 0.49 GB/s | 0.90 GB/s | no |
+| zpse 5 BALANCED | 1.92:1 | 0.26 GB/s | 0.80 GB/s | no |
+| zpse 6 (default) | 2.04:1 | 0.24 GB/s | 0.85 GB/s | no |
+| zpse 9 MAX | 2.20:1 | 0.16 GB/s | 0.85 GB/s | no |
+| zpse `LZ_FAST` | 2.06:1 | 0.50 GB/s | 1.09 GB/s | no |
 | lz4 -1 | 2.10:1 | 0.52 GB/s | 1.62 GB/s | yes |
 | lz4 -3 | 2.60:1 | 0.11 GB/s | 1.54 GB/s | yes |
 | lz4 -9 | 2.72:1 | 0.04 GB/s | 1.59 GB/s | yes |
@@ -1194,10 +1194,10 @@ Every row here was measured in one run, pinned to one core, lz4 and zstd
 included. One zpse row is on the frontier: level 1 at 1.25:1, which nothing
 else reaches at any rate -- the nearest competitor needs 2.89:1 before it gets
 to a comparable one. Everything else zpse offers here is dominated. Level 3 is
-behind `lz4 -1` at almost the same ratio, which is a change from what this
-table claimed before its rows were measured on the same basis, and level 6 and
-MAX lose on rate to tools that give up a third of the size -- the trade a
-shape-deciding encoder makes. The fast form is the closest row zpse has to
+now dominated by the fast form, which reaches the same encode rate with a
+stream 60% smaller -- level 3 is the rung the tile trials buy and the fast
+form does not need -- and level 6 and MAX lose on rate to tools that give up a
+third of the size: the trade a shape-deciding encoder makes. The fast form is the closest row zpse has to
 `lz4 -1`: 2% larger output at 96% of its encode rate, and still behind on both
 rates, so it is not on the frontier either. What it does move is zpse's own
 frontier: at 2:1 it is the cheapest row the codec has, twice the default

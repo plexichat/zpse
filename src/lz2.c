@@ -1,6 +1,7 @@
 #include "zpse/lz2.h"
 
 #include "zpse/bits.h"
+#include "zpse/hot.h"
 #include "zpse/status.h"
 
 #include <stddef.h>
@@ -90,7 +91,10 @@ static int lz2_put(uint8_t *dst, uint32_t cap, uint32_t *out,
     return 1;
 }
 
-uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
+/* Tagged with the rest of the hot set: this finder is the whole of the F
+ * form's encode, and it was the one kernel in the tree left at the build's
+ * own level. */
+ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                          uint32_t cap, void *table, uint32_t hash_bits)
 {
     uint16_t *tab = (uint16_t *)table;

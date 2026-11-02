@@ -38,6 +38,16 @@
 extern "C" {
 #endif
 
+/* Control-slot stride for the streamed encode. `ready` and `lens` are indexed
+ * one entry per 64 bytes, so two slots never share a cache line: a flag the
+ * writer polls and a flag the next worker releases must not invalidate each
+ * other, and with six workers on one line they did. */
+#define ZPSE_MT_CTRL_STRIDE 16u
+/* Most ring slots per worker the streamed encode will use. Four is where the
+ * writer's own work stops being on the workers' critical path; deeper only
+ * holds finished blocks longer without feeding anyone. */
+#define ZPSE_MT_MAX_DEPTH 4u
+
 /* Encode `in` as one frame using up to `threads` workers.
  *
  * `enc_arenas` holds `arena_count` caller-owned 448 KiB encode arenas
@@ -86,17 +96,31 @@ typedef int (*ZpseBlockEmit)(void *ctx, uint32_t seq, const uint8_t *block,
  * flag; a caller that has the whole input passes 1 with everything in one
  * call and gets the buffered encoder's stream, block for block.
  *
- * The workers write into `slot_mem`, which holds one (nominal_block_size + 32)
- * byte slot per worker, so only that much of the output is ever resident;
- * `ready` and `lens` are caller-owned `int` and `uint32_t` scratch of at least
- * that many entries, and `ready` is cleared here. The library still never
- * allocates. Worker `w` owns slot `w` and encodes blocks `w`, `w + n`,
- * `w + 2n`, ... in that order, so a slot has exactly one writer and the
- * writer thread frees a slot only after emitting it. Emitting blocks in order
- * is what makes the stream writable while the last blocks are still being
- * encoded; the static assignment is what makes the handoff provable, and an
- * earlier version that claimed blocks from a shared counter instead did hand
- * one block's bytes over under another block's length.
+ * The workers write into `slot_mem`, which holds (nominal_block_size + 32)
+ * byte slots at a stride of that size, up to ZPSE_MT_MAX_DEPTH of them per
+ * worker; `ready` and `lens` are caller-owned `int` and `uint32_t` scratch of
+ * one entry per slot per ZPSE_MT_CTRL_STRIDE, and `ready` is cleared here.
+ * The library still never allocates. Worker `w` owns slots `w`,
+ * `w + workers`, ... `w + (depth - 1) * workers` and encodes blocks `w`,
+ * `w + n`, `w + 2n`, ... into them in that order, so a slot has exactly one
+ * writer and the writer thread frees a slot only after emitting it.
+ * Emitting blocks in order is what makes the stream writable while the last
+ * blocks are still being encoded; the static assignment is what makes the
+ * handoff provable, and an earlier version that claimed blocks from a shared
+ * counter instead did hand one block's bytes over under another block's
+ * length.
+ *
+ * The depth is the pipeline's slack. With one slot per worker a worker can
+ * be at most one block ahead of the writer, so every worker blocks on an
+ * emit it has nothing to do with; with four it can run a block's worth of
+ * work ahead per slot and the writer catches up in a burst. The depth is
+ * whatever `slot_cap` holds, clamped to ZPSE_MT_MAX_DEPTH, so a caller that
+ * passes one slot per worker gets the shallow ring and the same stream.
+ *
+ * Control entries are one per 64 bytes rather than one per slot: the whole
+ * eightslot ring otherwise shares a single cache line, so every worker's
+ * release invalidates every other worker's next poll. `slot_mem` holds at
+ * least one slot per worker (or that many fewer workers are used).
  *
  * `threads` above is the ceiling: the worker count is the smallest of it, the
  * arena count and the number of slots in `slot_mem`, and a slab shorter than

@@ -26,7 +26,10 @@
 #include <string.h>
 #include "zpse/zpse.h"
 
-#define MAXN (400u * 1024u)
+/* The largest input any case uses. The streamed cases carry a short final
+ * block past 400 KiB on purpose (a 409677-byte slab at 16 KiB blocks ends
+ * mid-block), so the buffers are sized to hold that input, not 400 KiB. */
+#define MAXN (416u * 1024u)
 #define MAXTHREADS 6u
 #define BLKMAX 65536u
 /* Serial bound (input + 96 B per block + the index) and the reserved slot
@@ -102,7 +105,7 @@ static void fill_input(uint32_t n, int kind)
             break;
         case 2: /* prose-ish: the tile and LZ forms */
             in[i] = (uint8_t)("the quick brown fox jumps over the lazy dog. "
-                              "[i]"[(i / 7u) % 51u]);
+                              "[i]"[(i / 7u) % 48u]);
             break;
         default: /* runs of one value, then a gap */
             in[i] = (uint8_t)((i & 0x3FFu) < 900u ? 0u : (i & 0x3Fu));
@@ -214,6 +217,105 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     }
 }
 
+/* ---- the streamed encode --------------------------------------------
+ *
+ * The path the CLI ships: a slab in, finished blocks out through a callback,
+ * a ring of slots between. Its contract is the buffered path's -- the bytes
+ * the serial encoder writes -- and the ring is exactly where an earlier
+ * version of this went wrong: when the assignment came from a shared claim
+ * counter, a slot's previous generation could be handed out under the next
+ * block's length, so six workers sometimes wrote a different stream of the
+ * same size. So every worker count is compared against the serial frame's
+ * block region, at the shallowest and the deepest ring, and the callback
+ * refuses a block that arrives out of order.
+ */
+
+#define STRM_DEPTH_MAX 4u
+#define STRM_CTL (MAXTHREADS * STRM_DEPTH_MAX * ZPSE_MT_CTRL_STRIDE)
+static uint8_t slotmem[MAXTHREADS * STRM_DEPTH_MAX *
+                       (BLKMAX + ZPSE_BLOCK_HEADER_SIZE)];
+static int ready[STRM_CTL];
+static uint32_t lens[STRM_CTL];
+static uint8_t strm[COMP_CAP];
+
+typedef struct {
+    uint32_t next;
+    size_t len;
+    int bad;
+} StrmSink;
+
+static int stream_emit(void *ctx, uint32_t seq, const uint8_t *blk, size_t len)
+{
+    StrmSink *s = (StrmSink *)ctx;
+
+    if (seq != s->next || s->len + len > sizeof strm) {
+        s->bad = 1;
+        return PSE_BAD_ARG;
+    }
+    memcpy(strm + s->len, blk, len);
+    s->len += len;
+    s->next = seq + 1u;
+    return 0;
+}
+
+static void run_stream_case(uint32_t n, uint32_t block, unsigned max_threads,
+                            uint32_t enc_flags, int kind, int indexed,
+                            unsigned depth)
+{
+    size_t rlen = 0u;
+    size_t stride = (size_t)block + (size_t)ZPSE_BLOCK_HEADER_SIZE;
+    uint32_t nblocks = n / block + (n % block != 0u ? 1u : 0u);
+    size_t body;
+    unsigned t;
+    int rc;
+
+    fill_input(n, kind);
+    if (indexed) {
+        rc = zpse_compress_frame_indexed(in, n, ref, sizeof ref, &rlen, block,
+                                         enc_flags, arenas[0]);
+    } else {
+        rc = zpse_compress_frame_ex(in, n, ref, sizeof ref, &rlen, block,
+                                    enc_flags, arenas[0]);
+    }
+    CHECK(rc == PSE_OK, "stream: serial reference (n %u, block %u)", n, block);
+    if (rc != PSE_OK) {
+        return;
+    }
+    /* The stream carries blocks and nothing else: no frame header and, when
+     * the frame has one, no index. */
+    body = rlen - (size_t)ZPSE_FRAME_HEADER_SIZE -
+           (indexed ? (size_t)ZPSE_INDEX_HEADER_SIZE +
+                          (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)nblocks
+                    : 0u);
+    for (t = 1u; t <= max_threads; t++) {
+        StrmSink sink;
+        size_t slot_cap = stride * (size_t)t * (size_t)depth;
+
+        sink.next = 0u;
+        sink.len = 0u;
+        sink.bad = 0;
+        rc = zpse_compress_frame_stream(in, n, block, enc_flags, t, 0u, 1,
+                                        (void *const *)arenas, MAXTHREADS,
+                                        slotmem, slot_cap, ready, lens,
+                                        stream_emit, &sink);
+        CHECK(rc == PSE_OK,
+              "stream encode (%u workers, depth %u, n %u): %s", t, depth,
+              n, zpse_status_name(rc));
+        CHECK(sink.bad == 0,
+              "stream emitted out of order (%u workers, depth %u, n %u)", t,
+              depth, n);
+        CHECK(sink.len == body &&
+                  memcmp(strm, ref + ZPSE_FRAME_HEADER_SIZE, body) == 0,
+              "stream body differs (%u workers, depth %u, n %u, block %u, "
+              "flags %u, index %d): %lu vs %lu bytes",
+              t, depth, n, block, enc_flags, indexed,
+              (unsigned long)sink.len, (unsigned long)body);
+        if (t == max_threads) {
+            digest_bytes(strm, sink.len);
+        }
+    }
+}
+
 int main(void)
 {
     static const unsigned counts[] = { 2u, 3u, 4u, MAXTHREADS };
@@ -260,6 +362,19 @@ int main(void)
         CHECK(rc == PSE_OK, "fewer arenas than threads is accepted");
         digest_bytes(par, plen);
     }
+
+    /* The streamed path, whole-slab calls: both ring depths, every worker
+     * count, on a frame that reaches each of the forms the CLI can write. */
+    run_stream_case(400u * 1024u, 65536u, MAXTHREADS, 0u, 2, 1, 1u);
+    run_stream_case(400u * 1024u, 65536u, MAXTHREADS, 0u, 2, 1,
+                    STRM_DEPTH_MAX);
+    run_stream_case(400u * 1024u + 77u, 16384u, MAXTHREADS,
+                    (uint32_t)ZPSE_ENC_SPEED_MAX, 1, 0, STRM_DEPTH_MAX);
+    run_stream_case(192u * 1024u, 4096u, 4u,
+                    (uint32_t)ZPSE_ENC_LZ_FAST, 2, 0, STRM_DEPTH_MAX);
+    run_stream_case(96u * 1024u, 4096u, MAXTHREADS,
+                    (uint32_t)(ZPSE_ENC_LZ_FAST | ZPSE_ENC_CHECKSUM), 3, 1,
+                    3u);
 
     printf("PARALLEL: %s (%d checks, digest %08x)\n",
            fails == 0 ? "ALL OK" : "FAILURES", checks, (unsigned)digest);

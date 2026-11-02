@@ -477,12 +477,16 @@ static int encode_stream(const char *in_path, const char *out_path,
     int *ready = NULL;
     uint32_t *lens = NULL;
     uint8_t hdr[ZPSE_FRAME_HEADER_SIZE];
-    /* One slot per worker plus two, so a worker always has somewhere to put
-     * the block after its own while the writer is still on an earlier one;
-     * that band is all the output this ever holds. */
+    /* The ring is ZPSE_MT_MAX_DEPTH slots per worker, which is what lets a
+     * worker run ahead of the writer instead of blocking on an emit it has
+     * nothing to do with; `zpse_compress_frame_stream` clamps the depth to
+     * whatever `slot_cap` actually holds, so a short allocation still runs
+     * (shallower, same bytes). Control entries are padded to a cache line,
+     * one group per slot: six workers on one line evicted each other's polls. */
     size_t stride = (size_t)block + (size_t)ZPSE_BLOCK_HEADER_SIZE;
-    unsigned ring = (threads > 1u ? threads + 2u : 1u);
+    unsigned ring = (threads > 1u ? threads * ZPSE_MT_MAX_DEPTH : 1u);
     size_t slot_cap = stride * (size_t)ring;
+    size_t ctl = (size_t)ring * (size_t)ZPSE_MT_CTRL_STRIDE;
     /* A slab is read, encoded and written before the next one is read: 64
      * blocks is 4 MiB at the default block size, enough to keep the workers
      * fed and small enough that the input stays in cache. */
@@ -532,8 +536,8 @@ static int encode_stream(const char *in_path, const char *out_path,
     }
     in_buf = (uint8_t *)malloc((size_t)slab_blocks * (size_t)block);
     slot_mem = (uint8_t *)malloc(slot_cap);
-    ready = (int *)malloc(sizeof(int) * (size_t)ring);
-    lens = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)ring);
+    ready = (int *)malloc(sizeof(int) * ctl);
+    lens = (uint32_t *)malloc(sizeof(uint32_t) * ctl);
     if (in_buf == NULL || slot_mem == NULL || ready == NULL || lens == NULL) {
         fprintf(stderr, "zpse_cli: out of memory\n");
         goto done;

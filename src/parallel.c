@@ -284,7 +284,8 @@ typedef struct ZpseMtStream {
     uint32_t enc_flags;
     uint32_t first_block;
     int final_slab;
-    unsigned workers;   /* slots, and the stride of the assignment */
+    unsigned workers;   /* slots per ring group, and the block stride */
+    unsigned depth;     /* ring groups: slots per worker */
     uint8_t *slots;
     int *ready;
     uint32_t *lens;
@@ -324,6 +325,13 @@ static void zpse_mt_relax(void)
 #endif
 }
 
+/* Index of a slot's control entry. Every slot gets a whole cache line of
+ * them: the writer polls block i's flag while worker i+1's release lands on
+ * the neighbouring entry, and with one int per slot that release invalidates
+ * the line the writer is spinning on -- six workers on two lines, so the flag
+ * the writer waits for is evicted by five threads that are not touching it. */
+#define ZPSE_MT_CTL(slot) ((size_t)(slot) * (size_t)ZPSE_MT_CTRL_STRIDE)
+
 static void zpse_mt_stream_fail(ZpseMtStream *j, int rc)
 {
     if (j->failed == 0) {
@@ -344,11 +352,56 @@ static void zpse_mt_stream_fail(ZpseMtStream *j, int rc)
  * are strictly increasing, and the writer frees a generation only after
  * emitting it, so the only interleaving left is worker -> writer -> worker on
  * one slot, ordered by the acquire/release pair on `ready`. */
+/* Encode this worker's `g`-th block into its ring slot, unless the slot is
+ * still holding a block the writer has not emitted yet. Returns 1 when the
+ * block was encoded, 0 when the slot is held, or a negative status. Both the
+ * spawned workers and the calling thread go through this, which is what lets
+ * the caller be a worker: the block index, the slot and the sequence number
+ * are all a function of (worker, g), so which thread runs it changes nothing
+ * about which slot it lands in. */
+static int zpse_mt_stream_step(ZpseMtStream *j, ZpseEncoder *enc, unsigned w,
+                               unsigned g)
+{
+    size_t slot = (size_t)w +
+                  (size_t)(g % j->depth) * (size_t)j->workers;
+    size_t ctl = ZPSE_MT_CTL(slot);
+    size_t b = (size_t)w + (size_t)g * (size_t)j->workers;
+    size_t off;
+    size_t chunk;
+    int wrc;
+
+    if (b >= j->nblocks) {
+        return 0;
+    }
+    if (ZPSE_MT_FLAG_GET(&j->ready[ctl]) != ZPSE_MT_SLOT_EMPTY) {
+        return 0;
+    }
+    /* Sequence number and last-block flag are the block's position in the
+     * frame, not its arrival order, so a worker writes into the slot the
+     * serial encoder would have written into. */
+    ZPSE_MT_FLAG_SET(&j->ready[ctl], ZPSE_MT_SLOT_FILLING);
+    off = b * (size_t)j->block;
+    chunk = j->n - off;
+    if (chunk > (size_t)j->block) {
+        chunk = (size_t)j->block;
+    }
+    wrc = zpse_block_encode(enc, j->in + off, (uint32_t)chunk,
+                            j->first_block + (uint32_t)b,
+                            (j->final_slab && (b + 1u) == j->nblocks) ? 1 : 0,
+                            j->slots + slot * j->stride,
+                            (uint32_t)j->stride);
+    if (wrc <= 0 || (size_t)wrc > j->stride) {
+        return wrc < 0 ? wrc : PSE_BAD_HEADER;
+    }
+    j->lens[ctl] = (uint32_t)wrc;
+    ZPSE_MT_FLAG_SET(&j->ready[ctl], ZPSE_MT_SLOT_READY);
+    return 1;
+}
+
 static void zpse_mt_stream_worker(ZpseMtStream *j, void *arena, unsigned w)
 {
     ZpseEncoder enc;
-    size_t slot = (size_t)w;
-    size_t b;
+    unsigned g = 0u;
     int rc;
 
     rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
@@ -357,37 +410,23 @@ static void zpse_mt_stream_worker(ZpseMtStream *j, void *arena, unsigned w)
         return;
     }
     enc.enc_flags = j->enc_flags;
-    for (b = (size_t)w; b < j->nblocks; b += (size_t)j->workers) {
-        size_t off;
-        size_t chunk;
-        int wrc;
-
+    for (;;) {
         if (j->failed != 0) {
             return;
         }
-        while (ZPSE_MT_FLAG_GET(&j->ready[slot]) != ZPSE_MT_SLOT_EMPTY) {
-            if (j->failed != 0) {
-                return;
-            }
-            zpse_mt_relax();
-        }
-        ZPSE_MT_FLAG_SET(&j->ready[slot], ZPSE_MT_SLOT_FILLING);
-        off = b * (size_t)j->block;
-        chunk = j->n - off;
-        if (chunk > (size_t)j->block) {
-            chunk = (size_t)j->block;
-        }
-        wrc = zpse_block_encode(&enc, j->in + off, (uint32_t)chunk,
-                                j->first_block + (uint32_t)b,
-                                (j->final_slab && (b + 1u) == j->nblocks) ? 1 : 0,
-                                j->slots + slot * j->stride,
-                                (uint32_t)j->stride);
-        if (wrc <= 0 || (size_t)wrc > j->stride) {
-            zpse_mt_stream_fail(j, wrc);
+        if ((size_t)w + (size_t)g * (size_t)j->workers >= j->nblocks) {
             return;
         }
-        j->lens[slot] = (uint32_t)wrc;
-        ZPSE_MT_FLAG_SET(&j->ready[slot], ZPSE_MT_SLOT_READY);
+        rc = zpse_mt_stream_step(j, &enc, w, g);
+        if (rc < 0) {
+            zpse_mt_stream_fail(j, rc);
+            return;
+        }
+        if (rc == 0) {
+            zpse_mt_relax();
+            continue;
+        }
+        g++;
     }
 }
 
@@ -415,7 +454,7 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
                               uint32_t block, uint32_t enc_flags,
                               unsigned workers, uint32_t first_block,
                               int final_slab, void *const arenas[],
-                              uint8_t *slots, int *ready,
+                              uint8_t *slots, size_t slot_cap, int *ready,
                               uint32_t *lens, ZpseBlockEmit emit,
                               void *emit_ctx)
 {
@@ -428,7 +467,7 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
 #endif
     unsigned started = 0u;
     unsigned w;
-    size_t i;
+    size_t i = 0u;
     int rc = PSE_OK;
 
     job.in = in;
@@ -441,17 +480,31 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
     job.first_block = first_block;
     job.final_slab = final_slab;
     job.workers = workers;
+    /* Slots per worker, from the room the caller left: one is the shallow
+     * ring, and one is also what a caller that sized `slot_mem` for exactly
+     * one slot per worker gets, so an old allocation is a legal call. */
+    job.depth = (unsigned)(slot_cap / (job.stride * (size_t)workers));
+    if (job.depth == 0u) {
+        job.depth = 1u;
+    }
+    if (job.depth > (unsigned)ZPSE_MT_MAX_DEPTH) {
+        job.depth = (unsigned)ZPSE_MT_MAX_DEPTH;
+    }
     job.slots = slots;
     job.ready = ready;
     job.lens = lens;
     job.failed = 0;
-    for (w = 0u; w < workers; w++) {
-        ready[w] = ZPSE_MT_SLOT_EMPTY;
+    for (w = 0u; w < workers * job.depth; w++) {
+        ready[ZPSE_MT_CTL(w)] = ZPSE_MT_SLOT_EMPTY;
     }
-    /* Every worker is spawned here: the calling thread is the writer, so it
-     * cannot be one of them. Exactly one thread per slot, because a slot's
-     * owning worker is the only thread allowed to fill it. */
-    for (w = 0u; w < workers; w++) {
+    /* The workers 1..workers-1 are spawned here; the calling thread is
+     * worker 0 and also the writer. That is the whole point of the shape: a
+     * dedicated writer thread is a seventh thread on a six-CPU machine, and
+     * when it has nothing to emit it spins, so it takes a core from an
+     * encoder for the whole run. Measured on 64 MiB at six workers, this path
+     * with a spinning writer reached 2.5x one worker against the buffered
+     * encoder's 4.6x -- the ring was not the cost, the thread was. */
+    for (w = 1u; w < workers; w++) {
         args[w].job = &job;
         args[w].arena = arenas[w];
         args[w].worker = w;
@@ -469,34 +522,90 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
 #endif
         started++;
     }
-    if (started == 0u) {
+    if (started + 1u < workers) {
+        /* Not enough threads started to fill the ring: the blocks the missing
+         * workers own would never be encoded, so the whole slab goes serial
+         * instead of stalling the emit loop below. */
+        for (w = 1u; w <= started; w++) {
+#if defined(_WIN32)
+            WaitForSingleObject(handles[w], INFINITE);
+            CloseHandle(handles[w]);
+#else
+            pthread_join(handles[w], NULL);
+#endif
+        }
         return 1;
     }
-    for (i = 0; i < job.nblocks; i++) {
-        size_t slot = i % (size_t)workers;
+    {
+        ZpseEncoder enc;
+        unsigned g = 0u;
+        int erc = zpse_encoder_init(&enc, arenas[0],
+                                    (size_t)ZPSE_ENC_ARENA_SIZE);
 
-        while (ZPSE_MT_FLAG_GET(&ready[slot]) != ZPSE_MT_SLOT_READY) {
+        if (erc != PSE_OK) {
+            zpse_mt_stream_fail(&job, erc);
+            rc = erc;
+            goto join;
+        }
+        enc.enc_flags = enc_flags;
+        for (;;) {
+            size_t slot;
+            size_t ctl;
+
+            /* Everything the prefix of the frame has finished, in order. */
+            while (i < job.nblocks) {
+                slot = (i % (size_t)workers) +
+                       ((i / (size_t)workers) % (size_t)job.depth) *
+                           (size_t)workers;
+                ctl = ZPSE_MT_CTL(slot);
+                if (ZPSE_MT_FLAG_GET(&ready[ctl]) != ZPSE_MT_SLOT_READY) {
+                    break;
+                }
+                rc = emit(emit_ctx, first_block + (uint32_t)i,
+                          slots + slot * job.stride, (size_t)lens[ctl]);
+                if (rc != 0) {
+                    /* The emit failed (a short write, say): the workers have
+                     * to stop rather than wait for a writer that is not
+                     * coming. */
+                    zpse_mt_stream_fail(&job, rc);
+                    goto join;
+                }
+                ZPSE_MT_FLAG_SET(&ready[ctl], ZPSE_MT_SLOT_EMPTY);
+                i++;
+            }
+            if (i == job.nblocks) {
+                break;
+            }
             if (job.failed != 0) {
                 rc = job.failed < 0 ? job.failed : PSE_BAD_HEADER;
                 goto join;
             }
+            /* Nothing to emit yet: encode the next block this thread owns,
+             * which is the block the emit loop will need first and therefore
+             * the one worth doing here. */
+            {
+                int sr = zpse_mt_stream_step(&job, &enc, 0u, g);
+
+                if (sr < 0) {
+                    zpse_mt_stream_fail(&job, sr);
+                    rc = sr;
+                    goto join;
+                }
+                if (sr == 1) {
+                    g++;
+                    continue;
+                }
+            }
             zpse_mt_relax();
         }
-        rc = emit(emit_ctx, first_block + (uint32_t)i,
-                  slots + slot * job.stride, (size_t)lens[slot]);
-        if (rc != 0) {
-            /* The emit failed (a short write, say): the workers have to stop
-             * rather than wait for a writer that is not coming. */
-            zpse_mt_stream_fail(&job, rc);
-            goto join;
-        }
-        ZPSE_MT_FLAG_SET(&ready[slot], ZPSE_MT_SLOT_EMPTY);
     }
 join:
     if (rc != PSE_OK) {
         zpse_mt_stream_fail(&job, rc);
     }
-    for (w = 0u; w < started; w++) {
+    /* The spawned threads are 1..started: the calling thread is worker 0 and
+     * joins nobody but itself, so index 0 holds no handle. */
+    for (w = 1u; w <= started; w++) {
 #if defined(_WIN32)
         WaitForSingleObject(handles[w], INFINITE);
         CloseHandle(handles[w]);
@@ -614,7 +723,7 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
         int rc = zpse_mt_stream_run(in, in_len, nominal_block_size,
                                     enc_flags, workers, first_block,
                                     is_final_slab, enc_arenas, slot_mem,
-                                    ready, lens, emit, emit_ctx);
+                                    slot_cap, ready, lens, emit, emit_ctx);
 
         if (rc != 1) {
             return rc;
