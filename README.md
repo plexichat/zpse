@@ -819,6 +819,23 @@ the sweep's own price in the comparison rather than a bigger guess, so
 `ZPSE_LZ_SCREEN_BYTES` (a compile-time knob) is where the experiment lives
 and the default stays at the kilobyte both corpora agree on.
 
+Where a block's encode time actually goes is counted rather than guessed --
+`-DZPSE_BLOCK_STATS` carries the cycle counters -- and over the twelve files
+the match finder is 1754M of the 2330M cycles the measured stages account for
+(75%), the tile trials 316M (14%) and the decision probe 260M (11%). Nothing
+inside the finder is a hotspot that can be taken out: the same counters put
+the lazy probe at 11% of a pass, the literal copy at 7% and the backward walk
+at 1%, and an in-place writer for the four-in-five command measured as noise.
+That is why the fast form above is the only lever on this corpus worth
+measuring, and why it stays an option: it walks a block at 397-517 MB/s
+(`webster` 397, `mozilla` 517) against the token form's 222-257 (`dickens`
+222, `webster` 259), and at the cheap levels it is worth +34% encode and
++40% decode over the corpus -- 0.41 and 1.84 GB/s at 2.00:1 -- for 1.66% more
+bytes. The growth is not spread thin: `mozilla` pays 5% and a block of
+spikes every 256 bytes codes to 1320 against the token form's 1066, which is
+a ratio regression rather than a level ordering, so the deep rungs keep the
+smaller stream and the trade stays where `ZPSE_ENC_LZ_FAST` puts it.
+
 `ZPSE_ENC_LZ_FAST` (bit 5 of `enc_flags`, `-F` on the CLI) asks for that form
 and nothing else: one match-finder pass per block, no probe, no trials, no
 shape decision, with a verbatim copy as the only fallback. It is an option
