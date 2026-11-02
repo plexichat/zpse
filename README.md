@@ -793,6 +793,32 @@ transpose owns outright -- a block of zeros is 69 bytes of tiles against 802
 of finder -- and with the rule held to it the size suite's contract is still
 "no case grows".
 
+A gated block goes one step further, because its comparison needs no sample:
+the seven-bit form's total is arithmetic (`zpse_block_ascii_total`), so when
+the finder's stream beats that number the block is written from the finder
+and the tile trial -- which is handed the LZ total as a byte budget and stops
+before the end of the block -- does not run at all. That trial could not win
+(the total it is compared against is the one it provably produces), so the
+stream is unchanged and the work is not done. It is a small win on Silesia
+because the 1 KiB screen refuses the finder on most prose in the first place
+(`webster` 240 against 246 MB/s, within this host's run-to-run noise), and a
+large one wherever that screen does convict.
+
+Sizing the sample by the block instead of a kilobyte is the obvious next
+lever there, and it is measured and *not* taken. At 4 KiB the finder wins on
+exactly the text a kilobyte cannot see, and over the twelve Silesia files the
+default level goes from 2.03:1 to 2.16:1 (104,474,009 bytes to 98,023,866;
+`dickens` 1.16 -> 1.51, `osdb` 1.13 -> 1.82, level 9 2.18 -> 2.19): a 6%
+smaller corpus, which is past `lz4 -1`'s 2.10:1 instead of behind it. It costs
+the columnar corpus more than it buys there, though -- levels 5, 6 and 8 go
+5.06 -> 5.00, 5.10 -> 5.04 and 5.13 -> 4.88, and at level 8 it breaks the
+ladder's ordering against level 7 -- because a longer sample does not only
+measure better, it argues better for a form the tiles beat by a few percent on
+a column whose records a short sample has too few of. Taking that trade needs
+the sweep's own price in the comparison rather than a bigger guess, so
+`ZPSE_LZ_SCREEN_BYTES` (a compile-time knob) is where the experiment lives
+and the default stays at the kilobyte both corpora agree on.
+
 `ZPSE_ENC_LZ_FAST` (bit 5 of `enc_flags`, `-F` on the CLI) asks for that form
 and nothing else: one match-finder pass per block, no probe, no trials, no
 shape decision, with a verbatim copy as the only fallback. It is an option

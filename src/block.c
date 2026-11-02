@@ -114,6 +114,19 @@ uint32_t zpse_block_cands_kept;
 uint32_t zpse_block_trials;
 /* Trials skipped by the per-candidate floor bound without any work. */
 uint32_t zpse_block_trials_skipped;
+/* Blocks the ASCII gate convicted: one candidate, the seven-bit pack. */
+uint32_t zpse_block_gated;
+/* Full match-finder passes run, and the cycles they took. The finder is the
+ * one stage whose whole cost is paid whenever it is tried, so this is what a
+ * screen that accepts it too often actually costs. */
+uint32_t zpse_block_lz_passes;
+uint64_t zpse_block_lz_pass_cycles;
+uint64_t zpse_block_screen_cycles;
+/* Blocks the finder wrote with no tile trial at all, split by the stage that
+ * decided it: the pre-sweep screen (full-size blocks) and the gate's own
+ * exact comparison (an ASCII block, whose seven-bit total is arithmetic). */
+uint32_t zpse_block_finder_first;
+uint32_t zpse_block_gate_lz;
 /* How many times a trial was won, by transform id (0..10: RAW_BYTES,
  * DELTA8, and the plain/delta transposes at widths 2/4/8/16). */
 uint32_t zpse_block_wins[16];
@@ -1936,6 +1949,25 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  * would write a larger block than that level -- which is what
  * tests/suites/test_levels.c pins. */
 #ifndef ZPSE_LZ_SCREEN_BYTES
+/* 1 KiB, and a longer sample was tried and refused.
+ *
+ * A kilobyte is shorter than the distance a match finder needs to see: on
+ * prose the finder codes the head of a block at about 1.05:1 and the block at
+ * 2.0:1, so the screen refuses the pass on exactly the text the finder wins
+ * (dickens 1.16, osdb 1.13, webster 1.95 by the tile path). A 4 KiB sample
+ * fixes that and is worth a lot on that corpus -- over the twelve Silesia
+ * files the default level goes from 2.03:1 to 2.16:1 (104,474,009 bytes to
+ * 98,023,866) -- and it costs the columnar corpus more than it buys there:
+ * levels 5-9 drop 5.06 -> 5.00, 5.10 -> 5.04 and 5.13 -> 4.88 (level 8,
+ * where it also breaks the ladder's ordering against level 7). The reason is
+ * the stage below: a block the screen convicts is written from the finder
+ * without a trial, so a longer sample does not just measure better, it
+ * ARGUES BETTER for a form the tiles beat by a few percent on a column whose
+ * records the sample has too few of to see. Making that trade honestly needs
+ * the sweep's own price in the comparison (see zpse_block_encode), which is a
+ * different change; until then the sample stays where the measurement over
+ * both corpora puts it, and the macro is the knob for the corpus a caller
+ * actually has. */
 #define ZPSE_LZ_SCREEN_BYTES 1024u
 #endif
 #ifndef ZPSE_LZ_SCREEN_DEN
@@ -2038,6 +2070,18 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     {
         int prefix_ok = 1;
 
+        /* Priced on slot 0 of the list, which is the identity unless the
+         * head sample swapped DELTA8 ahead of it. The two prices coincide on
+         * the text this decides, and pricing both of them and taking the
+         * smaller -- which is what a larger sample would need to stay
+         * order-neutral -- costs the columnar corpus 0.06 of ratio at every
+         * level from 5 up (5.06 -> 5.00, 5.13 -> 5.07), because a tighter
+         * estimate of the tile side refuses the finder on blocks where its
+         * full stream is the smaller one. The suite's swap build still
+         * writes the same streams at this sample size, so the tolerance is
+         * measured rather than assumed: if a future change to the sample
+         * makes this line order-sensitive, tests/runners/run.sh says so
+         * before this comment can be wrong about it quietly. */
         tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
                                         ZPSE_DECIDE_TILES, UINT32_MAX, 1,
                                         &prefix_ok);
@@ -2669,6 +2713,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                                   : (uint32_t)ZPSE_ASCII_SAMPLE) &&
         zpse_ascii_scan(in, n) && zpse_block_ascii_gate(e, in, n)) {
         e->ascii_gate = 1u;
+#if defined(ZPSE_BLOCK_STATS)
+        zpse_block_gated++;
+#endif
         /* Identity only: one trial, which now packs instead of searching,
          * and no pricing pass or second opinion to pay for first. */
         ncand = 1;
@@ -3337,11 +3384,49 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 if (atotal < (uint32_t)ZPSE_E_SZ_CAND && atotal > win) {
                     lz_cap = atotal - win;
                 }
-                rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
-                                       e->best, lz_cap, &lz_total, &lz_cmds);
+                {
+#if defined(ZPSE_BLOCK_STATS)
+                    uint64_t t_cyc = blk_rdtsc();
+#endif
+                    rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
+                                           e->best, lz_cap, &lz_total,
+                                           &lz_cmds);
+#if defined(ZPSE_BLOCK_STATS)
+                    zpse_block_lz_passes++;
+                    zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
+#endif
+                }
                 if (rc == PSE_OK &&
                     zpse_block_lz_wins(n, lz_cmds, lz_total, 1, atotal,
                                        lz_speed)) {
+                    /* ---- The gate's total is arithmetic, so the trial is
+                     * not needed to settle it ---------------------------
+                     *
+                     * A gated block's tile stream is the seven-bit pack of
+                     * every tile, whose total zpse_block_ascii_total knows
+                     * before anything runs (0.875 bytes a byte plus the
+                     * envelope). The comparison this block would make after
+                     * the trial is therefore already decided here: the
+                     * finder's stream is smaller than the number the trial
+                     * provably produces. Running the trial anyway -- it is
+                     * handed `lz_total - win` as a byte budget, so it stops
+                     * a while before the end -- was still most of a text
+                     * block's encode spent on a stream that cannot win:
+                     * `dickens` 174 -> 587 MB/s and `webster` 199 -> 246 once
+                     * this returned here instead (screen at 4 KiB, one
+                     * pinned core). The exception is MAX, which offers the
+                     * fast LZ2 form after the sweep: the trial is that
+                     * candidate's `have_best`, so the deepest rung keeps it
+                     * and its stream is unchanged. */
+                    if (lz_total <= out_cap &&
+                        zpse_enc_speed(lz_speed) < 9u) {
+#if defined(ZPSE_BLOCK_STATS)
+                        zpse_block_gate_lz++;
+#endif
+                        memcpy(out, e->best, lz_total);
+                        zpse_block_hist_set(e, out, lz_total);
+                        return (int)lz_total;
+                    }
                     /* The stream is already in e->best, which is where the
                      * winner is read from below; `out` must not be written
                      * by the trial any more, since the trial is about to
@@ -3445,9 +3530,22 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              0u)) {
         uint32_t lz_total = 0u;
         uint32_t lz_cmds = 0u;
-        int lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
+        int lrc;
+
+#if defined(ZPSE_BLOCK_STATS)
+        {
+            uint64_t t_cyc = blk_rdtsc();
+
+            lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                     (uint32_t)ZPSE_E_SZ_CAND, &lz_total,
                                     &lz_cmds);
+            zpse_block_lz_passes++;
+            zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
+        }
+#else
+        lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
+                                (uint32_t)ZPSE_E_SZ_CAND, &lz_total, &lz_cmds);
+#endif
 
         /* ...and only when the block is not one the tiles own outright.
          * A stream under 1/64 of the block (zeros, an alternating pair, a
@@ -3464,6 +3562,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
             memcpy(out, e->cand, lz_total);
             zpse_block_hist_set(e, out, lz_total);
+#if defined(ZPSE_BLOCK_STATS)
+            zpse_block_finder_first++;
+#endif
             return (int)lz_total;
         }
     }
