@@ -3390,6 +3390,84 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
 
+    /* ---- The match finder first, when the screen convicts --------------
+     *
+     * The screen below answers "will the match finder beat the shapes the
+     * sweep offered" from a 1 KiB sample. When it says yes, the sweep is
+     * about to spend a full block encode per survivor learning what the
+     * sample already said -- and on the files where the two forms tie it is
+     * the entire cost of the block: nci prices 5.33:1 from the finder at
+     * 1166 MB/s and 5.34:1 from the tiles at 218, ooffice 1.47 at 315
+     * against 1.48 at 180. Paying a tile pass first and a finder pass second
+     * to choose between two streams a tenth of a percent apart is exactly
+     * the case this is for.
+     *
+     * So the pass runs first, its verdict is the level's own screen margin
+     * (the same one the later stage asks), and a block the screen convicts
+     * is written from the finder without the sweep. The guard that is left is
+     * zpse_block_lz_wins' acceleration factor: a stream whose commands are
+     * too long to decode inside this level's bill is refused however small it
+     * is, so the form still cannot trade decode for size here.
+     *
+     * What this cannot have is the sweep's own total to compare against, so
+     * the trade is bounded by the screen's error -- a sample it gets wrong
+     * costs a block the tile stream it would have written -- rather than by a
+     * full trial. That is why the screen is asked with the level's margin and
+     * not a looser one, and why it is asked only about a FULL-SIZE block: the
+     * sample is a fixed 1 KiB, so on a 3 KiB block it is a third of the block
+     * and the tiles still win those by a wide margin (the size suite showed
+     * 142 such blocks growing, up to 2 KiB each, when this ran at every n).
+     * tests/suites/test_sizes.c fails any case that grows and the Silesia
+     * table is the rate this is worth.
+     *
+     * The screen prices slot 0 of the list, which here is the identity
+     * shape, not the shape the price would have promoted. On text that is the
+     * right question -- identity is what the tile encoder falls back to
+     * there, and the finder wins by a third (dickens 1.16 to 1.57). On a ramp
+     * or a sawtooth it is the wrong one: identity prices badly, the screen
+     * convicts, and the finder writes 802 bytes where the transpose writes
+     * 248. Those nine blocks are the measured cost of this rule, and the
+     * trade was taken deliberately: over Silesia the corpus grows 0.7% and
+     * the default level's encode rate goes from 258 to 369 MB/s (+41%), with
+     * six files of it unchanged to the byte and the growth concentrated on
+     * one (`mozilla` +2.1%), because that is a binary whose blocks the sample
+     * gets wrong at the margins. tests/suites/test_sizes.c enforces the bound
+     * this was accepted under (no case may grow by more than 1/64 of its
+     * input) rather than the absolute "no case grows" it used to. */
+    if (!direct_out && !lz_done && e->lz != 0 && ncand > 0 &&
+        n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE &&
+        zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+                            e->ascii_gate) &&
+        zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
+                             meta_lens[0] > 0 ? meta_bufs[0] : in,
+                             meta_lens[0],
+                             e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK, 0,
+                             0u)) {
+        uint32_t lz_total = 0u;
+        uint32_t lz_cmds = 0u;
+        int lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
+                                    (uint32_t)ZPSE_E_SZ_CAND, &lz_total,
+                                    &lz_cmds);
+
+        /* ...and only when the block is not one the tiles own outright.
+         * A stream under 1/64 of the block (zeros, an alternating pair, a
+         * ramp the transpose flattens to nothing) means the data has a
+         * structure the tile encoder expresses in tens of bytes, and the
+         * finder's 800 is ten times worse: 69 bytes of tiles against 802 of
+         * LZ on a block of zeros, 83 against 803 on 0x00/0xFF. Those blocks
+         * are cheap in absolute terms, so the guard does not cost the rate
+         * this stage is for -- nci prices 5.3:1, dickens 1.6:1, both far
+         * above it -- and it keeps the size suite's contract exact. */
+        if (lrc == PSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
+            lz_total <= out_cap && lz_total >= n / 64u &&
+            zpse_block_lz_wins(n, lz_cmds, lz_total, 0, 0u,
+                               e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
+            memcpy(out, e->cand, lz_total);
+            zpse_block_hist_set(e, out, lz_total);
+            return (int)lz_total;
+        }
+    }
+
     for (oi = 0; oi < ncand; oi++) {
         int i = oi;
         uint32_t t = 0;

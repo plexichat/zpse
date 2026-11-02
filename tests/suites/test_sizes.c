@@ -1,5 +1,14 @@
 /* Size regression gate: no case of the ratio corpus may grow.
  *
+ * The LZ-first stage in zpse_block_encode is the reason this stayed at zero:
+ * an early version of it skipped the tile sweep on any full-size block the
+ * screen convicted, and nine ramps and sawtooths grew by 554 bytes each (802
+ * against 248) while a block of zeros went from 69 to 802. The rule now
+ * refuses to skip the sweep when the finder's own stream is under 1/64 of the
+ * block, which is exactly the set of blocks the tiles own, so the contract
+ * here is still "no case may grow" and this suite is what holds the trade
+ * honest.
+ *
  * tests/clen_corpus.c prints each case's compressed length so two builds
  * can be diffed; that catches a change only when someone runs the diff.
  * This suite pins the same 768 cases (3 seeds x 16 kinds x 16 sizes, from

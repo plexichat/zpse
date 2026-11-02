@@ -776,6 +776,23 @@ distance can beat the first form's variable-length codes when matches are
 short and far (a 300-byte period codes to 23,318 bytes against 23,449), and it
 is kept only when it is strictly smaller than everything already tried.
 
+The match finder is also asked FIRST, before the sweep, on the blocks it can
+be. The screen above compares the two forms on a 1 KiB sample and costs a
+couple of prescreens; the sweep learns the same thing by encoding the whole
+block, one survivor at a time. So when the screen convicts a full-size block
+-- and the top of its list is the identity shape, which is what the tile
+encoder falls back to on text -- the finder's pass runs there and then, and
+the sweep behind it does not run at all: on `nci` and `ooffice` the two forms
+land a tenth of a percent apart on size, so the sweep was only choosing
+between two streams it could not separate. Over Silesia that is the default
+level's encode rate from 0.27 to 0.37 GB/s for 0.5% more bytes, and it is a
+measured trade rather than a free one: the sample prices the identity shape
+and is wrong about a ramp, so a block whose finder stream comes out under
+1/64 of its input keeps its sweep. That is exactly the set of blocks the
+transpose owns outright -- a block of zeros is 69 bytes of tiles against 802
+of finder -- and with the rule held to it the size suite's contract is still
+"no case grows".
+
 `ZPSE_ENC_LZ_FAST` (bit 5 of `enc_flags`, `-F` on the CLI) asks for that form
 and nothing else: one match-finder pass per block, no probe, no trials, no
 shape decision, with a verbatim copy as the only fallback. It is an option
@@ -788,13 +805,14 @@ caller's page faults:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.20:1 | 0.17 GB/s | 1.36 GB/s | 96,437,363 |
-| level 6 (default) | 2.04:1 | 0.27 GB/s | 1.51 GB/s | 103,927,201 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.18:1 | 0.24 GB/s | 1.31 GB/s | 97,027,616 |
+| level 6 (default) | 2.03:1 | 0.37 GB/s | 1.52 GB/s | 104,474,009 |
 | level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.60 GB/s | 2.23 GB/s | 103,022,280 |
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default
-level as well as twice as fast (103,022,280 against 103,927,201). That is the
+level as well as about half again as fast (103,022,280 against
+104,474,009). That is the
 match table below: the fast path is the only shape that never touches the
 encoder's 128 KiB of candidate staging, so the table lives there. On the prose
 files it is still a real trade, because that is where the tile model has
@@ -1140,22 +1158,22 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.82 GB/s | 3.25 GB/s |
-| mozilla | 51,220,480 | 2.05 | 0.22 GB/s | 1.33 GB/s |
-| mr | 9,970,564 | 2.49 | 0.24 GB/s | 1.39 GB/s |
-| nci | 33,553,445 | 5.34 | 0.22 GB/s | 1.77 GB/s |
-| ooffice | 6,152,192 | 1.48 | 0.18 GB/s | 1.24 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.53 GB/s | 4.54 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.30 GB/s | 0.90 GB/s |
-| samba | 21,606,400 | 2.55 | 0.28 GB/s | 1.55 GB/s |
-| sao | 7,251,944 | 1.01 | 1.13 GB/s | 7.41 GB/s |
-| webster | 41,458,703 | 1.95 | 0.29 GB/s | 1.12 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 2.92 GB/s |
-| xml | 5,345,280 | 3.94 | 0.51 GB/s | 1.82 GB/s |
-| **total** | **211,938,580** | **2.04** | **0.27 GB/s** | **1.51 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.85 GB/s | 3.35 GB/s |
+| mozilla | 51,220,480 | 2.01 | 0.32 GB/s | 1.31 GB/s |
+| mr | 9,970,564 | 2.48 | 0.24 GB/s | 1.39 GB/s |
+| nci | 33,553,445 | 5.34 | 0.56 GB/s | 1.60 GB/s |
+| ooffice | 6,152,192 | 1.48 | 0.26 GB/s | 1.22 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.63 GB/s | 4.13 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.30 GB/s | 1.06 GB/s |
+| samba | 21,606,400 | 2.55 | 0.39 GB/s | 1.66 GB/s |
+| sao | 7,251,944 | 1.01 | 1.22 GB/s | 8.30 GB/s |
+| webster | 41,458,703 | 1.95 | 0.29 GB/s | 1.19 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.41 GB/s | 3.09 GB/s |
+| xml | 5,345,280 | 3.94 | 0.54 GB/s | 1.55 GB/s |
+| **total** | **211,938,580** | **2.03** | **0.37 GB/s** | **1.52 GB/s** |
 
-`zpse_cli bench -r 3`, default level (6), 64 KiB blocks, one pinned core, best
-of three runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
+`zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
+of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
 corpus from 106,140,388 to 103,921,535 bytes, which cost ~6% of encode and
 bought ~8% of decode (the tile bodies it compresses are shorter than the plain
 LZ streams they replace, so the command loop runs over fewer bytes). The
@@ -1177,12 +1195,12 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.73 GB/s | 0.94 GB/s | **yes** |
-| zpse 3 FASTER | 1.29:1 | 0.49 GB/s | 0.90 GB/s | no |
-| zpse 5 BALANCED | 1.92:1 | 0.26 GB/s | 0.80 GB/s | no |
-| zpse 6 (default) | 2.04:1 | 0.24 GB/s | 0.85 GB/s | no |
-| zpse 9 MAX | 2.20:1 | 0.16 GB/s | 0.85 GB/s | no |
-| zpse `LZ_FAST` | 2.06:1 | 0.50 GB/s | 1.09 GB/s | no |
+| zpse 1 FASTEST | 1.25:1 | 0.66 GB/s | 0.75 GB/s | **yes** |
+| zpse 3 FASTER | 1.29:1 | 0.48 GB/s | 0.90 GB/s | no |
+| zpse 5 BALANCED | 1.91:1 | 0.33 GB/s | 0.88 GB/s | no |
+| zpse 6 (default) | 2.03:1 | 0.32 GB/s | 0.85 GB/s | no |
+| zpse 9 MAX | 2.19:1 | 0.24 GB/s | 0.78 GB/s | no |
+| zpse `LZ_FAST` | 2.06:1 | 0.49 GB/s | 1.00 GB/s | no |
 | lz4 -1 | 2.10:1 | 0.52 GB/s | 1.62 GB/s | yes |
 | lz4 -3 | 2.60:1 | 0.11 GB/s | 1.54 GB/s | yes |
 | lz4 -9 | 2.72:1 | 0.04 GB/s | 1.59 GB/s | yes |
@@ -1198,10 +1216,10 @@ now dominated by the fast form, which reaches the same encode rate with a
 stream 60% smaller -- level 3 is the rung the tile trials buy and the fast
 form does not need -- and level 6 and MAX lose on rate to tools that give up a
 third of the size: the trade a shape-deciding encoder makes. The fast form is the closest row zpse has to
-`lz4 -1`: 2% larger output at 96% of its encode rate, and still behind on both
+`lz4 -1`: 2% larger output at 94% of its encode rate, and still behind on both
 rates, so it is not on the frontier either. What it does move is zpse's own
-frontier: at 2:1 it is the cheapest row the codec has, twice the default
-level's encode rate for a third more decode rate and 1% less output. So on
+frontier: at 2:1 it is the fastest row the codec has, half again the default
+level's encode rate for a fifth more decode rate and 1.5% less output. So on
 this corpus the frontier claim is level 1 only, and the honest summary of the
 rest is a ratio advantage that no other tool matches at any rate. `ZPSE_LEVELS="1 3 5 6
 9 F"` reproduces the table, `F` being `ZPSE_ENC_LZ_FAST`.
