@@ -769,8 +769,9 @@ A block is written in one of five forms, and the block flags say which: the
 tile form above (every form flag clear), a verbatim copy (`ZPSE_B_RAW`),
 intra-block LZ (`ZPSE_B_LZ`), **LZ over the tile body** (`ZPSE_B_LZ_TILE`), or
 the **fast LZ form** (`ZPSE_B_LZ2`) -- the same literal-and-command shape with
-a fixed 16-bit distance and no lookahead, no backward walk and no distance
-cache, which is what lz4 writes and why its decoder is a tight loop. MAX
+a fixed 16-bit distance, a four-entry repeat distance coded in one byte, no
+lookahead and no distance varint, which is what lz4 writes and why its decoder
+is a tight loop. MAX
 offers it as a last candidate, after the LZ-over-tiles stage: a fixed-width
 distance can beat the first form's variable-length codes when matches are
 short and far (a 300-byte period codes to 23,318 bytes against 23,449), and it
@@ -1201,19 +1202,19 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.85 GB/s | 3.35 GB/s |
-| mozilla | 51,220,480 | 2.01 | 0.32 GB/s | 1.31 GB/s |
-| mr | 9,970,564 | 2.48 | 0.24 GB/s | 1.39 GB/s |
-| nci | 33,553,445 | 5.34 | 0.56 GB/s | 1.60 GB/s |
+| dickens | 10,192,446 | 1.16 | 0.82 GB/s | 3.45 GB/s |
+| mozilla | 51,220,480 | 2.01 | 0.33 GB/s | 1.28 GB/s |
+| mr | 9,970,564 | 2.48 | 0.24 GB/s | 1.24 GB/s |
+| nci | 33,553,445 | 5.34 | 0.55 GB/s | 1.80 GB/s |
 | ooffice | 6,152,192 | 1.48 | 0.26 GB/s | 1.22 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.63 GB/s | 4.13 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.30 GB/s | 1.06 GB/s |
-| samba | 21,606,400 | 2.55 | 0.39 GB/s | 1.66 GB/s |
-| sao | 7,251,944 | 1.01 | 1.22 GB/s | 8.30 GB/s |
-| webster | 41,458,703 | 1.95 | 0.29 GB/s | 1.19 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.41 GB/s | 3.09 GB/s |
-| xml | 5,345,280 | 3.94 | 0.54 GB/s | 1.55 GB/s |
-| **total** | **211,938,580** | **2.03** | **0.37 GB/s** | **1.52 GB/s** |
+| osdb | 10,085,684 | 1.13 | 0.67 GB/s | 4.88 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.31 GB/s | 1.09 GB/s |
+| samba | 21,606,400 | 2.55 | 0.40 GB/s | 1.59 GB/s |
+| sao | 7,251,944 | 1.01 | 1.19 GB/s | 11.69 GB/s |
+| webster | 41,458,703 | 1.95 | 0.30 GB/s | 1.19 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.38 GB/s | 3.07 GB/s |
+| xml | 5,345,280 | 3.94 | 0.57 GB/s | 1.89 GB/s |
+| **total** | **211,938,580** | **2.03** | **0.38 GB/s** | **1.54 GB/s** |
 
 `zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
 of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the

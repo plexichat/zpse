@@ -206,6 +206,10 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     while (pos <= limit) {
         uint32_t cand = tab[h];
         uint32_t len = ZPSE_LZ2_MIN_MATCH;
+        /* The match's own start: the walk below moves these instead of the
+         * scanning cursor (see there). */
+        uint32_t mpos = pos;
+        uint32_t mcand = cand;
 
         tab[h] = (uint16_t)pos;
         if (__builtin_expect(cand == LZ2_EMPTY ||
@@ -222,9 +226,35 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             h = lz2_hash(cur, hash_bits);
             continue;
         }
+        /* Extend backward into the pending literals: an earlier start is a
+         * longer match for the same four bytes, and the run in front of it is
+         * that many bytes shorter. That walk is where the token form earns
+         * most of its size over this one, because it has always done it.
+         *
+         * It moves `mpos`/`mcand`, NOT the scanning cursor. `pos` was written
+         * into the table above and every position the literal scan probed on
+         * the way here is in it too; moving the cursor back over those would
+         * leave entries AHEAD of it, and the first iteration that read one
+         * would subtract to an enormous distance and desync the stream --
+         * which is exactly how the first version of this broke dickens at
+         * byte 2354 of a 3 KiB block. Coding the match from a copy cannot:
+         * the entries stay behind the end of the match, `mpos + len`, which
+         * is at least `pos + 4` because the walk only steps over bytes that
+         * already compare equal.
+         *
+         * The `mpos > anchor` bound is what keeps it honest: the walk can
+         * only take bytes this block has not coded yet, so the decoder never
+         * sees a match that starts before the last one ended. `len` below is
+         * measured from the new start, so the walked bytes are bytes the
+         * match now covers rather than bytes it has to give back, and
+         * `mcand > 0` keeps the reference inside the block. */
+        while (mpos > anchor && mcand > 0u && in[mpos - 1u] == in[mcand - 1u]) {
+            mpos--;
+            mcand--;
+        }
         /* Extend forward one eight-byte xor at a time. This is the only work
-         * a match does: no lookahead at pos+1, no walk back into the pending
-         * literals, and no distance cache to update.
+         * a match does: no lookahead at pos+1, no distance cache to update
+         * beyond the one byte the command carries.
          *
          * The xor is the length as well as the test: its lowest set bit is
          * the first byte that differs, so one pair of loads answers both "is
@@ -243,9 +273,9 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         {
             int tail = 0;
 
-            while (pos + len + 8u <= n) {
-                uint64_t x = lz2_load64(in + pos + len) ^
-                             lz2_load64(in + cand + len);
+            while (mpos + len + 8u <= n) {
+                uint64_t x = lz2_load64(in + mpos + len) ^
+                             lz2_load64(in + mcand + len);
 
                 if (x != 0u) {
                     len += zpse_ctz64(x) >> 3;
@@ -258,15 +288,15 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
              * readable there and the length has to be counted one at a
              * time. */
             if (tail == 0) {
-                while (pos + len < n && in[pos + len] == in[cand + len]) {
+                while (mpos + len < n && in[mpos + len] == in[mcand + len]) {
                     len++;
                 }
             }
         }
         {
-            uint32_t run = pos - anchor;
+            uint32_t run = mpos - anchor;
             const uint8_t *ls = in + anchor;
-            uint32_t off = pos - cand;
+            uint32_t off = mpos - mcand;
             uint32_t ridx = lz2_rep_index(rep, off);
             uint32_t rem = len;
 
@@ -363,7 +393,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 return 0u;
             }
         }
-        pos += len;
+        pos = mpos + len;
         anchor = pos;
         misses = 0u;
         if (pos + ZPSE_LZ2_MIN_MATCH > n) {
