@@ -23,8 +23,9 @@
  * this decoder a third of its rate: the four codes sit at the top of the
  * first distance byte, so the test is one compare against 0xFC and there is
  * no loop to run. That is the size the token form's cache buys, for a branch
- * instead of a parse -- and this form is now the finder at every level from
- * 5 up, so its decode rate is the default level's decode rate.
+ * instead of a parse -- and this form writes the blocks whose head it codes
+ * smaller than the token form does (see zpse_lz_pick_fast in src/block.c),
+ * so on prose its decode rate is the default level's decode rate.
  *
  * Payload layout, after the 32-byte block header:
  *

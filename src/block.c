@@ -2218,6 +2218,63 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return PSE_OK;
 }
 
+/* ---- Which of the two LZ forms writes the block --------------------- *
+ *
+ * The two forms are priced against each other on the head of the block and
+ * the smaller one's finder runs over the whole block. One pass, as before:
+ * what the second form costs is a sample, and what it buys is the choice --
+ * the fast form codes prose smaller than the token form on the twelve
+ * Silesia files and decodes it substantially faster, while the token form
+ * wins the blocks where matches are short and far (its 7-bit distance codes
+ * beat a fixed 16-bit field there) and is the form that already held that
+ * ground.
+ *
+ * The sample is four kilobytes, and that is a measurement: at one kilobyte
+ * the finder has not found its stride yet, and on sparse_mix the sample
+ * preferred the fast form on a block whose stream the token form codes 246
+ * bytes smaller -- which made level 7 write 8687 where the balanced level
+ * writes 8520, the ordering tests/suites/test_levels.c pins. At four the
+ * ladder holds over the whole corpus and the choice is the one the block's
+ * own pass would have made.
+ *
+ * The verdict is a function of those bytes alone, so every level makes the
+ * same choice on the same block -- which is what keeps the ladder's ordering
+ * (tests/suites/test_levels.c) a property of the screens and the win rule
+ * rather than of which form happened to win.
+ *
+ * This is deliberately not the earlier experiment of swapping the fast form
+ * in as the finder outright: that one made the deeper levels write LARGER
+ * blocks than the balanced level on sparse_mix (8687 against 8520), because
+ * a stream that is smaller on a block the screen convicts is not smaller on
+ * every block. Choosing per block keeps whichever form is smaller on the
+ * block in hand. */
+#ifndef ZPSE_LZ_PICK_BYTES
+#define ZPSE_LZ_PICK_BYTES 4096u
+#endif
+/* A sample of the token form is at most one literal per byte, five commands
+ * of two bytes for the escapes and the payload's two header words. */
+#define ZPSE_LZ_PICK_CAP   (ZPSE_LZ_PICK_BYTES + 128u)
+
+static int zpse_lz_pick_fast(ZpseEncoder *e, const uint8_t *in, uint32_t n)
+{
+    uint8_t t[ZPSE_LZ_PICK_CAP];
+    uint8_t f[ZPSE_LZ_PICK_CAP];
+    uint32_t sn = n < (uint32_t)ZPSE_LZ_PICK_BYTES
+                      ? n
+                      : (uint32_t)ZPSE_LZ_PICK_BYTES;
+    uint32_t st;
+    uint32_t sf;
+
+    st = zpse_lz_encode(in, sn, t, (uint32_t)sizeof t, e->lz,
+                        (uint32_t)ZPSE_LZ_HASH_BITS);
+    sf = zpse_lz2_encode(in, sn, f, (uint32_t)sizeof f, e->lz,
+                         (uint32_t)ZPSE_LZ_HASH_BITS);
+    if (st == 0u || sf == 0u) {
+        return 0;
+    }
+    return sf < st;
+}
+
 /* The match-finder candidate: the token form.
  *
  * The fast form was tried here and reverted, and the measurement is why.
@@ -2252,6 +2309,13 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ_MIN_PAYLOAD) {
         return PSE_OUTPUT_OVERFLOW;
+    }
+    /* Whichever form codes the head of this block smaller writes all of it.
+     * See zpse_lz_pick_fast for what the sample decides and why the choice
+     * is per block instead of per level. */
+    if (n > ZPSE_LZ_MIN_MATCH + 1u && zpse_lz_pick_fast(e, in, n)) {
+        return zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, dst, cap,
+                                  total_out, cmds_out);
     }
     payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
                              cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
