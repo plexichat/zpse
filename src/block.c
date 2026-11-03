@@ -2193,6 +2193,17 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u) {
             tab = e->cand;
             hb = 16u;
+        } else if (dst != e->cand) {
+            /* The caller is holding the candidate staging for something
+             * else, so its 64 KiB are free: 2^15 entries instead of 2^13.
+             * The bigger table is both faster and smaller -- 128 KiB still
+             * fits L2 while 16 KiB of it does not fit L1 beside a 64 KiB
+             * block streaming past, and it misses less -- which is the same
+             * measurement that made the F form use it. Only the gated path
+             * reaches this: the sweep's candidates all write into e->cand.
+             */
+            tab = e->cand;
+            hb = 15u;
         }
         payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
                                   cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
