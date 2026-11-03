@@ -2220,64 +2220,42 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
 /* ---- Which of the two LZ forms writes the block --------------------- *
  *
- * The two forms are priced against each other on the head of the block and
- * the smaller one's finder runs over the whole block. One pass, as before:
- * what the second form costs is a sample, and what it buys is the choice --
- * the fast form codes prose smaller than the token form on the twelve
- * Silesia files and decodes it substantially faster, while the token form
- * wins the blocks where matches are short and far (its 7-bit distance codes
- * beat a fixed 16-bit field there) and is the form that already held that
- * ground.
+ * The ASCII gate has already answered this by the time the finder runs. A
+ * block it convicts is one whose tiles lose to the seven-bit pack, which is
+ * text, and text is the shape the fast form was built for: matches of five
+ * or six bytes at a fresh distance are cheaper as a fixed 16-bit field plus
+ * a one-byte repeat code than as the token form's 7-bit varints, which is
+ * why it codes prose smaller AND decodes it at roughly twice the rate.
+ * Everywhere else the token form keeps the ground it held -- on the blocks
+ * where matches are short and far its codes are the cheaper ones, and on
+ * sparse_mix it codes 8441 bytes where the fast form writes 8687.
  *
- * The sample is four kilobytes, and that is a measurement: at one kilobyte
- * the finder has not found its stride yet, and on sparse_mix the sample
- * preferred the fast form on a block whose stream the token form codes 246
- * bytes smaller -- which made level 7 write 8687 where the balanced level
- * writes 8520, the ordering tests/suites/test_levels.c pins. At four the
- * ladder holds over the whole corpus and the choice is the one the block's
- * own pass would have made.
+ * The first version of this priced the two forms against each other on a
+ * four-kilobyte head sample instead, and the measurement is why it is not
+ * that. The sample alone cost 7.3% of the default level's encode rate (369.0
+ * to 341.9 MB/s over five Silesia files, best of two, one pinned core),
+ * because it runs on every block that reaches the finder -- and it still
+ * chose the token form on blocks the fast form codes smaller. The gate is
+ * free, the block having paid for it already, and on the same five files it
+ * wrote 61,923,050 bytes against the sample's 62,538,610, at 366.5 MB/s
+ * against 347.9, decoding at 1739.6 MB/s against 1514.7. The two tests agree
+ * on almost every block; where they disagree the gate is right more often,
+ * and it costs nothing.
  *
- * The verdict is a function of those bytes alone, so every level makes the
- * same choice on the same block -- which is what keeps the ladder's ordering
- * (tests/suites/test_levels.c) a property of the screens and the win rule
- * rather than of which form happened to win.
- *
- * This is deliberately not the earlier experiment of swapping the fast form
- * in as the finder outright: that one made the deeper levels write LARGER
- * blocks than the balanced level on sparse_mix (8687 against 8520), because
- * a stream that is smaller on a block the screen convicts is not smaller on
- * every block. Choosing per block keeps whichever form is smaller on the
- * block in hand. */
-#ifndef ZPSE_LZ_PICK_BYTES
-#define ZPSE_LZ_PICK_BYTES 4096u
-#endif
-/* A sample of the token form is at most one literal per byte, five commands
- * of two bytes for the escapes and the payload's two header words. */
-#define ZPSE_LZ_PICK_CAP   (ZPSE_LZ_PICK_BYTES + 128u)
-
-static int zpse_lz_pick_fast(ZpseEncoder *e, const uint8_t *in, uint32_t n)
-{
-    uint8_t t[ZPSE_LZ_PICK_CAP];
-    uint8_t f[ZPSE_LZ_PICK_CAP];
-    uint32_t sn = n < (uint32_t)ZPSE_LZ_PICK_BYTES
-                      ? n
-                      : (uint32_t)ZPSE_LZ_PICK_BYTES;
-    uint32_t st;
-    uint32_t sf;
-
-    st = zpse_lz_encode(in, sn, t, (uint32_t)sizeof t, e->lz,
-                        (uint32_t)ZPSE_LZ_HASH_BITS);
-    sf = zpse_lz2_encode(in, sn, f, (uint32_t)sizeof f, e->lz,
-                         (uint32_t)ZPSE_LZ_HASH_BITS);
-    if (st == 0u || sf == 0u) {
-        return 0;
-    }
-    return sf < st;
-}
+ * The verdict is level-independent -- the gate reads the block, not the
+ * ladder -- so every level makes the same choice on the same block, which is
+ * what keeps the ladder's ordering (tests/suites/test_levels.c) a property
+ * of the screens and the win rule rather than of which form happened to win.
+ * That is also why this is not the earlier experiment of swapping the fast
+ * form in as the finder outright: that one made the deeper levels write
+ * LARGER blocks than the balanced level on sparse_mix (8687 against 8520),
+ * because a stream that is smaller on one block is not smaller on every one.
+ */
 
 /* The match-finder candidate: the token form.
  *
- * The fast form was tried here and reverted, and the measurement is why.
+ * The fast form was tried here in its place and reverted, and the measurement
+ * is why.
  * Swapped in -- with its backward walk and its lazy probe -- it codes the
  * twelve Silesia files 3.0% smaller than the token form does at the 13-bit
  * table this path is restricted to, and the default level goes from
@@ -2310,10 +2288,9 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ_MIN_PAYLOAD) {
         return PSE_OUTPUT_OVERFLOW;
     }
-    /* Whichever form codes the head of this block smaller writes all of it.
-     * See zpse_lz_pick_fast for what the sample decides and why the choice
-     * is per block instead of per level. */
-    if (n > ZPSE_LZ_MIN_MATCH + 1u && zpse_lz_pick_fast(e, in, n)) {
+    /* The gate's verdict chooses the form: a text block is written by the
+     * fast one, everything else by this one. See the measurement above. */
+    if (n > ZPSE_LZ_MIN_MATCH + 1u && e->ascii_gate != 0u) {
         return zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, dst, cap,
                                   total_out, cmds_out);
     }
