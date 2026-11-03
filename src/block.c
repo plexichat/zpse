@@ -2056,6 +2056,16 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (sn < ZPSE_LZ_MIN_MATCH + 1u) {
         return 1;
     }
+    /* Priced with the token form, deliberately, even though the pass below
+     * writes the fast one. The thresholds this verdict is compared against
+     * (ZPSE_LZ_SCREEN_DEN, the slack ratio, the samples the ladder adds)
+     * were swept with these estimates, and the fast form codes the same
+     * sample smaller, which moves every verdict toward "run the finder" --
+     * measured as a level ladder that no longer holds: on sparse_mix the
+     * balanced level wrote 8520 bytes and the deeper one 8687, because the
+     * deeper screen accepted a block whose finder stream the tiles beat.
+     * Keeping the token form here keeps every verdict where it was, so the
+     * only thing the swap changes is the stream the finder writes. */
     lz_s = zpse_lz_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
                           lvl == 1u
                               ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
@@ -2208,6 +2218,25 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return PSE_OK;
 }
 
+/* The match-finder candidate: the token form.
+ *
+ * The fast form was tried here and reverted, and the measurement is why.
+ * Swapped in -- with its backward walk and its lazy probe -- it codes the
+ * twelve Silesia files 3.0% smaller than the token form does at the 13-bit
+ * table this path is restricted to, and the default level goes from
+ * 104,474,009 bytes to 102,102,403 at the same encode rate. What it also does
+ * is write a LARGER block than the token form on the sparse columnar cases:
+ * sparse_mix costs 8687 bytes from the fast form and 8441 from the token one,
+ * and because levels 7-9 take this pass's stream without a trial (see the
+ * early finder in zpse_block_encode), the deeper levels then wrote more than
+ * the shallower ones -- 8687 against the balanced level's 8520, which is the
+ * ordering tests/suites/test_levels.c pins and the reason the swap is not
+ * shipped. The fast form is still offered where nothing is skipped by taking
+ * it: the last candidate at MAX, competing on size alone.
+ *
+ * The table is e->lz and not e->cand on purpose: this runs inside the sweep,
+ * where e->cand and e->best are the encoder's own staging (see
+ * zpse_block_try_lz2). */
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
                              uint8_t *dst, uint32_t cap, uint32_t *total_out,
@@ -2232,13 +2261,9 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }
-    /* The stream's own layout gives the command count for free: a four-byte
-     * literal total, the literals padded to a word, then commands to the
-     * end of the payload. */
+    /* The payload header carries the count: the token stream is variable
+     * length, so the payload length does not divide into commands. */
     if (cmds_out != 0) {
-        /* The payload header carries the count: the token stream is
-         * variable length, so the payload length no longer divides into
-         * commands. */
         *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
     }
     total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
@@ -3975,8 +4000,12 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     /* ---- The fast LZ form, priced last ------------------------------ *
      *
      * Same envelope and same screen as the form above, a different command
-     * encoding: fixed 16-bit distances, no lookahead, no backward walk, no
-     * repeat cache. It is not always the loser against the other form -- a
+     * encoding: fixed 16-bit distances with a one-byte repeat code for the
+     * four most recent, a backward walk into the pending literals and a lazy
+     * probe at the next position (all three added since this form was first
+     * priced against the token one -- without them it was 2.9% of the corpus
+     * worse, with them it is 4.8% better on the same finder passes). It is not
+     * always the loser against the other form -- a
      * fixed-width distance is cheaper than that one's codes when matches are
      * short and far -- so it is offered as a candidate and kept only when its
      * total is strictly smaller. The size corpus measures that: 577 of its

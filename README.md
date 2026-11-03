@@ -849,14 +849,18 @@ caller's page faults:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.18:1 | 0.24 GB/s | 1.31 GB/s | 97,027,616 |
-| level 6 (default) | 2.03:1 | 0.37 GB/s | 1.52 GB/s | 104,474,009 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.06:1 | 0.60 GB/s | 2.23 GB/s | 103,022,280 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.23:1 | 0.23 GB/s | 1.58 GB/s | 95,083,328 |
+| level 6 (default) | 2.03:1 | 0.36 GB/s | 1.49 GB/s | 104,474,009 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.19:1 | 0.42 GB/s | 1.99 GB/s | 96,661,814 |
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default
-level as well as about half again as fast (103,022,280 against
-104,474,009). That is the
+level as well as about half again as fast (96,661,814 against
+104,474,009). It is also the deepest rung's equal on ratio and three times
+its encode (2.19:1 against 2.23:1, 418 against 235 MB/s), which is what the
+lazy probe bought: the form looks one position ahead and gives up a short
+match for a longer one that starts a byte later, and over the corpus that is
+4.8% of the payload for 4% of the finder's rate. That is the
 match table below: the fast path is the only shape that never touches the
 encoder's 128 KiB of candidate staging, so the table lives there. On the prose
 files it is still a real trade, because that is where the tile model has

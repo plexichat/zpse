@@ -873,7 +873,8 @@ static void emitter_block(uint32_t n, uint8_t v)
      * branch pins the exact arithmetic as before. The v2 LZ+tiles form is
      * the same kind of win one stage further on -- it compresses the tile
      * body itself -- so it is held to the same bound. */
-    if ((comp[3] & (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
+    if ((comp[3] & (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) !=
+        0) {
         CHECK(clen < 32u + 8u + 16u + 10u * ((n + 255u) / 256u),
               "block: a compressed form beats the tiles on a constant block");
     } else {

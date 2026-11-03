@@ -32,6 +32,23 @@
 #define ZPSE_LZ2_SKIP_BITS 5u
 #endif
 
+/* Lazy matching: the longest match the finder will still spend a second
+ * probe on to see whether the next byte starts a longer one. 4 disables the
+ * probe (the match is at least four bytes, so nothing passes the test).
+ *
+ * This is what closes the size gap to the token form, which has always
+ * looked ahead: a match that starts one byte later and runs longer is worth
+ * more than the one in hand, because the byte given up becomes the first
+ * byte of the next literal run rather than a byte of the match. Past a few
+ * dozen bytes the probe almost never pays -- a long match at one position
+ * is a long match at the next -- so the ceiling keeps the cost on the short
+ * matches where the decision actually differs, which are also the ones the
+ * probe can settle with a single xor. A parameter so the trade can be
+ * measured; see the README for the sweep that chose the value. */
+#ifndef ZPSE_LZ2_LAZY_MAX
+#define ZPSE_LZ2_LAZY_MAX 24u
+#endif
+
 static uint32_t lz2_hash(uint32_t v, uint32_t hash_bits)
 {
     /* One multiply at the cursor, top bits kept: the four-byte compare at the
@@ -171,6 +188,27 @@ static int lz2_put(uint8_t *dst, uint32_t cap, uint32_t *out,
     return 1;
 }
 
+/* Forward extension for the lazy probe only: the main loop's copy is inline
+ * because it runs at every match, and this one runs once per candidate the
+ * probe asks about. Same shape, so a length means the same thing on both
+ * sides of the decision. */
+static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
+                           uint32_t b, uint32_t len)
+{
+    while (a + len + 8u <= n) {
+        uint64_t x = lz2_load64(in + a + len) ^ lz2_load64(in + b + len);
+
+        if (x != 0u) {
+            return len + (zpse_ctz64(x) >> 3);
+        }
+        len += 8u;
+    }
+    while (a + len < n && in[a + len] == in[b + len]) {
+        len++;
+    }
+    return len;
+}
+
 /* Tagged with the rest of the hot set: this finder is the whole of the F
  * form's encode, and it was the one kernel in the tree left at the build's
  * own level. */
@@ -291,6 +329,48 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 while (mpos + len < n && in[mpos + len] == in[mcand + len]) {
                     len++;
                 }
+            }
+        }
+        /* Lazy matching, against the entry at the next position rather than
+         * a fresh probe of the whole table: the candidate that hashes to the
+         * position one byte on is the one a match there would use, so one
+         * load, one compare and one xor settle whether this match is the one
+         * to code. If the next position's is strictly longer, the byte at
+         * `mpos` becomes a literal -- the cursor steps over it and the next
+         * command's literal run picks it up, which is why nothing has to be
+         * written here -- and the loop re-finds the longer match at its own
+         * position, where it walks back into that run like any other.
+         *
+         * `c1 <= mpos` keeps the reference behind the new cursor: the entry
+         * read is whatever the block coded before, never the position being
+         * filed (this function writes `tab[h] = pos` at the loop top, and
+         * `pos + 1` is not written until the next iteration files it).
+         *
+         * `mpos == pos` is the other half of that guarantee, and the one
+         * that costs a stream when it is missing. The backward walk above
+         * can start the match BEHIND the scanning cursor, and stepping to
+         * `mpos + 1` would then move the cursor backwards, into positions
+         * the literal scan has already filed: the next candidate read from
+         * one of them sits ahead of the cursor, `pos - cand` underflows to a
+         * sixty-thousand-byte distance, and the block no longer decodes
+         * (mozilla, block 590, first bad byte 918 -- the first version of
+         * this had no guard). A walked-back match is already the better
+         * match, so there is nothing to look ahead for: the probe only runs
+         * when the match starts where the cursor is. */
+        if (mpos == pos && len <= (uint32_t)ZPSE_LZ2_LAZY_MAX &&
+            mpos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
+            uint32_t cur1 = zpse_load_u32le(in + mpos + 1u);
+            uint32_t h1 = lz2_hash(cur1, hash_bits);
+            uint32_t c1 = tab[h1];
+
+            if (c1 != LZ2_EMPTY && c1 <= mpos &&
+                zpse_load_u32le(in + c1) == cur1 &&
+                lz2_extend(in, n, mpos + 1u, c1, ZPSE_LZ2_MIN_MATCH) > len) {
+                pos = mpos + 1u;
+                misses = 0u;
+                cur = cur1;
+                h = h1;
+                continue;
             }
         }
         {
