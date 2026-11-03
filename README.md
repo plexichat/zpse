@@ -1206,28 +1206,35 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.16 | 0.82 GB/s | 3.45 GB/s |
-| mozilla | 51,220,480 | 2.01 | 0.33 GB/s | 1.28 GB/s |
-| mr | 9,970,564 | 2.48 | 0.24 GB/s | 1.24 GB/s |
-| nci | 33,553,445 | 5.34 | 0.55 GB/s | 1.80 GB/s |
-| ooffice | 6,152,192 | 1.48 | 0.26 GB/s | 1.22 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.67 GB/s | 4.88 GB/s |
-| reymont | 6,627,202 | 1.87 | 0.31 GB/s | 1.09 GB/s |
-| samba | 21,606,400 | 2.55 | 0.40 GB/s | 1.59 GB/s |
-| sao | 7,251,944 | 1.01 | 1.19 GB/s | 11.69 GB/s |
-| webster | 41,458,703 | 1.95 | 0.30 GB/s | 1.19 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.38 GB/s | 3.07 GB/s |
-| xml | 5,345,280 | 3.94 | 0.57 GB/s | 1.89 GB/s |
-| **total** | **211,938,580** | **2.03** | **0.38 GB/s** | **1.54 GB/s** |
+| dickens | 10,192,446 | 1.16 | 0.85 GB/s | 3.86 GB/s |
+| mozilla | 51,220,480 | 2.01 | 0.30 GB/s | 1.39 GB/s |
+| mr | 9,970,564 | 2.48 | 0.24 GB/s | 1.37 GB/s |
+| nci | 33,553,445 | 5.56 | 0.50 GB/s | 2.06 GB/s |
+| ooffice | 6,152,192 | 1.48 | 0.25 GB/s | 1.29 GB/s |
+| osdb | 10,085,684 | 1.13 | 0.65 GB/s | 5.29 GB/s |
+| reymont | 6,627,202 | 1.87 | 0.27 GB/s | 1.04 GB/s |
+| samba | 21,606,400 | 2.56 | 0.37 GB/s | 1.61 GB/s |
+| sao | 7,251,944 | 1.01 | 1.17 GB/s | 11.43 GB/s |
+| webster | 41,458,703 | 1.98 | 0.26 GB/s | 1.31 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 3.01 GB/s |
+| xml | 5,345,280 | 4.11 | 0.42 GB/s | 1.94 GB/s |
+| **total** | **211,938,580** | **2.04** | **0.34 GB/s** | **1.66 GB/s** |
 
 `zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
 of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
 corpus from 106,140,388 to 103,921,535 bytes, which cost ~6% of encode and
 bought ~8% of decode (the tile bodies it compresses are shorter than the plain
-LZ streams they replace, so the command loop runs over fewer bytes). The
-`sao` row is the raw fallback doing its job at copy speed, and `osdb` is close
-behind it. The prose rows are the ones the token form moved: `dickens` from
-1.09 to 1.16 and `webster` from 1.50 to 1.95 at the default, and the pair at
+LZ streams they replace, so the command loop runs over fewer bytes). The two
+LZ forms then halve the byte they each write: a block's own head sample picks
+between them, so prose is written by the fast form (smaller on it, and its
+command loop decodes at roughly twice the token form's rate) and the blocks
+where matches are short and far keep the token form. Paired against the build
+before it, on this corpus: 103,921,535 to 103,735,544 bytes, decode 1,499.9 to
+1,663.5 MB/s, encode 357.8 to 343.1 MB/s -- the sample is twice a block's
+head, so the rungs that run a match finder pay about 4% of encode for it.
+The `sao` row is the raw fallback doing its job at copy speed, and `osdb` is
+close behind it. The prose rows are the ones the finder moved: `dickens` from
+1.09 to 1.16, `webster` from 1.50 to 1.98 at the default, and the pair at
 1.87 together at MAX. `dickens` is the one file the default still refuses the
 LZ form on -- the screen margin that would take it is level 7's.
 
