@@ -1346,31 +1346,28 @@ frontier rule:
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 4.36:1 | 0.60 GB/s | 0.92 GB/s | no |
-| zpse 5 BALANCED | 5.65:1 | 0.41 GB/s | 0.87 GB/s | no |
-| zpse 6 (default) | 5.66:1 | 0.41 GB/s | 0.89 GB/s | **yes** |
-| zpse 9 MAX | 5.66:1 | 0.41 GB/s | 0.89 GB/s | **yes** |
-| lz4 -1 | 3.29:1 | 1.01 GB/s | 1.18 GB/s | yes |
-| lz4 -3 | 3.54:1 | 0.45 GB/s | 1.09 GB/s | no |
-| lz4 -9 | 3.61:1 | 0.34 GB/s | 1.05 GB/s | no |
-| zstd -1 | 4.78:1 | 0.68 GB/s | 1.33 GB/s | yes |
-| zstd -3 | 4.91:1 | 0.46 GB/s | 1.50 GB/s | yes |
-| zstd -19 | 5.71:1 | 0.006 GB/s | 1.23 GB/s | yes |
+| zpse 1 FASTEST | 4.35:1 | 1.00 GB/s | 3.73 GB/s | **yes** |
+| zpse 5 BALANCED | 5.69:1 | 0.71 GB/s | 3.71 GB/s | no |
+| zpse 6 (default) | 5.69:1 | 0.74 GB/s | 3.71 GB/s | **yes** |
+| zpse 9 MAX | 5.70:1 | 0.67 GB/s | 3.63 GB/s | **yes** |
+| lz4 -1 | 3.29:1 | 0.90 GB/s | 1.46 GB/s | no |
+| lz4 -3 | 3.54:1 | 0.17 GB/s | 1.41 GB/s | no |
+| lz4 -9 | 3.61:1 | 0.09 GB/s | 1.40 GB/s | no |
+| zstd -1 | 4.78:1 | 0.42 GB/s | 1.30 GB/s | no |
+| zstd -3 | 4.91:1 | 0.32 GB/s | 1.43 GB/s | no |
+| zstd -19 | 5.71:1 | 0.005 GB/s | 1.22 GB/s | **yes** |
 
-This is the one corpus where zpse is on the frontier, at two levels: 5.66:1 at
-0.41 GB/s in and 0.89 GB/s out. `zstd -3` reaches 4.91:1 at a similar encode
-rate, so the default trades 10% of rate for 15% of size against it and comes
-out ahead; nothing else is at 5.66:1 at any rate. `lz4 -1` is on the frontier
-too, but for a different trade -- 3.29:1, which is 42% larger than the default
--- so the two do not compete for the same row. Level 5 is *below* level 6 on
-both ratio and rate here, which is why it is marked off the frontier: on this
-corpus the level ladder's extra trial buys its keep.
-
-The gap to `zstd -3` is on the decode side rather than at either end: 0.89
-against 1.50 GB/s at the same size, which is the per-command decode cost the
-Silesia section measures. The corpus is `tests/corpus/corpus_write.c`'s output
-(17 cases at 4 MiB, 71,303,168 bytes) passed to `bench_pareto.sh` as a directory,
-which is how the 25-case columnar corpus is meant to be measured.
+This is the one corpus where zpse is on the frontier, and it is there at three
+levels: 5.69:1 at 0.74 GB/s in and 3.71 GB/s out. Decode is where that came
+from -- every level now reads 3.6 to 3.7 GB/s here, 2.5x `lz4 -1`'s 1.46 and
+2.6x `zstd -3`'s 1.43, while the tools it beats on rate pack to 3.29:1 and
+4.91:1. Encode at the default is 0.74 GB/s against `lz4 -1`'s 0.90, and lz4
+pays for that last 20% with a ratio 42% larger; the only competitor at the
+default's size is `zstd -19`, which needs 0.005 GB/s to get there. `lz4 -1`
+is off the frontier now: level 1 encodes at 1.00 GB/s, faster than lz4 does on
+the same bytes, at 4.35:1 against 3.29, and decodes over twice as fast. Level
+5 is marked off for the narrower reason that level 6 beats it on both ratio and
+rate -- the ladder's extra trial buys its keep on this corpus.
 
 One check on that claim belongs here, because it is the difference between a
 corpus and a format. A *real* table export in CSV form is not typed columns:
