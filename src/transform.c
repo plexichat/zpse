@@ -816,10 +816,12 @@ static ZPSE_T_AVX2 void zpse_delta16_inverse_avx2(const uint8_t *const segs[16],
     *g = q;
 }
 
-#endif /* ZPSE_T_HAVE_AVX2 */
-
 /* The 32-byte form of the in-place chain, and the one the widths 2, 4, 8 and
- * 16 encode paths take when AVX2 is present.
+ * 16 encode paths take when AVX2 is present. Guarded with the block above and
+ * not beside it: the intrinsic declarations come from the <immintrin.h> that
+ * only a build keeping the 256-bit kernels includes, so a build that gates
+ * them out (MinGW, or -DZPSE_AVX2_ABI_OK=0) has no `__m256i` at all and this
+ * body would not compile.
  *
  * A prefix sum over 64 bytes is six shift-add steps, but the byte that
  * crosses a 128-bit lane boundary is not one of them: `vpslldq` is lane-local,
@@ -879,6 +881,8 @@ static ZPSE_T_AVX2 void zpse_plane_chain32(uint8_t *p, uint32_t n,
         }
     }
 }
+
+#endif /* ZPSE_T_HAVE_AVX2 */
 
 /* In-place delta/xor over one contiguous plane: p[j] = p[j] - p[j-1]
  * (delta) or p[j] ^ p[j-1] (xor), with p[-1] == seed. The stride-16
