@@ -2285,7 +2285,8 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * zpse_block_try_lz2). */
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
-                             uint8_t *dst, uint32_t cap, uint32_t *total_out,
+                             uint8_t *dst, uint32_t cap, void *tab,
+                             uint32_t hb, uint32_t *total_out,
                              uint32_t *cmds_out)
 {
     ZpseBlockHeader h;
@@ -2305,11 +2306,22 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, dst, cap,
                                   total_out, cmds_out);
     }
+    /* The table is the caller's choice, because the caller is what knows
+     * which 64 KiB of staging this block has already spent. `tab`/`hb` name
+     * a buffer the CALLER has proved free at this point in the block's
+     * encode; the 16 KiB e->lz is the fallback for a caller that is inside
+     * the sweep, where cand and best are the trial's staging and the
+     * winner. See the call sites for which is which.
+     *
+     * A bigger table is both smaller and faster here for the reason the fast
+     * form's is: 16 KiB does not stay resident beside a 64 KiB block
+     * streaming past it, so the table pays L2 latency either way, and the
+     * bigger one misses less often. */
     payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, e->lz,
+                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
                              zpse_enc_speed(e->enc_flags) == 1u
                                  ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                 : (uint32_t)ZPSE_LZ_HASH_BITS);
+                                 : hb);
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }
@@ -3465,9 +3477,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #if defined(ZPSE_BLOCK_STATS)
                     uint64_t t_cyc = blk_rdtsc();
 #endif
+                    /* The finder writes e->best and a gated block never
+                     * runs the sweep, so e->cand is free for its table. */
                     rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
-                                           e->best, lz_cap, &lz_total,
-                                           &lz_cmds);
+                                           e->best, lz_cap, e->cand, 15u,
+                                           &lz_total, &lz_cmds);
 #if defined(ZPSE_BLOCK_STATS)
                     zpse_block_lz_passes++;
                     zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
@@ -3614,14 +3628,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             uint64_t t_cyc = blk_rdtsc();
 
             lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                    (uint32_t)ZPSE_E_SZ_CAND, &lz_total,
-                                    &lz_cmds);
+                                    (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
+                                    &lz_total, &lz_cmds);
             zpse_block_lz_passes++;
             zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
         }
 #else
         lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                (uint32_t)ZPSE_E_SZ_CAND, &lz_total, &lz_cmds);
+                                (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
+                                &lz_total, &lz_cmds);
 #endif
 
         /* ...and only when the block is not one the tiles own outright.
@@ -3963,7 +3978,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
             }
             rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                   lz_cap, &lz_total, &lz_cmds);
+                                   lz_cap, e->lz,
+                                   (uint32_t)ZPSE_LZ_HASH_BITS, &lz_total,
+                                   &lz_cmds);
             /* Smaller is not enough: the two forms decode at speeds that
              * have nothing to do with their ratio, so the win also has to be
              * big enough to pay for the decode it gives up and the command
