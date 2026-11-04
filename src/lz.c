@@ -315,8 +315,21 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < ZPSE_LZ_MIN_PAYLOAD) {
         return 0u;
     }
-    for (i = 0; i < entries; i++) {
-        tab[i] = (uint16_t)LZ_EMPTY;
+    /* Four entries per store. The loop this replaces was one 16-bit store per
+     * iteration, and at -O2 gcc does not vectorise it: 8192 iterations of
+     * store, increment, compare and branch, per block, on a table whose only
+     * purpose at that moment is to be overwritten. The table is 16 KiB and
+     * the pass around it reads it constantly, so the clear is paid every
+     * block of every file. */
+    {
+        uint64_t fill = UINT64_C(0xFFFFFFFFFFFFFFFF);
+
+        for (i = 0; i + 4u <= entries; i += 4u) {
+            memcpy(tab + i, &fill, 8u);
+        }
+        for (; i < entries; i++) {
+            tab[i] = (uint16_t)LZ_EMPTY;
+        }
     }
     o.dst = dst;
     o.cap = cap;
@@ -878,6 +891,16 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                         memcpy(op, op - (ptrdiff_t)off, 16u);
                     } else if (off >= 32u && mlen <= 32u && op_rem >= 32u) {
                         memcpy(op, op - (ptrdiff_t)off, 32u);
+                    } else if (off >= 8u && mlen <= 8u && op_rem >= 8u) {
+                        /* The short-distance match. All three of the tests
+                         * above are false for it (off is under sixteen, so
+                         * even the wide store's own guard could not have
+                         * run), and the copier reaches the same eight-byte
+                         * store through a call and its branch tree. One load
+                         * and one store here instead -- the shape that
+                         * dominates a tile body, where the LZ stream's
+                         * distances are the short ones of a record layout. */
+                        memcpy(op, op - (ptrdiff_t)off, 8u);
                     } else {
                         lz_copy_match(op, off, mlen, op_rem);
                     }

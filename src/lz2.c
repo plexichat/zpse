@@ -240,8 +240,18 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < ZPSE_LZ2_MIN_PAYLOAD) {
         return 0u;
     }
-    for (i = 0; i < entries; i++) {
-        tab[i] = (uint16_t)LZ2_EMPTY;
+    /* Four entries per store, for the same reason src/lz.c's clear has it:
+     * at -O2 the 16-bit fill is not vectorised, and this table is cleared
+     * once per block. */
+    {
+        uint64_t fill = UINT64_C(0xFFFFFFFFFFFFFFFF);
+
+        for (i = 0; i + 4u <= entries; i += 4u) {
+            memcpy(tab + i, &fill, 8u);
+        }
+        for (; i < entries; i++) {
+            tab[i] = (uint16_t)LZ2_EMPTY;
+        }
     }
     pos = 0u;
     anchor = 0u;
