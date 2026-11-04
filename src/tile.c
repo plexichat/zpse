@@ -4965,8 +4965,13 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
             ZPSE_CONST_STRIDE_LOOP(c);
         } else {
             uint32_t s = tile_stride_of(th.predictor_id);
-            int done = 0;
 #if ZPSE_TILE_HAVE_AVX2
+            /* `done` is declared only in a build that has the kernel it
+             * guards, so a build without AVX2 compiles the scalar chain below
+             * as a plain block: the only assignments to `j` are the ones it
+             * takes, and no compiler can see a path that reads `j` unset.
+             * (It did, from a build where `done` could only ever be zero.) */
+            int done = 0;
             if (s == 8u && (uint32_t)nt >= 32u &&
                 (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
                 /* Stride 8 is the 8-lane LANE_PREVIOUS recurrence with the
@@ -4985,8 +4990,9 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
                                     units, res_mode, el, el, 0u);
                 done = 1;
             }
+            if (!done)
 #endif
-            if (!done) {
+            {
                 if (s == 1u) {
                     /* One chain over the exceptions, then a vector fill:
                      * see tile_stride1_recon. */

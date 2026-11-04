@@ -41,6 +41,17 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
 int zpse_frame_index_count(const uint8_t *in, size_t in_len,
                            uint32_t *count_out);
 
+/* Validate a FrameIndex a sequential reader has already read out of the file
+ * at fh->frame_index_offset, against the blocks that reader walked: `count`
+ * entries, with offsets[k] and sizes[k] the file offset and compressed size of
+ * block k. The table has to describe exactly the stream that was decoded, and
+ * the blocks have to end where the table begins -- the same guarantee
+ * zpse_frame_decode makes before it returns, for a decoder that never holds
+ * the frame in memory. `idx` needs ZPSE_INDEX_HEADER_SIZE + 8 per entry. */
+int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
+                              size_t idx_len, uint32_t count,
+                              const uint32_t *offsets, const uint32_t *sizes);
+
 /* Decode exactly one block of a frame, using its FrameIndex. `output`
  * must hold that block's uncompressed size (at most 64 KiB); the frame
  * header's nominal_block_size bounds it, and the block's own header is

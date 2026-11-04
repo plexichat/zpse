@@ -798,6 +798,14 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     lit = tok >> 4;
                     dp = lp + 1u + lit;
                     b0 = (uint32_t)dp[0];
+                    /* The width of the distance is data, and the two forms
+                     * are nearly a coin toss on the binaries, so decoding
+                     * both and selecting measured WORSE than testing: on the
+                     * twelve-file corpus at the default level this form went
+                     * from 5.25 to 5.13 GB/s on dickens, 2.35 to 2.16 on
+                     * webster and 1.79 to 1.78 on nci, i.e. the mispredicted
+                     * branch is cheaper than the extra ALU work plus the
+                     * third-group test it would still need. */
                     if (b0 < 0x80u) {
                         v = b0;
                         dp += 1;

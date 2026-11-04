@@ -257,6 +257,63 @@ static void corrupt_cases(void)
                                      (size_t)count * ZPSE_INDEX_ENTRY_SIZE));
     }
 
+    /* The table is also validated against the blocks a sequential reader
+     * walks, which is what a decoder that never holds the frame in memory
+     * uses (the CLI's `zpse d` on an indexed frame). Same guarantees, from
+     * the bytes on disk instead of from a copy of the whole frame. */
+    {
+        ZpseFrameHeader fh;
+        uint8_t *idx;
+        uint32_t *offs;
+        uint32_t *lens;
+        uint32_t pos = (uint32_t)ZPSE_FRAME_HEADER_SIZE;
+        size_t idx_len;
+        uint32_t m;
+
+        offs = (uint32_t *)malloc(sizeof *offs * (size_t)count);
+        lens = (uint32_t *)malloc(sizeof *lens * (size_t)count);
+        CHECK(offs != 0 && lens != 0, "walker arrays");
+        CHECK(zpse_frame_header_read(&fh, comp) == PSE_OK, "walker header");
+        for (m = 0; m < count; m++) {
+            ZpseBlockHeader bh;
+
+            CHECK(zpse_block_header_parse(&bh, comp + pos,
+                                          (uint32_t)ZPSE_BLOCK_HEADER_SIZE) ==
+                      PSE_OK,
+                  "walker block %u header", m);
+            offs[m] = pos;
+            lens[m] = bh.compressed_block_size;
+            pos += bh.compressed_block_size;
+        }
+        CHECK(pos == frame_index_off, "blocks end at the table (%u/%u)", pos,
+              frame_index_off);
+        idx = comp + frame_index_off;
+        idx_len = (size_t)ZPSE_INDEX_HEADER_SIZE +
+                  (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
+        CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count, offs,
+                                        lens) == PSE_OK,
+              "index validates against the walk");
+        lens[count - 1u] += 1u;
+        CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count, offs,
+                                        lens) == PSE_BAD_HEADER,
+              "walked size mismatch refused");
+        lens[count - 1u] -= 1u;
+        offs[0] += 1u;
+        CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count, offs,
+                                        lens) == PSE_BAD_HEADER,
+              "walked offset mismatch refused");
+        offs[0] -= 1u;
+        CHECK(zpse_frame_index_validate(&fh, idx,
+                                        (size_t)ZPSE_INDEX_HEADER_SIZE, count,
+                                        offs, lens) == PSE_TRUNCATED,
+              "short table refused by the walker");
+        CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count - 1u, offs,
+                                        lens) == PSE_BAD_HEADER,
+              "walker count that disagrees with the frame refused");
+        free(offs);
+        free(lens);
+    }
+
     /* A corrupted entry table: the checksum is what catches this. */
     {
         uint8_t keep = comp[frame_index_off + ZPSE_INDEX_HEADER_SIZE + 2u];

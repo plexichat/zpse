@@ -325,12 +325,22 @@ static void free_arenas(void **a, unsigned threads)
  * the frame header, and a frame that carries no index is the only kind that
  * takes this path (see the caller).
  *
- * Returns 0 on success, 1 on any failure, matching write_file. */
+ * A frame that carries a FrameIndex takes this path too. The table rides
+ * behind the last block, so the walk never reads it as a block, and it is
+ * validated against the blocks the walk actually visited (see the tail of
+ * this function) instead of against a copy of the frame. That copy plus the
+ * whole output in one fresh allocation is what `-x` used to cost: on the
+ * 202 MiB corpus it measured 0.36 s against this path's 0.12 s, with the same
+ * bytes decoded either way.
+ *
+ * Returns 0 on success, 1 on any failure, matching write_file. A failure
+ * removes the partial output, because this path writes as it goes. */
 static int decode_stream(const char *in_path, const char *out_path,
-                         const ZpseFrameHeader *fh, void *dec_arena)
+                         const ZpseFrameHeader *fh, void *dec_arena,
+                         int indexed)
 {
-    FILE *f;
-    FILE *fi;
+    FILE *f = NULL;
+    FILE *fi = NULL;
     /* One block: its header, then its payload directly behind it. */
     uint8_t blk[ZPSE_BLOCK_HEADER_SIZE + ZPSE_MAX_BLOCK_SIZE];
     uint8_t out[ZPSE_MAX_BLOCK_SIZE];
@@ -339,22 +349,37 @@ static int decode_stream(const char *in_path, const char *out_path,
     int have_last = 0;
     int has_count = (fh->frame_flags & (uint16_t)ZPSE_F_BLOCK_COUNT) != 0u;
     int has_content = (fh->frame_flags & (uint16_t)ZPSE_F_CONTENT_SIZE) != 0u;
+    /* Where each block this walk visits starts and how long it is, so the
+     * table can be checked against the blocks that are really there. One
+     * entry to spare, so a frame that holds more blocks than it declares is
+     * recorded rather than overrun before it is refused. */
+    uint32_t *blk_off = NULL;
+    uint32_t *blk_len = NULL;
+    size_t blk_pos = (size_t)ZPSE_FRAME_HEADER_SIZE;
 
     fi = fopen(in_path, "rb");
     if (fi == NULL) {
         fprintf(stderr, "zpse_cli: cannot open %s\n", in_path);
         return 1;
     }
+    if (indexed) {
+        size_t entries = (size_t)fh->block_count + 1u;
+
+        blk_off = (uint32_t *)malloc(entries * sizeof *blk_off);
+        blk_len = (uint32_t *)malloc(entries * sizeof *blk_len);
+        if (blk_off == NULL || blk_len == NULL) {
+            fprintf(stderr, "zpse_cli: out of memory\n");
+            goto fail;
+        }
+    }
     if (fseek(fi, (long)ZPSE_FRAME_HEADER_SIZE, SEEK_SET) != 0) {
         fprintf(stderr, "zpse_cli: cannot seek %s\n", in_path);
-        fclose(fi);
-        return 1;
+        goto fail;
     }
     f = fopen(out_path, "wb");
     if (f == NULL) {
         fprintf(stderr, "zpse_cli: cannot write %s\n", out_path);
-        fclose(fi);
-        return 1;
+        goto fail;
     }
     for (;;) {
         ZpseBlockHeader bh;
@@ -375,33 +400,30 @@ static int decode_stream(const char *in_path, const char *out_path,
             bh.uncompressed_size < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
             bh.uncompressed_size > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
             fprintf(stderr, "zpse_cli: bad block at block %zu\n", nblocks);
-            fclose(f);
-            fclose(fi);
-            return 1;
+            goto fail;
         }
         comp_sz = bh.compressed_block_size;
+        if (blk_off != NULL) {
+            blk_off[nblocks] = (uint32_t)blk_pos;
+            blk_len[nblocks] = comp_sz;
+            blk_pos += (size_t)comp_sz;
+        }
         if (comp_sz > (uint32_t)ZPSE_BLOCK_HEADER_SIZE &&
             fread(blk + ZPSE_BLOCK_HEADER_SIZE, 1u,
                   (size_t)(comp_sz - (uint32_t)ZPSE_BLOCK_HEADER_SIZE), fi) !=
                 (size_t)(comp_sz - (uint32_t)ZPSE_BLOCK_HEADER_SIZE)) {
             fprintf(stderr, "zpse_cli: frame ends mid-block\n");
-            fclose(f);
-            fclose(fi);
-            return 1;
+            goto fail;
         }
         if (zpse_decompress_block(blk, comp_sz, out, (uint32_t)sizeof out,
                                   &blk_out, dec_arena) != PSE_OK ||
             blk_out != bh.uncompressed_size) {
             fprintf(stderr, "zpse_cli: block %zu does not decode\n", nblocks);
-            fclose(f);
-            fclose(fi);
-            return 1;
+            goto fail;
         }
         if (blk_out > 0u && fwrite(out, 1u, blk_out, f) != blk_out) {
             fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
-            fclose(f);
-            fclose(fi);
-            return 1;
+            goto fail;
         }
         out_pos += (size_t)blk_out;
         nblocks++;
@@ -411,36 +433,74 @@ static int decode_stream(const char *in_path, const char *out_path,
         }
         if (has_count && (uint64_t)nblocks > (uint64_t)fh->block_count) {
             fprintf(stderr, "zpse_cli: more blocks than the frame declares\n");
-            fclose(f);
-            fclose(fi);
-            return 1;
+            goto fail;
         }
     }
     if (!have_last &&
         (!has_count || (uint64_t)nblocks != (uint64_t)fh->block_count)) {
         fprintf(stderr, "zpse_cli: block count disagrees with the frame\n");
-        fclose(f);
-        fclose(fi);
-        return 1;
+        goto fail;
     }
     if (has_count && (uint64_t)nblocks != (uint64_t)fh->block_count) {
         fprintf(stderr, "zpse_cli: block count disagrees with the frame\n");
-        fclose(f);
-        fclose(fi);
-        return 1;
+        goto fail;
     }
     if (has_content && (uint64_t)out_pos != (uint64_t)fh->content_size) {
         fprintf(stderr, "zpse_cli: content size disagrees with the frame\n");
-        fclose(f);
-        fclose(fi);
-        return 1;
+        goto fail;
+    }
+    /* The table a -x frame carries has to describe exactly the blocks this
+     * walk just decoded, and the blocks have to end where it begins: a table
+     * that disagrees with the stream is a corrupt frame, and a reader that
+     * seeks by it would land somewhere else than this one did. The check runs
+     * here, on the blocks that were really there, rather than against a copy
+     * of the whole frame. */
+    if (indexed) {
+        size_t count = (size_t)fh->block_count;
+        size_t need = (size_t)ZPSE_INDEX_HEADER_SIZE +
+                      count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
+        uint8_t *idx = (uint8_t *)malloc(need);
+        int vrc;
+
+        if (idx == NULL) {
+            fprintf(stderr, "zpse_cli: out of memory\n");
+            goto fail;
+        }
+        if (fseek(fi, (long)fh->frame_index_offset, SEEK_SET) != 0 ||
+            fread(idx, 1u, need, fi) != need) {
+            fprintf(stderr, "zpse_cli: frame ends before its index\n");
+            free(idx);
+            goto fail;
+        }
+        vrc = zpse_frame_index_validate(fh, idx, need, (uint32_t)nblocks,
+                                        blk_off, blk_len);
+        free(idx);
+        if (vrc != PSE_OK) {
+            fprintf(stderr, "zpse_cli: index disagrees with the frame\n");
+            goto fail;
+        }
     }
     fclose(fi);
     if (fclose(f) != 0) {
         fprintf(stderr, "zpse_cli: close failed on %s\n", out_path);
+        remove(out_path);
         return 1;
     }
+    free(blk_off);
+    free(blk_len);
     return 0;
+
+fail:
+    if (f != NULL) {
+        fclose(f);
+        remove(out_path);
+    }
+    if (fi != NULL) {
+        fclose(fi);
+    }
+    free(blk_off);
+    free(blk_len);
+    return 1;
 }
 
 /* Encode a frame block by block, writing each block as it is finished.
@@ -843,21 +903,26 @@ static int cmd_codec(int argc, char **argv)
         return rc;
     }
     if (!compress && threads == 1u) {
-        /* Peek the header straight from the file. A frame that carries no
-         * index decodes sequentially, and that needs no copy of the frame in
-         * memory at all -- see decode_stream for what the copy cost. */
+        /* Peek the header straight from the file. Every frame decodes
+         * sequentially block by block, indexed or not, and that needs no copy
+         * of the frame in memory at all -- see decode_stream for what the copy
+         * cost. An indexed frame also has to carry its block count, which is
+         * what the table is checked against. */
         ZpseFrameHeader ph;
         uint8_t head[ZPSE_FRAME_HEADER_SIZE];
         int peek = 0;
+        int indexed = 0;
         FILE *pf = fopen(in_path, "rb");
 
         if (pf != NULL) {
             if (fread(head, 1u, sizeof head, pf) == sizeof head &&
                 zpse_frame_header_read(&ph, head) == PSE_OK &&
-                (ph.frame_flags & (uint16_t)ZPSE_F_FRAME_INDEX) == 0u &&
                 (ph.frame_flags & (uint16_t)ZPSE_F_CONTENT_SIZE) != 0u &&
-                ph.content_size != UINT64_MAX) {
+                ph.content_size != UINT64_MAX &&
+                ((ph.frame_flags & (uint16_t)ZPSE_F_FRAME_INDEX) == 0u ||
+                 (ph.frame_flags & (uint16_t)ZPSE_F_BLOCK_COUNT) != 0u)) {
                 peek = 1;
+                indexed = (ph.frame_flags & (uint16_t)ZPSE_F_FRAME_INDEX) != 0u;
             }
             fclose(pf);
         }
@@ -869,7 +934,8 @@ static int cmd_codec(int argc, char **argv)
                 fprintf(stderr, "zpse_cli: arena allocation failed\n");
                 return 1;
             }
-            drc = decode_stream(in_path, out_path, &ph, (void *)arenas[0]);
+            drc = decode_stream(in_path, out_path, &ph, (void *)arenas[0],
+                                indexed);
             free_arenas(arenas, 1u);
             return drc;
         }

@@ -20,7 +20,11 @@
  *     the fastest level is not allowed to be the slowest.
  */
 /* clock_gettime is POSIX, and a strict -std=c11 hides it unless the
- * feature test macro says so. It has to come before any system header. */
+ * feature test macro says so. It has to come before any system header. On
+ * Windows the same reading is QueryPerformanceCounter: llvm-mingw's MSVCRT
+ * target resolves clock_gettime to clock_gettime64, which is not in the
+ * import library it links against, so asking for it there fails at link
+ * time rather than at the call. */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -28,7 +32,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <time.h>
+#endif
 
 #include "zpse/zpse.h"
 #include "columnar_gen.h"
@@ -65,9 +74,21 @@ static const char *const names[9] = {"fastest", "2", "faster", "4",
 
 static double now_ns(void)
 {
+#if defined(_WIN32)
+    static LARGE_INTEGER freq = {{0}};
+    LARGE_INTEGER c;
+
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1e9 / (double)freq.QuadPart;
+#else
     struct timespec ts;
+
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+#endif
 }
 
 int main(void)

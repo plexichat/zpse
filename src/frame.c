@@ -342,6 +342,66 @@ int zpse_frame_index_count(const uint8_t *in, size_t in_len,
     return zpse_frame_index_check(in, in_len, &fh, 0, count_out);
 }
 
+int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
+                              size_t idx_len, uint32_t count,
+                              const uint32_t *offsets, const uint32_t *sizes)
+{
+    size_t need;
+    uint32_t k;
+
+    if (fh == 0 || idx == 0 || offsets == 0 || sizes == 0) {
+        return PSE_BAD_ARG;
+    }
+    if ((fh->frame_flags & ZPSE_F_FRAME_INDEX) == 0u) {
+        return PSE_UNSUPPORTED_FEATURE;
+    }
+    if (count == 0u || idx_len < (size_t)ZPSE_INDEX_HEADER_SIZE) {
+        return PSE_TRUNCATED;
+    }
+    if (zpse_load_u32le(idx) != ZPSE_INDEX_MAGIC) {
+        return PSE_BAD_HEADER;
+    }
+    need = (size_t)ZPSE_INDEX_HEADER_SIZE +
+           (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
+    if (idx_len < need) {
+        return PSE_TRUNCATED;
+    }
+    /* The count in the table and the reserved word both have to be the ones
+     * the format writes, and the entries have to be the ones the CRC covers. */
+    if (zpse_load_u32le(idx + 4u) != count) {
+        return PSE_BAD_HEADER;
+    }
+    if (zpse_crc32c(idx + (size_t)ZPSE_INDEX_HEADER_SIZE,
+                    (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE) !=
+        zpse_load_u32le(idx + 8u)) {
+        return PSE_BAD_HEADER_CRC;
+    }
+    if (zpse_load_u32le(idx + 12u) != 0u) {
+        return PSE_BAD_HEADER;
+    }
+    if ((fh->frame_flags & ZPSE_F_BLOCK_COUNT) != 0u &&
+        (uint64_t)count != (uint64_t)fh->block_count) {
+        return PSE_BAD_HEADER;
+    }
+    for (k = 0; k < count; k++) {
+        const uint8_t *ent = idx + (size_t)ZPSE_INDEX_HEADER_SIZE +
+                             (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
+
+        if (zpse_load_u32le(ent) != offsets[k] ||
+            zpse_load_u32le(ent + 4u) != sizes[k]) {
+            return PSE_BAD_HEADER;
+        }
+    }
+    /* A table that names the right blocks but sits in the wrong place is
+     * still a frame a seeker would read wrongly, so the blocks have to end
+     * exactly where the table starts. */
+    if ((uint64_t)offsets[count - 1u] + (uint64_t)sizes[count - 1u] !=
+        (uint64_t)fh->frame_index_offset) {
+        return PSE_BAD_HEADER;
+    }
+    return PSE_OK;
+}
+
 int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                     uint32_t block_index, uint8_t *output, uint32_t out_cap,
                     uint32_t *out_len_out)
