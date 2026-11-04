@@ -763,6 +763,120 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             if (lp >= tend) {
                 return PSE_BAD_LZ;
             }
+            /* ---- The escape-free fast region --------------------------
+             * A token whose two nibbles are both below fifteen names a
+             * literal run of at most fourteen bytes and a match of at most
+             * eighteen, so a command of that shape needs no per-field bound
+             * test at all -- only the room it is about to use, which one
+             * compare against each buffer covers. That shape is four commands
+             * in five on prose and most of them on the binaries, and it is
+             * what the fast form (src/lz2.c) has always had and this loop
+             * never did: measured over the twelve Silesia files, this form's
+             * decode ran at 1.50 GB/s against the fast one's 2.22.
+             *
+             * The eighteen bytes of payload and thirty-two of output are
+             * what makes every read and write below provably in bounds:
+             * the token, fourteen literals, the two distance bytes and one
+             * to spare; fourteen literals plus an eighteen-byte match and
+             * nothing else. A command that does not fit either budget, or
+             * a distance that needs a third group, falls through to the
+             * careful path with `lp` untouched -- the token is read again
+             * there, so nothing is consumed twice and no stream this
+             * function refused before is accepted now. */
+            if ((size_t)(tend - lp) >= 18u && op_rem >= 32u) {
+                tok = *lp;
+                if (((tok >> 4) != 15u) && ((tok & 15u) != 15u)) {
+                    /* The distance is read BEFORE the literals are copied, so
+                     * a third group -- which is the one shape this region
+                     * cannot take -- leaves `lp` and the output exactly as
+                     * the careful path expects to find them. `lit` is at most
+                     * fourteen, so `dp[1]` is inside the eighteen bytes the
+                     * region proved it has. */
+                    const uint8_t *dp;
+                    uint32_t b0;
+
+                    lit = tok >> 4;
+                    dp = lp + 1u + lit;
+                    b0 = (uint32_t)dp[0];
+                    if (b0 < 0x80u) {
+                        v = b0;
+                        dp += 1;
+                    } else if (dp[1] < 0x80u) {
+                        v = (b0 & 0x7Fu) | ((uint32_t)dp[1] << 7u);
+                        dp += 2;
+                    } else {
+                        goto careful;
+                    }
+                    /* The run as one 8-byte store, or two overlapping ones
+                     * when it is nine to fourteen bytes: a memcpy of `lit`
+                     * is a size dispatch per command, and the bytes past the
+                     * run are the distance and the next token, both written
+                     * before anything reads them. */
+                    if (lit <= 8u) {
+                        memcpy(op, lp + 1u, 8u);
+                    } else {
+                        memcpy(op, lp + 1u, 8u);
+                        memcpy(op + lit - 8u, lp + 1u + lit - 8u, 8u);
+                    }
+                    op += lit;
+                    op_rem -= lit;
+                    op_done += lit;
+                    lit_seen += lit;
+                    lp = dp;
+                    if (v == 0u) {
+                        if (lit == 0u) {
+                            return PSE_BAD_LZ;
+                        }
+                        continue;
+                    }
+                    /* The distance cache, without a branch on the kind of
+                     * distance. Whether this command names one of the four
+                     * recent distances or an explicit one is data, and on the
+                     * binaries -- where this form is what the gate writes --
+                     * it is close to a coin toss, so the test mispredicted per
+                     * command. Both candidates are computed and selected. */
+                    {
+                        uint32_t isrep = (v <= 4u) ? 1u : 0u;
+                        uint32_t i = v - 1u;
+                        uint32_t roff = (i == 0u)
+                                            ? rep0
+                                            : ((i == 1u) ? rep1
+                                                         : ((i == 2u) ? rep2 : rep3));
+                        uint32_t n1, n2, n3;
+
+                        off = isrep != 0u ? roff : (v - 4u);
+                        n1 = isrep != 0u ? ((i >= 1u) ? rep0 : rep1) : rep0;
+                        n2 = isrep != 0u ? ((i >= 2u) ? rep1 : rep2) : rep1;
+                        n3 = isrep != 0u ? ((i == 3u) ? rep2 : rep3) : rep2;
+                        rep0 = off;
+                        rep1 = n1;
+                        rep2 = n2;
+                        rep3 = n3;
+                    }
+                    mlen = (uint32_t)(tok & 15u) + ZPSE_LZ_MIN_MATCH;
+                    if (off > op_done) {
+                        return PSE_BAD_LZ;
+                    }
+                    /* A short match at a distance at least as wide as the
+                     * store: one store covers the match, and the bytes it
+                     * writes past it are output a later command overwrites.
+                     * Eighteen is the longest match this region can see, so
+                     * the two wide shapes are the only ones it needs -- past
+                     * those the copier's own overlap handling runs. */
+                    if (off >= 16u && mlen <= 16u) {
+                        memcpy(op, op - (ptrdiff_t)off, 16u);
+                    } else if (off >= 32u && mlen <= 32u && op_rem >= 32u) {
+                        memcpy(op, op - (ptrdiff_t)off, 32u);
+                    } else {
+                        lz_copy_match(op, off, mlen, op_rem);
+                    }
+                    op += mlen;
+                    op_rem -= mlen;
+                    op_done += mlen;
+                    continue;
+                }
+            }
+        careful:
             tok = *lp++;
             lit = tok >> 4;
             if (lit == 15u) {

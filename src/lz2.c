@@ -114,20 +114,29 @@ static void lz2_rep_move(uint32_t *rep, uint32_t off, uint32_t idx)
 
 /* Decode side: resolve a distance value (1..4 = the k-th recent distance,
  * 0 = a literal-only command) and move the cache the way the encoder did. */
-static uint32_t lz2_dist_take(uint32_t *rep, uint32_t v)
+static inline uint32_t lz2_dist_take(uint32_t *rep, uint32_t v)
 {
-    uint32_t off;
+    uint32_t i, off, n1, n2, n3;
 
     if (v == 0u) {
         return 0u;
     }
-    if (v <= 4u) {
-        off = rep[v - 1u];
-        lz2_rep_move(rep, off, v - 1u);
-        return off;
-    }
-    off = v; /* unreachable: the encoder codes only 1..4 here */
-    lz2_rep_move(rep, off, 4u);
+    /* 1..4 name a slot, and the move is the encoder's: the hit goes to the
+     * front and everything before it slides back one. Selects rather than a
+     * shift loop, because which slot a command names is data and the slot
+     * changes often enough -- this is the hot form on text -- that a loop
+     * with a data-dependent trip count is a branch to mispredict per command
+     * and three stores to a loop counter that has to be right. */
+    i = v - 1u;
+    off = (i == 0u) ? rep[0]
+                    : ((i == 1u) ? rep[1] : ((i == 2u) ? rep[2] : rep[3]));
+    n1 = (i >= 1u) ? rep[0] : rep[1];
+    n2 = (i >= 2u) ? rep[1] : rep[2];
+    n3 = (i == 3u) ? rep[2] : rep[3];
+    rep[0] = off;
+    rep[1] = n1;
+    rep[2] = n2;
+    rep[3] = n3;
     return off;
 }
 
@@ -588,14 +597,37 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 op += lit;
                 lp += lit;
                 lit_seen += lit;
-                if (lp[0] >= LZ2_REP_BASE) {
-                    off = lz2_dist_take(rep, (uint32_t)(lp[0] & 3u) + 1u);
-                    lp++;
-                } else {
-                    off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
-                    lp += 2;
+                /* The distance, without a branch on which kind it is.
+                 *
+                 * `lp[0] >= 0xFC` asks whether this command names one of the
+                 * four recent distances or an explicit one, and the answer
+                 * is data: on prose it is a run, on the binaries -- which is
+                 * where this form is the default level's choice -- it is
+                 * close to a coin toss, so the test mispredicts and the
+                 * pointer advance it guards sits on the critical path of
+                 * every command. Both candidates are computed and selected
+                 * instead, which is four cheap ALU operations against a
+                 * branch that costs fifteen cycles when it is wrong. */
+                {
+                    uint32_t c0 = (uint32_t)lp[0];
+                    uint32_t isrep = (c0 >= (uint32_t)LZ2_REP_BASE) ? 1u : 0u;
+                    uint32_t ri = c0 & 3u;
+                    uint32_t roff = rep[ri];
+                    uint32_t eoff = c0 | ((uint32_t)lp[1] << 8u);
+                    uint32_t n1, n2, n3;
+
+                    off = isrep != 0u ? roff : eoff;
+                    n1 = isrep != 0u ? ((ri >= 1u) ? rep[0] : rep[1]) : rep[0];
+                    n2 = isrep != 0u ? ((ri >= 2u) ? rep[1] : rep[2]) : rep[1];
+                    n3 = isrep != 0u ? ((ri == 3u) ? rep[2] : rep[3]) : rep[2];
+                    lp += isrep != 0u ? 1u : 2u;
+                    /* A literal-only command (an explicit zero) names no
+                     * distance and leaves the cache alone. */
                     if (off != 0u) {
-                        lz2_rep_move(rep, off, 4u);
+                        rep[0] = off;
+                        rep[1] = n1;
+                        rep[2] = n2;
+                        rep[3] = n3;
                     }
                 }
                 mlen = (uint32_t)(tok & 15u) + ZPSE_LZ2_MIN_MATCH;
@@ -608,7 +640,18 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 if (off > op) {
                     return PSE_BAD_LZ;
                 }
-                lz2_copy_match(out, op, n, off, mlen);
+                /* A short match at a distance at least as wide as the store:
+                 * the whole match is one store, and the bytes past it are
+                 * output a later command overwrites. Thirty-two bytes covers
+                 * the longest match a two-nibble token can name, which is
+                 * what this region is restricted to. */
+                if (off >= 32u && mlen <= 32u && op + 32u <= n) {
+                    memcpy(out + op, out + op - off, 32u);
+                } else if (off >= 16u && mlen <= 16u && op + 16u <= n) {
+                    memcpy(out + op, out + op - off, 16u);
+                } else {
+                    lz2_copy_match(out, op, n, off, mlen);
+                }
                 op += mlen;
                 continue;
             }
