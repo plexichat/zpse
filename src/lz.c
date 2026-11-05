@@ -630,12 +630,16 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
  *
  * The shape comes from lzav, which makes the same pair of stores for every
  * distance over fifteen and, at the other end, ends its copy loops with an
- * overlapping store rather than a byte tail. Measured here as the same
- * blocks decoded repeatedly with the best pass kept, against the tree
- * before the change: nci's token-LZ decode 1 623.6 -> 1 707.1 MB/s (5.1%),
- * its byte stream dominated by seventeen-to-twenty-byte matches; mr, whose
- * LZ_TILE bodies run through this same copier, moves inside the host's
- * drift; the fast form's own gain is in src/lz2.c. */
+ * overlapping store rather than a byte tail. Measured as the same blocks
+ * decoded repeatedly for two and a half seconds a reading, two binaries
+ * built from the tree before and after, alternating: nci's token-LZ decode
+ * 1 606.8 -> 1 687.7 MB/s (5.0%), every after-reading above every
+ * before-reading, its stream dominated by seventeen-to-twenty-byte matches.
+ *
+ * The same shapes in the fast form's copier did NOT pay, and the shorter
+ * readings that said otherwise were drift: webster, which is 98% that form,
+ * went 1 987.2 -> 1 957.3 (-1.5%) over the same windows. They live here and
+ * not in src/lz2.c for that reason. */
 ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
                           uint32_t room)
 {
