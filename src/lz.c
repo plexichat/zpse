@@ -626,10 +626,21 @@ static void lz_copy_literals(uint8_t *dst, const uint8_t *src, uint32_t len,
  * an eight-byte copy and then two byte moves, each with its own loop
  * branch -- and on the text corpora that shape is the common one (four
  * fifths of the matches are under sixteen bytes at a distance over
- * thirty-two), so the tail is most of the copy. */
+ * thirty-two), so the tail is most of the copy.
+ *
+ * The shape comes from lzav, which makes the same pair of stores for every
+ * distance over fifteen and, at the other end, ends its copy loops with an
+ * overlapping store rather than a byte tail. Measured here as the same
+ * blocks decoded repeatedly with the best pass kept, against the tree
+ * before the change: nci's token-LZ decode 1 623.6 -> 1 707.1 MB/s (5.1%),
+ * its byte stream dominated by seventeen-to-twenty-byte matches; mr, whose
+ * LZ_TILE bodies run through this same copier, moves inside the host's
+ * drift; the fast form's own gain is in src/lz2.c. */
 ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
                           uint32_t room)
 {
+    uint8_t *const d0 = dst;
+
     if (len <= 32u) {
         if (off >= 32u && room >= 32u) {
             memcpy(dst, dst - off, 32u);
@@ -641,6 +652,25 @@ ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
         }
         if (len <= 8u && off >= 8u && room >= 8u) {
             memcpy(dst, dst - off, 8u);
+            return;
+        }
+        /* lzav's shape, and the one the three above miss: a match of
+         * seventeen to twenty bytes at a distance of at least sixteen. None
+         * of the exact-fit stores can take it (the match is wider than
+         * sixteen, the distance narrower than thirty-two), so it used to
+         * fall through to the loops below -- an eight-byte copy, a loop
+         * branch, and up to twelve serial byte moves -- while a sixteen-byte
+         * store plus a four-byte one covers the whole match, because the
+         * second store is allowed to write past the end and a later command
+         * reclaims the slack. Reading `dst + 16 - off` is safe at sixteen
+         * because the first store has already written the sixteen bytes in
+         * front of `dst`: at distance sixteen the read starts exactly at
+         * `dst`, and further out it starts in bytes written before this
+         * match. That is the argument lzav makes for the same pair of stores
+         * (`d > 15`), and it is why this is one shape rather than two. */
+        if (len <= 20u && off >= 16u && room >= 20u) {
+            memcpy(dst, dst - off, 16u);
+            memcpy(dst + 16u, dst + 16u - off, 4u);
             return;
         }
     }
@@ -718,6 +748,19 @@ ZPSE_HOT static void lz_copy_match(uint8_t *dst, uint32_t off, uint32_t len,
             memcpy(dst, dst - off, 8u);
             dst += 8u;
             len -= 8u;
+        }
+        /* The tail as one more store of the same width, lzav's other trick:
+         * after the loop copies every whole eight bytes, one to seven are
+         * left, and an eight-byte store at `dst` covers them plus slack the
+         * next command overwrites. `off >= 8` means the load reads only
+         * bytes already written, and the room test is the same one the loop
+         * makes, so this is the loop's own store shape with the tail folded
+         * into it -- where the byte loop it replaces cost up to seven
+         * dependent load-and-store pairs and a branch each, on the matches
+         * that are most of a prose block. */
+        if (len != 0u && room - (uint32_t)(dst - d0) >= 8u) {
+            memcpy(dst, dst - off, 8u);
+            len = 0u;
         }
     }
     while (len != 0u) {
@@ -889,6 +932,12 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                      * those the copier's own overlap handling runs. */
                     if (off >= 16u && mlen <= 16u) {
                         memcpy(op, op - (ptrdiff_t)off, 16u);
+                    } else if (off >= 16u && mlen <= 20u && op_rem >= 20u) {
+                        /* Seventeen to twenty bytes at a distance of sixteen
+                         * or more: see lz_copy_match, which this region grew
+                         * to keep out of its loops. */
+                        memcpy(op, op - (ptrdiff_t)off, 16u);
+                        memcpy(op + 16u, op + 16u - (ptrdiff_t)off, 4u);
                     } else if (off >= 32u && mlen <= 32u && op_rem >= 32u) {
                         memcpy(op, op - (ptrdiff_t)off, 32u);
                     } else if (off >= 8u && mlen <= 8u && op_rem >= 8u) {

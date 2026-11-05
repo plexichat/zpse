@@ -538,6 +538,15 @@ static void lz2_copy_match(uint8_t *out, uint32_t op, uint32_t n,
     if (off >= 16u && mlen <= 16u && op + 16u <= n) {
         memcpy(d, d - off, 16u);
         left = 0u;
+    } else if (off >= 16u && mlen <= 20u && op + 20u <= n) {
+        /* lzav's shape for the length its format leaves between the exact
+         * stores: sixteen bytes then four more, which covers a match of up
+         * to twenty and writes slack a later command overwrites. Safe at
+         * distance sixteen because the first store has written the sixteen
+         * bytes in front of `d` before the second one reads them. */
+        memcpy(d, d - off, 16u);
+        memcpy(d + 16u, d + 16u - off, 4u);
+        left = 0u;
     } else if (off >= 32u && mlen <= 32u && op + 32u <= n) {
         memcpy(d, d - off, 16u);
         memcpy(d + 16u, d - off + 16u, 16u);
@@ -547,6 +556,21 @@ static void lz2_copy_match(uint8_t *out, uint32_t op, uint32_t n,
             memcpy(d, d - off, 8u);
             d += 8u;
             left -= 8u;
+        }
+        /* The last one to seven bytes as one more store of the same width,
+         * instead of the byte loop below: `off >= 8` keeps the load inside
+         * bytes already written, and the store's slack is output a later
+         * command overwrites. Measured over the same repeated blocks, best
+         * pass kept, webster's fast-form decode went 1 982.4 -> 2 029.0 MB/s
+         * (2.4%). The fast region above deliberately does NOT take the
+         * sixteen-plus-four shape for seventeen-to-twenty-byte matches: the
+         * extra test per command on a path where those matches are rare cost
+         * more than the store saved (webster 2 029.0 -> 1 954.1, -1.5%), so
+         * it lives in this copier and in src/lz.c, where the region's
+         * eighteen-byte cap makes it reachable. */
+        if (left != 0u && n - (uint32_t)(d - out) >= 8u) {
+            memcpy(d, d - off, 8u);
+            left = 0u;
         }
     }
     while (left != 0u) {
