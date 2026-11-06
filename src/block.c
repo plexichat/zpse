@@ -1327,6 +1327,39 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #ifndef ZPSE_TIE_SHORT_N
 #define ZPSE_TIE_SHORT_N 8192u
 #endif
+/* ...and how wide the field has to be before that cut is allowed at all.
+ *
+ * A field of four or fewer survivors is left whole on a full-size block,
+ * because one more trial there is a rounding error and the third price is all
+ * the evidence the block has. A page is the other case: the trial is half the
+ * page's encode cycles and a survivor is what it costs, so the floor drops to
+ * two -- any field the price separated gets one trial.
+ *
+ * Measured at 4 KiB on the dumps, best of five, five pairings: the default
+ * level goes 122.8 -> 133.1 MB/s (+8.2%) for 77 782 bytes over 88.9 MB
+ * (+0.036 points), and the trials a page run 1.65/2.97/1.66 -> 1.06/2.55/1.20.
+ * The survivors it still tries are the ones a CONTENT rule kept rather than
+ * the price -- c_heap keeps 3.0 a page and still spends 2.55 -- which is the
+ * guard that has to stay, since those are the fields the price is known not
+ * to describe. */
+#ifndef ZPSE_TIE_MIN_FIELD
+#define ZPSE_TIE_MIN_FIELD 4u
+#endif
+#ifndef ZPSE_TIE_SHORT_MIN_FIELD
+#define ZPSE_TIE_SHORT_MIN_FIELD 2u
+#endif
+/* The block size the narrower floor above applies to, inclusive: the page this
+ * whole file's page trades exist for.
+ *
+ * It is a size and not a level gate because of what the size corpus caught: a
+ * 6 KiB case (kind 4) prices three shapes within a tenth of a percent of each
+ * other, the dropped trial is the one that wins, and the block grows 24 bytes
+ * -- at floor 2 and at floor 3 alike. A page's field is the case the cut is
+ * for, because the survivor costs half the block's encode; a 6 KiB block is
+ * neither a page nor a full block, so it keeps the full-size floor. */
+#ifndef ZPSE_TIE_PAGE_N
+#define ZPSE_TIE_PAGE_N 4096u
+#endif
 
 /* The other half of that trade, and the levels column `tie_field`: the band
  * above says "within 1.6% the price cannot order two shapes". Outside it the
@@ -1369,11 +1402,11 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * points. 16 KiB and 64 KiB blocks are byte-identical (the gate is below
  * them), and so is every whole-file stream, which uses 64 KiB blocks.
  *
- * Four planes, not every-plane, is the shipped answer: eight planes buys +18%
- * at level 6 for +0.06 points (a third of the speed for a third of the cost),
- * two planes +41% for +0.20, so four is where the trade flattens out at the
- * default level. Level 1 pays the most ratio of any rung (it has no trials to
- * repair a coarse ranking) and is where the stride is worth the most speed.
+ * Four planes, not every-plane, is the shipped answer above level 4: eight
+ * planes buys +18% at level 6 for +0.06 points (a third of the speed for a
+ * third of the cost), two planes +41% for +0.20, so four is where the trade
+ * flattens out at the default level. The cheap rungs price six, for the
+ * reason in ZPSE_PLANE_STRIDE_PLANES_FAST below.
  *
  * 0 disables it (every plane, everywhere), which is what this encoder did
  * before. */
@@ -1383,22 +1416,51 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_PLANE_STRIDE_PLANES
 #define ZPSE_PLANE_STRIDE_PLANES 4u
 #endif
+/* ...and how many a level up to ZPSE_PLANE_STRIDE_FAST_MAX prices.
+ *
+ * A cheap rung cannot repair a coarse ranking: it has one, two or three trials
+ * and no more, so the price it acts on IS the answer. Four planes of a
+ * sixteen-plane page are too coarse for that -- 0.66 points at level 1 and a
+ * full 1.0% of ratio at level 2, both over the line every page trade here has
+ * to stay under. Six planes is 0.30% at level 1 and 0.28-0.35% at levels 2-4,
+ * and the speed it gives back is small against what the stride won: 249.8
+ * against 197.5 MB/s at level 1, 200.0 against 156.4 at level 2, 177.8 against
+ * 133.5 at level 4 (4 KiB, dumps, three pairings).
+ *
+ * So the gate is 4, and levels 5-9 keep four planes: the default level pays
+ * 0.17 points for the stride where level 1 pays 0.30, because its trials
+ * repair a coarse ranking and its probe is where the page's time has gone. */
+#ifndef ZPSE_PLANE_STRIDE_PLANES_FAST
+#define ZPSE_PLANE_STRIDE_PLANES_FAST 6u
+#endif
+#ifndef ZPSE_PLANE_STRIDE_FAST_MAX
+#define ZPSE_PLANE_STRIDE_FAST_MAX 4u
+#endif
 
-static unsigned zpse_block_plane_step(uint32_t blk_n, uint8_t sc)
+static unsigned zpse_block_plane_step(const ZpseEncoder *e, uint32_t blk_n,
+                                      uint8_t sc)
 {
 #if (ZPSE_PLANE_STRIDE_N > 0)
+    unsigned want = (unsigned)ZPSE_PLANE_STRIDE_PLANES;
     unsigned step;
 
-    if (blk_n >= (uint32_t)ZPSE_PLANE_STRIDE_N ||
-        (unsigned)sc <= (unsigned)ZPSE_PLANE_STRIDE_PLANES) {
+    if (e != 0 &&
+        zpse_enc_speed(e->enc_flags) <= (uint32_t)ZPSE_PLANE_STRIDE_FAST_MAX) {
+        want = (unsigned)ZPSE_PLANE_STRIDE_PLANES_FAST;
+    }
+    if (want == 0u || blk_n >= (uint32_t)ZPSE_PLANE_STRIDE_N ||
+        (unsigned)sc <= want) {
         return 1u;
     }
-    step = (unsigned)sc / (unsigned)ZPSE_PLANE_STRIDE_PLANES;
+    /* Round UP, so `want` means "price at most `want` planes": a 16-plane
+     * page at want 6 prices 6 (0, 3, 6, ... 15), not 8. */
+    step = ((unsigned)sc + want - 1u) / want;
     return step == 0u ? 1u : step;
 #else
     /* Off: every plane, everywhere, which is what this encoder has always
      * priced. `blk_n` is still taken so the call sites do not have to know
      * whether the knob is on. */
+    (void)e;
     (void)blk_n;
     (void)sc;
     return 1u;
@@ -1729,7 +1791,7 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
         }
     }
     {
-        unsigned step = zpse_block_plane_step(blk_n, sc);
+        unsigned step = zpse_block_plane_step(e, blk_n, sc);
         unsigned npriced = 0u;
 
         for (s = 0u; s < sc; s += step) {
@@ -1798,7 +1860,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
 {
     uint32_t lens[16];
     uint8_t *planes[16];
-    unsigned pstep = zpse_block_plane_step(blk_n, sc);
+    unsigned pstep = zpse_block_plane_step(e, blk_n, sc);
 
     /* A multi-plane candidate is priced with one tile in every plane, at
      * every level (the cheap levels fill nothing in for a transpose any
@@ -3661,12 +3723,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * cutting under them would only reorder the handful they try. */
             {
                 uint32_t keep = (uint32_t)ZPSE_TIE_KEEP;
+                uint32_t fmin = (uint32_t)ZPSE_TIE_MIN_FIELD;
                 int cut_ok = (n >= (uint32_t)ZPSE_TIE_MIN_N) ? 1 : 0;
 
 #if (ZPSE_TIE_SHORT_KEEP > 0)
                 if (cut_ok == 0 && n < (uint32_t)ZPSE_TIE_SHORT_N) {
                     cut_ok = 1;
                     keep = (uint32_t)ZPSE_TIE_SHORT_KEEP;
+                    if (n <= (uint32_t)ZPSE_TIE_PAGE_N) {
+                        fmin = (uint32_t)ZPSE_TIE_SHORT_MIN_FIELD;
+                    }
                 }
 #endif
                 if (cut_ok != 0 && cap == 0u && ncand > (int)keep) {
@@ -3676,7 +3742,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     uint32_t best = ex[0];
                     uint32_t third = ex[keep];
 
-                    if (pick >= 0 && ncand >= 4 && !head_misleads &&
+                    if (pick >= 0 && ncand >= (int)fmin && !head_misleads &&
                         !content_kept && third != UINT32_MAX &&
                         (row->tie_field != 0u ||
                          third - best <= best >> ZPSE_TIE_BAND_SHIFT)) {
