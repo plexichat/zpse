@@ -4867,8 +4867,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
     /* ---- General path: dispatch once, then run the family loop ---- */
     fam = tile_family(th.predictor_id);
 
-    /* ---- CONST with few exceptions ------------------------------ *
-     * A constant prediction does not depend on any byte the tile writes,
+    /* ---- CONST with few exceptions ------------------------------ *     * A constant prediction does not depend on any byte the tile writes,
      * so such a tile is that constant everywhere except at its
      * exceptions: fill it and then write them, instead of walking 256
      * mask bits. The exceptions are visited in mask order (ascending),
@@ -4876,7 +4875,10 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
      * byte is resolved from the constant exactly as the byte loops below
      * resolve it. Below the crossover this is a memset plus k stores; the
      * 32-wide kernel it replaces costs a fixed ~150 cycles, so the limit
-     * is where a few cycles per exception overtakes it. */
+     * is where a few cycles per exception overtakes it. Raising it was
+     * measured and refused: at 64 it read +0.1% on `mr` (noise) and -14% on
+     * `x-ray`, whose dense tiles the 32-wide kernel handles better than a
+     * scatter ever will, so the crossover stays at the sparse end. */
     if (fam == TILE_FAM_CONST && (uint32_t)k <= 24u) {
         uint8_t c = (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
                         ? constant_C : 0u;

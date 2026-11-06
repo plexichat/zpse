@@ -382,7 +382,12 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * block is at most 64 KiB. That is also why the table is cleared
          * per call. Dropping the compare takes two operations out of the
          * loop the match finder spends its time in, and cannot change
-         * which candidate is tested. */
+         * which candidate is tested. Two ways per slot was measured and
+         * refused: one 32-bit slot holding two 16-bit positions in the same
+         * 16 KiB took 0.10% off the corpus (89,695,990 -> 89,605,767) and
+         * cost 5% of the encode rate (ooffice -13.5%, osdb -12.5%, mozilla
+         * -11.7%, dickens -6.7%), so the table keeps one way: the collision
+         * it removes does not pay for the compare that removes it. */
         if (cand == LZ_EMPTY ||
             zpse_load_u32le(in + cand) != cur) {
             /* Two misses are a coincidence; a run of them means the data
