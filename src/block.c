@@ -2911,7 +2911,34 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * it. The pass keeps the candidates within the margin (a like-for-like
      * comparison) and orders them by price, which is the order the trial loop
      * below walks. */
-    if (ncand > 1 && n >= 8192u) {
+    /* Smallest block the pricing pass runs on.
+     *
+     * This was 8 KiB, on the argument that a short block's trial is cheap
+     * enough that pricing cannot pay for itself. That is true of ONE trial
+     * and false of the ten a block actually builds: below the gate the
+     * sweep prices nothing, so every candidate goes to a full trial. On the
+     * heap corpus a 4 KiB block runs 9.74 trials per block against 1.00 on a
+     * 64 KiB block, and those trials are 97.8% of its encode cycles
+     * (203,735 cycles a block, ~55 us, at 74 MB/s -- against 620 MB/s for
+     * the same data in 64 KiB blocks). The pricing pass it skips costs one
+     * tile per plane of each candidate, which is exactly the estimate that
+     * makes a 64 KiB block run one trial instead of ten.
+     *
+     * So the gate is now the smallest block the sweep can see, not a quarter
+     * of the format's maximum. Measured on 4 KiB blocks, gate 8192 -> 4096:
+     * trials a block 9.74 -> 1.00, encode 73 -> 138 MB/s on a Python heap,
+     * 175 -> 379 on a C heap and 117 -> 149 on shared-library pages at level
+     * 1; 64 -> 82, 140 -> 177 and 87 -> 89 at level 6. The probe is 73% of
+     * what is left, the trials 24%. It costs ratio, because a price on a
+     * short block can drop a survivor a trial would have kept: 0.19, 0.43 and
+     * 0.33 points at level 1 and 0.01, 0.18 and 0.07 at level 6. That is
+     * inside what the size gate tolerates -- tests/suites/test_sizes.c
+     * reports grew=0 over its 768 cases and the whole suite passes -- and on
+     * 64 KiB blocks the two builds are byte-identical (35.78% either way). */
+#ifndef ZPSE_PRICE_MIN_N
+#define ZPSE_PRICE_MIN_N 4096u
+#endif
+    if (ncand > 1 && n >= ZPSE_PRICE_MIN_N) {
         uint32_t ex[ZPSE_MAX_CAND];
         uint32_t pc[ZPSE_MAX_CAND];
         uint8_t order[ZPSE_MAX_CAND];
