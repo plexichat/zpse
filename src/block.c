@@ -1301,6 +1301,33 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_TIE_KEEP 2u
 #endif
 
+/* The same cut on a SHORT block, where the full-size gate does not reach:
+ * keep ZPSE_TIE_SHORT_KEEP survivors on a block shorter than
+ * ZPSE_TIE_SHORT_N.
+ *
+ * The gate above is 64 KiB because a full block's trial is the most
+ * expensive thing the sweep can do, and a short block's trial is cheap --
+ * but on a 4 KiB page the trial is HALF the block's encode cycles (measured
+ * with the ZPSE_BLOCK_STATS build: 2.4-3.0 trials a page, 48-64% of the
+ * cycles at the default level), so the same arithmetic applies for a
+ * different reason: a page's trial is not cheap relative to the page.
+ *
+ * One, at the default level: 4 KiB 116.1 -> 122.6 MB/s (+5.6%, three
+ * pairings) for 9 319 bytes over 88.8 MB (+0.011 points), and Silesia's pages
+ * 121.1 -> 124.0 for 0.02 points. Two is worse on both axes (118.8 MB/s for
+ * 5 608 bytes), which is the price sample being good enough to order the
+ * field and not good enough to be free: keeping the runner-up costs a whole
+ * page encode and recovers half of what the cut cost. Short of 8 KiB only --
+ * 16 KiB and 64 KiB blocks are byte-identical to the gate's own behaviour.
+ *
+ * 0 keeps the full-size gate as the only cut. */
+#ifndef ZPSE_TIE_SHORT_KEEP
+#define ZPSE_TIE_SHORT_KEEP 1u
+#endif
+#ifndef ZPSE_TIE_SHORT_N
+#define ZPSE_TIE_SHORT_N 8192u
+#endif
+
 /* The other half of that trade, and the levels column `tie_field`: the band
  * above says "within 1.6% the price cannot order two shapes". Outside it the
  * price HAS ordered them, and a full trial is ~6x the price that already said
@@ -1321,6 +1348,62 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint8_t tid, uint8_t sc,
                              const uint8_t *meta_bytes, uint16_t meta_len,
                              uint8_t *planes[16], uint32_t lens[16]);
+
+/* How far apart the planes of a multi-plane candidate are priced on a SHORT
+ * block: 1 prices every plane, k prices every k-th one and charges the rest
+ * the average of those (the machinery zpse_block_exact_sum carried for the
+ * cheap levels before every-plane pricing replaced it).
+ *
+ * A 4 KiB page split sixteen ways is sixteen 256-byte planes, so "one tile in
+ * every plane" is the whole page -- and every transform candidate is priced
+ * that way, ten of them. That is what the probe spends its time on: on the
+ * dumps at level 1 the pricing pass is 74% of the block's encode cycles and
+ * it prices 9.5 candidates a page. On a 64 KiB block one tile per plane is
+ * 4 KiB of the block, which is why the bias this average introduces is not
+ * worth its cost there and why the knob has a size gate, not a level one.
+ *
+ * Measured on the three dumps at 4 KiB, best of five rounds, three pairings
+ * of the two builds alternating on one pinned core: level 6 goes 82.6 ->
+ * 122.6 MB/s and level 1 185.8 -> 267.6 (+48% and +44%) for 0.17 and 0.66
+ * points of ratio; Silesia's 4 KiB pages 93.8 -> 124.0 at level 6 for 0.08
+ * points. 16 KiB and 64 KiB blocks are byte-identical (the gate is below
+ * them), and so is every whole-file stream, which uses 64 KiB blocks.
+ *
+ * Four planes, not every-plane, is the shipped answer: eight planes buys +18%
+ * at level 6 for +0.06 points (a third of the speed for a third of the cost),
+ * two planes +41% for +0.20, so four is where the trade flattens out at the
+ * default level. Level 1 pays the most ratio of any rung (it has no trials to
+ * repair a coarse ranking) and is where the stride is worth the most speed.
+ *
+ * 0 disables it (every plane, everywhere), which is what this encoder did
+ * before. */
+#ifndef ZPSE_PLANE_STRIDE_N
+#define ZPSE_PLANE_STRIDE_N 16384u
+#endif
+#ifndef ZPSE_PLANE_STRIDE_PLANES
+#define ZPSE_PLANE_STRIDE_PLANES 4u
+#endif
+
+static unsigned zpse_block_plane_step(uint32_t blk_n, uint8_t sc)
+{
+#if (ZPSE_PLANE_STRIDE_N > 0)
+    unsigned step;
+
+    if (blk_n >= (uint32_t)ZPSE_PLANE_STRIDE_N ||
+        (unsigned)sc <= (unsigned)ZPSE_PLANE_STRIDE_PLANES) {
+        return 1u;
+    }
+    step = (unsigned)sc / (unsigned)ZPSE_PLANE_STRIDE_PLANES;
+    return step == 0u ? 1u : step;
+#else
+    /* Off: every plane, everywhere, which is what this encoder has always
+     * priced. `blk_n` is still taken so the call sites do not have to know
+     * whether the knob is on. */
+    (void)blk_n;
+    (void)sc;
+    return 1u;
+#endif
+}
 
 /* Exact price of a plane: the smaller of its tile records (a spread of its
  * tiles, classified, mode-searched and packed exactly as a trial does) and
@@ -1395,7 +1478,7 @@ static uint32_t zpse_block_cand_floor(uint32_t len)
 static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
                                       const uint32_t lens[16], uint8_t sc,
                                       unsigned tiles, uint32_t limit,
-                                      int every_plane)
+                                      int every_plane, unsigned pstep)
 {
     uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 16u;
     uint32_t records = 0u;
@@ -1438,6 +1521,9 @@ static uint32_t zpse_block_exact_sum(ZpseEncoder *e, uint8_t *planes[16],
      * which is where the cheap levels' speed comes from. */
     if (!every_plane) {
         step = 1u;
+    }
+    if (pstep > step) {
+        step = pstep;
     }
     for (s = 0u; s < sc; s += step) {
         /* The running share: everything still unspent below `limit`
@@ -1590,7 +1676,8 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * ZPSE_PREFIX_NEED_FULL when the prefix cannot answer the question (see
  * above); the caller then runs the full staging. */
 static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
-                                        uint32_t n, uint8_t tid, uint8_t sc,
+                                        uint32_t n, uint32_t blk_n,
+                                        uint8_t tid, uint8_t sc,
                                         const uint8_t *meta_bytes,
                                         uint16_t meta_len, uint32_t limit)
 {
@@ -1641,31 +1728,49 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
             return ZPSE_PREFIX_NEED_FULL;
         }
     }
-    for (s = 0u; s < sc; s++) {
-        uint32_t tc = (lens[s] + 255u) >> 8;
-        uint32_t c = zpse_block_exact_plane(e, planes[s], 256u, 1u,
-                                            UINT32_MAX);
+    {
+        unsigned step = zpse_block_plane_step(blk_n, sc);
+        unsigned npriced = 0u;
 
-        if (c == UINT32_MAX) {
-            return UINT32_MAX;
-        }
-        if (c == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u) {
-            /* All-hit first tile: the plane may still be constant, and the
-             * dense form prices that below ten bytes a tile. */
-            return ZPSE_PREFIX_NEED_FULL;
-        }
-        records += (c - (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) * tc;
-        /* The sweep's running verdict, applied per plane exactly as the full
-         * pass applies it: a bound already past `limit` cannot win, so the
-         * planes behind it do not have to be staged or priced. */
-        if (limit != UINT32_MAX) {
-            uint64_t lb = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
-                          (uint64_t)sc * 16u + (uint64_t)records;
+        for (s = 0u; s < sc; s += step) {
+            uint32_t tc = (lens[s] + 255u) >> 8;
+            uint32_t c = zpse_block_exact_plane(e, planes[s], 256u, 1u,
+                                                UINT32_MAX);
 
-            if (lb > (uint64_t)limit) {
-                return (uint32_t)(lb > (uint64_t)UINT32_MAX
-                                      ? (uint64_t)UINT32_MAX
-                                      : lb);
+            if (c == UINT32_MAX) {
+                return UINT32_MAX;
+            }
+            if (c == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u) {
+                /* All-hit first tile: the plane may still be constant, and
+                 * the dense form prices that below ten bytes a tile. */
+                return ZPSE_PREFIX_NEED_FULL;
+            }
+            records += (c - (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) * tc;
+            npriced++;
+            /* The sweep's running verdict, applied per plane exactly as the
+             * full pass applies it: a bound already past `limit` cannot win,
+             * so the planes behind it do not have to be staged or priced. */
+            if (limit != UINT32_MAX) {
+                uint64_t lb = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + 16u +
+                              (uint64_t)sc * 16u + (uint64_t)records;
+
+                if (lb > (uint64_t)limit) {
+                    return (uint32_t)(lb > (uint64_t)UINT32_MAX
+                                          ? (uint64_t)UINT32_MAX
+                                          : lb);
+                }
+            }
+        }
+        /* The planes the stride skipped: charged the average of the ones it
+         * priced, exactly as the cheap levels' estimate used to. */
+        if (step > 1u && npriced > 0u) {
+            uint32_t avg = records / npriced;
+            unsigned sp;
+
+            for (sp = 0u; sp < sc; sp++) {
+                if ((sp % step) != 0u) {
+                    records += avg;
+                }
             }
         }
     }
@@ -1684,7 +1789,8 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
  * their head (a single-plane one spread over the window, or the tail
  * check's whole-window price) is not where the prefix pays. */
 static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
-                                       uint32_t n, uint8_t tid, uint8_t sc,
+                                       uint32_t n, uint32_t blk_n,
+                                       uint8_t tid, uint8_t sc,
                                        const uint8_t *meta_bytes,
                                        uint16_t meta_len, unsigned tiles,
                                        uint32_t limit, int every_plane,
@@ -1692,6 +1798,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
 {
     uint32_t lens[16];
     uint8_t *planes[16];
+    unsigned pstep = zpse_block_plane_step(blk_n, sc);
 
     /* A multi-plane candidate is priced with one tile in every plane, at
      * every level (the cheap levels fill nothing in for a transpose any
@@ -1704,8 +1811,8 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
      * see zpse_block_prefix_price) falls through to the full pass, and the
      * caller stops trying prefixes. */
     if (prefix_ok != 0 && *prefix_ok && sc > 1u) {
-        uint32_t p = zpse_block_prefix_price(e, in, n, tid, sc, meta_bytes,
-                                             meta_len, limit);
+        uint32_t p = zpse_block_prefix_price(e, in, n, blk_n, tid, sc,
+                                             meta_bytes, meta_len, limit);
 
         if (p != ZPSE_PREFIX_NEED_FULL) {
             return p;
@@ -1716,7 +1823,8 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                           lens) != PSE_OK) {
         return UINT32_MAX;
     }
-    return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit, every_plane);
+    return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit,
+                                every_plane, pstep);
 }
 
 /* Exchange two candidate slots, moving the candidate itself in every array
@@ -2167,7 +2275,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * measured rather than assumed: if a future change to the sample
          * makes this line order-sensitive, tests/runners/run.sh says so
          * before this comment can be wrong about it quietly. */
-        tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
+        tile_s = zpse_block_proxy_exact(e, in, sn, n, tid, sc, mb, meta_len,
                                         ZPSE_DECIDE_TILES, UINT32_MAX, 1,
                                         &prefix_ok);
     }
@@ -2254,7 +2362,7 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     {
         int prefix_ok = 1;
 
-        tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
+        tile_s = zpse_block_proxy_exact(e, in, sn, n, tid, sc, mb, meta_len,
                                         ZPSE_DECIDE_TILES, UINT32_MAX, 1,
                                         &prefix_ok);
     }
@@ -2588,8 +2696,8 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
         if ((uint32_t)scs[j] > pn) {
             continue;
         }
-        h = zpse_block_proxy_exact(e, in, pn, tids[j], scs[j], in, metas[j],
-                                   ZPSE_ASCII_SAMPLE_TILES, alim, 1,
+        h = zpse_block_proxy_exact(e, in, pn, n, tids[j], scs[j], in,
+                                   metas[j], ZPSE_ASCII_SAMPLE_TILES, alim, 1,
                                    &prefix_ok);
         if (h == UINT32_MAX || h <= alim) {
             return 0;
@@ -2598,7 +2706,7 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
             uint32_t t;
 
             prefix_ok = 1;
-            t = zpse_block_proxy_exact(e, in + (n - pn), pn, tids[j],
+            t = zpse_block_proxy_exact(e, in + (n - pn), pn, n, tids[j],
                                        scs[j], in, metas[j],
                                        ZPSE_ASCII_SAMPLE_TILES, alim, 1,
                                        &prefix_ok);
@@ -3289,7 +3397,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     continue;
                 }
             }
-            ex[ci] = zpse_block_proxy_exact(e, in, pn, tids[ci],
+            ex[ci] = zpse_block_proxy_exact(e, in, pn, n, tids[ci],
                                             scounts[ci], mb, meta_lens[ci],
                                             ZPSE_DECIDE_TILES, lim,
                                             every_plane, &prefix_ok);
@@ -3456,7 +3564,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (sample_flat && n > pn) {
                 const uint8_t *wmb = meta_lens[pick] > 0 ? meta_bufs[pick] : in;
                 uint32_t tp = zpse_block_proxy_exact(
-                    e, in + (n - pn), pn, tids[pick], scounts[pick], wmb,
+                    e, in + (n - pn), pn, n, tids[pick], scounts[pick], wmb,
                     meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX,
                     every_plane, 0);
 
@@ -3551,18 +3659,29 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             /* Only a level that prices EVERY survivor can cut a field: the
              * cheap rungs already stop at their own trial count, and
              * cutting under them would only reorder the handful they try. */
-            if (cap == 0u && ncand > (int)ZPSE_TIE_KEEP && n >= ZPSE_TIE_MIN_N) {
-                /* The survivors are sorted by price after the compaction
-                 * (ties in list order), so the third-cheapest is slot 2 and
-                 * the ones to drop are the tail of that order. */
-                uint32_t best = ex[0];
-                uint32_t third = ex[ZPSE_TIE_KEEP];
+            {
+                uint32_t keep = (uint32_t)ZPSE_TIE_KEEP;
+                int cut_ok = (n >= (uint32_t)ZPSE_TIE_MIN_N) ? 1 : 0;
 
-                if (pick >= 0 && ncand >= 4 && !head_misleads &&
-                    !content_kept && third != UINT32_MAX &&
-                    (row->tie_field != 0u ||
-                     third - best <= best >> ZPSE_TIE_BAND_SHIFT)) {
-                    ncand = (int)ZPSE_TIE_KEEP;
+#if (ZPSE_TIE_SHORT_KEEP > 0)
+                if (cut_ok == 0 && n < (uint32_t)ZPSE_TIE_SHORT_N) {
+                    cut_ok = 1;
+                    keep = (uint32_t)ZPSE_TIE_SHORT_KEEP;
+                }
+#endif
+                if (cut_ok != 0 && cap == 0u && ncand > (int)keep) {
+                    /* The survivors are sorted by price after the compaction
+                     * (ties in list order), so the survivor one past the cut
+                     * is the cheapest of the ones to drop. */
+                    uint32_t best = ex[0];
+                    uint32_t third = ex[keep];
+
+                    if (pick >= 0 && ncand >= 4 && !head_misleads &&
+                        !content_kept && third != UINT32_MAX &&
+                        (row->tie_field != 0u ||
+                         third - best <= best >> ZPSE_TIE_BAND_SHIFT)) {
+                        ncand = (int)keep;
+                    }
                 }
             }
             /* The trials this level is willing to spend, from the level
