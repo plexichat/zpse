@@ -1220,6 +1220,15 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * at level 6, where the trials behind the price repair it; Silesia's pages
  * move the other way (83.96 -> 83.91% at level 1).
  *
+ * Four, five and six were tried at the CHEAP rungs too, on the argument that
+ * levels 2-4 have trials left to repair a coarser list: four is +1.24, +1.04
+ * and +0.66 points of ratio at levels 2, 3 and 4 for 17.7, 15.1 and 10.0% of
+ * encode, and five and six buy 0.13-0.60 points for +2.7, -1.4 and -4% --
+ * inside this host's band. Four also costs the deep rungs speed (81.9 against
+ * 83.2 MB/s at level 6 on 4 KiB pages), because the price of a page is not
+ * what level 6 spends its time on. So the sample is eight at every level and
+ * the coarse-list idea is refused here rather than on the shelf.
+ *
  * 0 restores the whole block. */
 #ifndef ZPSE_PROBE_SHORT_TILES
 #define ZPSE_PROBE_SHORT_TILES 8u
@@ -1236,6 +1245,31 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * fires on are cheap either way; the cap stays where the size corpus was
  * tuned against it. */
 #define ZPSE_FLAT_TRIALS 3
+#endif
+
+/* The margin the fast form's screen asks for on a block shorter than
+ * ZPSE_LZ2_SHORT_N, as a multiplier on the level's own (NUM/DEN).
+ *
+ * The screen samples a fixed 1 KiB, which on a page is a quarter of the
+ * block, so it convicts more readily there than on a 64 KiB block -- but the
+ * pass it guards is a full match-finder pass and the form wins only a
+ * fraction of the pages it is offered. Asking for half again the level's own
+ * margin on those blocks is worth 3.7% of the encode rate on the 4 KiB dump
+ * total (82.9 -> 86.0 MB/s at the default level, six pairings of best-of-
+ * eight on one pinned core) and 5.2% on Silesia's 4 KiB pages (87.8 -> 92.4),
+ * for 0.05 and 0.01 points of ratio. 16 KiB blocks are byte-identical, which
+ * is the boundary: only the pages pay this, and they are the ones the trade
+ * is for.
+ *
+ * 4/4 is the screen as it was, every block asking for the level's margin. */
+#ifndef ZPSE_LZ2_SHORT_N
+#define ZPSE_LZ2_SHORT_N 16384u
+#endif
+#ifndef ZPSE_LZ2_SHORT_MARGIN_NUM
+#define ZPSE_LZ2_SHORT_MARGIN_NUM 6u
+#endif
+#ifndef ZPSE_LZ2_SHORT_MARGIN_DEN
+#define ZPSE_LZ2_SHORT_MARGIN_DEN 4u
 #endif
 
 /* The band, as a fraction of the best window price (in 1/2^N), inside which
@@ -2205,6 +2239,12 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
     if (sn < ZPSE_LZ2_MIN_MATCH + 1u || e->cand == 0) {
         return 1;
+    }
+    /* A short block's sample is a larger fraction of the block, and the pass
+     * it guards is the expensive one (see ZPSE_LZ2_SHORT_N). */
+    if (n < (uint32_t)ZPSE_LZ2_SHORT_N) {
+        num = num * (uint32_t)ZPSE_LZ2_SHORT_MARGIN_NUM /
+              (uint32_t)ZPSE_LZ2_SHORT_MARGIN_DEN;
     }
     lz_s = zpse_lz2_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
                            (uint32_t)ZPSE_LZ_HASH_BITS);
@@ -4230,7 +4270,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * stream alone. The decode pays a match-finder pass over the body before
      * the tile reconstruction, so a few bytes is the wrong trade; measured
      * over Silesia at the default level, the stage takes 13.3% off the tile
-     * payload of exactly the blocks where tiles beat LZ. */
+     * payload of exactly the blocks where tiles beat LZ.
+     *
+     * Its cost on short blocks was measured on the way past: gating it to
+     * blocks of 16 KiB and up moved the 4 KiB dump total from 41.45 to 42.42
+     * points -- a full point of ratio -- for 2% of encode, which a build that
+     * changes nothing also spends. The body it compresses is already a tile
+     * stream, so the finder is fast on it and there is no pass to save. */
     if (!direct_out && have_best && e->lz != 0 &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
@@ -4324,6 +4370,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * the question with the form that writes the stream is what lets the
  * candidate reach the blocks it wins -- and the sizes can only fall, because
  * the stage is last and commits on a strict improvement.
+ *
+ * One finder pass instead of two was tried too, on levels 5-7: ask this
+ * form's screen first and skip the token pass on a block it convicts. There
+ * is no pass to skip -- the token form has its own screen over the same block
+ * and already refuses those pages -- so it moved the 4 KiB dump total by
+ * 15 918 bytes (+0.02 points) for nothing measurable. At 16 KiB it was 0.32
+ * points SMALLER at 6% less encode, and that is not the win it looks like: it
+ * is the second screen seeing a larger `best_total` and so convicting blocks
+ * into this form that the token pass would have beaten. What it describes is
+ * the token screen being too eager at that page size, not a missing saving,
+ * and the fix for that is not a second screen call per block.
  *
  * Measured on this tree, 4 KiB pages over three process dumps: 89 074 160 ->
  * 88 254 342 bytes (41.77 -> 41.38%, and on the C-heap dump alone 8.93 ->
