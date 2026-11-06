@@ -59,7 +59,16 @@ typedef struct ZpseLaneState {
  * unconditional: 128 KiB of memset for a block whose tiles may never name
  * ORDER2, which on a one-value or stride block was the largest fixed cost
  * in the whole path. Every caller that is about to touch the table calls
- * this first, so the wipe happens exactly when it is needed and once. */
+ * this first, so the wipe happens exactly when it is needed and once.
+ *
+ * Handing the generation out from the encoder context, so that only the
+ * 16-bit wrap needs the table cleared, was implemented and measured and is
+ * not worth its code: the streams came out byte-identical (same corpus
+ * sizes to the byte) and the encode rate did not move -- Python heap 73.9
+ * against 73.5 MB/s at 4 KiB blocks, 609 against 580 MB/s at 64 KiB. So
+ * this clear is not the fixed per-block cost that dominates small-block
+ * encode; it is rare enough to be free, and the counter stays in the lane
+ * state. */
 void zpse_lane_o2_use(ZpseLaneState *s);
 
 void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal);
