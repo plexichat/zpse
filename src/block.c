@@ -1192,8 +1192,49 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_WINDOW 12288u
 #endif
 
+/* Tiles a SHORT block is priced on.
+ *
+ * The window above is a prefix of the block, so a block shorter than it is
+ * priced on the whole of itself -- and the price of a window is paid once per
+ * candidate, ten of them on a full list. On a 4 KiB page that is ten passes
+ * over the page before the first trial runs, which is most of what a
+ * page-at-a-time encode spends (see ZPSE_PRICE_MIN_N).
+ *
+ * A price only has to RANK the candidates, and the ranking of a page's shapes
+ * is what its first half says as well as what all of it says. So a short
+ * block is priced on its first ZPSE_PROBE_SHORT_TILES tiles: still a prefix
+ * (a transform needs one), still an exact price of that prefix, and every
+ * comparison below -- the candidate floor, the raw-window test, the tail
+ * check -- keeps reading a price of `pn` bytes, which is what they are
+ * written against.
+ *
+ * Eight, not four, and the four is the measurement. On 4 KiB pages the dump
+ * total at level 1 goes 126.5 -> 144.7 MB/s at eight tiles and 114.0 -> 148.0
+ * on the shared-library dump alone (best of five rounds, one pinned core,
+ * with a build that changes nothing -- sixteen tiles -- reporting the same
+ * bytes 122-131 MB/s, so the host's band is about 7%). Four tiles roughly
+ * doubles the win and is not affordable: it prices a width-16 candidate's
+ * planes at 64 bytes each, which is where the ranking breaks, and the dump
+ * total grows 2.21 points (59.50 -> 61.71%) against eight's 0.32 (59.82).
+ * The cost at eight is 0.48 points on the shared-library dump alone and 0.06
+ * at level 6, where the trials behind the price repair it; Silesia's pages
+ * move the other way (83.96 -> 83.91% at level 1).
+ *
+ * 0 restores the whole block. */
+#ifndef ZPSE_PROBE_SHORT_TILES
+#define ZPSE_PROBE_SHORT_TILES 8u
+#endif
+
 
 #ifndef ZPSE_FLAT_TRIALS
+/* The trial cap for a block the 12 KiB window price convicts of being flat.
+ *
+ * One was tried (and two) against this three. It is ratio-neutral to 0.004%
+ * on Silesia at level 6 and 0.0002% at level 9, and it is invisible in time:
+ * 293.9 against 298.0 MB/s at level 6 and 190.9 against 184.4 at level 9,
+ * where a build that changes nothing occupies the same band. The blocks this
+ * fires on are cheap either way; the cap stays where the size corpus was
+ * tuned against it. */
 #define ZPSE_FLAT_TRIALS 3
 #endif
 
@@ -2130,6 +2171,74 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return 1;
 }
 
+/* The fast form's own screen: the same question zpse_block_lz_screen asks,
+ * asked with the form that is going to write the stream.
+ *
+ * The token form's screen prices its sample with zpse_lz_encode, and on the
+ * two forms' own sample sizes the two answers disagree -- a fixed 16-bit
+ * distance is the cheaper code exactly when matches are short and fresh (a
+ * page of heap data, a struct array), and the token form's varint is the
+ * cheaper one when they are long and near (columnar text, prose off the
+ * gate). A screen priced with the wrong form therefore refuses passes the
+ * other form would win. That is measurable on the dumps, where this form's
+ * whole stream is smaller than the sweep's winner AND arrives at half the
+ * encode cost, so the verdict that matters has to be taken with it.
+ *
+ * Everything else is the token screen's: the same sample size, the same
+ * level margin (so the ladder's monotonicity is the ladder's, not this
+ * function's), the same tile price of the same shape, and the same second
+ * sample for a block the first one convicts. The two minimum payloads are
+ * both 10 bytes, so the sample-scaled estimate is the token one unchanged. */
+static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                                 uint8_t tid, uint8_t sc, const uint8_t *mb,
+                                 uint16_t meta_len, uint32_t speed,
+                                 int have_best, uint32_t best_total)
+{
+    uint32_t lvl = zpse_enc_speed(speed);
+    uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
+                      ? n
+                      : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
+    const ZpseLevel *row = zpse_level_row(lvl);
+    uint32_t num = (uint32_t)row->screen_num;
+    uint32_t lz_s;
+    uint32_t tile_s;
+
+    if (sn < ZPSE_LZ2_MIN_MATCH + 1u || e->cand == 0) {
+        return 1;
+    }
+    lz_s = zpse_lz2_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                           (uint32_t)ZPSE_LZ_HASH_BITS);
+    if (lz_s == 0u) {
+        return 1;
+    }
+    {
+        int prefix_ok = 1;
+
+        tile_s = zpse_block_proxy_exact(e, in, sn, tid, sc, mb, meta_len,
+                                        ZPSE_DECIDE_TILES, UINT32_MAX, 1,
+                                        &prefix_ok);
+    }
+    if (tile_s == UINT32_MAX) {
+        return 1;
+    }
+    if ((uint64_t)tile_s * (uint64_t)ZPSE_LZ_SCREEN_DEN <
+        (uint64_t)lz_s * (uint64_t)num) {
+        return 0;
+    }
+    if (row->samples > 1u && have_best) {
+        uint32_t off = (n - sn) / 2u;
+        uint32_t lz_m = zpse_lz2_encode(in + off, sn, e->cand,
+                                        (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                                        (uint32_t)ZPSE_LZ_HASH_BITS);
+
+        if (lz_m != 0u &&
+            !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Is this LZ stream worth taking? Smaller than the tile winner (or the
  * sweep found nothing at all, in which case there is no tile stream to
  * compare against), inside the level's acceleration factor, and smaller by
@@ -2525,6 +2634,61 @@ static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
     e->hist_tid = h.transform_id;
     e->hist_sc = h.segment_count;
     e->hist_valid = 1u;
+}
+
+/* ---- Why there is no pre-sweep raw test -------------------------- *
+ * A block that is going out raw still pays ten window prices and a trial to
+ * find that out, and the page corpora make that look like the biggest single
+ * saving left (44% of a shared-library dump is written raw at level 1). Two
+ * designs were built and measured on this tree, and neither is here.
+ *
+ * The first put two cheap questions in front of the sweep -- sixteen spread
+ * tiles all near-random by the encoder's own rule, and a fast-LZ pass over
+ * the head kilobyte finding no repeat -- and wrote RAW when both said so. It
+ * is ratio-safe and useless: it fires on 91 blocks of the shared-library
+ * dump's 29 297 (0.3%), because the pages that go raw are not noise, they
+ * are simply not compressible by any shape the sweep prices, and that is
+ * exactly what the price is for. It also cost Silesia 0.008% at level 6 and
+ * 0.12% at level 9 (102 227 937 -> 102 236 237 and 94 239 250 -> 94 356 526),
+ * where a full-size block it convicted did have a shape left to find.
+ *
+ * The second cut ZPSE_FLAT_TRIALS from 3 to 1 for the blocks the window price
+ * already convicts. Ratio-neutral to 0.004% on Silesia at level 6 (+3 752
+ * bytes of 102 MB) and -0.0002% at level 9, and no time it was possible to
+ * see on this host: 293.9 against 298.0 MB/s at level 6, 190.9 against 184.4
+ * at level 9, inside the same band a no-op build occupies. So the cap stays
+ * at three trials, which is what the size corpus was tuned against. */
+
+/* The RAW fallback's envelope, in one place: the plain block header, no
+ * transform, no segments, the bytes themselves. */
+static int zpse_block_write_raw(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                                uint32_t in_crc, uint32_t seq, int is_last,
+                                uint8_t *out, uint32_t out_cap)
+{
+    uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n;
+    ZpseBlockHeader h;
+    uint8_t flags = (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET |
+                              (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+                                   ? ZPSE_B_CRC
+                                   : 0u));
+
+    if (is_last) {
+        flags |= ZPSE_B_LAST;
+    }
+    if (out_cap < total) {
+        return PSE_OUTPUT_OVERFLOW;
+    }
+    zpse_block_fill_header(&h, flags, n, total, 0, 1, 0, seq, in_crc);
+    zpse_block_header_serialize(out, &h);
+    zpse_block_fix_header_crc(out);
+    memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
+    zpse_block_hist_set(e, out, total);
+#if defined(ZPSE_BLOCK_STATS)
+    /* The RAW fallback won, but it is not a transform win: the sweep found
+     * nothing that paid, and the block went out raw. */
+    zpse_block_win_tid[15u]++;
+#endif
+    return (int)total;
 }
 
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -2973,6 +3137,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t pn = n < (uint32_t)ZPSE_PROBE_WINDOW
                           ? n
                           : (uint32_t)ZPSE_PROBE_WINDOW;
+#if ZPSE_PROBE_SHORT_TILES > 0
+        /* A block shorter than the window is priced on a sample of itself
+         * (see ZPSE_PROBE_SHORT_TILES). Only a short block: a 64 KiB block's
+         * window is already a fraction of the block, and shrinking it is the
+         * separate trade ZPSE_PROBE_WINDOW records. */
+        if (n < (uint32_t)ZPSE_PROBE_WINDOW &&
+            pn > (uint32_t)ZPSE_PROBE_SHORT_TILES *
+                     (uint32_t)ZPSE_TILE_SIZE) {
+            pn = (uint32_t)ZPSE_PROBE_SHORT_TILES *
+                 (uint32_t)ZPSE_TILE_SIZE;
+        }
+#endif
         /* BALANCED and deeper price every plane of a candidate, which is
          * what ranks a transpose correctly; the cheap levels price a stride
          * of them and fill the rest in (see zpse_block_exact_sum). */
@@ -4123,36 +4299,61 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * in `out` when it is strictly smaller -- which it can only be by
      * `t2 < best_total`, and `t2 <= out_cap` keeps it inside the buffer.
      *
-     * MAX offers it and no other level does, and the reason is measured
-     * rather than assumed. Offered from level 5 up -- the rungs that already
-     * pay a match finder on some blocks -- it took 915 bytes off the whole of
-     * Silesia and cost 19% of the default level's encode rate (275.6 to 223.5
-     * MB/s, same corpus, same host, same two runs each): a second pass over
-     * the blocks the first one's screen had already accepted, for a win the
-     * first form usually gets anyway. Offered from level 5 up it moved the
-     * size corpus by 4,056 bytes over its 768 blocks, so the form is real, if
-     * small -- and the rung that exists to buy ratio is where it belongs.
-     *
-     * The rungs below cannot take it at all. Levels 1-4 hold zero in the
-     * ladder's screen columns, which the screen reads as "accept everything":
-     * the pass would run on every block, including the ones level 5 then
-     * refuses -- a level-4 block of 20,501 bytes against a level-5 block of
-     * 21,092 on a float column, which is exactly the ordering
-     * tests/suites/test_levels.c pins. The screen's columns are what hold
-     * that ordering: its margin only loosens with depth and its sample count
-     * only rises, so a deeper rung accepts a superset of what the rung below
-     * accepts. Level 9 is the loosest screen on the ladder, so offering the
-     * form there and nowhere above keeps every level's stream at or below the
-     * one before it. */
+     * Offered from level 5 up it once took 915 bytes off the whole of Silesia
+     * and cost 19% of the default level's encode rate (275.6 to 223.5 MB/s,
+     * same corpus, same host, same two runs each), which is why it used to be
+     * offered at MAX only. That experiment kept the token form's screen (see
+     * below): it paid a second full pass on the blocks the first screen had
+     * already accepted, and reached none of the blocks this form wins.
+     * * The rungs below cannot take it at all. Levels 1-4 hold zero in the
+ * ladder's screen columns, which the screen reads as "accept everything":
+ * the pass would run on every block, including the ones level 5 then
+ * refuses -- a level-4 block of 20,501 bytes against a level-5 block of
+ * 21,092 on a float column, which is exactly the ordering
+ * tests/suites/test_levels.c pins. The screen's columns are what hold
+ * that ordering: its margin only loosens with depth and its sample count
+ * only rises, so a deeper rung accepts a superset of what the rung below
+ * accepts.
+ *
+ * Every rung that pays a match finder offers it (ZPSE_LZ2_MIN_LEVEL), and
+ * the screen in front of it is its own (zpse_block_lz2_screen). The earlier
+ * experiment that offered it from level 5 up kept the token form's screen,
+ * and that is what made it a bad trade: on the blocks where the tile shapes
+ * beat the token sample the candidate never ran, so the whole change bought
+ * 915 bytes over Silesia for 19% of the default level's encode rate. Asking
+ * the question with the form that writes the stream is what lets the
+ * candidate reach the blocks it wins -- and the sizes can only fall, because
+ * the stage is last and commits on a strict improvement.
+ *
+ * Measured on this tree, 4 KiB pages over three process dumps: 89 074 160 ->
+ * 88 254 342 bytes (41.77 -> 41.38%, and on the C-heap dump alone 8.93 ->
+ * 6.82%, where this form goes from 0.0 to 6.3% of the raw bytes), 16 KiB
+ * 83 112 979 -> 82 238 691, 64 KiB page totals within 36 bytes of 80 644 276,
+ * and Silesia at 64 KiB unchanged to the byte at levels 6 and 9. It is paid
+ * for in encode time: 73.1 -> 60.3 MB/s on the 4 KiB dump total at level 6,
+ * with decode 1964 -> 2689 MB/s on the C heap, where a command loop over
+ * fixed-width distances beats the tile reconstruction it replaces. This is
+ * the one trade here that buys size with encode time instead of the other
+ * way round, and on this corpus it is the right one: the form is the
+ * cheapest way to code a page of pointers, and level 6 without it wrote a
+ * C-heap page 24% larger than one greedy pass.
+ *
+ * Levels 1-4 still cannot take it: they write no LZ form at all, and offering
+ * one would make a shallow rung write smaller blocks than the rung above it.
+ */
+#ifndef ZPSE_LZ2_MIN_LEVEL
+#define ZPSE_LZ2_MIN_LEVEL ZPSE_ENC_SPEED_LZ_MIN
+#endif
     if (have_best && e->lz != 0 &&
-        zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >= 9u &&
+        zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
+            (uint32_t)ZPSE_LZ2_MIN_LEVEL &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
                                 ZPSE_LZ2_MIN_PAYLOAD) &&
-        zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
-                             meta_lens[0] > 0 ? meta_bufs[0] : in,
-                             meta_lens[0],
-                             e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
-                             1, best_total)) {
+        zpse_block_lz2_screen(e, in, n, tids[0], scounts[0],
+                              meta_lens[0] > 0 ? meta_bufs[0] : in,
+                              meta_lens[0],
+                              e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+                              1, best_total)) {
         uint32_t t2 = 0u;
         uint32_t cmds2 = 0u;
 
@@ -4169,36 +4370,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             best_idx = 15u;
             have_best = 1;
         }
-    }
-
-    /* RAW fallback when coded does not pay: coded >= 32 + N. */
+    }    /* RAW fallback when coded does not pay: coded >= 32 + N. */
     if (!have_best || (uint64_t)best_total >=
                       (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n) {
-        uint32_t total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n;
-        ZpseBlockHeader h;
-        uint8_t flags = (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET |
-                                  (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
-                                       ? ZPSE_B_CRC : 0u));
-        uint32_t decoded_crc;
-        if (is_last) {
-            flags |= ZPSE_B_LAST;
-        }
-        if (out_cap < total) {
-            return PSE_OUTPUT_OVERFLOW;
-        }
-        decoded_crc = in_crc;
-        zpse_block_fill_header(&h, flags, n, total, 0, 1, 0, seq,
-                               decoded_crc);
-        zpse_block_header_serialize(out, &h);
-        zpse_block_fix_header_crc(out);
-        memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
-        zpse_block_hist_set(e, out, total);
-#if defined(ZPSE_BLOCK_STATS)
-        /* The RAW fallback won, but it is not a transform win: the sweep
-         * found nothing that paid, and the block went out raw. */
-        zpse_block_win_tid[15u]++;
-#endif
-        return (int)total;
+        return zpse_block_write_raw(e, in, n, in_crc, seq, is_last, out,
+                                    out_cap);
     }
 
     if (out_cap < best_total) {
