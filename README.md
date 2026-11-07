@@ -109,6 +109,25 @@ smaller shape for them. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 84% of the dump
 survives there against 63% at the default level and 61% at the deepest.
 
+Silesia's twelve files put the same shape on a general corpus:
+
+| 4 KiB pages | level 1 | level 6 | level 9 |
+| --- | ---: | ---: | ---: |
+| ratio | 80.47% | 55.07% | 53.50% |
+| encode | 226 MB/s | 112 MB/s | 99 MB/s |
+| decode | 2.8 GB/s | 1.7 GB/s | 1.7 GB/s |
+
+Against zstd on the same pages (one process, one reused context, the same
+keep-it-if-it-is-smaller rule) the page size is where zstd is the better
+default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
+130 MB/s, against 55.07% at 112 and 41.37% at 123. What zpse keeps is decode --
+1.6 to 4.1 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
+twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
+reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
+of the 10.77 points to zstd 6, which would leave the dumps at 34.4% against
+zstd's 30.9% while paying for the coder. At a page the format's problem is the
+ratio it starts from, not the last few bits of it.
+
 A page's block carries a **16-byte header** rather than 32 whenever the
 payload checksum is off -- the version, tile size, predictor profile and
 reserved byte are fixed by the format, and the decoded CRC has nowhere to live
