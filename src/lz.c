@@ -186,6 +186,11 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
  * positive one and the decoder refuses. Only a position strictly inside
  * the block before the new cursor is a match at all.
  *
+ * A second look one byte further on was measured and refused: it takes
+ * another 8,830 bytes off the three dumps at the default level (0.010%)
+ * for 3% of the encode rate, and 8,098 at level 9 for 4%. The one-byte
+ * window is where the win is.
+ *
  * 0 disables it. */
 #ifndef ZPSE_LZ_LAZY_LEN
 #define ZPSE_LZ_LAZY_LEN 1u
