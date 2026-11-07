@@ -384,18 +384,31 @@ static int decode_stream(const char *in_path, const char *out_path,
     for (;;) {
         ZpseBlockHeader bh;
         uint32_t comp_sz;
+        uint32_t hdr_sz;
         uint32_t blk_out = 0u;
-        size_t got = fread(blk, 1u, (size_t)ZPSE_BLOCK_HEADER_SIZE, fi);
+        size_t got = fread(blk, 1u, (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT, fi);
 
         /* End of file exactly on a block boundary: legal only for a frame
          * whose declared count agrees, which the tail below checks. */
         if (got == 0u) {
             break;
         }
-        if (got < (size_t)ZPSE_BLOCK_HEADER_SIZE ||
-            zpse_block_header_parse(&bh, blk, ZPSE_BLOCK_HEADER_SIZE) !=
-                PSE_OK ||
-            bh.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
+        /* The sync says which header this is: a page's block carries 16
+         * bytes, everything else the 32 the format has always had, so the
+         * short read above is enough to tell and the rest is read here. */
+        hdr_sz = zpse_block_header_size(blk, (uint32_t)got);
+        if (hdr_sz == 0u || got < (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            fprintf(stderr, "zpse_cli: bad block at block %zu\n", nblocks);
+            goto fail;
+        }
+        if (hdr_sz > (uint32_t)got &&
+            fread(blk + got, 1u, (size_t)(hdr_sz - (uint32_t)got), fi) !=
+                (size_t)(hdr_sz - (uint32_t)got)) {
+            fprintf(stderr, "zpse_cli: frame ends mid-header\n");
+            goto fail;
+        }
+        if (zpse_block_header_parse(&bh, blk, hdr_sz) != PSE_OK ||
+            bh.compressed_block_size < hdr_sz ||
             bh.compressed_block_size > (uint32_t)sizeof blk ||
             bh.uncompressed_size < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
             bh.uncompressed_size > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
@@ -408,10 +421,9 @@ static int decode_stream(const char *in_path, const char *out_path,
             blk_len[nblocks] = comp_sz;
             blk_pos += (size_t)comp_sz;
         }
-        if (comp_sz > (uint32_t)ZPSE_BLOCK_HEADER_SIZE &&
-            fread(blk + ZPSE_BLOCK_HEADER_SIZE, 1u,
-                  (size_t)(comp_sz - (uint32_t)ZPSE_BLOCK_HEADER_SIZE), fi) !=
-                (size_t)(comp_sz - (uint32_t)ZPSE_BLOCK_HEADER_SIZE)) {
+        if (comp_sz > hdr_sz &&
+            fread(blk + hdr_sz, 1u, (size_t)(comp_sz - hdr_sz), fi) !=
+                (size_t)(comp_sz - hdr_sz)) {
             fprintf(stderr, "zpse_cli: frame ends mid-block\n");
             goto fail;
         }

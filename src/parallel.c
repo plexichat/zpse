@@ -220,7 +220,8 @@ static int zpse_mt_close(ZpseMtJob *j, int with_index, size_t *out_len_out)
         if (rc != PSE_OK) {
             return rc;
         }
-        if (bh.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
+        if (bh.compressed_block_size <
+                (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
             (size_t)bh.compressed_block_size > j->stride ||
             bh.block_sequence_number != (uint32_t)i) {
             return PSE_BAD_HEADER;

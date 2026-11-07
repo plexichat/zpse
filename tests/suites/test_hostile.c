@@ -41,6 +41,26 @@ static void refresh_crc(void) {
     refresh_flags((uint32_t)ZPSE_ENC_CHECKSUM);
 }
 
+/* These cases corrupt a header field and repair the checksum that covers it.
+ * A block of a page's size carries the 16-byte header (flags at byte 2,
+ * transform at 3, checksum over 14 bytes) and a longer one the 32-byte
+ * header (flags at 3, transform at 12, checksum over 28), so both the field's
+ * offset and the repair follow from the sync. */
+static uint32_t hostile_short(const uint8_t *b, uint32_t len)
+{
+    return zpse_block_header_size(b, len) ==
+           (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+}
+
+static void hostile_fix_crc(uint8_t *b, uint32_t len)
+{
+    if (hostile_short(b, len)) {
+        zpse_store_u16le(b + 14, (uint16_t)(zpse_crc32c(b, 14) & 0xFFFFu));
+    } else {
+        zpse_store_u32le(b + 28, zpse_crc32c(b, 28));
+    }
+}
+
 int main(void) {
     uint32_t olen = 0;
     int rc, i;
@@ -95,21 +115,24 @@ int main(void) {
      * form has to be refused by the form's own envelope check rather than by
      * a reserved-bit mask -- the flag alone must never be enough to read a
      * tile payload as commands. Bit 7 first, then the LZ bit. */
-    memcpy(work, comp, clen); work[3] |= 0x80;
-    zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
+    memcpy(work, comp, clen);
+    work[hostile_short(work, clen) ? 2u : 3u] |= 0x80;
+    hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc < 0, "fast LZ flag on a tile payload rejected");
 
     /* The LZ form on a stream that is not one: the flag alone must not be
      * enough to read a tile payload as commands. */
-    memcpy(work, comp, clen); work[3] |= 0x20;
-    zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
+    memcpy(work, comp, clen);
+    work[hostile_short(work, clen) ? 2u : 3u] |= 0x20;
+    hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc < 0, "LZ flag on a tile payload rejected");
 
     /* Bad transform_id with repaired CRC -> BAD_TRANSFORM. */
-    memcpy(work, comp, clen); work[12] = 12;
-    zpse_store_u32le(work + 28, zpse_crc32c(work, 28));
+    memcpy(work, comp, clen);
+    work[hostile_short(work, clen) ? 3u : 12u] = 12;
+    hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc == PSE_BAD_TRANSFORM, "transform 12 rejected");
 

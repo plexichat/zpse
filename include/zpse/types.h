@@ -35,6 +35,10 @@ typedef struct ZpseBlockHeader {
     uint32_t block_sequence_number;
     uint32_t decoded_crc32c;
     uint32_t header_crc32c;
+    /* How many bytes the header occupies on the wire: ZPSE_BLOCK_HEADER_SIZE
+     * for the long form, ZPSE_BLOCK_HEADER_SIZE_SHORT for a page's. Set by
+     * the parser, and the offset the payload starts at. */
+    uint8_t  header_size;
 } ZpseBlockHeader;
 
 typedef struct ZpseSegmentDirEntry {
@@ -90,6 +94,13 @@ int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t l
 void zpse_frame_header_serialize(uint8_t out[32], const ZpseFrameHeader *h);
 int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len);
 void zpse_block_header_serialize(uint8_t out[32], const ZpseBlockHeader *h);
+/* 32, 16, or 0 when `buf` does not start with a recognised block sync. Only
+ * the first two bytes are read, so a caller that has 16 bytes of a page's
+ * block can tell which header it is looking at before reading the rest. */
+uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len);
+/* The 16-byte page header. Requires block_flags without ZPSE_B_CRC and an
+ * uncompressed size of at most ZPSE_BLOCK_SHORT_MAX. */
+void zpse_block_header_serialize_short(uint8_t out[16], const ZpseBlockHeader *h);
 int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32_t len);
 void zpse_segment_header_serialize(uint8_t out[16], const ZpseSegmentHeader *h);
 int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len);

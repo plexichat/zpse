@@ -118,7 +118,7 @@ int main(void) {
         h.decoded_crc32c ^= 1u;
         zpse_block_header_serialize(comp, &h);
         {
-            uint32_t rec0 = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
+            uint32_t rec0 = zpse_block_header_size(comp, cl) +
                             (uint32_t)h.transform_meta_size +
                             (uint32_t)h.segment_count * 8u + 16u;
             CHECK((comp[rec0 + 2] & 0x40) != 0,

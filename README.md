@@ -84,6 +84,47 @@ wide stores and never reads them back; `random` decoding at 66 200 MB/s is
 the raw path doing a copy plus a header check, i.e. right at the `memcpy`
 ceiling. Everything else is transform- and tile-bound, not memory-bound.
 
+### 4 KiB pages
+
+zram hands the codec one page at a time, so a page-sized block is a different
+trade from the 64 KiB one above: the sweep has one tile per plane to price a
+shape on, the trial it skips is worth half the block, and every structural
+byte is charged against 4096 rather than 65536. Measured on three process
+dumps -- a Python heap, a C heap and 120 MB of shared-library pages, 213 MB
+together -- each page encoded as its own block and kept only when it comes out
+smaller than it went in, one pinned core, best of five:
+
+| level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 39.77% | 10.57% | 84.14% | 59.71% | 209 / 450 / 205 MB/s |
+| 6 (default) | 17.37% | 6.64% | 63.30% | **41.37%** | 106 / 181 / 120 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 17.26% | 6.47% | 62.61% | 40.92% | 96 / 183 / 100 MB/s |
+
+The default level's page costs about 107 MB/s of encode for 41.37%, and
+decodes at 1.6 to 3.8 GB/s (the C heap is all pointers, which the fast LZ form
+codes as commands). The deepest level buys 0.45 points of ratio for about 10%
+of the rate, because on a page the tier's extra margin and decode bill reach
+the blocks the default level leaves to the tiles rather than finding a
+smaller shape for them. The shared-library dump is what holds every level's
+total where it is: two pages in five go out raw at level 1, and 84% of the dump
+survives there against 63% at the default level and 61% at the deepest.
+
+A page's block carries a **16-byte header** rather than 32 whenever the
+payload checksum is off -- the version, tile size, predictor profile and
+reserved byte are fixed by the format, and the decoded CRC has nowhere to live
+in the short form, so a checksummed stream keeps the long one. Sixteen bytes
+is 0.39% of a 4096-byte page, which is 0.34 points of ratio over the three
+dumps (a page that goes out raw has no header left to save, so 45 000 of the
+52 065 pages shrink). The sync value (`0x50B6` or `0x50B7`) is what a reader uses to tell the
+two apart, and nothing else about the block changes.
+
+What a page cannot afford is the full-size block's trial structure: a 4 KiB
+block below the probe's gate would run nine full trials, and the two knobs
+that stop that are the ones this size was tuned with -- the pricing gate at
+`ZPSE_PRICE_MIN_N` 4096 and the tie cut's field floor at two survivors for a
+page against four for anything larger. 16 KiB and 64 KiB blocks are byte for
+byte what they were before either knob.
+
 ### Methodology, and why this is not science
 
 * In-process only. `tests/benchmarks/bench_vs.sh` measures other tools by

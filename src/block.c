@@ -214,6 +214,51 @@ static void zpse_block_fill_header(ZpseBlockHeader *h, uint8_t flags,
     h->block_sequence_number = seq;
     h->decoded_crc32c = decoded_crc;
     h->header_crc32c = 0;
+    h->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE;
+}
+
+/* Write the winner's header in the 16-byte page form when it can carry it.
+ *
+ * `out` holds [32-byte header][payload] of `total` bytes. Sixteen of those
+ * header bytes are fields the format fixes (version, tile size, predictor
+ * profile, reserved) or that a page does not use (a payload CRC, which keeps
+ * the long header), so a page's block can say the same thing in 16 -- and 16
+ * bytes is 0.30 points of the shared-library dump's ratio at 63.6%, or 0.34
+ * points over the three dumps together (52 065 pages, 45 000 of which
+ * shrink, 719 591 bytes). The payload moves down onto the header it just gave up;
+ * nothing else about the block changes, and the sync value tells a reader
+ * which header it is looking at.
+ *
+ * Refused (total returned unchanged) for a block over ZPSE_BLOCK_SHORT_MAX, a
+ * payload CRC, or a size the 16-bit fields would overflow -- none of which a
+ * page produces, since a page is 4096 and its raw envelope is 4112. */
+static uint32_t zpse_block_shrink_page(uint8_t *out, uint32_t n,
+                                       uint32_t total)
+{
+    ZpseBlockHeader h;
+    uint8_t sh[ZPSE_BLOCK_HEADER_SIZE_SHORT];
+    uint32_t payload;
+
+    if (n > (uint32_t)ZPSE_BLOCK_SHORT_MAX ||
+        total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+        return total;
+    }
+    if (zpse_block_header_parse(&h, out, ZPSE_BLOCK_HEADER_SIZE) != PSE_OK) {
+        return total;
+    }
+    if ((h.block_flags & ZPSE_B_CRC) != 0u || h.transform_meta_size > 255u) {
+        return total;
+    }
+    payload = total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+    if (payload + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT > 65535u) {
+        return total;
+    }
+    h.compressed_block_size = payload + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    zpse_block_header_serialize_short(sh, &h);
+    memmove(out + ZPSE_BLOCK_HEADER_SIZE_SHORT, out + ZPSE_BLOCK_HEADER_SIZE,
+            payload);
+    memcpy(out, sh, sizeof sh);
+    return payload + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
 }
 
 int zpse_block_probe(const uint8_t *in, uint32_t in_len,
@@ -221,19 +266,24 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
                      uint32_t *uncompressed_size_out)
 {
     ZpseBlockHeader h;
+    uint32_t hdr;
     int rc;
 
     if (in == 0 || compressed_size_out == 0 || uncompressed_size_out == 0) {
         return PSE_BAD_ARG;
     }
-    if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+    if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return PSE_TRUNCATED;
+    }
+    hdr = zpse_block_header_size(in, in_len);
+    if (hdr == 0u || in_len < hdr) {
         return PSE_TRUNCATED;
     }
     rc = zpse_block_header_parse(&h, in, in_len);
     if (rc != PSE_OK) {
         return rc;
     }
-    if (h.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+    if (h.compressed_block_size < hdr) {
         return PSE_BAD_BLOCK_SIZE;
     }
     if (in_len < h.compressed_block_size) {
@@ -255,6 +305,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     const uint8_t *dir, *payloads;
     const uint8_t *body;
     uint32_t body_off, body_len;
+    uint32_t hdr;
     uint32_t seg_lens[16];
     const uint8_t *csegs[16];
     uint32_t cum, s;
@@ -267,7 +318,11 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if (d->recon == 0 || d->out_stage == 0) {
         return PSE_BAD_ARG;
     }
-    if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+    if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return PSE_TRUNCATED;
+    }
+    hdr = zpse_block_header_size(in, in_len);
+    if (hdr == 0u || in_len < hdr) {
         return PSE_TRUNCATED;
     }
     rc = zpse_block_header_parse(&h, in, in_len);
@@ -275,7 +330,12 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         return rc;
     }
     /* Header CRC defence in depth (parse is expected to check it). */
-    if (zpse_crc32c(in, 28) != h.header_crc32c) {
+    if (hdr == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        if ((uint32_t)(zpse_crc32c(in, 14) & UINT32_C(0xFFFF)) !=
+            h.header_crc32c) {
+            return PSE_BAD_HEADER_CRC;
+        }
+    } else if (zpse_crc32c(in, 28) != h.header_crc32c) {
         return PSE_BAD_HEADER_CRC;
     }
 
@@ -284,7 +344,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
         return PSE_BAD_BLOCK_SIZE;
     }
-    if (c < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+    if (c < hdr) {
         return PSE_BAD_BLOCK_SIZE;
     }
     if (in_len < c) {
@@ -332,7 +392,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             (h.block_flags & (ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) != 0) {
             return PSE_BAD_HEADER;
         }
-        if (c != (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+        if (c != hdr + n) {
             return PSE_BAD_BLOCK_SIZE;
         }
         if ((h.block_flags & ZPSE_B_CRC) != 0) {
@@ -340,12 +400,12 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
              * copy of the input, so a single pass both fills the caller's
              * buffer and returns the CRC of exactly the bytes copied --
              * no second sweep over 64 KiB that has already left L1. */
-            calc = zpse_crc32c_copy(output, in + ZPSE_BLOCK_HEADER_SIZE, n);
+            calc = zpse_crc32c_copy(output, in + hdr, n);
             if (calc != h.decoded_crc32c) {
                 return PSE_BAD_PAYLOAD_CRC;
             }
         } else {
-            memcpy(output, in + ZPSE_BLOCK_HEADER_SIZE, n);
+            memcpy(output, in + hdr, n);
         }
         if (out_len_out != 0) {
             *out_len_out = n;
@@ -363,11 +423,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
             return PSE_BAD_HEADER;
         }
-        if (c <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+        if (c <= hdr) {
             return PSE_BAD_BLOCK_SIZE;
         }
-        rc = zpse_lz_decode(in + ZPSE_BLOCK_HEADER_SIZE,
-                            c - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, output, n);
+        rc = zpse_lz_decode(in + hdr, c - hdr, output, n);
         if (rc != PSE_OK) {
             return rc;
         }
@@ -393,11 +452,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             (h.block_flags & (ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
             return PSE_BAD_HEADER;
         }
-        if (c <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+        if (c <= hdr) {
             return PSE_BAD_BLOCK_SIZE;
         }
-        rc = zpse_lz2_decode(in + ZPSE_BLOCK_HEADER_SIZE,
-                             c - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, output, n);
+        rc = zpse_lz2_decode(in + hdr, c - hdr, output, n);
         if (rc != PSE_OK) {
             return rc;
         }
@@ -416,7 +474,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 
     /* Coded path: structural directory checks (PHASE1). */
     body = in;
-    body_off = (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+    body_off = hdr;
     body_len = c;
     /* v2: the body below is itself an intra-block LZ stream. Unpack it once
      * into the decoder's own buffer and let the tile path read it as if it
@@ -430,18 +488,15 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (d->lzbuf == 0) {
             return PSE_BAD_ARG;
         }
-        if (c < (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) +
-                    (uint32_t)ZPSE_LZ_MIN_PAYLOAD) {
+        if (c < hdr + 4u + (uint32_t)ZPSE_LZ_MIN_PAYLOAD) {
             return PSE_BAD_BLOCK_SIZE;
         }
-        blen = zpse_load_u32le(in + ZPSE_BLOCK_HEADER_SIZE);
+        blen = zpse_load_u32le(in + hdr);
         if (blen < (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE ||
             blen > (uint32_t)ZPSE_D_SZ_LZBUF) {
             return PSE_BAD_BLOCK_SIZE;
         }
-        rc = zpse_lz_decode(in + ZPSE_BLOCK_HEADER_SIZE + 4u,
-                            c - (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u),
-                            d->lzbuf, blen);
+        rc = zpse_lz_decode(in + hdr + 4u, c - (hdr + 4u), d->lzbuf, blen);
         if (rc != PSE_OK) {
             return rc;
         }
@@ -2892,6 +2947,7 @@ static int zpse_block_write_raw(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_header_serialize(out, &h);
     zpse_block_fix_header_crc(out);
     memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
+    total = zpse_block_shrink_page(out, n, total);
     zpse_block_hist_set(e, out, total);
 #if defined(ZPSE_BLOCK_STATS)
     /* The RAW fallback won, but it is not a transform win: the sweep found
@@ -2963,6 +3019,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         (void)f_cmds;
         if (lrc == PSE_OK &&
             f_total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+            f_total = zpse_block_shrink_page(out, n, f_total);
             zpse_block_hist_set(e, out, f_total);
             return (int)f_total;
         }
@@ -2989,6 +3046,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             zpse_block_header_serialize(out, &h);
             zpse_block_fix_header_crc(out);
             memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
+            rtotal = zpse_block_shrink_page(out, n, rtotal);
             zpse_block_hist_set(e, out, rtotal);
             return (int)rtotal;
         }
@@ -3943,6 +4001,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                         zpse_block_gate_lz++;
 #endif
                         memcpy(out, e->best, lz_total);
+                        lz_total = zpse_block_shrink_page(out, n, lz_total);
                         zpse_block_hist_set(e, out, lz_total);
                         return (int)lz_total;
                     }
@@ -4081,6 +4140,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             zpse_block_lz_wins(n, lz_cmds, lz_total, 0, 0u,
                                e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
             memcpy(out, e->cand, lz_total);
+            lz_total = zpse_block_shrink_page(out, n, lz_total);
             zpse_block_hist_set(e, out, lz_total);
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_finder_first++;
@@ -4625,6 +4685,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (!direct_out) {
         memcpy(out, e->best, best_total);
     }
+    best_total = zpse_block_shrink_page(out, n, best_total);
     zpse_block_hist_set(e, out, best_total);
 #if defined(ZPSE_BLOCK_STATS)
     {

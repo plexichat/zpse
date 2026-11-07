@@ -88,7 +88,9 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
         return PSE_BAD_ARG;
     }
-    if (in_len < 32u) {
+    /* A page's block is 16 bytes of header, so this floor is the short one:
+     * the header itself is what says which form it is. */
+    if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
         return PSE_TRUNCATED;
     }
     rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);

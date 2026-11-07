@@ -174,14 +174,24 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         if (rc != PSE_OK) {
             return rc;
         }
-        if (comp_sz < ZPSE_BLOCK_HEADER_SIZE) {
+        if (comp_sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             return PSE_BAD_HEADER;
         }
         if ((size_t)comp_sz > rem) {
             return PSE_TRUNCATED;
         }
-        /* comp_sz >= 32 and <= rem, so in[pos+3] is in bounds. */
-        is_last = (in[pos + 3] & ZPSE_B_LAST) != 0;
+        /* The flags byte sits at offset 3 in the long header and at 2 in a
+         * page's 16-byte one, so the LAST flag is read through the parse
+         * rather than off a fixed offset. */
+        {
+            ZpseBlockHeader bh;
+
+            rc = zpse_block_header_parse(&bh, in + pos, comp_sz);
+            if (rc != PSE_OK) {
+                return rc;
+            }
+            is_last = (bh.block_flags & ZPSE_B_LAST) != 0;
+        }
         if (uncomp_sz < ZPSE_MIN_BLOCK_SIZE ||
             uncomp_sz > ZPSE_MAX_BLOCK_SIZE) {
             return PSE_BAD_BLOCK_SIZE;
@@ -436,7 +446,7 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     size = zpse_load_u32le(entries + (size_t)block_index *
                                         (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
     if ((size_t)off < (size_t)ZPSE_FRAME_HEADER_SIZE ||
-        size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
+        size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
         (uint64_t)off + (uint64_t)size > (uint64_t)in_len) {
         return PSE_BAD_HEADER;
     }
@@ -497,7 +507,7 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
         uint8_t *ent = out + at + ZPSE_INDEX_HEADER_SIZE +
                        (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
 
-        if ((size_t)off + (size_t)ZPSE_BLOCK_HEADER_SIZE > pos) {
+        if ((size_t)off + (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT > pos) {
             return PSE_BAD_HEADER;
         }
         rc = zpse_block_header_parse(&bh, out + off,
@@ -505,7 +515,8 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
         if (rc != PSE_OK) {
             return rc;
         }
-        if (bh.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
+        if (bh.compressed_block_size <
+                (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
             (size_t)off + (size_t)bh.compressed_block_size > pos ||
             bh.block_sequence_number != k) {
             return PSE_BAD_HEADER;
@@ -576,7 +587,7 @@ int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
         uint8_t *ent = idx_out + (size_t)ZPSE_INDEX_HEADER_SIZE +
                        (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
 
-        if (sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+        if (sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             return PSE_BAD_BLOCK_SIZE;
         }
         if ((uint64_t)off + (uint64_t)sz > (uint64_t)index_offset) {
@@ -680,7 +691,7 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
         }
         /* Invariant: pos <= out_cap, so the subtraction cannot wrap. */
         rem = out_cap - pos;
-        if (rem < ZPSE_BLOCK_HEADER_SIZE) {
+        if (rem < (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             return PSE_OUTPUT_OVERFLOW;
         }
         cap = rem > (size_t)UINT32_MAX ? UINT32_MAX : (uint32_t)rem;

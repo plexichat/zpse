@@ -9,6 +9,89 @@ static int zpse_is_valid_segment_count(uint8_t c)
     return c == 1 || c == 2 || c == 4 || c == 8 || c == 16;
 }
 
+uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len)
+{
+    uint16_t sync;
+
+    if (buf == 0 || len < 2u) {
+        return 0u;
+    }
+    sync = zpse_load_u16le(buf + 0);
+    if (sync == ZPSE_BLOCK_SYNC) {
+        return (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+    }
+    if (sync == ZPSE_BLOCK_SYNC_SHORT) {
+        return (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    }
+    return 0u;
+}
+
+/* The 16-byte page header: [sync][flags][transform][segcount][meta8]
+ * [uncomp16][comp16][seq32][crc16]. Everything the long header carries that
+ * is not here is fixed by the format (version, tile size, predictor profile,
+ * reserved), and a payload CRC has nowhere to live, so a block that wants
+ * one is written long. */
+static int zpse_block_header_parse_short(ZpseBlockHeader *out,
+                                         const uint8_t *buf)
+{
+    uint8_t flags, tid, scount, meta8;
+    uint32_t uncomp, comp, seq;
+    uint16_t stored, calc;
+
+    flags = buf[2];
+    tid = buf[3];
+    scount = buf[4];
+    meta8 = buf[5];
+    uncomp = (uint32_t)zpse_load_u16le(buf + 6);
+    comp = (uint32_t)zpse_load_u16le(buf + 8);
+    seq = zpse_load_u32le(buf + 10);
+    stored = zpse_load_u16le(buf + 14);
+    calc = (uint16_t)(zpse_crc32c(buf, 14) & UINT32_C(0xFFFF));
+
+    if (calc != stored) {
+        return PSE_BAD_HEADER_CRC;
+    }
+    if ((flags & ZPSE_B_CRC) != 0u) {
+        return PSE_UNSUPPORTED_FEATURE;
+    }
+    if ((flags & ZPSE_B_RESET) == 0u) {
+        return PSE_BAD_HEADER;
+    }
+    if (((flags & ZPSE_B_HAS_META) != 0u) != (meta8 > 0u)) {
+        return PSE_BAD_HEADER;
+    }
+    if ((flags & ZPSE_B_RESERVED_MASK) != 0u) {
+        return PSE_UNSUPPORTED_FEATURE;
+    }
+    if (uncomp < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
+        uncomp > (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+        return PSE_BAD_BLOCK_SIZE;
+    }
+    if (comp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return PSE_BAD_BLOCK_SIZE;
+    }
+    if (tid > 11u || !zpse_is_valid_segment_count(scount)) {
+        return PSE_BAD_TRANSFORM;
+    }
+
+    out->sync = ZPSE_BLOCK_SYNC_SHORT;
+    out->block_version = ZPSE_BLOCK_VERSION;
+    out->block_flags = flags;
+    out->uncompressed_size = uncomp;
+    out->compressed_block_size = comp;
+    out->transform_id = tid;
+    out->segment_count = scount;
+    out->transform_meta_size = (uint16_t)meta8;
+    out->tile_size = (uint16_t)ZPSE_TILE_SIZE;
+    out->predictor_profile = 0u;
+    out->reserved0 = 0u;
+    out->block_sequence_number = seq;
+    out->decoded_crc32c = 0u;
+    out->header_crc32c = stored;
+    out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    return PSE_OK;
+}
+
 int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t len)
 {
     uint32_t magic;
@@ -105,13 +188,24 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     uint32_t seq;
     uint32_t dec_crc;
     uint32_t stored_crc, calc_crc;
+    uint32_t hsz;
     int has_meta;
 
     if (out == 0 || buf == 0) {
         return PSE_BAD_ARG;
     }
-    if (len < ZPSE_BLOCK_HEADER_SIZE) {
+    if (len < 2u) {
         return PSE_TRUNCATED;
+    }
+    hsz = zpse_block_header_size(buf, len);
+    if (hsz == 0u) {
+        return PSE_BAD_HEADER;
+    }
+    if (len < hsz) {
+        return PSE_TRUNCATED;
+    }
+    if (hsz == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return zpse_block_header_parse_short(out, buf);
     }
     sync = zpse_load_u16le(buf + 0);
     ver = buf[2];
@@ -184,7 +278,27 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     out->block_sequence_number = seq;
     out->decoded_crc32c = dec_crc;
     out->header_crc32c = stored_crc;
+    out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE;
     return PSE_OK;
+}
+
+void zpse_block_header_serialize_short(uint8_t out[16], const ZpseBlockHeader *h)
+{
+    uint32_t crc;
+
+    if (out == 0 || h == 0) {
+        return;
+    }
+    zpse_store_u16le(out + 0, ZPSE_BLOCK_SYNC_SHORT);
+    out[2] = h->block_flags;
+    out[3] = h->transform_id;
+    out[4] = h->segment_count;
+    out[5] = (uint8_t)h->transform_meta_size;
+    zpse_store_u16le(out + 6, (uint16_t)h->uncompressed_size);
+    zpse_store_u16le(out + 8, (uint16_t)h->compressed_block_size);
+    zpse_store_u32le(out + 10, h->block_sequence_number);
+    crc = zpse_crc32c(out, 14);
+    zpse_store_u16le(out + 14, (uint16_t)(crc & UINT32_C(0xFFFF)));
 }
 
 void zpse_block_header_serialize(uint8_t out[32], const ZpseBlockHeader *h)

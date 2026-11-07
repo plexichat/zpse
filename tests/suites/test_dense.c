@@ -873,19 +873,32 @@ static void emitter_block(uint32_t n, uint8_t v)
      * branch pins the exact arithmetic as before. The v2 LZ+tiles form is
      * the same kind of win one stage further on -- it compresses the tile
      * body itself -- so it is held to the same bound. */
-    if ((comp[3] & (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) !=
-        0) {
-        CHECK(clen < 32u + 8u + 16u + 10u * ((n + 255u) / 256u),
-              "block: a compressed form beats the tiles on a constant block");
-    } else {
-        /* One segment, no metadata: 32-byte block header, 8-byte directory
-         * entry, 16-byte segment header, then the first record. */
-        CHECK((((comp[32 + 8 + 16 + 2] & ZPSE_DENSE_MARKER) != 0) ? 1 : 0) ==
-                  want,
-              "block: dense marker iff smaller");
-        if (want) {
-            CHECK(clen == 32u + 8u + 16u + 12u * ((n + 4095u) / 4096u),
-                  "block: dense constant size");
+    {
+        ZpseBlockHeader bh;
+
+        /* The flags byte is at offset 3 in the long header and at 2 in a
+         * page's 16-byte one, so read it through the parse. */
+        CHECK(zpse_block_header_parse(&bh, comp, clen) == PSE_OK,
+              "constant block header parses");
+        if ((bh.block_flags &
+             (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) != 0) {
+            CHECK(clen < 32u + 8u + 16u + 10u * ((n + 255u) / 256u),
+                  "block: a compressed form beats the tiles on a constant "
+                  "block");
+        } else {
+            /* One segment, no metadata: the block header (32 bytes, or 16
+             * for a page's), 8-byte directory entry, 16-byte segment
+             * header, then the first record. */
+            uint32_t hdr = zpse_block_header_size(comp, clen);
+
+            CHECK((((comp[hdr + 8 + 16 + 2] & ZPSE_DENSE_MARKER) != 0) ? 1
+                                                                     : 0) ==
+                      want,
+                  "block: dense marker iff smaller");
+            if (want) {
+                CHECK(clen == hdr + 8u + 16u + 12u * ((n + 4095u) / 4096u),
+                      "block: dense constant size");
+            }
         }
     }
     rc = zpse_decompress_block(comp, clen, back, (uint32_t)sizeof back, &dlen,
