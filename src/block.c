@@ -4658,12 +4658,35 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
             (uint32_t)ZPSE_LZ2_MIN_LEVEL &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
-                                ZPSE_LZ2_MIN_PAYLOAD) &&
-        zpse_block_lz2_screen(e, in, n, tids[0], scounts[0],
-                              meta_lens[0] > 0 ? meta_bufs[0] : in,
-                              meta_lens[0],
-                              e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
-                              1, best_total)) {
+                                ZPSE_LZ2_MIN_PAYLOAD)) {
+        /* The screen prices its sample under ONE candidate's transform, and
+         * which one must not depend on the order the sweep attempted them in:
+         * both orders are required to write identical streams (test_fuzz
+         * under ZPSE_FORCE_TRIAL_SWAP), and a few bytes of margin make the
+         * screen answer differently -- a segment header's worth was enough.
+         * List position 0 is the attempt order's first, so it is not that
+         * candidate; the lowest list index is, and it is also the cheapest to
+         * price -- the identity or the sample's favourite, whose plane needs
+         * no staging copy. Pricing the WINNER instead was measured and
+         * refused: on the 4 KiB dumps it took 3 691 bytes off for 3.3% of the
+         * encode rate, because a winning transpose prices its sample through
+         * a staged plane. */
+        int wi = 0;
+        int wj;
+
+        for (wj = 1; wj < ncand; wj++) {
+            if (idx[wj] < idx[wi]) {
+                wi = wj;
+            }
+        }
+        if (!zpse_block_lz2_screen(e, in, n, tids[wi], scounts[wi],
+                                   meta_lens[wi] > 0 ? meta_bufs[wi] : in,
+                                   meta_lens[wi],
+                                   e->enc_flags &
+                                       (uint32_t)ZPSE_ENC_SPEED_MASK,
+                                   1, best_total)) {
+            goto lz2_done;
+        }
         uint32_t t2 = 0u;
         uint32_t cmds2 = 0u;
 
@@ -4680,7 +4703,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             best_idx = 15u;
             have_best = 1;
         }
-    }    /* RAW fallback when coded does not pay: coded >= 32 + N. */
+    }
+lz2_done:
+    /* RAW fallback when coded does not pay: coded >= 32 + N. */
     if (!have_best || (uint64_t)best_total >=
                       (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n) {
         return zpse_block_write_raw(e, in, n, in_crc, seq, is_last, out,
