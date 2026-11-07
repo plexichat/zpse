@@ -164,6 +164,33 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
  * below skip working out the exact size first. */
 #define LZ_CMD_ROOM 8u
 
+/* Lazy matching by LENGTH, for pages only.
+ *
+ * The probe above asks one question -- "is there an eight-byte match one
+ * byte ahead?" -- and that is the right question for a 64 KiB block, where
+ * matches are long enough that one byte of literal never pays for a second
+ * lookup. It is the wrong question for a 4096-byte page, where the average
+ * match is five bytes: a five-byte match at pos and a nine-byte match at
+ * pos+1 is a four-byte win, and the eight-byte test throws it away.
+ *
+ * So at page size the match is measured first and then the position one
+ * byte later is measured too, and the byte is given up only when the later
+ * match is strictly longer by more than the literal it costs. The probe is
+ * gated on the block being a page: 16 KiB and 64 KiB blocks keep their
+ * bytes exactly.
+ *
+ * `cand1 < pos + 1u` is not decoration. Backward extension has already
+ * moved `pos` back here, and the table holds the position this iteration
+ * inserted -- which is ahead of the extended cursor. Taking such a
+ * candidate gives a negative distance, which the encoder writes as a huge
+ * positive one and the decoder refuses. Only a position strictly inside
+ * the block before the new cursor is a match at all.
+ *
+ * 0 disables it. */
+#ifndef ZPSE_LZ_LAZY_LEN
+#define ZPSE_LZ_LAZY_LEN 1u
+#endif
+
 /* The four most recent distances, most recent first. This used to be a
  * `for` loop with a `break`, which is what the profiler found: on prose a
  * command repeats a distance often enough that the branch is a coin toss
@@ -490,6 +517,30 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 }
             }
         }
+#if (ZPSE_LZ_LAZY_LEN > 0)
+        if (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX && pos + len + 1u < n) {
+            uint32_t v1 = zpse_load_u32le(in + pos + 1u);
+            uint32_t h1 = lz_hash(v1, hash_bits);
+            uint32_t cand1 = tab[h1];
+
+            if (cand1 != LZ_EMPTY && cand1 < pos + 1u && cand1 + 4u <= n &&
+                zpse_load_u32le(in + cand1) == v1) {
+                uint32_t l1 = ZPSE_LZ_MIN_MATCH;
+
+                while (pos + 1u + l1 < n && cand1 + l1 < n &&
+                       in[pos + 1u + l1] == in[cand1 + l1]) {
+                    l1++;
+                }
+                if (l1 > len + 1u) {
+                    pos++;
+                    misses = 0u;
+                    cur = v1;
+                    h = h1;
+                    continue;
+                }
+            }
+        }
+#endif
         lz_emit(&o, in + anchor, pos - anchor, pos - cand, len);
         if (o.fail) {
             return 0u;

@@ -97,12 +97,12 @@ smaller than it went in, one pinned core, best of five:
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
 | 1 `ZPSE_ENC_SPEED_FASTEST` | 39.77% | 10.57% | 84.14% | 59.71% | 209 / 450 / 205 MB/s |
-| 6 (default) | 17.37% | 6.64% | 63.30% | **41.37%** | 106 / 181 / 120 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 17.26% | 6.47% | 62.61% | 40.92% | 96 / 183 / 100 MB/s |
+| 6 (default) | 16.89% | 6.32% | 62.69% | **40.84%** | 109 / 167 / 118 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 16.84% | 6.32% | 62.01% | 40.44% | 96 / 168 / 106 MB/s |
 
-The default level's page costs about 107 MB/s of encode for 41.37%, and
-decodes at 1.6 to 3.8 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands). The deepest level buys 0.45 points of ratio for about 10%
+The default level's page costs about 120 MB/s of encode for 40.84%, and
+decodes at 1.9 to 5.7 GB/s (the C heap is all pointers, which the fast LZ form
+codes as commands). The deepest level buys 0.40 points of ratio for about 11%
 of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
@@ -120,7 +120,7 @@ Silesia's twelve files put the same shape on a general corpus:
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-130 MB/s, against 55.07% at 112 and 41.37% at 123. What zpse keeps is decode --
+120 MB/s, against 55.07% at 112 and 40.84% at 120. What zpse keeps is decode --
 1.6 to 4.1 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
@@ -132,20 +132,20 @@ shape a browser's or a build tree's footprint has:
 
 | 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ratio | 78.81% | 55.77% | 55.12% | 46.40% | 44.18% | 44.17% |
-| encode | 248 MB/s | 116 MB/s | 109 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
-| decode | 4.0 GB/s | 1.5 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
+| ratio | 78.81% | 55.25% | 54.63% | 46.40% | 44.18% | 44.17% |
+| encode | 240 MB/s | 107 MB/s | 99 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
+| decode | 4.2 GB/s | 1.4 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
 
-Where the dumps' 10.44-point gap to zstd sits, split by the form the default
+Where the dumps' 9.91-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
 
 | form at level 6 | pages | zpse | zstd | gap |
 | --- | ---: | ---: | ---: | ---: |
-| token LZ | 25 202 | 17.85% | 12.52% | 5.33 |
-| raw | 7 037 | 13.52% | 11.00% | 2.52 |
-| LZ + tiles | 8 772 | 5.53% | 4.25% | 1.28 |
-| tiles | 2 407 | 3.05% | 2.35% | 0.70 |
-| fast LZ | 8 647 | 1.42% | 0.81% | 0.61 |
+| token LZ | 34 628 | 19.08% | 13.49% | 5.59 |
+| raw | 7 036 | 13.51% | 11.00% | 2.51 |
+| LZ + tiles | 7 524 | 5.00% | 3.97% | 1.03 |
+| tiles | 2 358 | 2.98% | 2.30% | 0.68 |
+| fast LZ | 519 | 0.27% | 0.17% | 0.10 |
 
 Half of it is the token LZ form's own payload on half the pages, and a quarter
 is pages that go out raw; both are the same loss, bytes written as bytes. A
@@ -154,7 +154,7 @@ a hundred bytes against a literal stream of one or two thousand -- so zstd's
 answer does not transfer to this size without tables baked for one corpus. The
 one distance coding a page's format can carry was measured and refused:
 delta-coding the explicit distances costs 2.5 points instead of saving them
-(41.37% to 43.89% on the dumps) and 7 points on the mixed workload, because a
+(41.37% to 43.89% on the dumps, measured before the page parse below) and 7 points on the mixed workload, because a
 match's distance has no relation to the last one on text, and zigzag doubles
 every small distance that used to fit in one group.
 
@@ -169,15 +169,33 @@ same bytes otherwise. Sixteen bytes is 0.39% of a 4096-byte page, which is
 header left to save, so 45 000 of the 52 065 pages shrink; the checksummed
 run saves the identical 719 591 bytes). The sync value (`0x50B6` or `0x50B7`)
 is what a reader uses to tell the two apart, and nothing else about the block
-changes. At 16 KiB and above the header stays 32 bytes and the streams are
-byte for byte what they were.
+changes. At 16 KiB and above the header stays 32 bytes.
+
+The largest win the page size has had is in the match finder's *decision*, not
+its search. The finder's lazy step asks one question -- does the position one
+byte on start an eight-byte match? -- and that is the right question at 64 KiB,
+where matches are long enough that a byte of literal never pays for a second
+lookup. At a page it is the wrong one: the average match on these dumps is five
+bytes, so a five-byte match here and a nine-byte match one byte on is a
+four-byte win the eight-byte test throws away. At page size the match is now
+measured first and the next position measured too, and the byte is given up
+only when the later match is strictly longer by more than it costs. That is
+1 118 807 bytes over the three dumps at the default level -- 41.37% to 40.84%,
+0.53 points -- for about 8% of the encode rate (132 to 120 MB/s), and
+1 014 016 bytes at level 9 (40.92% to 40.44%). The mixed workload gains 0.52
+points at the default level (55.77% to 55.25%) and gives up 8% of its rate. The
+streams are unchanged in form, so decode is untouched.
 
 What a page cannot afford is the full-size block's trial structure: a 4 KiB
 block below the probe's gate would run nine full trials, and the two knobs
 that stop that are the ones this size was tuned with -- the pricing gate at
 `ZPSE_PRICE_MIN_N` 4096 and the tie cut's field floor at two survivors for a
-page against four for anything larger. 16 KiB and 64 KiB blocks are byte for
-byte what they were before either knob.
+page against four for anything larger, and both stop at a page: 16 KiB and
+64 KiB blocks are byte for byte what they were before either knob. The parse
+step above is the one thing that is not free at those sizes -- a page-sized
+body inside a larger block takes it too -- so a 16 KiB block is 34 779 bytes
+smaller than it was and a 64 KiB block 52 785 bytes larger (0.07%), which is
+why the step is worth shipping for pages and for nothing else.
 
 ### Methodology, and why this is not science
 

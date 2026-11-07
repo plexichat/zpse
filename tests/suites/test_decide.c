@@ -9,7 +9,9 @@
  *                          one byte value, and the dense record form writes
  *                          them at twelve bytes per 4 KiB: 272 as tiles. The
  *                          v2 LZ+tiles form compresses that body and writes
- *                          83, and that is what the pin now holds.
+ *                          81, and that is what the pin now holds. (82
+ *                          before the page-sized parse step in src/lz.c, which
+ *                          a 4 KiB body takes even inside a 64 KiB block.)
  *   two-byte spikes        at width 8, seven of the phases are constant and
  *                          are written in the dense form at twelve bytes per
  *                          4 KiB: 1211. The width-16 shape of the same block
@@ -21,7 +23,11 @@
  *                          search per tile, so the tile loop stops as soon
  *                          as the palette is priced and 33288 is written.
  *   zeros                  the tile floor is 248; the v2 LZ+tiles form
- *                          takes the constant body down to 69.
+ *                          takes the constant body down to 70. (69 before the
+ *                          same parse step: on a body that is one match from
+ *                          the second byte the lazy probe gives up a byte at
+ *                          the end for no match, which is the step's one
+ *                          measured cost and is why it is confined to pages.)
  *
  * A change that regresses one of these still round-trips, so nothing else in
  * the suite would notice; that is why the sizes are pinned. Links
@@ -77,7 +83,7 @@ int main(void)
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
     }
-    check("alt00FF", 65536u, 83u);
+    check("alt00FF", 65536u, 81u);
 
     memset(in, 0, sizeof in);
     for (i = 0; i < 65536u; i += 256u) {
@@ -97,7 +103,7 @@ int main(void)
     check("4-bit noise", 65536u, 33288u);
 
     memset(in, 0, sizeof in);
-    check("zeros", 65536u, 69u);
+    check("zeros", 65536u, 70u);
 
     if (fails != 0) {
         printf("DECIDE: %d FAILED\n", fails);
