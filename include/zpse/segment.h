@@ -63,7 +63,7 @@ uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
 
 /* Smallest size one transformed plane can be written in, whole: its tile
  * records (sampled), or one of the two dense forms when that is smaller.
- * Includes the 16-byte segment header; UINT32_MAX when it cannot be
+ * Includes the 8-byte segment header; UINT32_MAX when it cannot be
  * priced. (See segment.c.)
  *
  * `limit` bounds what the caller needs to know: when the plane's own

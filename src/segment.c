@@ -445,7 +445,8 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
      * statuses, exactly as a malformed tile is rejected with the tile
      * ones. The record is the segment's only record, so the whole plane
      * (and the segment's decoded size) comes from one call. */
-    if (payload_len > 18u && (payload[18] & ZPSE_DENSE_MARKER) != 0u) {
+    if (payload_len > (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u &&
+        (payload[ZPSE_SEGMENT_HEADER_SIZE + 2u] & ZPSE_DENSE_MARKER) != 0u) {
         if ((uint32_t)h.tile_count != 1u) {
             return PSE_BAD_TILE_SIZE;
         }
@@ -483,7 +484,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
      * tile in the segment reads. */
     zpse_lane_reset_hist(lanes, h.initial_literal);
 
-    pos = 16u;
+    pos = ZPSE_SEGMENT_HEADER_SIZE;
     produced = 0u;
     o1_seed = 0;
     o2_seed = 0;
@@ -2153,6 +2154,11 @@ uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
 {
     int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
     uint32_t tc = (plane_len + 255u) / 256u;
+    /* The PRICE keeps the envelope every threshold was tuned with, not the
+     * eight bytes the segment header now costs: this number ranks candidates
+     * against each other, and moving it by eight flips the near ties the
+     * sweep was tuned on -- measured, 64 KiB level 6 grew 80 697 025 to
+     * 81 043 247 while every other page size shrank. */
     uint32_t cost = 16u;
     uint32_t sum = 0u;
     uint32_t t;
@@ -2901,7 +2907,7 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
  * Each sampled tile goes through exactly the pipeline the trial loop runs,
  * including the second candidate when it is competitive, so this is the
  * trial's own per-tile size rather than a proxy for it. Returns the price
- * INCLUDING the 16-byte segment header, or UINT32_MAX when a tile cannot be
+ * INCLUDING the 8-byte segment header, or UINT32_MAX when a tile cannot be
  * priced (the caller then has no estimate). */
 static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                                const uint8_t *plane, uint32_t plane_len,
@@ -3085,7 +3091,7 @@ uint32_t zpse_segment_const_cost(const uint8_t *plane, uint32_t plane_len)
  * is a tie the segment encoder resolves exactly on its own.
  *
  * The result is what zpse_segment_encode would return for the plane, up to
- * the tile sample's error, and includes the 16-byte segment header.
+ * the tile sample's error, and includes the 8-byte segment header.
  * UINT32_MAX means the plane could not be priced.
  *
  * `limit` threads the sweep's running verdict into the sample: planes that
@@ -3247,7 +3253,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     if (e->hist == 0 || e->comb == 0 || e->input == 0) {
         return PSE_BAD_ARG;
     }
-    if (payload_cap < 16u) {
+    if (payload_cap < ZPSE_SEGMENT_HEADER_SIZE) {
         return PSE_OUTPUT_OVERFLOW;
     }
     /* Assigned after the argument checks, not with the declarations: both
@@ -3375,7 +3381,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         memset(rep_key, 0, sizeof rep_key);
     }
 
-    pos = 16u;
+    pos = ZPSE_SEGMENT_HEADER_SIZE;
     for (t = 0; t < tc; t++) {
         uint32_t seg_pos = t * 256u;
         uint16_t nt =

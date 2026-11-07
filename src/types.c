@@ -330,8 +330,6 @@ int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32
     uint32_t dec_size;
     uint16_t tile_count;
     uint8_t init_lit, sflags;
-    uint32_t dir_size;
-    uint32_t reserved;
 
     if (out == 0 || buf == 0) {
         return PSE_BAD_ARG;
@@ -343,8 +341,6 @@ int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32
     tile_count = zpse_load_u16le(buf + 4);
     init_lit = buf[6];
     sflags = buf[7];
-    dir_size = zpse_load_u32le(buf + 8);
-    reserved = zpse_load_u32le(buf + 12);
 
     if (tile_count == 0) {
         return PSE_BAD_TILE_SIZE;
@@ -355,23 +351,21 @@ int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32
     if (sflags != ZPSE_S_LEN_PREFIX) {
         return PSE_UNSUPPORTED_FEATURE;
     }
-    if (dir_size != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
-    }
-    if (reserved != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
-    }
 
+    /* The directory size and the reserved word are no longer carried: both
+     * had exactly one legal value (zero), so the bytes that held them said
+     * nothing. A reader that wants them still gets the only values a stream
+     * can have produced. */
     out->segment_decoded_size = dec_size;
     out->tile_count = tile_count;
     out->initial_literal = init_lit;
     out->segment_flags = sflags;
-    out->tile_directory_size = dir_size;
-    out->reserved = reserved;
+    out->tile_directory_size = 0u;
+    out->reserved = 0u;
     return PSE_OK;
 }
 
-void zpse_segment_header_serialize(uint8_t out[16], const ZpseSegmentHeader *h)
+void zpse_segment_header_serialize(uint8_t out[8], const ZpseSegmentHeader *h)
 {
     if (out == 0 || h == 0) {
         return;
@@ -380,8 +374,6 @@ void zpse_segment_header_serialize(uint8_t out[16], const ZpseSegmentHeader *h)
     zpse_store_u16le(out + 4, h->tile_count);
     out[6] = h->initial_literal;
     out[7] = h->segment_flags;
-    zpse_store_u32le(out + 8, h->tile_directory_size);
-    zpse_store_u32le(out + 12, h->reserved);
 }
 
 int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len)

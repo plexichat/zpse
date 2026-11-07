@@ -83,7 +83,7 @@ int main(void)
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
     }
-    check("alt00FF", 65536u, 81u);
+    check("alt00FF", 65536u, 79u);
 
     memset(in, 0, sizeof in);
     for (i = 0; i < 65536u; i += 256u) {
@@ -100,10 +100,10 @@ int main(void)
             in[i] = (uint8_t)((r >> 24) & 0x0Fu);
         }
     }
-    check("4-bit noise", 65536u, 33288u);
+    check("4-bit noise", 65536u, 33280u);
 
     memset(in, 0, sizeof in);
-    check("zeros", 65536u, 70u);
+    check("zeros", 65536u, 67u);
 
     if (fails != 0) {
         printf("DECIDE: %d FAILED\n", fails);

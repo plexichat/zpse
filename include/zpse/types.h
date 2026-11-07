@@ -102,7 +102,7 @@ uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len);
  * uncompressed size of at most ZPSE_BLOCK_SHORT_MAX. */
 void zpse_block_header_serialize_short(uint8_t out[16], const ZpseBlockHeader *h);
 int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32_t len);
-void zpse_segment_header_serialize(uint8_t out[16], const ZpseSegmentHeader *h);
+void zpse_segment_header_serialize(uint8_t out[8], const ZpseSegmentHeader *h);
 int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len);
 int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
                               const uint8_t *buf, uint16_t len,

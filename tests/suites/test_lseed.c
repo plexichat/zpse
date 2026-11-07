@@ -193,7 +193,7 @@ static int run_case(const char *name, int ntiles, const uint8_t *pids,
     for (t = 0; t < (int)nex; t++)
         resid[t] = (uint8_t)(t * 5u + 3u); /* <= 127, so exclusion is legal */
 
-    pos = 16u;
+    pos = ZPSE_SEGMENT_HEADER_SIZE;
     for (t = 0; t < ntiles; t++) {
         uint8_t *rec = payload + pos + 2u;
         uint16_t rsz = (uint16_t)(ZPSE_TILE_HEADER_SIZE + 32u + nex);

@@ -43,7 +43,13 @@
 #define ZPSE_INDEX_MAGIC        UINT32_C(0x31584950) /* "PXI1" LE */
 #define ZPSE_INDEX_HEADER_SIZE  16u
 #define ZPSE_INDEX_ENTRY_SIZE   8u
-#define ZPSE_SEGMENT_HEADER_SIZE 16u
+/* Eight bytes, not sixteen. The last eight carried a tile-directory size and
+ * a reserved word, and the parser refused any value but zero for either --
+ * so they were eight bytes of nothing on every segment. At the page this
+ * format is asked for there is one segment a block, which is eight bytes off
+ * every page's payload: 8 * 52 065 pages is 416 520 bytes on the dump corpus,
+ * for no change in what a segment can express. */
+#define ZPSE_SEGMENT_HEADER_SIZE 8u
 #define ZPSE_TILE_HEADER_SIZE    8u
 #define ZPSE_SEG_DIR_ENTRY_SIZE  8u
 

@@ -1580,7 +1580,7 @@ static uint32_t zpse_block_plane_floor(uint32_t len)
 /* Smallest price zpse_block_exact_sum can return for a candidate whose
  * planes total `len` bytes: the block envelope zpse_block_exact_sum starts
  * from, plus one plane at its floor. Any candidate with more than one plane
- * pays the 16-byte segment envelope once per plane and so cannot be below
+ * pays the 8-byte segment envelope once per plane and so cannot be below
  * this; a single-segment one reaches it exactly when its plane is at the
  * floor. */
 static uint32_t zpse_block_cand_floor(uint32_t len)
@@ -3539,7 +3539,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
             /* The content price: what the sample actually measured, with the
              * candidate's fixed structural envelope -- block header, block
-             * segment directory and one 16-byte segment header per plane --
+             * segment directory and one 8-byte segment header per plane --
              * taken back out. The sample can only see content; the envelope
              * is a constant it cannot judge, and it is what made the two
              * orders disagree on "spike every 256": the width-4 shape prices

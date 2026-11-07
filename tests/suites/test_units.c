@@ -120,7 +120,7 @@ int main(void) {
         {
             uint32_t rec0 = zpse_block_header_size(comp, cl) +
                             (uint32_t)h.transform_meta_size +
-                            (uint32_t)h.segment_count * 8u + 16u;
+                            (uint32_t)h.segment_count * 8u + (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
             CHECK((comp[rec0 + 2] & 0x40) != 0,
                   "const block uses dense records");
             comp[rec0 + 3] = 9u;    /* TILE_CONSTANT */
