@@ -126,16 +126,51 @@ twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
 of the 10.77 points to zstd 6, which would leave the dumps at 34.4% against
 zstd's 30.9% while paying for the coder. At a page the format's problem is the
-ratio it starts from, not the last few bits of it.
+ratio it starts from, not the last few bits of it.A mixed workload at the same page size -- 160 MB of programs, shared
+libraries, documentation and this project's own build outputs, which is the
+shape a browser's or a build tree's footprint has:
 
-A page's block carries a **16-byte header** rather than 32 whenever the
-payload checksum is off -- the version, tile size, predictor profile and
-reserved byte are fixed by the format, and the decoded CRC has nowhere to live
-in the short form, so a checksummed stream keeps the long one. Sixteen bytes
-is 0.39% of a 4096-byte page, which is 0.34 points of ratio over the three
-dumps (a page that goes out raw has no header left to save, so 45 000 of the
-52 065 pages shrink). The sync value (`0x50B6` or `0x50B7`) is what a reader uses to tell the
-two apart, and nothing else about the block changes.
+| 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ratio | 78.81% | 55.77% | 55.12% | 46.40% | 44.18% | 44.17% |
+| encode | 248 MB/s | 116 MB/s | 109 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
+| decode | 4.0 GB/s | 1.5 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
+
+Where the dumps' 10.44-point gap to zstd sits, split by the form the default
+level picked (zstd's column is its size over the same pages):
+
+| form at level 6 | pages | zpse | zstd | gap |
+| --- | ---: | ---: | ---: | ---: |
+| token LZ | 25 202 | 17.85% | 12.52% | 5.33 |
+| raw | 7 037 | 13.52% | 11.00% | 2.52 |
+| LZ + tiles | 8 772 | 5.53% | 4.25% | 1.28 |
+| tiles | 2 407 | 3.05% | 2.35% | 0.70 |
+| fast LZ | 8 647 | 1.42% | 0.81% | 0.61 |
+
+Half of it is the token LZ form's own payload on half the pages, and a quarter
+is pages that go out raw; both are the same loss, bytes written as bytes. A
+page cannot pay for a per-block entropy table -- a canonical Huffman header is
+a hundred bytes against a literal stream of one or two thousand -- so zstd's
+answer does not transfer to this size without tables baked for one corpus. The
+one distance coding a page's format can carry was measured and refused:
+delta-coding the explicit distances costs 2.5 points instead of saving them
+(41.37% to 43.89% on the dumps) and 7 points on the mixed workload, because a
+match's distance has no relation to the last one on text, and zigzag doubles
+every small distance that used to fit in one group.
+
+A page's block carries a **16-byte header** rather than 32, always: the
+version, tile size, predictor profile and reserved byte are fixed by the
+format, and the decoded CRC has nowhere to live in sixteen bytes. A page
+written with `ZPSE_ENC_CHECKSUM` therefore drops the CRC field and its flag
+rather than spending eight header bytes it cannot use -- the block says it
+carries no checksum, which is what the decoder reads, and the stream is the
+same bytes otherwise. Sixteen bytes is 0.39% of a 4096-byte page, which is
+0.34 points of ratio over the three dumps (a page that goes out raw has no
+header left to save, so 45 000 of the 52 065 pages shrink; the checksummed
+run saves the identical 719 591 bytes). The sync value (`0x50B6` or `0x50B7`)
+is what a reader uses to tell the two apart, and nothing else about the block
+changes. At 16 KiB and above the header stays 32 bytes and the streams are
+byte for byte what they were.
 
 What a page cannot afford is the full-size block's trial structure: a 4 KiB
 block below the probe's gate would run nine full trials, and the two knobs

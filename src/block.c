@@ -221,17 +221,18 @@ static void zpse_block_fill_header(ZpseBlockHeader *h, uint8_t flags,
  *
  * `out` holds [32-byte header][payload] of `total` bytes. Sixteen of those
  * header bytes are fields the format fixes (version, tile size, predictor
- * profile, reserved) or that a page does not use (a payload CRC, which keeps
- * the long header), so a page's block can say the same thing in 16 -- and 16
+ * profile, reserved) or that a page does not use (a payload CRC, which is
+ * dropped here with its flag), so a page's block can say the same thing in 16
+ * -- and 16
  * bytes is 0.30 points of the shared-library dump's ratio at 63.6%, or 0.34
  * points over the three dumps together (52 065 pages, 45 000 of which
  * shrink, 719 591 bytes). The payload moves down onto the header it just gave up;
  * nothing else about the block changes, and the sync value tells a reader
  * which header it is looking at.
  *
- * Refused (total returned unchanged) for a block over ZPSE_BLOCK_SHORT_MAX, a
- * payload CRC, or a size the 16-bit fields would overflow -- none of which a
- * page produces, since a page is 4096 and its raw envelope is 4112. */
+ * Refused (total returned unchanged) for a block over ZPSE_BLOCK_SHORT_MAX or
+ * a size the 16-bit fields would overflow -- neither of which a page produces,
+ * since a page is 4096 and its raw envelope is 4112. */
 static uint32_t zpse_block_shrink_page(uint8_t *out, uint32_t n,
                                        uint32_t total)
 {
@@ -246,9 +247,16 @@ static uint32_t zpse_block_shrink_page(uint8_t *out, uint32_t n,
     if (zpse_block_header_parse(&h, out, ZPSE_BLOCK_HEADER_SIZE) != PSE_OK) {
         return total;
     }
-    if ((h.block_flags & ZPSE_B_CRC) != 0u || h.transform_meta_size > 255u) {
+    if (h.transform_meta_size > 255u) {
         return total;
     }
+    /* A page's block has the 16-byte header and no other: the decoded CRC has
+     * nowhere to live in it, so a page written with ZPSE_ENC_CHECKSUM drops
+     * the field and the flag with it rather than paying eight bytes of header
+     * it cannot use (see ZPSE_BLOCK_HEADER_SIZE_SHORT). The flag is what the
+     * decoder reads, so the block is a well-formed "no checksum" one. */
+    h.block_flags = (uint8_t)(h.block_flags & ~ZPSE_B_CRC);
+    h.decoded_crc32c = 0u;
     payload = total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
     if (payload + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT > 65535u) {
         return total;

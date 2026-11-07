@@ -13,8 +13,10 @@
 /* A page's header, half the size. The 32-byte header spends 12 of its bytes
  * on fields a page does not need to spell out -- the version, the tile size,
  * the predictor profile and reserved byte (all fixed by the format), and the
- * decoded CRC (a page stream that asks for a payload checksum keeps the long
- * header, because the field has nowhere to go here). What is left fits in
+ * decoded CRC (a page stream that asks for a payload checksum drops it: the
+ * field has nowhere to go here, and eight header bytes on every page are
+ * worth more than a check the caller can have at any larger block size).
+ * What is left fits in
  * 16: sync, flags, transform, segment count, metadata length, both sizes as
  * 16-bit, the sequence number and a 16-bit header checksum.
  *

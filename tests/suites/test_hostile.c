@@ -15,6 +15,10 @@ static uint8_t input[2048];
 static uint8_t comp[8192];
 static uint8_t work[8192];
 static uint8_t out[2048];
+static uint8_t big[20000];
+static uint8_t big_comp[24000];
+static uint8_t big_out[20000];
+static uint32_t big_len = 0;
 static int fails = 0;
 #define CHECK(cond, ...) do { \
     if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } \
@@ -39,6 +43,17 @@ static void refresh(void) {
 /* The same input with the optional payload CRC tag. */
 static void refresh_crc(void) {
     refresh_flags((uint32_t)ZPSE_ENC_CHECKSUM);
+}
+
+/* The same, on a block too long for a page's 16-byte header, so the decoded
+ * CRC has a field to live in. */
+static void refresh_crc_big(void) {
+    uint32_t dummy = 0;
+    int rc = zpse_compress_block_ex(big, sizeof big, big_comp, sizeof big_comp,
+                                    &dummy, 0, 1,
+                                    (uint32_t)ZPSE_ENC_CHECKSUM, enc_arena);
+    (void)rc;
+    big_len = dummy;
 }
 
 /* These cases corrupt a header field and repair the checksum that covers it.
@@ -83,18 +98,28 @@ int main(void) {
      * stream asks for the checksum. Use incompressible input so the block
      * takes the RAW path, where any payload byte flip provably changes
      * only values (structure of a coded block could break earlier with a
-     * different code). */
+     * different code). A page is asked for no checksum at all (see
+     * ZPSE_BLOCK_HEADER_SIZE_SHORT: the field has nowhere to live), so the
+     * stream here is longer than a page and the block keeps the long
+     * header. */
     {
         uint32_t r = 0x12345u;
         int i;
+
         for (i = 0; i < (int)sizeof input; i++) {
             r = r * 1664525u + 1013904223u;
             input[i] = (uint8_t)(r >> 24);
         }
-        refresh_crc();
-        memcpy(work, comp, clen);
-        work[100] ^= 0xFF;
-        rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
+        memset(big, 0, sizeof big);
+        for (i = 0; i < (int)sizeof big; i++) {
+            r = r * 1664525u + 1013904223u;
+            big[i] = (uint8_t)(r >> 24);
+        }
+        refresh_crc_big();
+        big_comp[100] ^= 0xFF;
+        rc = zpse_decompress_block(big_comp, big_len, big_out,
+                                   (uint32_t)sizeof big_out, &olen,
+                                   dec_arena);
         CHECK(rc == PSE_BAD_PAYLOAD_CRC, "bad payload CRC rejected");
         /* The default stream carries no checksum, so the same flip is a
          * value change the format never promised to detect -- that is the
@@ -108,6 +133,22 @@ int main(void) {
               "default stream has no payload CRC (flip undetected)");
         for (i = 0; i < (int)sizeof input; i++) input[i] = (uint8_t)(i & 0xFF);
         refresh();
+
+        /* A page asked for a checksum gets a page's header anyway: the
+         * decoded CRC has no field in sixteen bytes, so the flag and the
+         * field are dropped rather than eight header bytes spent on them,
+         * and the block says what it is ("no checksum"). */
+        refresh_crc();
+        CHECK(zpse_block_header_size(comp, clen) ==
+                  (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
+              "a page's checksummed block takes the short header");
+        CHECK((comp[2] & (uint8_t)ZPSE_B_CRC) == 0u,
+              "and carries no CRC flag");
+        rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen,
+                                   dec_arena);
+        CHECK(rc == PSE_OK && olen == sizeof input &&
+                  memcmp(out, input, sizeof input) == 0,
+              "and the page still round-trips");
     }
 
     /* Every block flag bit now names a form: 5 the LZ form, 6 LZ plus
