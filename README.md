@@ -197,9 +197,9 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | `PAGE_FAST` L1 | plain L2 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: |
-| dumps | 58.61% at 242 MB/s | 66.17% at 917 MB/s | 57.32% at 193 MB/s | 66.04% at 903 MB/s |
-| mixed | 78.45% at 269 MB/s | 81.25% at 805 MB/s | 77.37% at 237 MB/s | 80.73% at 790 MB/s |
-| Silesia | 80.08% at 250 MB/s | 82.92% at 571 MB/s | 77.54% at 215 MB/s | 80.31% at 587 MB/s |
+| dumps | 58.61% at 239 MB/s | 66.09% at 861 MB/s | 57.32% at 194 MB/s | 65.96% at 845 MB/s |
+| mixed | 78.45% at 274 MB/s | 81.06% at 754 MB/s | 77.37% at 239 MB/s | 80.54% at 782 MB/s |
+| Silesia | 80.08% at 248 MB/s | 82.85% at 563 MB/s | 77.54% at 218 MB/s | 80.24% at 570 MB/s |
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
@@ -217,7 +217,7 @@ priced on a stride of tiles and not on every plane -- the level above it is
 where the price ranking decides the ratio, and there the cut measured inside
 the host's own band.
 
-Two and a half to four and a half times the encode for 2.8 to 7.6 points of ratio, and
+Two and a quarter to three and a half times the encode for 2.6 to 7.5 points of ratio, and
 decode improves with it (3.4 GB/s on the dumps) because a page written as one
 identity segment is one plane the decoder walks straight through.
 
