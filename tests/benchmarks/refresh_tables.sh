@@ -270,9 +270,10 @@ if "$CC" -std=c11 -O2 -I "$inc" "$repo/tests/benchmarks/bench_levels.c" \
     say "compiler: -O2 vs -O3 on the level corpus"
     if [ "$fast" = 1 ]; then it=2; rep=1; else it=20; rep=3; fi
     for b in "$work/levels_o2" "$work/levels_o3"; do
-        printf '%s ' "$(basename "$b")"
+        printf '%s: ' "$(basename "$b")"
         taskset -c 0 "$b" "$it" "$rep" 2>/dev/null | awk -F'|' '
-            $2 ~ / BALANCED/ { printf "balanced %s MB/s\n", $5 }'
+            $3 ~ / BALANCED/ { printf "%s ", $5 }'
+        echo
     done
 else
     missing "bench_levels build"
