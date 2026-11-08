@@ -20,16 +20,16 @@ jobs:
           sudo apt-get install -y -qq zip
 
       - name: Build binaries
-        # -O3 for the two artifacts a user actually runs: the amalgamation is
-        # a single translation unit, so -O3 reaches the inliner across every
-        # module, and it is worth a few percent of encode (README, "What the
-        # compiler adds") with byte-identical output and sizes. The tree still
-        # builds and measures at -O2 everywhere else, so every number in the
-        # README stays an -O2 number.
+        # -O2, like everything the README measures. These two artifacts used to
+        # be built at -O3 on the strength of a few percent of encode; re-run on
+        # the current tree the amalgamation is about 1% SLOWER at -O3 with 41%
+        # more text and byte-identical output (README, "What the compiler
+        # adds"), so the release now matches the level every figure here is
+        # measured at.
         run: |
-          gcc-15 -std=c11 -O3 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
+          gcc-15 -std=c11 -O2 -Wall -Wextra -Werror -DNDEBUG -Iinclude \
             tests/tools/zpse_cli.c src/zpse_unity.c -o zpse_cli_linux
-          gcc-15 -std=c11 -O3 -DNDEBUG -Iinclude tests/tools/zpse_cli.c src/zpse_unity.c \
+          gcc-15 -std=c11 -O2 -DNDEBUG -Iinclude tests/tools/zpse_cli.c src/zpse_unity.c \
             -o zpse_cli_linux_fast
 
       - name: Generate GitHub Release

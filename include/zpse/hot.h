@@ -6,11 +6,11 @@
  * Every build of this tree is -O2 -- the CI matrix, tests/runners/run.sh and
  * the release CLI all say so -- and the hot paths were tuned at that level.
  * This tag asks gcc for the -O3 passes on one function inside that -O2
- * build: on the 18 functions it marks it is worth a measured 1.029x of
+ * build: on the 18 functions it marks it is worth a measured 1.025x of
  * encode throughput on tests/benchmarks/bench_levels.c over the 25-case
- * corpus (best of seven interleaved rounds with the order swapped every
- * round, against the same tree built with the macro empty; two builds of
- * identical sources read 1.000 in that harness), for a slightly larger
+ * corpus (best of three interleaved rounds with the order swapped every
+ * round, against the same tree built with the macro empty), for a slightly
+ * larger
  * binary, with every size in that corpus unchanged.  It is not a
  * substitute for building the amalgamation at -O3 -- +7% on the tree that
  * took that number, 0.99 on the current one (see README.md) -- and it

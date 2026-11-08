@@ -1589,24 +1589,26 @@ show up on structured columns, which is what the 25-case corpus measures.
 
 ### What the compiler adds, and what the tags are worth
 
-Every number in this README is an `-O2` number: the CI matrix and
-`tests/runners/run.sh` build at `-O2`. The one binary that ships at `-O3` is
-the released CLI, because it is the one nobody can rebuild -- and the compiler
-still has something to add at `-O3`, which the third row below is the
-measurement of. The two ways to ask for it are not interchangeable. Both were measured on the level corpus (`bench_levels.c`, 25
+Every number in this README is an `-O2` number: the CI matrix,
+`tests/runners/run.sh` and the released CLI all build at `-O2`. `-O3` was worth
+a few percent of encode on the amalgamation when the release was set to use
+it, and re-measured on the current tree it is slower -- that is the third row
+below. The two ways to ask for a per-function level are not interchangeable.
+Both were measured on the level corpus (`bench_levels.c`, 25
 cases x 4 MiB in 64 KiB blocks; A/B/A/B runs interleaved with the order swapped
 every round, median of the per-case throughput ratios, one pinned core):
 
 | build | encode | notes |
 | --- | ---: | --- |
 | `-O2` | 1.000 | everything in this tree |
-| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.029 | 14 KB more text; decode and every compressed size unchanged |
+| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.025 | 16 KB more text; decode and every compressed size unchanged |
 | the amalgamation at `-O3` | 0.99 | re-measured at the counts above on gcc 15.2.0: median 0.9895 of 75 per-case ratios; text 244 KB -> 344 KB |
 | that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
 | `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
 
-Only the `-O3` row has been re-run on the current tree; the `ZPSE_HOT` and
-pragma rows are measurements of the tree that predates the LZ2 and page work.
+The `-O2`, `ZPSE_HOT` and `-O3` rows were re-run on the current tree (gcc
+15.2.0, three interleaved rounds at the counts above); the pragma rows are
+measurements of the tree that predates the LZ2 and page work.
 
 Rows three to five are the same request made at three scopes, and why they
 differ is worth knowing before adding a tag. At `-O3` the text of the
@@ -1631,17 +1633,16 @@ agrees over five interleaved rounds: 1,209 MB/s at `-O2` against 1,191 at
 figures measured a different tree and a different inliner, not a property of
 this one.
 
-So the release still ships the `-O3` binary, but on this tree that is not a
-measured gain: it is about 1% of encode for 41% more text. Whether to keep it
-is worth deciding on the current measurement rather than inheriting it.
+So the release ships the `-O2` binary, like everything else in the tree: on
+the current measurement `-O3` is about 1% of encode for 41% more text, with
+every compressed size identical either way.
 
 `ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 18 functions it
 marks were measured together, and a tag put on a function whose callees are
-untagged reproduces that last row. The set is measured best of seven
+untagged reproduces that last row. The set is measured best of three
 interleaved rounds with the order swapped every round, against the same tree
-built with the macro defined away; two builds of identical sources read 1.000
-(base readings 0.999 - 1.002), which is the noise floor the row above is
-quoted from. That measurement is also why the functions called from the
+built with the macro defined away; the per-round medians were 1.008, 1.039 and
+1.025, which is the spread the row above is quoted from. That measurement is also why the functions called from the
 middle of a chain stay untagged: they come back with fewer instructions
 retired and more cycles spent. Nor does a tag combine with a target
 attribute -- gcc re-applies the command line's target to a function it has
