@@ -3068,7 +3068,20 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * only for blocks big enough for either to be worth measuring -- the
      * same 8 KiB gate the prescreen proxy uses -- so small blocks keep
      * exactly the trial structure they have always had. */
-    flat_min = (n >= 8192u) ? (n / ZPSE_FLAT_MIN_DIV) : 0u;
+    /* A page under ZPSE_ENC_PAGE_FAST has one trial and no sweep behind it,
+     * so this is the only thing that can stop that trial on a page that is
+     * noise: without it, a 4 KiB page that ends RAW pays all sixteen noise
+     * tiles (about 5.9 us) to learn what the first four already said. The
+     * abort is armed only while beating the RAW envelope is the trial's only
+     * way to win, and a page that aborts goes RAW exactly as it would have
+     * at the end, so it can only remove work -- unless a page that is noise
+     * at the front compresses later, which is why this is measured rather
+     * than assumed (see the PAGE_FAST table's bytes). */
+    flat_min = (n >= 8192u ||
+                ((e->enc_flags & ZPSE_ENC_PAGE_FAST) != 0u &&
+                 n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX))
+                   ? (n / ZPSE_FLAT_MIN_DIV)
+                   : 0u;
     if (flat_min != 0u && flat_min < 1024u)
         flat_min = 1024u;
 

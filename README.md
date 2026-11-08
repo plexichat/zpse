@@ -197,13 +197,26 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | `PAGE_FAST` L1 | plain L2 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: |
-| dumps | 58.56% at 244 MB/s | 66.08% at 920 MB/s | 57.28% at 196 MB/s | 65.95% at 923 MB/s |
-| mixed | 78.42% at 243 MB/s | 81.05% at 739 MB/s | 77.33% at 213 MB/s | 80.53% at 736 MB/s |
-| Silesia | 80.06% at 240 MB/s | 82.84% at 542 MB/s | 77.49% at 222 MB/s | 80.23% at 592 MB/s |
+| dumps | 58.56% at 244 MB/s | 66.17% at 888 MB/s | 57.28% at 196 MB/s | 66.03% at 848 MB/s |
+| mixed | 78.42% at 243 MB/s | 81.24% at 710 MB/s | 77.33% at 213 MB/s | 80.72% at 704 MB/s |
+| Silesia | 80.06% at 240 MB/s | 82.91% at 544 MB/s | 77.49% at 222 MB/s | 80.30% at 452 MB/s |
 
-Three to five times the encode for 2.6 to 7.5 points of ratio, and decode
-improves with it (2.9 to 4.1 GB/s on the dumps) because a page written as one
-identity segment is one plane the decoder walks straight through. What it
+Two to three and a half times the encode for 2.8 to 7.6 points of ratio, and
+decode improves with it (3.4 GB/s on the dumps) because a page written as one
+identity segment is one plane the decoder walks straight through.
+
+What is left on a page that stays raw is the trial itself. On the library dump
+40.7% of the page bytes go out raw, and each of those pages used to encode all
+sixteen of its noise tiles to learn what the first four already said. The
+trial-level noise abort -- armed only at 8 KiB and up, because a larger block
+whose front is noise may still compress at the back -- now arms for a page
+under this flag too, and the flag is what makes it safe there: a page has no
+sweep behind its trial to pick a shape the abort could have missed. The output
+is unchanged to the byte on every corpus measured (dumps 141,107,723, mixed
+129,982,550, Silesia 175,723,846), and pages of pure random bytes go from 688
+to 1,473 MB/s, the mixed corpus gains 9% and the dumps and Silesia 1 to 2%.
+The plain encoder is untouched: without the flag the abort keeps its 8 KiB
+gate, and 4 KiB level 1 writes the same 125,077,793 bytes it did before. What it
 gives up is the predictors -- a width-16 transpose is 16.2% of the Python
 heap's page bytes at level 1 -- so it is an option and not a level: every
 level's own stream is unchanged, and so is every stream this flag writes for a
@@ -1205,8 +1218,8 @@ a `memcmp` over the whole file, not on a sample.
 
 | file | bytes | text | typed columns | gain |
 | --- | ---: | ---: | ---: | ---: |
-| `titanic.csv` (891 × 12, real export) | 60 302 | 55 213 (1.09:1) | 40 071 (1.50:1) | 27.4% |
-| `uber-rides-data1.csv` (1 511 443 × 3) | 58 604 196 | 16 363 309 (3.58:1) | 15 188 805 (3.86:1) | 7.2% |
+| `titanic.csv` (891 × 12, real export) | 60 302 | 55 205 (1.09:1) | 39 999 (1.51:1) | 27.5% |
+| `uber-rides-data1.csv` (1 511 443 × 3) | 58 604 196 | 16 324 704 (3.59:1) | 14 999 864 (3.91:1) | 8.1% |
 
 The typed form itself is *larger* than the CSV (104 180 bytes on `titanic`:
 eight bytes per int and per double, against `33.9732`). That is the point --
@@ -1214,7 +1227,7 @@ fixed-width columns of the same meaning compress like a columnar file instead
 of like prose, which is why the packed size falls while the intermediate grows.
 The gain shrinks as the file grows: `titanic` is 60 KiB, where the frame
 overhead is a large share of a 40 KiB result, and 891 rows of a 12-column table
-is not what the path is for; on the 58 MB export it is still 7.2% (and 1.4 s for
+is not what the path is for; on the 58 MB export it is still 8.1% (and 1.4 s for
 the whole typed-and-verified round trip), which is a narrow win on a format
 whose numbers are dominated by the timestamp column staying text.
 
@@ -1405,30 +1418,32 @@ when no other row is at least as good on all three.
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 1.25:1 | 0.88 GB/s | 2.76 GB/s | **yes** |
-| zpse 3 FASTER | 1.29:1 | 0.53 GB/s | 2.54 GB/s | **yes** |
-| zpse 5 BALANCED | 1.95:1 | 0.36 GB/s | 1.51 GB/s | no |
-| zpse 6 (default) | 2.07:1 | 0.35 GB/s | 1.52 GB/s | no |
-| zpse 9 MAX | 2.25:1 | 0.23 GB/s | 1.39 GB/s | **yes** |
-| zpse `LZ_FAST` | 2.19:1 | 0.39 GB/s | 1.71 GB/s | **yes** |
-| lz4 -1 | 2.10:1 | 0.52 GB/s | 1.63 GB/s | **yes** |
-| lz4 -3 | 2.60:1 | 0.11 GB/s | 1.56 GB/s | **yes** |
-| lz4 -9 | 2.72:1 | 0.04 GB/s | 1.43 GB/s | **yes** |
-| zstd -1 | 2.89:1 | 0.35 GB/s | 1.01 GB/s | **yes** |
-| zstd -3 | 3.20:1 | 0.22 GB/s | 0.92 GB/s | **yes** |
-| zstd -19 | 4.01:1 | 0.002 GB/s | 0.84 GB/s | **yes** |
+| zpse 1 FASTEST | 1.25:1 | 0.78 GB/s | 2.74 GB/s | **yes** |
+| zpse 3 FASTER | 1.29:1 | 0.55 GB/s | 2.43 GB/s | **yes** |
+| zpse 5 BALANCED | 2.00:1 | 0.34 GB/s | 1.70 GB/s | no |
+| zpse 6 (default) | 2.08:1 | 0.32 GB/s | 1.53 GB/s | no |
+| zpse 9 MAX | 2.25:1 | 0.23 GB/s | 1.46 GB/s | no |
+| zpse `LZ_FAST` | 2.19:1 | 0.40 GB/s | 1.82 GB/s | **yes** |
+| lz4 -1 | 2.10:1 | 1.35 GB/s | 1.45 GB/s | **yes** |
+| lz4 -3 | 2.60:1 | 0.37 GB/s | 1.52 GB/s | **yes** |
+| lz4 -9 | 2.72:1 | 0.15 GB/s | 1.52 GB/s | **yes** |
+| zstd -1 | 2.89:1 | 0.33 GB/s | 1.00 GB/s | **yes** |
+| zstd -3 | 3.20:1 | 0.22 GB/s | 0.87 GB/s | **yes** |
+| zstd -19 | 4.01:1 | 0.002 GB/s | 0.87 GB/s | **yes** |
 
 Every row here was measured in one run, pinned to one core, lz4 and zstd
-included. Four zpse rows are on the frontier. Level 1 at 1.25:1 is reached by
-nothing else at any rate -- the nearest competitor needs 2.89:1 before it gets
-to a comparable one -- and it decodes at 2.76 GB/s, 1.7x `lz4 -1`; level 3
-shares that corner. At the default level the ratio is 2.07:1 against `lz4 -1`'s
-2.10 and the decode is 1.52 against 1.63 -- inside 7% of lz4's decode for a
-stream 1.4% larger. MAX reads 2.25:1 at 1.39 GB/s, and `LZ_FAST` 2.19:1 at
-1.71, the fastest decode of any row at or above lz4's ratio.
+included. Levels 1 and 3, the fast form and every lz4 and zstd row are on the
+frontier. Level 1 at 1.25:1 is reached by nothing else at that rate -- the
+nearest competitor needs 2.89:1 before it gets to a comparable one -- and it
+decodes at 2.74 GB/s, 1.9x `lz4 -1`; level 3 shares that corner. At the default
+level the ratio is 2.08:1 against `lz4 -1`'s 2.10 and the decode 1.53 against
+1.45 -- lz4 wins encode by four times and still decodes more slowly on a
+slightly larger stream. MAX leaves the frontier: `lz4 -3` encodes at 369 MB/s
+against its 233 with a better decode and only a bigger stream. `LZ_FAST` at
+2.19:1 and 1.82 GB/s is the fastest decode of any row at or above lz4's ratio.
 
-The one column zpse still loses on is encode: 0.35 GB/s at the default level
-against `lz4 -1`'s 0.52, and the fast form's 0.39. That is the decision the
+The one column zpse still loses on is encode: 0.32 GB/s at the default level
+against `lz4 -1`'s 1.35, and the fast form's 0.40. That is the decision the
 encoder makes on every block and lz4 makes on none, and it is what the
 paragraphs below are about. `F` also dominates the default level on all three
 columns (2.19:1, 0.39 GB/s, 1.71 GB/s against 2.07:1, 0.35 and 1.52): `F` is
@@ -1469,8 +1484,7 @@ codec, and an LZ block decodes at the rate of its own command loop.
 
 *Encode.* A block here is decided, not merely encoded: the probe prices the
 candidate shapes, the ASCII gate prices three of them on two samples, and a
-block the gate convicts pays a screened match-finder pass. That decision is
-what caps the encoder at a ninth of `lz4 -1`'s rate, and lz4 makes none of
+block the gate convicts pays a screened match-finder pass.That decision is what caps the encoder at a quarter of `lz4 -1`'s rate, and lz4 makes none of
 it -- one pass, one token per match, no comparison of shapes. The probe alone
 is 14.7% of the encode time over the twelve files, weighted by each file's
 share of the work: 2% on `dickens`, where the tiles win immediately, and 74%
@@ -1497,29 +1511,27 @@ frontier rule:
 
 | tool | ratio | encode | decode | frontier |
 | --- | ---: | ---: | ---: | :---: |
-| zpse 1 FASTEST | 4.35:1 | 1.18 GB/s | 3.84 GB/s | **yes** |
-| zpse 5 BALANCED | 5.69:1 | 0.90 GB/s | 3.62 GB/s | no |
-| zpse 6 (default) | 5.69:1 | 0.94 GB/s | 3.55 GB/s | **yes** |
-| zpse 9 MAX | 5.70:1 | 0.79 GB/s | 3.63 GB/s | **yes** |
-| lz4 -1 | 3.29:1 | 0.85 GB/s | 1.45 GB/s | no |
-| lz4 -3 | 3.54:1 | 0.17 GB/s | 1.45 GB/s | no |
-| lz4 -9 | 3.61:1 | 0.09 GB/s | 1.33 GB/s | no |
-| zstd -1 | 4.78:1 | 0.63 GB/s | 1.31 GB/s | no |
-| zstd -3 | 4.91:1 | 0.45 GB/s | 1.38 GB/s | no |
-| zstd -19 | 5.71:1 | 0.006 GB/s | 1.30 GB/s | **yes** |
+| zpse 1 FASTEST | 4.36:1 | 1.25 GB/s | 3.94 GB/s | **yes** |
+| zpse 5 BALANCED | 5.69:1 | 0.77 GB/s | 3.60 GB/s | no |
+| zpse 6 (default) | 5.70:1 | 0.89 GB/s | 3.67 GB/s | **yes** |
+| zpse 9 MAX | 5.70:1 | 0.77 GB/s | 3.61 GB/s | no |
+| lz4 -1 | 3.29:1 | 0.95 GB/s | 1.16 GB/s | no |
+| lz4 -3 | 3.54:1 | 0.42 GB/s | 1.07 GB/s | no |
+| lz4 -9 | 3.61:1 | 0.27 GB/s | 1.06 GB/s | no |
+| zstd -1 | 4.78:1 | 0.61 GB/s | 1.22 GB/s | no |
+| zstd -3 | 4.91:1 | 0.43 GB/s | 1.39 GB/s | no |
+| zstd -19 | 5.71:1 | 0.006 GB/s | 1.17 GB/s | **yes** |
 
-This is the one corpus where zpse is on the frontier, and it is there at three
-levels: 5.69:1 at 0.94 GB/s in and 3.55 GB/s out. Encode is where that came
-from -- the CLI maps its input instead of copying it into a slab, which took a
-68 MiB encode on these bytes from 96 ms to 75 -- and level 6 now encodes faster
-than `lz4 -1` does on the same bytes, 0.94 against 0.85, with a stream 42%
-smaller. Decode reads 3.5 to 3.8 GB/s here, 2.5x `lz4 -1`'s 1.45 and 2.6x
-`zstd -3`'s 1.38. `lz4 -1` is off the frontier: level 1 encodes at 1.18 GB/s,
-39% faster than lz4 does on the same bytes, at 4.35:1 against 3.29, and decodes
-over twice as fast. Level 5 is marked off for the narrower reason that level 6
-beats it on both ratio and rate -- the ladder's extra trial buys its keep on
-this corpus. MAX at 0.79 GB/s is the one rung that encodes slower than lz4, and
-it answers with 5.70:1 and 3.63 GB/s.
+This is the one corpus where zpse is on the frontier, and it is there at two
+levels: level 6 at 5.70:1, 0.89 GB/s in and 3.67 GB/s out, and level 1 at
+4.36:1 and 1.25 GB/s in. Level 6's stream is 45% smaller than `lz4 -1`'s on the
+same bytes (5.70:1 against 3.29:1) and decodes 3.2x as fast (3.67 against
+1.16), for 6% less encode. `lz4 -1` is off the frontier: level 1 encodes 32%
+faster than lz4 does at 4.36:1 against 3.29, and decodes 3.4x as fast. Level 5
+is marked off for the narrower reason that level 6 beats it on both ratio and
+rate -- the ladder's extra trial buys its keep on this corpus. MAX at 0.77 GB/s
+has the same 5.70:1 as the default and a slower decode, so this is the one
+corpus where the deepest rung has nothing left to buy.
 
 One check on that claim belongs here, because it is the difference between a
 corpus and a format. A *real* table export in CSV form is not typed columns:
@@ -1531,7 +1543,7 @@ measures is what a binary table format stores, not what a text export of the
 same rows contains.
 
 `zpse_cli col` is what closes the ratio part of that: the same export, typed
-into columns first, packs to 3.86:1 -- past `lz4 -1`, 7.2% under the text form,
+into columns first, packs to 3.91:1 -- past `lz4 -1`, 8.1% under the text form,
 and rebuilt byte for byte by `uncol`. It does not close it to `zstd -3`, which
 reads 5.47:1 on the same bytes.
 
