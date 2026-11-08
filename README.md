@@ -195,11 +195,11 @@ is always built, so the pricing pass, the attempt-order sample, the compaction
 and the trial cap all fall away with it. What is left is one tile trial and
 the raw comparison, and the rate follows:
 
-| 4 KiB pages | plain L1 | `PAGE_FAST` L1 | plain L2 | `PAGE_FAST` L2 |
-| --- | ---: | ---: | ---: | ---: |
-| dumps | 58.61% at 239 MB/s | 66.09% at 861 MB/s | 57.32% at 194 MB/s | 65.96% at 845 MB/s |
-| mixed | 78.45% at 274 MB/s | 81.06% at 754 MB/s | 77.37% at 239 MB/s | 80.54% at 782 MB/s |
-| Silesia | 80.08% at 248 MB/s | 82.85% at 563 MB/s | 77.54% at 218 MB/s | 80.24% at 570 MB/s |
+| 4 KiB pages | plain L1 | plain L2 | plain BALANCED | `PAGE_FAST` L1 | `PAGE_FAST` L2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dumps | 58.61% at 239 MB/s | 57.32% at 194 MB/s | 40.92% at 117 MB/s | 66.09% at 861 MB/s | 65.96% at 845 MB/s |
+| mixed | 78.45% at 274 MB/s | 77.37% at 239 MB/s | 56.52% at 115 MB/s | 81.06% at 754 MB/s | 80.54% at 782 MB/s |
+| Silesia | 80.08% at 248 MB/s | 77.54% at 218 MB/s | 56.10% at 121 MB/s | 82.85% at 563 MB/s | 80.24% at 570 MB/s |
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
@@ -219,9 +219,9 @@ reason: the same cut on 64 KiB blocks costs 0.35% of packed bytes at BALANCED,
 because a big block's body is where the trials earn what they cost. The two
 probes, not the price strategy, are what keep the sizes suite at `grew=0`.
 
-All twelve cells are one pass of one build on one pinned core; the host's own
-band across passes is about 5%, which is why the ratios are quoted to 0.01 of a
-point and the rates only as a picture of the trade.
+Fifteen cells, best of five passes each, one build, one pinned core. The host's
+own band between passes is up to 12%, which is why the ratios are quoted to
+0.01 of a point while the rates only show the shape of the trade.
 
 Two and a quarter to three and a half times the encode for 2.6 to 7.5 points of ratio, and
 decode improves with it (3.4 GB/s on the dumps) because a page written as one
