@@ -766,13 +766,31 @@ static const uint8_t zpse_block_screen[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
  * about to write. The abort further requires a leading run of unpredicted
  * tiles. Returns 1 only when the whole block reads as noise at every sample
  * point. */
+/* How many tiles a PAGE_FAST page's noise probe reads. A page has sixteen
+ * tiles, and the generic probe below reads all sixteen -- the whole page --
+ * one tile before the trial prescreens each of them again. One sample, at the
+ * page's midpoint, is worth 4.6 to 11.9% of the page rate here (dumps +4.6%,
+ * mixed +11.9%, Silesia +6.6% at level 1; +5.7%, +10.6%, +6.9% at level 2,
+ * medians of five paired rounds) for 0.009 to 0.013% of the packed bytes: the
+ * page it can misjudge is one whose middle reads as noise and whose rest does
+ * not. Two samples, an eighth of the page, bought the same 4% on the dumps and
+ * lost rate on the other two, and sixteen is the byte-identical setting. A
+ * build that defines this 0 arms the abort with no probe at all, which costs
+ * more ratio than one sample. The arms are measured on the page table in the
+ * README. */
+#ifndef ZPSE_PAGE_NOISE_POINTS
+#define ZPSE_PAGE_NOISE_POINTS 1u
+#endif
+
 static int zpse_block_is_noise(const uint8_t *const planes[16], uint8_t sc,
-                               const uint32_t lens[16], uint32_t n)
+                               const uint32_t lens[16], uint32_t n,
+                               unsigned points)
 {
     unsigned i;
 
-    for (i = 0; i < 16u; i++) {
-        uint64_t target = ((uint64_t)n * (uint64_t)(2u * i + 1u)) / 32u;
+    for (i = 0; i < points; i++) {
+        uint64_t target =
+            ((uint64_t)n * (uint64_t)(2u * i + 1u)) / (2u * (uint64_t)points);
         uint64_t seen = 0;
         uint32_t len, off;
         const uint8_t *pl;
@@ -816,7 +834,8 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                               int is_last, uint32_t seq,
                               uint8_t *dst, uint32_t cap, uint32_t *total_out,
                               int *budget_hit, int have_best,
-                              uint32_t best_total, uint32_t flat_abort_min)
+                              uint32_t best_total, uint32_t flat_abort_min,
+                              unsigned noise_points)
 {
     /* A trial is only ever chosen when its total is below the RAW
      * envelope (32 + N), so it cannot matter once it has reached it:
@@ -924,8 +943,11 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 (!have_best ||
                  (uint64_t)best_total >=
                      (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n))
-                   ? zpse_block_is_noise((const uint8_t *const *)planes, sc,
-                                         lens, n)
+                   ? (noise_points == 0u
+                          ? 1
+                          : zpse_block_is_noise(
+                                (const uint8_t *const *)planes, sc, lens, n,
+                                noise_points))
                    : 0;
     cum = 0;
     for (s = 0; s < sc; s++) {
@@ -4261,13 +4283,19 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                     meta_lens[i], is_last, seq, tdst, tcap,
                                     &t, &budget_hit, have_best, best_total,
-                                    flat_min);
+                                    flat_min,
+                                    page_fast_page
+                                        ? (unsigned)ZPSE_PAGE_NOISE_POINTS
+                                        : 16u);
             zpse_block_trial_cycles += blk_rdtsc() - t_cycle;
         }
 #else
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq, tdst, tcap, &t,
-                                &budget_hit, have_best, best_total, flat_min);
+                                &budget_hit, have_best, best_total, flat_min,
+                                page_fast_page
+                                    ? (unsigned)ZPSE_PAGE_NOISE_POINTS
+                                    : 16u);
 #endif
 #if defined(ZPSE_TRACE_TRIALS)
         fprintf(stderr, "  trial oi=%d tid=%u rc=%d t=%u haven=%d bt=%u\n",

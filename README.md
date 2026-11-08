@@ -197,11 +197,11 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | `PAGE_FAST` L1 | plain L2 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: |
-| dumps | 58.56% at 244 MB/s | 66.17% at 888 MB/s | 57.28% at 196 MB/s | 66.03% at 848 MB/s |
-| mixed | 78.42% at 243 MB/s | 81.24% at 710 MB/s | 77.33% at 213 MB/s | 80.72% at 704 MB/s |
-| Silesia | 80.06% at 240 MB/s | 82.91% at 544 MB/s | 77.49% at 222 MB/s | 80.30% at 452 MB/s |
+| dumps | 58.56% at 244 MB/s | 66.17% at 917 MB/s | 57.28% at 196 MB/s | 66.04% at 903 MB/s |
+| mixed | 78.42% at 243 MB/s | 81.25% at 805 MB/s | 77.33% at 213 MB/s | 80.73% at 790 MB/s |
+| Silesia | 80.06% at 240 MB/s | 82.92% at 571 MB/s | 77.49% at 222 MB/s | 80.31% at 587 MB/s |
 
-Two to three and a half times the encode for 2.8 to 7.6 points of ratio, and
+Two and a half to four and a half times the encode for 2.8 to 7.6 points of ratio, and
 decode improves with it (3.4 GB/s on the dumps) because a page written as one
 identity segment is one plane the decoder walks straight through.
 
@@ -211,10 +211,15 @@ sixteen of its noise tiles to learn what the first four already said. The
 trial-level noise abort -- armed only at 8 KiB and up, because a larger block
 whose front is noise may still compress at the back -- now arms for a page
 under this flag too, and the flag is what makes it safe there: a page has no
-sweep behind its trial to pick a shape the abort could have missed. The output
-is unchanged to the byte on every corpus measured (dumps 141,107,723, mixed
-129,982,550, Silesia 175,723,846), and pages of pure random bytes go from 688
-to 1,473 MB/s, the mixed corpus gains 9% and the dumps and Silesia 1 to 2%.
+sweep behind its trial to pick a shape the abort could have missed. It also
+probes one sample at the page's midpoint instead of all sixteen tiles, which
+is 4.6 to 11.9% of the page rate at levels 1 and 2 (dumps 876 to 917, mixed
+720 to 805, Silesia 536 to 571 MB/s at level 1) for 0.009 to 0.013% of the
+packed bytes -- a hundredth of a ratio point -- because the page the sample can
+misjudge is one whose midpoint reads as noise and whose rest does not. All
+sixteen samples is the byte-identical setting, and it is the row above that
+pays the rate for it. Pages of pure random bytes go from 688 to 1,473 MB/s,
+and the abort on its own was worth 9% on the mixed corpus.
 The plain encoder is untouched: without the flag the abort keeps its 8 KiB
 gate, and 4 KiB level 1 writes the same 125,077,793 bytes it did before. What it
 gives up is the predictors -- a width-16 transpose is 16.2% of the Python
