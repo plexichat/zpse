@@ -3558,6 +3558,12 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t cfloor;
         /* The identity priced at raw at both windows: cut the list. */
         int flat_head = 0;
+        /* Candidates the sweep has priced on this block, and the ones the page
+         * cap (ZPSE_PAGE_CAND_CAP) left unpriced. Unpriced-by-the-cap is not
+         * the same as unpriced: the sweep must never drop a candidate it could
+         * not price, only one it chose not to. */
+        int np = 0;
+        uint8_t cap_skip[ZPSE_MAX_CAND];
         int ci;
         int k;
 
@@ -3584,6 +3590,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         for (ci = 0; ci < ncand; ci++) {
             ex[ci] = UINT32_MAX;
             pc[ci] = UINT32_MAX;
+            cap_skip[ci] = 0u;
         }
         /* Answered once instead of once per candidate: the loop below ends
          * the sweep the moment the identity prices at this floor, and the
@@ -3598,6 +3605,19 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
             if (flat_head && n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
                 k >= (int)ZPSE_FLAT_PRICE) {
+                break;
+            }
+            /* A page stops the sweep at the cap. The identity is priced
+             * first, so it is always in the list the compaction chooses
+             * from; what the cap costs is the shape a candidate behind it
+             * would have won with. */
+            if (np >= (int)ZPSE_PAGE_CAND_CAP &&
+                n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+                int j;
+
+                for (j = k; j < nord; j++) {
+                    cap_skip[order[j]] = 1u;
+                }
                 break;
             }
 #if defined(ZPSE_BLOCK_STATS)
@@ -3642,6 +3662,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                             scounts[ci], mb, meta_lens[ci],
                                             ZPSE_DECIDE_TILES, lim,
                                             every_plane, &prefix_ok);
+            np++;
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_cands_priced++;
             zpse_block_probe_cycles += blk_rdtsc() - t_cycle;
@@ -3733,7 +3754,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             uint8_t win_idx = idx[pick];
 
             for (ci = 0; ci < ncand; ci++) {
-                if (ci == pick || ex[ci] == UINT32_MAX ||
+                if (ci == pick ||
+                    (ex[ci] == UINT32_MAX && cap_skip[ci] == 0u) ||
                     ex[ci] <= limit || pc[ci] < pc[pick]) {
                     if (ci == pick) {
                         win = kept;

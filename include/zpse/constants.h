@@ -270,6 +270,17 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
 
 /* Levels whose sweep prices every plane of every candidate (5-9). */
 #define ZPSE_ENC_SPEED_EVERY_PLANE_MIN 5u
+/* How many candidates a page block's sweep may price.
+ *
+ * The sweep prices a candidate by staging its transform over the whole page
+ * and pricing every plane of it, and a page has nine of them, so the candidate
+ * list -- not the probe's order or its floor test -- is where a 4 KiB encode's
+ * time goes. Capping the list at seven drops the two shapes the sweep reaches
+ * last. On the dump corpus that is 1.1% of packed bytes for a fifth of the
+ * encode rate; the mixed and Silesia corpora pay 0.004 and 0.08% for 12 to
+ * 13%. Only a page: a 64 KiB block's body is where the candidates behind the
+ * seventh earn their price. */
+#define ZPSE_PAGE_CAND_CAP 7u
 /* Levels that run the match finder at all (5-9). */
 #define ZPSE_ENC_SPEED_LZ_MIN 5u
 /* Levels whose segment prescreen is cut to the three uniform predictors (1

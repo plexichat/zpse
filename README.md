@@ -197,9 +197,9 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | plain L2 | plain BALANCED | `PAGE_FAST` L1 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| dumps | 58.61% at 239 MB/s | 57.32% at 194 MB/s | 40.92% at 117 MB/s | 66.09% at 861 MB/s | 65.96% at 845 MB/s |
-| mixed | 78.45% at 274 MB/s | 77.37% at 239 MB/s | 56.52% at 115 MB/s | 81.06% at 754 MB/s | 80.54% at 782 MB/s |
-| Silesia | 80.08% at 248 MB/s | 77.54% at 218 MB/s | 56.10% at 121 MB/s | 82.85% at 563 MB/s | 80.24% at 570 MB/s |
+| dumps | 58.61% at 239 MB/s | 57.32% at 194 MB/s | 41.38% at 142 MB/s | 66.09% at 861 MB/s | 65.96% at 845 MB/s |
+| mixed | 78.45% at 274 MB/s | 77.37% at 239 MB/s | 56.52% at 130 MB/s | 81.06% at 754 MB/s | 80.54% at 782 MB/s |
+| Silesia | 80.08% at 248 MB/s | 77.54% at 218 MB/s | 56.14% at 136 MB/s | 82.85% at 563 MB/s | 80.24% at 570 MB/s |
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
@@ -218,6 +218,21 @@ workload and 119.6 against 111.7 on Silesia, with 0.009, 0.047 and 0.067%
 reason: the same cut on 64 KiB blocks costs 0.35% of packed bytes at BALANCED,
 because a big block's body is where the trials earn what they cost. The two
 probes, not the price strategy, are what keep the sizes suite at `grew=0`.
+
+The candidate list is itself a cost, and on a page it is now capped. The sweep
+prices a candidate by staging its transform over the whole page and pricing
+every plane of it, so nine candidates are nine whole-page stagings to choose
+one: on the dumps it was pricing 9.5 per page. `ZPSE_PAGE_CAND_CAP` stops the
+sweep at seven and drops the candidates it left unpriced -- not the ones it
+could not price, which it still never drops -- and the count falls to 6.9.
+What the cap costs is the shape the eighth and ninth candidates would have
+won with, and on these corpora that is a shape the trial was rejecting
+anyway: the dumps pay 1.13% of packed bytes for a fifth of the rate back
+(40.92% to 41.38%, 112.0 to 136.2 MB/s at five paired passes), the mixed
+workload pays 0.008% (104.2 to 118.0) and Silesia 0.064% (119.6 to 134.0).
+It is armed on a page only: a 64 KiB block's body is where the candidates
+behind the seventh earn their price. `PAGE_FAST` is untouched, because it cuts
+the list to the identity before the cap can see it.
 
 Fifteen cells, best of five passes each, one build, one pinned core. The host's
 own band between passes is up to 12%, which is why the ratios are quoted to
