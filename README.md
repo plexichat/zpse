@@ -217,6 +217,10 @@ priced on a stride of tiles and not on every plane -- the level above it is
 where the price ranking decides the ratio, and there the cut measured inside
 the host's own band.
 
+All twelve cells are one pass of one build on one pinned core; the host's own
+band across passes is about 5%, which is why the ratios are quoted to 0.01 of a
+point and the rates only as a picture of the trade.
+
 Two and a quarter to three and a half times the encode for 2.6 to 7.5 points of ratio, and
 decode improves with it (3.4 GB/s on the dumps) because a page written as one
 identity segment is one plane the decoder walks straight through.
