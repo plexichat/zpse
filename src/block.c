@@ -3379,6 +3379,28 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_PRICE_MIN_N
 #define ZPSE_PRICE_MIN_N 4096u
 #endif
+    /* ZPSE_ENC_PAGE_FAST: one shape, no decision.
+     *
+     * The list above is the sweep's menu; this option asks for its first line
+     * and nothing else. The identity is entry 0 and is always built, so
+     * cutting the list to one skips the pricing pass outright (it needs
+     * ncand > 1), and with it the attempt-order sample, the compaction and
+     * the trial cap -- every decision the encoder makes about a page, for the
+     * one shape a cheap rung writes anyway. Over the dump corpus at 4 KiB,
+     * levels 1 and 2 write no LZ form at all (0.0% of their bytes) and the
+     * pricing pass is 68% of their cycles, so paying it to choose between
+     * tile shapes is the trade a caller who wants the rate should not make.
+     *
+     * Nothing about the format changes: the identity is a shape the sweep
+     * could have chosen, so the header and the decoder are the same, and a
+     * page the identity cannot beat a verbatim copy on still goes RAW. What
+     * it gives up is the predictors -- on the Python heap's pages a width-16
+     * transpose is 16.2% of the bytes at level 1 -- which is why it is an
+     * option and not a level. */
+    if ((e->enc_flags & ZPSE_ENC_PAGE_FAST) != 0u &&
+        n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+        ncand = 1;
+    }
     if (ncand > 1 && n >= ZPSE_PRICE_MIN_N) {
         uint32_t ex[ZPSE_MAX_CAND];
         uint32_t pc[ZPSE_MAX_CAND];

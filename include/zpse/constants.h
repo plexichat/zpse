@@ -131,6 +131,25 @@
  * command writing as the only other work. */
 #define ZPSE_ENC_LZ_FAST        (UINT32_C(1) << 5)
 
+/* Write the page with ONE shape, chosen by measurement rather than by the
+ * sweep: a page block (n <= ZPSE_BLOCK_SHORT_MAX) is coded as the identity
+ * tile stream and compared with a verbatim copy, and nothing else is priced,
+ * staged or tried. This is the shape that level 1 and 2 pick on 4 KiB pages:
+ * the LZ forms are 0.0% of the bytes at both levels over the dump corpus (see
+ * the census in the README's page section), so the forms the sweep decides
+ * between are not the ones a cheap rung writes -- what a cheap rung spends is
+ * the decision itself. The probe is 68% of level 1's sweep cycles at a page
+ * and prices nine or ten candidates to choose a stream that costs about a
+ * third of that to write, so skipping the choice is worth more than any
+ * candidate in it.
+ *
+ * It is an option rather than a level for the reason ZPSE_ENC_LZ_FAST is: it
+ * gives up the predictors instead of trading against them, and on a page of
+ * typed data a width-16 transpose is where the ratio is (16.2% of the
+ * Python heap's page bytes at level 1). A caller who wants the rate and can
+ * afford the ratio asks for this; every existing level is unchanged. */
+#define ZPSE_ENC_PAGE_FAST      (UINT32_C(1) << 6)
+
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
  * 2,4,6,...,18. This trades compressed size for encode time and never

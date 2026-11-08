@@ -185,6 +185,30 @@ only when the later match is strictly longer by more than it costs. That is
 points at the default level (55.62% to 55.12%) and gives up 4% of its rate. The
 streams are unchanged in form, so decode is untouched.
 
+The decision itself is the last thing to pay for. At a page, levels 1 and 2
+write no LZ form at all -- 0.0% of the dump corpus's bytes at either level --
+and the pricing pass that chooses between tile shapes is 68% of their sweep
+cycles, pricing nine or ten candidates to pick a stream that costs a third of
+that to write. `ZPSE_ENC_PAGE_FAST` (bit 6 of `enc_flags`) cuts the candidate
+list to the identity, which is the shape those rungs pick on these pages and
+is always built, so the pricing pass, the attempt-order sample, the compaction
+and the trial cap all fall away with it. What is left is one tile trial and
+the raw comparison, and the rate follows:
+
+| 4 KiB pages | plain L1 | `PAGE_FAST` L1 | plain L2 | `PAGE_FAST` L2 |
+| --- | ---: | ---: | ---: | ---: |
+| dumps | 58.56% at 244 MB/s | 66.08% at 920 MB/s | 57.28% at 196 MB/s | 65.95% at 923 MB/s |
+| mixed | 78.42% at 243 MB/s | 81.05% at 739 MB/s | 77.33% at 213 MB/s | 80.53% at 736 MB/s |
+| Silesia | 80.06% at 240 MB/s | 82.84% at 542 MB/s | 77.49% at 222 MB/s | 80.23% at 592 MB/s |
+
+Three to five times the encode for 2.6 to 7.5 points of ratio, and decode
+improves with it (2.9 to 4.1 GB/s on the dumps) because a page written as one
+identity segment is one plane the decoder walks straight through. What it
+gives up is the predictors -- a width-16 transpose is 16.2% of the Python
+heap's page bytes at level 1 -- so it is an option and not a level: every
+level's own stream is unchanged, and so is every stream this flag writes for a
+block larger than a page.
+
 What a page cannot afford is the full-size block's trial structure: a 4 KiB
 block below the probe's gate would run nine full trials, and the two knobs
 that stop that are the ones this size was tuned with -- the pricing gate at
@@ -449,26 +473,26 @@ each run the harness's own best of three timed reps, on one host,
 
 | level | mean ratio | mean encode | mean decode | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 3.99:1 | 2.26 GB/s | 19.0 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
-| 2 | 4.06:1 | 1.99 GB/s | 19.5 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
-| 3 `ZPSE_ENC_SPEED_FASTER` | 4.06:1 | 1.93 GB/s | 19.4 GB/s | the same prescreen, three full trials |
-| 4 | 4.06:1 | 1.88 GB/s | 19.4 GB/s | four full trials, still no match finder |
-| 5 `ZPSE_ENC_SPEED_BALANCED` | 5.07:1 | 0.88 GB/s | 13.9 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
-| 6 (default) | 5.11:1 | 0.87 GB/s | 14.4 GB/s | the margin loosened to 1.1875x and the decode bill raised to 6 bytes per command — the bill is free on the encode side, so the default takes it; see the Silesia section for what the two knobs are each worth |
-| 7 | 5.11:1 | 0.88 GB/s | 14.4 GB/s | the margin loosened to 1.125x, the decode bill unchanged from 6 |
-| 8 | 5.14:1 | 0.83 GB/s | 12.9 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
-| 9 `ZPSE_ENC_SPEED_MAX` | 5.14:1 | 0.84 GB/s | 13.8 GB/s | the same 1.0625x margin with one screen sample instead of two, acceleration factor 24 (4 bytes per command), and the fast LZ form as a last candidate |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 4.01:1 | 2.17 GB/s | 18.4 GB/s | one trial per block: the probe's winner, on the cheap prescreen that tries the three uniform predictors only; no match finder |
+| 2 | 4.09:1 | 1.90 GB/s | 18.5 GB/s | the full nine-predictor prescreen, two full trials, no match finder |
+| 3 `ZPSE_ENC_SPEED_FASTER` | 4.09:1 | 1.81 GB/s | 19.0 GB/s | the same prescreen, three full trials |
+| 4 | 4.09:1 | 1.78 GB/s | 19.2 GB/s | four full trials, still no match finder |
+| 5 `ZPSE_ENC_SPEED_BALANCED` | 5.12:1 | 0.99 GB/s | 12.3 GB/s | every candidate priced on a tile of every plane, a guarded full-size field cut to its best two (see below), and the LZ form offered on a 1.25x sample win, 8 bytes per command |
+| 6 (default) | 5.16:1 | 1.01 GB/s | 12.5 GB/s | the margin loosened to 1.1875x and the decode bill raised to 6 bytes per command — the bill is free on the encode side, so the default takes it; see the Silesia section for what the two knobs are each worth |
+| 7 | 5.16:1 | 1.01 GB/s | 12.4 GB/s | the margin loosened to 1.125x, the decode bill unchanged from 6 |
+| 8 | 5.16:1 | 0.96 GB/s | 13.0 GB/s | the margin loosened to 1.0625x, acceleration factor 20 (4.8 bytes per command), and the field cut back to a tied tail only |
+| 9 `ZPSE_ENC_SPEED_MAX` | 5.16:1 | 0.92 GB/s | 12.6 GB/s | the same 1.0625x margin with one screen sample instead of two, acceleration factor 24 (4 bytes per command), and the fast LZ form as a last candidate |
 
 Levels 5 to 9 are the v2 form's rows: `ZPSE_B_LZ_TILE` lifts the corpus mean
-from 4.49:1 to 5.11:1 at the default level and costs about a fifth of the
+from 4.49:1 to 5.16:1 at the default level and costs about a fifth of the
 encode rate, because every block it wins pays a full match-finder pass over
 the tile body that the tile form alone never needed. Raising
 `ZPSE_LZ_TILE_DIV` (the 1/32 threshold in `src/block.c`) trades straight back
 along that line: at 16 the corpus grows 63 KB for no measurable speed.
 
 Levels 3 and 4 read as the same mean ratio because on this corpus a third or
-fourth candidate almost never wins: the extra trials cost encode time (1.89 to
-1.81 GB/s) and buy the odd block, which is worth a rung to the caller who
+fourth candidate almost never wins: the extra trials cost encode time (1.81 to
+1.78 GB/s) and buy the odd block, which is worth a rung to the caller who
 wants it and worth nothing to the average. Level 2 is the visible step in that
 tier, because the prescreen it switches to is what changes which shape the
 winner is.
@@ -961,15 +985,15 @@ caller's page faults:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.23:1 | 0.23 GB/s | 1.58 GB/s | 95,083,328 |
-| level 6 (default) | 2.03:1 | 0.36 GB/s | 1.49 GB/s | 104,474,009 |
-| level 6 + `ZPSE_ENC_LZ_FAST` | 2.19:1 | 0.42 GB/s | 1.99 GB/s | 96,661,814 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.25:1 | 0.23 GB/s | 1.70 GB/s | 94,248,419 |
+| level 6 (default) | 2.08:1 | 0.36 GB/s | 1.72 GB/s | 101,858,449 |
+| level 6 + `ZPSE_ENC_LZ_FAST` | 2.19:1 | 0.41 GB/s | 2.30 GB/s | 96,661,814 |
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default
 level as well as about half again as fast (96,661,814 against
-104,474,009). It is also the deepest rung's equal on ratio and three times
-its encode (2.19:1 against 2.23:1, 418 against 235 MB/s), which is what the
+101,858,449). It is also the deepest rung's equal on ratio and three times
+its encode (2.19:1 against 2.25:1, 414 against 233 MB/s), which is what the
 lazy probe bought: the form looks one position ahead and gives up a short
 match for a longer one that starts a byte later, and over the corpus that is
 4.8% of the payload for 4% of the finder's rate. That is the
@@ -1318,23 +1342,23 @@ text:
 
 | file | bytes | ratio | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
-| dickens | 10,192,446 | 1.17 | 0.95 GB/s | 5.21 GB/s |
-| mozilla | 51,220,480 | 2.01 | 0.33 GB/s | 1.42 GB/s |
-| mr | 9,970,564 | 2.48 | 0.25 GB/s | 1.25 GB/s |
-| nci | 33,553,445 | 5.34 | 0.57 GB/s | 1.75 GB/s |
-| ooffice | 6,152,192 | 1.49 | 0.22 GB/s | 1.23 GB/s |
-| osdb | 10,085,684 | 1.13 | 0.60 GB/s | 4.80 GB/s |
-| reymont | 6,627,202 | 1.99 | 0.30 GB/s | 1.91 GB/s |
-| samba | 21,606,400 | 2.60 | 0.40 GB/s | 1.84 GB/s |
-| sao | 7,251,944 | 1.01 | 1.05 GB/s | 8.72 GB/s |
-| webster | 41,458,703 | 2.10 | 0.32 GB/s | 2.16 GB/s |
-| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 2.64 GB/s |
-| xml | 5,345,280 | 4.27 | 0.58 GB/s | 2.47 GB/s |
-| **total** | **211,938,580** | **2.07** | **0.38 GB/s** | **1.88 GB/s** |
+| dickens | 10,192,446 | 1.19 | 0.70 GB/s | 3.96 GB/s |
+| mozilla | 51,220,480 | 2.01 | 0.30 GB/s | 1.20 GB/s |
+| mr | 9,970,564 | 2.49 | 0.23 GB/s | 1.26 GB/s |
+| nci | 33,553,445 | 5.43 | 0.54 GB/s | 1.84 GB/s |
+| ooffice | 6,152,192 | 1.49 | 0.20 GB/s | 1.24 GB/s |
+| osdb | 10,085,684 | 1.15 | 0.59 GB/s | 4.14 GB/s |
+| reymont | 6,627,202 | 1.99 | 0.32 GB/s | 1.60 GB/s |
+| samba | 21,606,400 | 2.61 | 0.37 GB/s | 1.57 GB/s |
+| sao | 7,251,944 | 1.01 | 0.93 GB/s | 6.65 GB/s |
+| webster | 41,458,703 | 2.10 | 0.29 GB/s | 2.19 GB/s |
+| x-ray | 8,474,240 | 1.72 | 0.39 GB/s | 2.81 GB/s |
+| xml | 5,345,280 | 4.27 | 0.39 GB/s | 2.55 GB/s |
+| **total** | **211,938,580** | **2.08** | **0.35 GB/s** | **1.74 GB/s** |
 
 `zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
 of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
-corpus from 106,140,388 to the 102,237,345 bytes above, which cost ~6% of
+corpus from 106,140,388 to the 101,858,449 bytes above, which cost ~6% of
 encode and bought ~8% of decode (the tile bodies it compresses are shorter
 than the plain LZ streams they replace, so the command loop runs over fewer
 bytes).
@@ -1507,15 +1531,15 @@ OR-ing into it, and the ladder is what the level table documents:
 
 | level | dickens + webster | ratio | encode |
 | --- | ---: | ---: | ---: |
-| 1 FASTEST | 47,256,891 | 1.09 | 1.89 GB/s |
-| 2 | 47,256,861 | 1.09 | 1.73 |
-| 3 FASTER | 47,256,861 | 1.09 | 1.83 |
-| 4 | 47,256,861 | 1.09 | 1.83 |
-| 5 BALANCED | 31,411,878 | 1.64 | 0.32 |
-| 6 (default) | 30,126,388 | 1.71 | 0.30 |
-| 7 | 28,254,795 | 1.83 | 0.25 |
-| 8 | 27,622,876 | 1.87 | 0.23 |
-| 9 MAX | 27,622,876 | 1.87 | 0.24 |
+| 1 FASTEST | 47,250,579 | 1.09 | 3.41 GB/s |
+| 2 | 47,250,549 | 1.09 | 3.55 |
+| 3 FASTER | 47,250,549 | 1.09 | 3.21 |
+| 4 | 47,250,549 | 1.09 | 3.02 |
+| 5 BALANCED | 29,724,409 | 1.74 | 0.37 |
+| 6 (default) | 28,278,012 | 1.83 | 0.32 |
+| 7 | 26,179,799 | 1.97 | 0.30 |
+| 8 | 25,572,783 | 2.02 | 0.29 |
+| 9 MAX | 25,572,783 | 2.02 | 0.14 |
 
 Sizes are non-increasing from level 2 up, which is the property the table
 promises, and the step from level 4 to 5 is where the match finder is offered
@@ -1524,7 +1548,7 @@ to every block.
 The default is level 6 rather than 5 because level 6 buys real size for a
 small rate: 106,140,388 packed bytes against 113,246,135 over all twelve
 files (2.00:1 against 1.87:1), encode 296 against 315 MB/s on the prose pair,
-and decode 4% lower. MAX goes further -- 97,634,045 bytes, 2.17:1 -- for
+and decode 4% lower. MAX goes further -- 94,248,419 bytes, 2.25:1 -- for
 about a third less encode rate, which is the rung to choose when size is the
 only thing that matters.
 
