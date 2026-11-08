@@ -3616,9 +3616,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * the price IS the decision -- it has one or two trials and no
              * more, so it cannot repair a ranking the cap made coarse -- and
              * on the dumps the two shapes behind the cap are worth 2.5 points
-             * there (level 1: 58.61% to 61.09%, level 2: 57.32% to 59.95%)
-             * against 3.7% of the rate. BALANCED pays 0.46 points for a fifth
-             * of its rate, which is the trade this exists for. */
+             * there (level 1: 58.61% to 61.09%, level 2: 57.32% to 59.95%),
+             * five times what BALANCED pays for the same fifth of rate, and no
+             * construction measured here showed a cheap rung winning more
+             * speed for it than BALANCED does. */
             if (np >= (int)ZPSE_PAGE_CAND_CAP &&
                 n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
                 zpse_enc_speed(speed) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN) {

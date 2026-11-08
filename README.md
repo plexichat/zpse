@@ -236,10 +236,11 @@ A cheap rung cannot pay that price, and capping one was a mistake worth
 recording. Levels 1 to 4 act on the price alone -- one, two or three trials
 and no more -- so the shape the cap drops is the shape they write, and capping
 them cost the dumps 2.5 points: 58.61% to 61.09% at level 1, 57.32% to 59.95%
-at level 2, and the same points on the mixed workload for the same fifth of
-the rate BALANCED buys with 0.46. So the cap is armed only where every plane
-is priced, levels 5 to 9, and the table below keeps the cheap rungs' full
-candidate list -- their ratios are the ones the list was always worth. It is
+at level 2, five times what BALANCED pays for the cap's fifth of the rate, and
+no construction measured here showed a cheap rung winning more speed for it
+than BALANCED does. So the cap is armed only where every plane is priced,
+levels 5 to 9, and the table below keeps the cheap rungs' full candidate list
+-- their ratios are the ones the list was always worth. It is
 armed on a page only for the same reason at the block size: a 64 KiB block's
 body is where the candidates behind the seventh earn their price.
 `PAGE_FAST` is untouched, because it cuts the list to the identity before the
