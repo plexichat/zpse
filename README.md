@@ -96,13 +96,13 @@ smaller than it went in, one pinned core, best of five:
 
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.11% | 58.56% | 213 / 456 / 218 MB/s |
-| 6 (default) | 16.05% | 6.31% | 62.67% | **40.61%** | 108 / 160 / 113 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 16.01% | 6.31% | 62.00% | 40.22% | 94 / 157 / 102 MB/s |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.19% | 58.61% | 213 / 442 / 255 MB/s |
+| 6 (default) | 17.68% | 6.31% | 62.71% | **41.06%** | 130 / 166 / 136 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 17.65% | 6.31% | 62.04% | 40.68% | 116 / 167 / 123 MB/s |
 
-The default level's page costs about 118 MB/s of encode for 40.61%, and
-decodes at 1.8 to 5.6 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands).The deepest level buys 0.39 points of ratio for about 10% of the rate, because on a page the tier's extra margin and decode bill reach
+The default level's page costs about 138 MB/s of encode for 41.06%, and
+decodes at 1.9 to 5.7 GB/s (the C heap is all pointers, which the fast LZ form
+codes as commands). The deepest level buys 0.38 points of ratio for about 9% of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 83% of the dump
@@ -236,11 +236,15 @@ A cheap rung cannot pay that price, and capping one was a mistake worth
 recording. Levels 1 to 4 act on the price alone -- one, two or three trials
 and no more -- so the shape the cap drops is the shape they write, and capping
 them cost the dumps 2.5 points: 58.61% to 61.09% at level 1, 57.32% to 59.95%
-at level 2, five times what BALANCED pays for the cap's fifth of the rate, and
-no construction measured here showed a cheap rung winning more speed for it
-than BALANCED does. So the cap is armed only where every plane is priced,
-levels 5 to 9, and the table below keeps the cheap rungs' full candidate list
--- their ratios are the ones the list was always worth. It is
+at level 2. The speed is real and large -- three paired passes read 262.7 to
+334.6 MB/s at level 1 and 210.7 to 274.7 at level 2, and on the mixed and
+Silesia corpora the same cap is nearly free, 0.09 and 0.05% of packed bytes
+for 16 and 21% of rate -- but 2.5 points is five times what BALANCED pays for
+its fifth of the rate and over twice the one-point line these page trades are
+held to. So the cap is armed only where every plane is priced, levels 5 to 9,
+and the table below keeps the cheap rungs' full candidate list -- their ratios
+are the ones the list was always worth. Relaxing that line at levels 1 and 2
+is the lever those two corpora leave open. It is
 armed on a page only for the same reason at the block size: a 64 KiB block's
 body is where the candidates behind the seventh earn their price.
 `PAGE_FAST` is untouched, because it cuts the list to the identity before the

@@ -3616,10 +3616,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * the price IS the decision -- it has one or two trials and no
              * more, so it cannot repair a ranking the cap made coarse -- and
              * on the dumps the two shapes behind the cap are worth 2.5 points
-             * there (level 1: 58.61% to 61.09%, level 2: 57.32% to 59.95%),
-             * five times what BALANCED pays for the same fifth of rate, and no
-             * construction measured here showed a cheap rung winning more
-             * speed for it than BALANCED does. */
+             * there (level 1: 58.61% to 61.09%, level 2: 57.32% to 59.95%).
+             * The speed is real -- three paired passes read 262.7 -> 334.6
+             * MB/s at level 1 and 210.7 -> 274.7 at level 2, and the mixed and
+             * Silesia corpora pay 0.09 and 0.05% of bytes for 16 and 21% --
+             * but 2.5 points is five times BALANCED's 0.46 for the same fifth
+             * of rate, and over twice the one-point line these page trades are
+             * held to. */
             if (np >= (int)ZPSE_PAGE_CAND_CAP &&
                 n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
                 zpse_enc_speed(speed) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN) {
