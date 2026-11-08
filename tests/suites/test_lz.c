@@ -611,6 +611,61 @@ static void lazy_window_cases(void)
     }
 }
 
+/* The block that exposed the ahead-of-cursor candidate: 16 KiB of mozilla at
+ * offset 50,823,168. With the lazy window armed it decoded 78 bytes of the
+ * wrong history on the unfixed finder, and it does not shrink -- every
+ * prefix and suffix under 16 KiB round-trips -- so it is kept whole.
+ *
+ * Located relative to this source file rather than the process's directory:
+ * the runners compile from the tree and run the binary from anywhere. A
+ * missing fixture is a failed check, never a skip, because a regression case
+ * that quietly disappears is worse than none. */
+static void fixture_cases(void)
+{
+    char path[1024];
+    const char *slash = strrchr(__FILE__, '/');
+    const char *bslash = strrchr(__FILE__, '\\');
+    const char *tail = "../corpus/lz_lazy_16k.bin";
+    size_t dir;
+    FILE *f;
+    size_t got;
+
+    if (bslash != NULL && (slash == NULL || bslash > slash)) {
+        slash = bslash;
+    }
+    dir = (slash != NULL) ? (size_t)(slash - __FILE__) + 1u : 0u;
+    if (dir + strlen(tail) + 1u > sizeof path) {
+        CHECK(0, "lazy fixture: path too long");
+        return;
+    }
+    memcpy(path, __FILE__, dir);
+    strcpy(path + dir, tail);
+    f = fopen(path, "rb");
+    CHECK(f != NULL, "lazy fixture: cannot open %s", path);
+    if (f == NULL) {
+        return;
+    }
+    got = fread(plain, 1, 16384u, f);
+    fclose(f);
+    CHECK(got == 16384u, "lazy fixture: read %u bytes", (unsigned)got);
+    if (got != 16384u) {
+        return;
+    }
+    {
+        uint32_t pl = zpse_lz_encode_ex(plain, 16384u, payload, sizeof payload,
+                                        tab, ZPSE_LZ_HASH_BITS, 16384u);
+
+        CHECK(pl > 0u, "lazy fixture: no payload");
+        if (pl == 0u) {
+            return;
+        }
+        memset(out, 0xA5, sizeof out);
+        CHECK(zpse_lz_decode(payload, pl, out, 16384u) == PSE_OK,
+              "lazy fixture: decode refused");
+        CHECK(memcmp(out, plain, 16384u) == 0, "lazy fixture: bytes differ");
+    }
+}
+
 int main(void)
 {
     if (zpse_encoder_init(NULL, ea, sizeof ea) != PSE_BAD_ARG) {
@@ -619,6 +674,7 @@ int main(void)
     }
     roundtrip_cases();
     lazy_window_cases();
+    fixture_cases();
     hostile_cases();
     block_cases();
     table_size_cases();
