@@ -197,9 +197,25 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | `PAGE_FAST` L1 | plain L2 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: |
-| dumps | 58.56% at 244 MB/s | 66.17% at 917 MB/s | 57.28% at 196 MB/s | 66.04% at 903 MB/s |
-| mixed | 78.42% at 243 MB/s | 81.25% at 805 MB/s | 77.33% at 213 MB/s | 80.73% at 790 MB/s |
-| Silesia | 80.06% at 240 MB/s | 82.92% at 571 MB/s | 77.49% at 222 MB/s | 80.31% at 587 MB/s |
+| dumps | 58.61% at 242 MB/s | 66.17% at 917 MB/s | 57.32% at 193 MB/s | 66.04% at 903 MB/s |
+| mixed | 78.45% at 269 MB/s | 81.25% at 805 MB/s | 77.37% at 237 MB/s | 80.73% at 790 MB/s |
+| Silesia | 80.08% at 250 MB/s | 82.92% at 571 MB/s | 77.54% at 215 MB/s | 80.31% at 587 MB/s |
+
+The plain columns pay less for the decision than they used to. A block whose
+identity window prices at raw at *both* ends is one the sweep has been told
+does not compress in the shape it tries first, and there the pricing pass is
+cut to the identity after two probes: a tail price, which separates a flat
+block from one with a noise prefix, and the width-4 shapes, which separate it
+from a record whose stride the identity cannot see (every fourth byte random,
+the rest a small ramp). Without those probes the same cut was 10 to 22%
+faster and turned 66 of the sizes suite's 768 cases raw; with them the suite is
+back to `grew=0` and the 4 KiB level-1 CLI bench reads 11.5, 19.1 and 9.0%
+faster on the dumps, the mixed workload and Silesia for +0.078, +0.032 and
++0.037% of packed bytes. BALANCED's stream does not move at all, because the
+cut is armed only below `ZPSE_ENC_SPEED_EVERY_PLANE_MIN`, where a candidate is
+priced on a stride of tiles and not on every plane -- the level above it is
+where the price ranking decides the ratio, and there the cut measured inside
+the host's own band.
 
 Two and a half to four and a half times the encode for 2.8 to 7.6 points of ratio, and
 decode improves with it (3.4 GB/s on the dumps) because a page written as one

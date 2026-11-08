@@ -3418,6 +3418,34 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_PRICE_MIN_N
 #define ZPSE_PRICE_MIN_N 4096u
 #endif
+/* Candidates priced on a block whose identity window prices at raw at both
+ * ends of it -- a block the sweep has just been told does not compress in the
+ * shape it tries first, at either end.
+ *
+ * The pricing pass is what a page-at-a-time encode spends most of its cycles
+ * on (see ZPSE_PRICE_MIN_N): 68% of a plain page's cycles, and 41% of the
+ * shared-library dump's pages end raw at level 1. On such a block the pass has
+ * one question to answer -- can anything compress this? -- and the identity
+ * has already answered no for the common case. Two probes keep it from being
+ * wrong about the uncommon one: the tail window separates a flat block from
+ * one with a noise prefix ("noise then a constant"), and the width-4 pair
+ * separates it from a record whose stride the identity cannot see (every
+ * fourth byte random, the rest a small ramp). A block either probe can
+ * compress is priced in full; only a block that fails both keeps this many
+ * candidates, and the trials behind them decide it (ZPSE_FLAT_TRIALS via
+ * sample_flat). Without the two probes the same cut was 10 to 22% faster and
+ * turned 66 of tests/suites/test_sizes.c's 768 cases from compressed to raw.
+ *
+ * It is armed only where the sweep is cheap. The cheap rungs price a stride of
+ * tiles per plane; BALANCED and deeper price every plane of every candidate,
+ * which is what ranks a transpose correctly and is where the level's ratio is
+ * decided, and there the cut is not worth what it saves: on the level corpus
+ * it measured inside the noise band against the full list. So the gate is
+ * !every_plane, the same line the pricing code already draws between the two
+ * strategies. */
+#ifndef ZPSE_FLAT_PRICE
+#define ZPSE_FLAT_PRICE 1
+#endif
     /* ZPSE_ENC_PAGE_FAST: one shape, no decision.
      *
      * The list above is the sweep's menu; this option asks for its first line
@@ -3521,6 +3549,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * pn (one segment, no metadata, so it is the smallest total any
          * candidate of this block could reach). See where it is filled. */
         uint32_t cfloor;
+        /* The identity priced at raw at both windows: cut the list. */
+        int flat_head = 0;
         int ci;
         int k;
 
@@ -3558,6 +3588,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         for (k = 0; k < nord; k++) {
             const uint8_t *mb;
             uint32_t lim = UINT32_MAX;
+
+            if (flat_head && !every_plane && k >= (int)ZPSE_FLAT_PRICE) {
+                break;
+            }
 #if defined(ZPSE_BLOCK_STATS)
             uint64_t t_cycle = blk_rdtsc();
 #endif
@@ -3607,6 +3641,43 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (ex[ci] == UINT32_MAX) {
                 pc[ci] = UINT32_MAX;
                 continue;
+            }
+            if (idx[ci] == 0u && scounts[ci] == 1u &&
+                ex[ci] >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
+                uint32_t tp = (n > pn)
+                    ? zpse_block_proxy_exact(e, in + (n - pn), pn, n,
+                                             tids[ci], scounts[ci], mb,
+                                             meta_lens[ci], ZPSE_DECIDE_TILES,
+                                             UINT32_MAX, every_plane, 0)
+                    : ex[ci];
+
+                if (tp == UINT32_MAX ||
+                    tp >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
+                    /* The width-4 pair, plain and delta: the stride shapes. */
+                    int stride_wins = 0;
+                    int pj;
+
+                    for (pj = 0; pj < ncand; pj++) {
+                        uint32_t sp;
+
+                        if (scounts[pj] != 4u || ex[pj] != UINT32_MAX) {
+                            continue;
+                        }
+                        sp = zpse_block_proxy_exact(
+                            e, in, pn, n, tids[pj], scounts[pj],
+                            meta_lens[pj] > 0 ? meta_bufs[pj] : in,
+                            meta_lens[pj], ZPSE_DECIDE_TILES, UINT32_MAX,
+                            every_plane, 0);
+                        if (sp != UINT32_MAX &&
+                            sp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
+                            stride_wins = 1;
+                            break;
+                        }
+                    }
+                    if (!stride_wins) {
+                        flat_head = 1;
+                    }
+                }
             }
             /* The content price: what the sample actually measured, with the
              * candidate's fixed structural envelope -- block header, block
