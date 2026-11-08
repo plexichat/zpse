@@ -28,7 +28,8 @@
  *     attribute, which -Wunknown-attributes (on by default) diagnoses, and
  *     this tree builds with -Werror, so emitting it would fail the clang
  *     build rather than merely doing nothing.  clang's own knob is the
- *     build flag: compile with -O3 or above.
+ *     build flag, which on this tree measures 0.93 against clang's own
+ *     -O2, so it is not a substitute either.
  *   - MSVC has no per-function optimization level at all.
  *
  * Where it expands to nothing, the sources and the format are identical and
@@ -37,8 +38,9 @@
  * by taste.  One measurement to keep in mind before adding one: gcc will
  * not inline across an optimization mismatch, so tagging a function in the
  * middle of a hot call chain *costs* -- tagging zpse_transform_inverse
- * alone measured -7% encode, because its -O2 callees stopped being inlined
- * into it.  The tags below are a set that was measured together; adding one
+ * alone measured -7% encode while its callees were plain -O2 code, and
+ * measures 1.04 on this tree now that they carry these tags too, which is
+ * the mismatch being the cost rather than the tag.  The tags below are a set that was measured together; adding one
  * to a function whose callees are untagged reproduces that mistake.  The
  * set is therefore leaves and functions that call only other tagged code;
  * the functions that are called from the middle of a chain (tile_classify,

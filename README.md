@@ -1603,8 +1603,8 @@ every round, median of the per-case throughput ratios, one pinned core):
 | `-O2` | 1.000 | everything in this tree |
 | `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.025 | 16 KB more text; decode and every compressed size unchanged |
 | the amalgamation at `-O3` | 0.99 | re-measured at the counts above on gcc 15.2.0: median 0.9895 of 75 per-case ratios; text 244 KB -> 344 KB |
-| that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
-| `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
+| that pragma scoped around six modules instead (the transform/predictor chain: `transform`, `predictor`, `combinadic`, `mask`, `residual`, `dense`) | 0.98 | 4.5 KB more text; the level corpus's median of 75 per-case ratios |
+| `optimize("O3")` on one function inside a hot chain | 1.04 | `zpse_transform_inverse` alone, against a build with the tags defined away |
 
 The `-O2`, `ZPSE_HOT` and `-O3` rows were re-run on the current tree (gcc
 15.2.0, three interleaved rounds at the counts above); the pragma rows are
@@ -1617,9 +1617,11 @@ inside the loops -- those are hand-written SIMD already tuned at `-O2` -- it
 is the inliner and the interprocedural passes deciding more, and those run at
 the level the compilation was given, which a per-function attribute cannot
 raise. The scope-every-module row confirms it: same object size as `-O2`,
-same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
-that function with its `-O2` neighbours, which is why the last row is slower
-than leaving the function untagged.
+same speed. A tag also stops gcc inlining that function with its `-O2`
+neighbours, and that is what the last row used to measure: it cost 7% when
+the chain around `zpse_transform_inverse` was plain `-O2` code. Re-measured on
+this tree the same tag is worth 4%, because its callees are tagged too -- the
+cost was the mismatch, not the tag.
 
 The `-O3` row was the one the release used, and it did not survive the tree it
 was measured on. Re-run at the counts above -- 25 cases x 4 MiB in 64 KiB
@@ -1654,7 +1656,9 @@ clang does not implement `optimize` and diagnoses it as an unknown attribute,
 which `-Werror` would turn into a failed build, and MSVC has no per-function
 optimization level at all -- so those builds compile the same sources with no
 tag, and a build that wants gcc's `-O3` passes has to ask for them on the
-command line rather than with this header.
+command line rather than with this header. That knob does not pay on this
+tree either: clang 20.1.8 at `-O3` reads a median of 0.9339 over 50 per-case
+ratios against its own `-O2`, with the text growing 262 KB -> 299 KB.
 
 ```sh
 bash tests/runners/run.sh          # POSIX / Git Bash / WSL
