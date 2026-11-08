@@ -300,6 +300,9 @@ static inline void lz_emit_cmd(LzOut *o, const uint8_t *lit_src, uint32_t lit,
     }
     o->pos = (uint32_t)(t - o->dst);
     o->cmds++;
+#ifdef ZPSE_LZ_TRACE
+    fprintf(stderr, "E lit=%u offv=%u ml=%u\n", lit, offv, ml);
+#endif
 }
 
 /* One match and the literals that precede it. Runs longer than a token
@@ -432,7 +435,20 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
          * cost 5% of the encode rate (ooffice -13.5%, osdb -12.5%, mozilla
          * -11.7%, dickens -6.7%), so the table keeps one way: the collision
          * it removes does not pay for the compare that removes it. */
-        if (cand == LZ_EMPTY ||
+/* A candidate at or ahead of the cursor is not a prior occurrence.  The
+ * match finder inserts `tab[h] = pos` before it decides, and the measured
+ * lazy step below can move the cursor back onto a position whose slot
+ * already holds the later one, so the slot is not always behind the cursor
+ * the way the clear-once-per-call argument above assumes.  Taking such a
+ * candidate makes `pos - cand` underflow to 0xFFFFFFFF; lz_emit_cmd then
+ * writes `off + 4`, which wraps to 3 -- the repeat code for the third most
+ * recent distance -- and the decoder reproduces bytes from the wrong
+ * history while the stream still parses to the right length.  That is one
+ * 16 KiB block at mozilla offset 50,823,168: 78 wrong bytes, a clean
+ * round-trip status, and only above a page because the lazy pass stops at
+ * ZPSE_LZ_LAZY_MAX.  One compare, on the probe that already loads the word
+ * at the candidate. */
+        if (cand == LZ_EMPTY || (uint32_t)cand >= pos ||
             zpse_load_u32le(in + cand) != cur) {
             /* Two misses are a coincidence; a run of them means the data
              * has no match here, so the cursor accelerates. */
