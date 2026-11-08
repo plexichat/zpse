@@ -113,14 +113,14 @@ Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.53% | 54.71% | 53.19% |
-| encode | 237 MB/s | 112 MB/s | 91 MB/s |
-| decode | 2.9 GB/s | 1.8 GB/s | 1.6 GB/s |
+| ratio | 80.05% | 54.64% | 53.16% |
+| encode | 255 MB/s | 114 MB/s | 98 MB/s |
+| decode | 3.5 GB/s | 1.9 GB/s | 1.9 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-120 MB/s, against 54.71% at 112 and 40.84% at 120. What zpse keeps is decode --
+120 MB/s, against 54.64% at 114 and 40.84% at 120. What zpse keeps is decode --
 1.6 to 4.1 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95

@@ -1078,7 +1078,7 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
     }
     return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + (uint32_t)meta_len +
            (uint32_t)sc * ((uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE +
-                           (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) +
+                           (uint32_t)ZPSE_SEGMENT_PRICE_SIZE) +
            records_bytes;
 }
 
@@ -1865,12 +1865,12 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
             if (c == UINT32_MAX) {
                 return UINT32_MAX;
             }
-            if (c == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u) {
+            if (c == (uint32_t)ZPSE_SEGMENT_PRICE_SIZE + 10u) {
                 /* All-hit first tile: the plane may still be constant, and
                  * the dense form prices that below ten bytes a tile. */
                 return ZPSE_PREFIX_NEED_FULL;
             }
-            records += (c - (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) * tc;
+            records += (c - (uint32_t)ZPSE_SEGMENT_PRICE_SIZE) * tc;
             npriced++;
             /* The sweep's running verdict, applied per plane exactly as the
              * full pass applies it: a bound already past `limit` cannot win,
@@ -2668,8 +2668,8 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
                              uint8_t *dst, uint32_t cap, void *tab,
-                             uint32_t hb, uint32_t *total_out,
-                             uint32_t *cmds_out)
+                             uint32_t hb, uint32_t lazy_max,
+                             uint32_t *total_out, uint32_t *cmds_out)
 {
     ZpseBlockHeader h;
     uint8_t flags;
@@ -2699,11 +2699,12 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * form's is: 16 KiB does not stay resident beside a 64 KiB block
      * streaming past it, so the table pays L2 latency either way, and the
      * bigger one misses less often. */
-    payload = zpse_lz_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                             cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
-                             zpse_enc_speed(e->enc_flags) == 1u
-                                 ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                 : hb);
+    payload = zpse_lz_encode_ex(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                                cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
+                                zpse_enc_speed(e->enc_flags) == 1u
+                                    ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                    : hb,
+                                lazy_max);
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
     }
@@ -3973,9 +3974,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #endif
                     /* The finder writes e->best and a gated block never
                      * runs the sweep, so e->cand is free for its table. */
-                    rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
-                                           e->best, lz_cap, e->cand, 15u,
-                                           &lz_total, &lz_cmds);
+                    rc = zpse_block_try_lz(
+                        e, in, n, in_crc, is_last, seq, e->best, lz_cap,
+                        e->cand, 15u, (uint32_t)ZPSE_BLOCK_SHORT_MAX,
+                        &lz_total, &lz_cmds);
 #if defined(ZPSE_BLOCK_STATS)
                     zpse_block_lz_passes++;
                     zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
@@ -4124,6 +4126,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
             lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                     (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
+                                    (uint32_t)ZPSE_BLOCK_SHORT_MAX,
                                     &lz_total, &lz_cmds);
             zpse_block_lz_passes++;
             zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
@@ -4131,7 +4134,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #else
         lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                 (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
-                                &lz_total, &lz_cmds);
+                                (uint32_t)ZPSE_BLOCK_SHORT_MAX, &lz_total,
+                                &lz_cmds);
 #endif
 
         /* ...and only when the block is not one the tiles own outright.
@@ -4475,8 +4479,41 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
             rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                    lz_cap, e->lz,
-                                   (uint32_t)ZPSE_LZ_HASH_BITS, &lz_total,
+                                   (uint32_t)ZPSE_LZ_HASH_BITS,
+                                   (uint32_t)ZPSE_BLOCK_SHORT_MAX, &lz_total,
                                    &lz_cmds);
+            /* ---- The lazy window above a page -------------------------
+             *
+             * The length-measured lazy step is worth 0.5 points at a page and
+             * is not offered at 8 or 16 KiB because it is a heuristic, not a
+             * proof: at those sizes it sometimes gives up a byte for a later
+             * match that codes longer, and the level ladder (a deeper level
+             * never writes a larger block) is then a property of the data
+             * rather than of the encoder. Above a page there is no ladder to
+             * break by taking the smaller of two streams, and the scratch is
+             * free: the LZ+tile stage below is the next thing to want
+             * e->tstage, so the plain stream stays where it was written and
+             * the lazy one is written beside it. Only a strictly smaller
+             * stream replaces it, so enabling this window can cost encode
+             * time and cannot cost a byte. */
+            if (rc == PSE_OK && e->ascii_gate == 0u &&
+                n > (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+                n <= (uint32_t)ZPSE_LZ_LAZY_MAX &&
+                lz_total <= (uint32_t)ZPSE_E_SZ_TSTAGE) {
+                uint32_t lz_lazy = 0u;
+                uint32_t lz_lazy_cmds = 0u;
+
+                if (zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
+                                      e->tstage, lz_cap, e->lz,
+                                      (uint32_t)ZPSE_LZ_HASH_BITS,
+                                      (uint32_t)ZPSE_LZ_LAZY_MAX, &lz_lazy,
+                                      &lz_lazy_cmds) == PSE_OK &&
+                    lz_lazy < lz_total) {
+                    memcpy(e->cand, e->tstage, lz_lazy);
+                    lz_total = lz_lazy;
+                    lz_cmds = lz_lazy_cmds;
+                }
+            }
             /* Smaller is not enough: the two forms decode at speeds that
              * have nothing to do with their ratio, so the win also has to be
              * big enough to pay for the decode it gives up and the command

@@ -81,6 +81,13 @@
  * them, which is the floor the block encoder budgets against. */
 #define ZPSE_LZ_MIN_CMD         2u
 
+/* The largest block the length-measured lazy step is ever offered. It was
+ * tuned at a 4 KiB page and is not a no-op above one -- on a 16 KiB block it
+ * can give up a byte for a later match that does not pay it back -- so the
+ * only caller that asks for it past a page runs the pass twice and keeps the
+ * smaller stream (src/block.c). 16 KiB is the next page size up. */
+#define ZPSE_LZ_LAZY_MAX        16384u
+
 /* The smallest payload zpse_lz_encode can produce for an n-byte block:
  * the two header words and one command -- a token byte and a one-byte
  * distance. A block whose first match starts at offset one is exactly
@@ -99,6 +106,15 @@
  * win on incompressible data without a special case. */
 uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                          uint32_t cap, void *table, uint32_t hash_bits);
+
+/* The same pass, with the length-measured lazy step enabled on blocks up to
+ * `lazy_max` bytes rather than up to a page. `lazy_max == 0` is the pass with
+ * the step off, which is what zpse_lz_encode is for every block above a page.
+ * The stream such a pass writes is not ordered against the page one -- taking
+ * the smaller of the two is the caller's job. */
+uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n, uint8_t *dst,
+                           uint32_t cap, void *table, uint32_t hash_bits,
+                           uint32_t lazy_max);
 
 /* Decode a payload of in_len bytes into exactly n bytes at out. Returns
  * PSE_OK, or a negative status for any stream that does not decode to

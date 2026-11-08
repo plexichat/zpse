@@ -176,8 +176,12 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
  * So at page size the match is measured first and then the position one
  * byte later is measured too, and the byte is given up only when the later
  * match is strictly longer by more than the literal it costs. The probe is
- * gated on the block being a page: 16 KiB and 64 KiB blocks keep their
- * bytes exactly.
+ * gated on the block size: `lazy_max` is a page for every caller that has
+ * not asked for more, because the rule is not a no-op above it -- on a 16 KiB
+ * block it sometimes gives up a byte for a later match that does not pay it
+ * back. The one caller that asks for 16 KiB runs the pass twice and keeps
+ * the smaller stream (see zpse_block_try_lz's callers), which is what makes
+ * the wider window safe rather than merely measured.
  *
  * `cand1 < pos + 1u` is not decoration. Backward extension has already
  * moved `pos` back here, and the table holds the position this iteration
@@ -329,6 +333,14 @@ static inline void lz_emit(LzOut *o, const uint8_t *lit_src, uint32_t run,
 
 ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                         uint32_t cap, void *table, uint32_t hash_bits)
+{
+    return zpse_lz_encode_ex(in, n, dst, cap, table, hash_bits,
+                             (uint32_t)ZPSE_BLOCK_SHORT_MAX);
+}
+
+ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
+                                    uint8_t *dst, uint32_t cap, void *table,
+                                    uint32_t hash_bits, uint32_t lazy_max)
 {
     uint16_t *tab = (uint16_t *)table;
     LzOut o;
@@ -523,7 +535,7 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             }
         }
 #if (ZPSE_LZ_LAZY_LEN > 0)
-        if (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX && pos + len + 1u < n) {
+        if (lazy_max != 0u && n <= lazy_max && pos + len + 1u < n) {
             uint32_t v1 = zpse_load_u32le(in + pos + 1u);
             uint32_t h1 = lz_hash(v1, hash_bits);
             uint32_t cand1 = tab[h1];

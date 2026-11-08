@@ -50,6 +50,17 @@
  * every page's payload: 8 * 52 065 pages is 416 520 bytes on the dump corpus,
  * for no change in what a segment can express. */
 #define ZPSE_SEGMENT_HEADER_SIZE 8u
+/* The envelope the sweep's PRICES are charged for a segment, which is not the
+ * one the format writes. Every pruning threshold in the sweep -- the
+ * candidate floors, the sample's running limit, the all-hit test that reads a
+ * price back -- was swept with sixteen bytes a segment, and a price eight
+ * bytes lower moves them, because it moves the candidates with many segments
+ * further than the ones with few: on the dump corpus 64 KiB level 6 grew
+ * from 80 697 025 bytes to 81 043 247 when the header shrank, while 4 KiB
+ * and 16 KiB fell. Charging the numbers the thresholds were tuned with keeps
+ * their relative positions, and what is left of the eight bytes is the part
+ * that never entered a comparison. */
+#define ZPSE_SEGMENT_PRICE_SIZE  16u
 #define ZPSE_TILE_HEADER_SIZE    8u
 #define ZPSE_SEG_DIR_ENTRY_SIZE  8u
 
