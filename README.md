@@ -1601,14 +1601,16 @@ every round, median of the per-case throughput ratios, one pinned core):
 | build | encode | notes |
 | --- | ---: | --- |
 | `-O2` | 1.000 | everything in this tree |
-| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.025 | 16 KB more text; decode and every compressed size unchanged |
+| `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.053 | 16 KB more text; decode and every compressed size unchanged |
 | the amalgamation at `-O3` | 0.99 | re-measured at the counts above on gcc 15.2.0: median 0.9895 of 75 per-case ratios; text 244 KB -> 344 KB |
-| that pragma scoped around six modules instead (the transform/predictor chain: `transform`, `predictor`, `combinadic`, `mask`, `residual`, `dense`) | 0.98 | 4.5 KB more text; the level corpus's median of 75 per-case ratios |
-| `optimize("O3")` on one function inside a hot chain | 1.04 | `zpse_transform_inverse` alone, against a build with the tags defined away |
+| that pragma scoped around six modules instead (the transform/predictor chain: `transform`, `predictor`, `combinadic`, `mask`, `residual`, `dense`) | 0.96 | 4.5 KB more text; median 0.9617 of 125 per-case ratios over five rotated rounds |
+| `optimize("O3")` on one function inside a hot chain | 1.00 | `zpse_transform_inverse` alone, against a build with the tags defined away; the transform module's five functions read 0.996 and the module plus the two tile writers 1.014 |
 
-The `-O2`, `ZPSE_HOT` and `-O3` rows were re-run on the current tree (gcc
-15.2.0, three interleaved rounds at the counts above); the pragma rows are
-measurements of the tree that predates the LZ2 and page work.
+All four rows are measurements of this tree at the counts above (gcc 15.2.0):
+three rotated rounds of 25 per-case ratios each for the tag rows, five for the
+two pragma rows. The pragma rows used to be quoted from a tree that predates
+the LZ2 and page work; at their own scopes on this one they read 0.96 and
+1.00, which is not the trade the old figures described.
 
 Rows three to five are the same request made at three scopes, and why they
 differ is worth knowing before adding a tag. At `-O3` the text of the
@@ -1616,12 +1618,16 @@ amalgamation grows from 244 KB to 344 KB: most of what `-O3` buys here is not
 inside the loops -- those are hand-written SIMD already tuned at `-O2` -- it
 is the inliner and the interprocedural passes deciding more, and those run at
 the level the compilation was given, which a per-function attribute cannot
-raise. The scope-every-module row confirms it: same object size as `-O2`,
-same speed. A tag also stops gcc inlining that function with its `-O2`
+raise. The scope-every-module row is the same request made wider and it is worse,
+not better: 4.5 KB more text and 4% slower than plain `-O2`, because a pragma
+over whole modules hands gcc more functions to inline at the higher level
+without the interprocedural view that the flag itself would give it. A tag also stops gcc inlining that function with its `-O2`
 neighbours, and that is what the last row used to measure: it cost 7% when
 the chain around `zpse_transform_inverse` was plain `-O2` code. Re-measured on
-this tree the same tag is worth 4%, because its callees are tagged too -- the
-cost was the mismatch, not the tag.
+this tree the same tag is worth nothing (1.000): one tagged function does not
+carry its untagged callers, and the module around it reads 0.996 with all five
+of its functions tagged, 1.014 once the two tile writers are added -- still a
+fifth of the set's win.
 
 The `-O3` row was the one the release used, and it did not survive the tree it
 was measured on. Re-run at the counts above -- 25 cases x 4 MiB in 64 KiB
@@ -1643,8 +1649,8 @@ every compressed size identical either way.
 marks were measured together, and a tag put on a function whose callees are
 untagged reproduces that last row. The set is measured best of three
 interleaved rounds with the order swapped every round, against the same tree
-built with the macro defined away; the per-round medians were 1.008, 1.039 and
-1.025, which is the spread the row above is quoted from. That measurement is also why the functions called from the
+built with the macro defined away; the per-round medians were 1.046, 1.073 and
+1.053, so the row above is the middle round and the spread is about 2.5%. That measurement is also why the functions called from the
 middle of a chain stay untagged: they come back with fewer instructions
 retired and more cycles spent. Nor does a tag combine with a target
 attribute -- gcc re-applies the command line's target to a function it has
@@ -1657,8 +1663,9 @@ which `-Werror` would turn into a failed build, and MSVC has no per-function
 optimization level at all -- so those builds compile the same sources with no
 tag, and a build that wants gcc's `-O3` passes has to ask for them on the
 command line rather than with this header. That knob does not pay on this
-tree either: clang 20.1.8 at `-O3` reads a median of 0.9339 over 50 per-case
-ratios against its own `-O2`, with the text growing 262 KB -> 299 KB.
+tree either: clang 20.1.8 at `-O3` reads a median of 0.9888 over 125 per-case
+ratios against its own `-O2` (824 MB/s against 936), with the text growing
+262 KB -> 299 KB.
 
 ```sh
 bash tests/runners/run.sh          # POSIX / Git Bash / WSL

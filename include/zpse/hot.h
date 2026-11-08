@@ -6,10 +6,10 @@
  * Every build of this tree is -O2 -- the CI matrix, tests/runners/run.sh and
  * the release CLI all say so -- and the hot paths were tuned at that level.
  * This tag asks gcc for the -O3 passes on one function inside that -O2
- * build: on the 18 functions it marks it is worth a measured 1.025x of
+ * build: on the 18 functions it marks it is worth a measured 1.053x of
  * encode throughput on tests/benchmarks/bench_levels.c over the 25-case
- * corpus (best of three interleaved rounds with the order swapped every
- * round, against the same tree built with the macro empty), for a slightly
+ * corpus (three rotated rounds at 20 iterations x 3 repetitions per case,
+ * against the same tree built with the macro empty), for a slightly
  * larger
  * binary, with every size in that corpus unchanged.  It is not a
  * substitute for building the amalgamation at -O3 -- +7% on the tree that
@@ -28,7 +28,7 @@
  *     attribute, which -Wunknown-attributes (on by default) diagnoses, and
  *     this tree builds with -Werror, so emitting it would fail the clang
  *     build rather than merely doing nothing.  clang's own knob is the
- *     build flag, which on this tree measures 0.93 against clang's own
+ *     build flag, which on this tree measures 0.99 against clang's own
  *     -O2, so it is not a substitute either.
  *   - MSVC has no per-function optimization level at all.
  *
@@ -39,8 +39,9 @@
  * not inline across an optimization mismatch, so tagging a function in the
  * middle of a hot call chain *costs* -- tagging zpse_transform_inverse
  * alone measured -7% encode while its callees were plain -O2 code, and
- * measures 1.04 on this tree now that they carry these tags too, which is
- * the mismatch being the cost rather than the tag.  The tags below are a set that was measured together; adding one
+ * on this tree it is a wash: 1.000 against the untagged build, with the
+ * transform module's five functions at 0.996 and the module plus the two
+ * tile writers at 1.014.  One tagged function does not carry the set.  The tags below are a set that was measured together; adding one
  * to a function whose callees are untagged reproduces that mistake.  The
  * set is therefore leaves and functions that call only other tagged code;
  * the functions that are called from the middle of a chain (tile_classify,
