@@ -213,10 +213,12 @@ It is `-P` on the CLI. A page under it is one shape at *every* level: the four
 LZ stages are decisions too, so the flag declines them as well -- before that,
 levels 5 to 9 still offered the token and fast LZ forms to a page (the library
 dump's 4 KiB total read 75,218,131 bytes with the flag at level 6 against
-104,827,267 at level 2), which is not what one shape means. From level 2 up the
-pages this flag writes are now the same stream; level 1 is 0.27% larger
-(105,106,058 bytes on that dump) because its trial does less per tile, not
-because it chooses anything.
+104,827,267 at level 2), which is not what one shape means. From level 2 up
+the pages this flag writes are within 0.003% of each other -- byte-identical
+on the dumps, 170,179,999 against 170,184,257 bytes over Silesia at 4 KiB
+between level 2 and levels 5 and 9 -- and level 1 is 0.27% larger (105,106,058
+bytes on that dump) because its trial does less per tile, not because it
+chooses anything.
 
 What a page cannot afford is the full-size block's trial structure: a 4 KiB
 block below the probe's gate would run nine full trials, and the two knobs
