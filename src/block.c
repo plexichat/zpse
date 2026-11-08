@@ -3610,9 +3610,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             /* A page stops the sweep at the cap. The identity is priced
              * first, so it is always in the list the compaction chooses
              * from; what the cap costs is the shape a candidate behind it
-             * would have won with. */
+             * would have won with.
+             *
+             * Only where every plane is priced (levels 5-9). On a cheap rung
+             * the price IS the decision -- it has one or two trials and no
+             * more, so it cannot repair a ranking the cap made coarse -- and
+             * on the dumps the two shapes behind the cap are worth 2.5 points
+             * there (level 1: 58.61% to 61.09%, level 2: 57.32% to 59.95%)
+             * against 3.7% of the rate. BALANCED pays 0.46 points for a fifth
+             * of its rate, which is the trade this exists for. */
             if (np >= (int)ZPSE_PAGE_CAND_CAP &&
-                n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+                n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+                zpse_enc_speed(speed) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN) {
                 int j;
 
                 for (j = k; j < nord; j++) {

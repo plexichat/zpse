@@ -197,9 +197,9 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | plain L2 | plain BALANCED | `PAGE_FAST` L1 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| dumps | 58.61% at 239 MB/s | 57.32% at 194 MB/s | 41.38% at 142 MB/s | 66.09% at 861 MB/s | 65.96% at 845 MB/s |
-| mixed | 78.45% at 274 MB/s | 77.37% at 239 MB/s | 56.52% at 130 MB/s | 81.06% at 754 MB/s | 80.54% at 782 MB/s |
-| Silesia | 80.08% at 248 MB/s | 77.54% at 218 MB/s | 56.14% at 136 MB/s | 82.85% at 563 MB/s | 80.24% at 570 MB/s |
+| dumps | 58.61% at 253 MB/s | 57.32% at 195 MB/s | 41.38% at 126 MB/s | 66.09% at 879 MB/s | 65.96% at 877 MB/s |
+| mixed | 78.45% at 279 MB/s | 77.37% at 230 MB/s | 56.52% at 116 MB/s | 81.06% at 743 MB/s | 80.54% at 738 MB/s |
+| Silesia | 80.08% at 273 MB/s | 77.54% at 221 MB/s | 56.14% at 131 MB/s | 82.85% at 563 MB/s | 80.24% at 575 MB/s |
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
@@ -220,23 +220,37 @@ because a big block's body is where the trials earn what they cost. The two
 probes, not the price strategy, are what keep the sizes suite at `grew=0`.
 
 The candidate list is itself a cost, and on a page it is now capped. The sweep
-prices a candidate by staging its transform over the whole page and pricing
-every plane of it, so nine candidates are nine whole-page stagings to choose
-one: on the dumps it was pricing 9.5 per page. `ZPSE_PAGE_CAND_CAP` stops the
-sweep at seven and drops the candidates it left unpriced -- not the ones it
-could not price, which it still never drops -- and the count falls to 6.9.
-What the cap costs is the shape the eighth and ninth candidates would have
-won with, and on these corpora that is a shape the trial was rejecting
-anyway: the dumps pay 1.13% of packed bytes for a fifth of the rate back
-(40.92% to 41.38%, 112.0 to 136.2 MB/s at five paired passes), the mixed
-workload pays 0.008% (104.2 to 118.0) and Silesia 0.064% (119.6 to 134.0).
-It is armed on a page only: a 64 KiB block's body is where the candidates
-behind the seventh earn their price. `PAGE_FAST` is untouched, because it cuts
-the list to the identity before the cap can see it.
+prices a candidate by staging its transform over its probe window -- 2 KiB of
+a page, see `ZPSE_PROBE_SHORT_TILES` -- and pricing every plane of it, so nine
+candidates are nine stagings to choose one: on the dumps it was pricing 9.5
+per page. `ZPSE_PAGE_CAND_CAP` stops the sweep at seven and drops the
+candidates it left unpriced -- not the ones it could not price, which it still
+never drops -- and the count falls to 6.9. What the cap costs is the shape the
+eighth and ninth candidates would have won with, and where the level prices
+every plane that is a shape the trial was rejecting anyway: the dumps pay
+1.13% of packed bytes for a fifth of the rate back (40.92% to 41.38%, 112.0 to
+136.2 MB/s at five paired passes), the mixed workload pays 0.008% (104.2 to
+118.0) and Silesia 0.064% (119.6 to 134.0).
 
-Fifteen cells, best of five passes each, one build, one pinned core. The host's
-own band between passes is up to 12%, which is why the ratios are quoted to
-0.01 of a point while the rates only show the shape of the trade.
+A cheap rung cannot pay that price, and capping one was a mistake worth
+recording. Levels 1 to 4 act on the price alone -- one, two or three trials
+and no more -- so the shape the cap drops is the shape they write, and capping
+them cost the dumps 2.5 points: 58.61% to 61.09% at level 1, 57.32% to 59.95%
+at level 2, and the same points on the mixed workload for the same fifth of
+the rate BALANCED buys with 0.46. So the cap is armed only where every plane
+is priced, levels 5 to 9, and the table below keeps the cheap rungs' full
+candidate list -- their ratios are the ones the list was always worth. It is
+armed on a page only for the same reason at the block size: a 64 KiB block's
+body is where the candidates behind the seventh earn their price.
+`PAGE_FAST` is untouched, because it cuts the list to the identity before the
+cap can see it.
+
+Fifteen cells, best of five passes each, one build, one pinned core. All
+twenty-five come from one session, so they are comparable to each other and to
+nothing measured on another day: the ratios are byte counts and do not move,
+while a rate on this host swings up to 12% between passes, which is why the
+ratios are quoted to 0.01 of a point and the rates only show the shape of the
+trade.
 
 Two and a quarter to three and a half times the encode for 2.6 to 7.5 points of ratio, and
 decode improves with it (3.4 GB/s on the dumps) because a page written as one
