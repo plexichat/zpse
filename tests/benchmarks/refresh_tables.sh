@@ -92,6 +92,7 @@ fi
 # ---- Corpora ----------------------------------------------------------
 
 corpus="$work/corpus"
+mkdir -p "$corpus" || exit 1
 "$work/corpus_write" "$corpus" >/dev/null || exit 1
 
 silesia="${SILESIA_DIR:-}"
@@ -191,16 +192,27 @@ if "$CC" -std=c11 -O2 -DNDEBUG -I "$inc" \
     grep '^transforms(' "$work/col.txt"
     say "columnar rows (zpse default)"
     grep '| zpse default |' "$work/col.txt"
-    # The per-case LZ-form table: tile-only arm (level 4), and MAX.
+    # The per-case LZ-form table: the default, MAX, and the tile-only arm
+    # (level 4, the deepest rung with no match finder).
     taskset -c 0 "$work/columnar" 1 1 all zpse 64 8 2>/dev/null |
         grep '| zpse default |' >"$work/tile.txt"
     taskset -c 0 "$work/columnar" 1 1 all zpse 64 18 2>/dev/null |
         grep '| zpse default |' >"$work/max.txt"
     say "per-case LZ form (tile-only arm is level 4)"
-    join -t'|' -j1 <(awk -F'|' '{print $1"|"$2"|"$3}' "$work/col.txt" | sort) \
-        <(awk -F'|' '{print $1"|"$2"|"$3}' "$work/tile.txt" | sort) 2>/dev/null |
-        head -0
-    echo "(compare $work/col.txt, tile.txt and max.txt)"
+    echo "| case | \`ZPSE_ENC_SPEED_BALANCED\` | \`ZPSE_ENC_MAX\` | tile stream alone |"
+    echo "| --- | ---: | ---: | ---: |"
+    cells() { # file -> case|ratio, one per line
+        awk -F'|' '{
+            c = $2; r = $4
+            gsub(/^ +| +$/, "", c); gsub(/^ +| +$/, "", r)
+            if (c != "") print c "|" r
+        }' "$1" | LC_ALL=C sort
+    }
+    cells "$work/col.txt" >"$work/d.rat"
+    cells "$work/max.txt" >"$work/m.rat"
+    cells "$work/tile.txt" >"$work/t.rat"
+    join -t'|' "$work/d.rat" "$work/m.rat" | join -t'|' - "$work/t.rat" |
+        awk -F'|' '{ printf "| `%s` | %s | %s | %s |\n", $1, $2, $3, $4 }'
 else
     missing "bench_columnar build (dlopen?)"
 fi
@@ -229,8 +241,10 @@ if [ -f "$titanic" ] && [ -f "$uber" ]; then
     for f in "$titanic" "$uber"; do
         [ -f "$f" ] || continue
         "$cli" colcheck "$f" 2>/dev/null |
-            awk -v n="$(basename "$f")" '/ratio/ {print}' >/dev/null
-        "$cli" colcheck "$f" 2>/dev/null
+            awk -v n="$(basename "$f")" '{
+                printf "| %s | %d | %d (%.2f:1) | %d (%.2f:1) | %s |\n",
+                       n, $2, $3, $4, $5, $6, $7
+            }'
     done
 else
     missing "titanic.csv and uber-rides-data1.csv"
