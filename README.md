@@ -214,7 +214,9 @@ faster on the dumps, the mixed workload and Silesia for +0.078, +0.032 and
 +0.037% of packed bytes. BALANCED gets it too, and there it is a win on both
 sides: 117.1 against 111.0 MB/s on the dumps, 109.0 against 92.5 on the mixed
 workload and 119.6 against 111.7 on Silesia, with 0.009, 0.047 and 0.067%
-*fewer* packed bytes. It is armed at every level for that reason -- the two
+*fewer* packed bytes. It is armed at every level and only on a page for that
+reason: the same cut on 64 KiB blocks costs 0.35% of packed bytes at BALANCED,
+because a big block's body is where the trials earn what they cost. The two
 probes, not the price strategy, are what keep the sizes suite at `grew=0`.
 
 All twelve cells are one pass of one build on one pinned core; the host's own

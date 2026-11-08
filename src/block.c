@@ -3443,7 +3443,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * it is a win there too -- 4 KiB BALANCED reads 117.1 against 111.0 MB/s on
  * the dumps, 109.0 against 92.5 on the mixed workload and 119.6 against
  * 111.7 on Silesia, with packed bytes 0.009, 0.047 and 0.067% SMALLER -- so
- * the gate is gone and the two probes alone decide. */
+ * the gate is gone and the two probes alone decide.
+ *
+ * It is a PAGE rule, and the last check of that is the measurement above it:
+ * on 64 KiB blocks at BALANCED the same cut costs 0.35% of packed bytes
+ * (80,583,972 -> 80,868,755 over the dump corpus) and 5% of rate, because a
+ * big block's body is where the sweep's trials earn what they cost. So the
+ * cut is gated to n <= ZPSE_BLOCK_SHORT_MAX, which is the size a page is. */
 #ifndef ZPSE_FLAT_PRICE
 #define ZPSE_FLAT_PRICE 1
 #endif
@@ -3590,7 +3596,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             const uint8_t *mb;
             uint32_t lim = UINT32_MAX;
 
-            if (flat_head && k >= (int)ZPSE_FLAT_PRICE) {
+            if (flat_head && n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+                k >= (int)ZPSE_FLAT_PRICE) {
                 break;
             }
 #if defined(ZPSE_BLOCK_STATS)
