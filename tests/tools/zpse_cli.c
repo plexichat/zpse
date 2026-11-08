@@ -18,6 +18,10 @@
  *
  * Options (c and bench):
  *   -l LEVEL   balanced (default) | faster | fastest | max
+ *   -F         write the fast LZ form only (one match-finder pass, no
+ *              shape decision); see ZPSE_ENC_LZ_FAST
+ *   -P         a page (block <= 4096) gets the identity tile stream and no
+ *              shape decision; ignored above a page. See ZPSE_ENC_PAGE_FAST
  *   -c         emit the per-block payload CRC32-C (verified on decode)
  *   -b N       nominal block size, 1..65536 (default 65536)
  *   -x         append the FrameIndex (random access); bench also seeks
@@ -845,6 +849,12 @@ static int cmd_codec(int argc, char **argv)
              * its last candidate, so any decoder reads it. */
             enc_flags |= ZPSE_ENC_LZ_FAST;
             break;
+        case 'P':
+            /* One shape per page: the identity tile stream, compared with a
+             * verbatim copy and nothing else priced or tried. Ignored above
+             * a page, where the flag has no meaning. */
+            enc_flags |= ZPSE_ENC_PAGE_FAST;
+            break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;
             break;
@@ -1113,6 +1123,12 @@ static int cmd_bench(int argc, char **argv)
              * its last candidate, so any decoder reads it. */
             enc_flags |= ZPSE_ENC_LZ_FAST;
             break;
+        case 'P':
+            /* One shape per page: the identity tile stream, compared with a
+             * verbatim copy and nothing else priced or tried. Ignored above
+             * a page, where the flag has no meaning. */
+            enc_flags |= ZPSE_ENC_PAGE_FAST;
+            break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;
             break;
@@ -1206,8 +1222,10 @@ static int cmd_bench(int argc, char **argv)
         return 1;
     }
     if (!quiet) {
-        printf("level %s%s, block %u, %s, %u thread%s\n", level_name(enc_flags),
+        printf("level %s%s%s, block %u, %s, %u thread%s\n",
+               level_name(enc_flags),
                (enc_flags & ZPSE_ENC_CHECKSUM) ? ", crc" : "",
+               (enc_flags & ZPSE_ENC_PAGE_FAST) ? ", page-fast" : "",
                (unsigned)block, indexed ? "indexed" : "no index",
                threads, threads == 1u ? "" : "s");
         printf("%-14s %11s %11s %7s %10s %10s %8s\n", "file", "bytes",

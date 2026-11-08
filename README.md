@@ -209,6 +209,15 @@ heap's page bytes at level 1 -- so it is an option and not a level: every
 level's own stream is unchanged, and so is every stream this flag writes for a
 block larger than a page.
 
+It is `-P` on the CLI. A page under it is one shape at *every* level: the four
+LZ stages are decisions too, so the flag declines them as well -- before that,
+levels 5 to 9 still offered the token and fast LZ forms to a page (the library
+dump's 4 KiB total read 75,218,131 bytes with the flag at level 6 against
+104,827,267 at level 2), which is not what one shape means. From level 2 up the
+pages this flag writes are now the same stream; level 1 is 0.27% larger
+(105,106,058 bytes on that dump) because its trial does less per tile, not
+because it chooses anything.
+
 What a page cannot afford is the full-size block's trial structure: a 4 KiB
 block below the probe's gate would run nine full trials, and the two knobs
 that stop that are the ones this size was tuned with -- the pricing gate at
@@ -294,19 +303,19 @@ exercises (this is the `transforms(...)` line `bench_columnar` prints):
 | --- | --- |
 | `bools_nulls` | RAW |
 | `decimal8` | T8 |
-| `dict_u8` | RAW (51/64), T2 |
-| `dict_u16le` | T2 |
+| `dict_u8` | RAW (51/64), T2 (13/64) |
+| `dict_u16le` | T2 (55/64), DT2 |
 | `dna_2bit` | RAW |
 | `float_mix` | DT16 |
-| `float_sparse` | RAW (47/64), T2, D8, T4 |
+| `float_sparse` | RAW (56/64), T2 |
 | `geo_point` | RAW |
 | `i32_seq` | DT4 |
 | `i64_mixed` | DT8 |
 | `json_rows` | RAW |
 | `log_lines` | RAW |
-| `rle_lens` | T4 (63/64), DT4 |
+| `rle_lens` | T4 (58/64), DT4 |
 | `sorted_near` | DT4 (62/64), DT8 |
-| `sparse_mix` | RAW (61/64), T2 (3/64) |
+| `sparse_mix` | RAW |
 | `struct_offsets` | DT4 |
 | `text_en` | RAW |
 | `ts_gapped` | T4 |
@@ -314,9 +323,9 @@ exercises (this is the `transforms(...)` line `bench_columnar` prints):
 | `ts_seq` | DT8 |
 | `ts_us` | DT8 |
 | `utf8_multi` | RAW |
-| `uuid_mix` | T16 |
+| `uuid_mix` | RAW |
 | `var_string` | RAW |
-| `zeros_burst` | RAW (63/64), D8 |
+| `zeros_burst` | RAW (61/64), T2 |
 
 RAW means the block kept its bytes (the intra-block LZ form can still ride on
 top of that at levels 5-9), T* is the plain width-* transpose, DT* the delta
@@ -333,28 +342,29 @@ change.
 
 | pattern | zpse | zstd -3 | |
 | --- | ---: | ---: | --- |
-| `zeros` | 0.0038 | 0.00004 | zstd 95x smaller |
-| `const5A` | 0.0038 | 0.00004 | zstd 95x smaller |
-| `incr` | 0.0400 | 0.00016 | zstd 250x smaller |
-| `strided` | 0.0400 | 0.00034 | zstd 118x smaller |
-| `sparse` | 0.0593 | 0.00021 | zstd 282x smaller |
-| `sparse2` | 0.0185 | 0.00023 | zstd 80x smaller |
-| `alt00FF` | 0.0042 | 0.00010 | zstd 42x smaller |
-| `sawtooth` | 0.0405 | 0.0626 | **zpse 1.5x smaller** |
-| `lowentropy` | 0.5080 | 0.5196 | **zpse 2% smaller** |
+| `zeros` | 0.0010 | 0.00004 | zstd 29x smaller |
+| `const5A` | 0.0010 | 0.00004 | zstd 29x smaller |
+| `incr` | 0.0016 | 0.00016 | zstd 10x smaller |
+| `strided` | 0.0017 | 0.00034 | zstd 5.1x smaller |
+| `sparse` | 0.0464 | 0.00021 | zstd 219x smaller |
+| `sparse2` | 0.0163 | 0.00023 | zstd 69x smaller |
+| `alt00FF` | 0.0012 | 0.00010 | zstd 12.8x smaller |
+| `sawtooth` | 0.0018 | 0.0626 | **zpse 35x smaller** |
+| `lowentropy` | 0.5079 | 0.5196 | **zpse 2.3% smaller** |
 | `random` | 1.0005 | 1.0000 | tie |
 
 That is the honest picture, and read the table as the shape of the comparison
 rather than as the default level's numbers: the intra-block LZ form below moves
-`var_string` from 1.0005 to about 0.40 at level 5. zpse has no entropy stage
+`var_string` from 1.09 to about 0.34 at the default level. zpse has no entropy stage
 and no cross-block window -- a match distance is 16 bits inside the block, so a
 block stays independent -- and its tile model is "one of ten predictors over
 256-byte tiles, code the exceptions enumeratively", with a single-probe hash
 match finder (LZ4's shape, not a search) offered as one more candidate at
 levels 5-9. On the ramp and one-value patterns zstd's finder still turns almost the
-entire file into a handful of copies and beats zpse by two orders of
-magnitude; on the sawtooth and the sixteen-value stream it is zpse that wins,
-because a repeating ramp is a prediction rather than a match. Where the data
+entire file into a handful of copies and beats zpse by one to two orders of
+magnitude (5x on the stride, 29x on a constant); on the sawtooth and the
+sixteen-value stream it is zpse that wins, by 35x and 2.3%, because a
+repeating ramp is a prediction rather than a match. Where the data
 has no redundancy to match but does have a small
 alphabet, zpse's tile model is competitive, and on truly random data both are
 at 1.000.
@@ -377,13 +387,13 @@ line, only the compressed size compared):
 
 | column | zpse | zstd -3 | |
 | --- | ---: | ---: | --- |
-| `ts_seq` (i64 µs timestamps) | 0.1858 | 0.2564 | **zpse 1.4x smaller** |
-| `ts_ns` (i64 ns timestamps) | 0.1728 | 0.2564 | **zpse 1.5x smaller** |
-| `float_sparse` (f32 readings) | 0.3676 | 0.2398 | zstd 1.5x smaller |
-| `var_string` (JSON-ish records) | 0.3973 | 0.2123 | zstd 1.9x smaller |
-| `sparse_mix` (nullable i64) | 0.1423 | 0.1020 | zstd 1.4x smaller |
-| `geo_point` (lat/lon + cell) | 0.0644 | 0.0338 | zstd 1.9x smaller |
-| `struct_offsets` (i32 offsets) | 0.2519 | 0.7808 | **zpse 3.1x smaller** |
+| `ts_seq` (i64 µs timestamps) | 0.1770 | 0.2564 | **zpse 1.4x smaller** |
+| `ts_ns` (i64 ns timestamps) | 0.1636 | 0.2564 | **zpse 1.6x smaller** |
+| `float_sparse` (f32 readings) | 0.3239 | 0.2398 | zstd 1.4x smaller |
+| `var_string` (JSON-ish records) | 0.3382 | 0.2123 | zstd 1.6x smaller |
+| `sparse_mix` (nullable i64) | 0.1238 | 0.1020 | zstd 1.2x smaller |
+| `geo_point` (lat/lon + cell) | 0.0538 | 0.0338 | zstd 1.6x smaller |
+| `struct_offsets` (i32 offsets) | 0.2245 | 0.7808 | **zpse 3.5x smaller** |
 
 Three of those rows are worth reading twice.
 
@@ -395,13 +405,13 @@ instead of matching is not simply a worse match finder; on data with no
 redundancy to match, it is a different codec, and it can win.*
 
 `var_string` is the other end: high-cardinality JSON-ish text, where every
-value is unique. The cheap levels fall back to raw (1.0005) because none of the
+value is unique. The cheap levels fall back to raw (1.09) because none of the
 ten tile predictors help, and zstd's match finder finds the repeated keys and
 gets 0.21. This is the tile model's own limit showing up on realistic text
 rather than on a synthetic ramp, and without the LZ form it is the row that
 decides against zpse for this data. With the LZ form it is a different row:
-`var_string` at the default level is about 0.40 (2.5:1), which is the effort
-level table's number rather than the 1.0005 a tile-only sweep reaches.
+`var_string` at the default level is about 0.34 (2.96:1), which is the effort
+level table's number rather than the 1.09 a tile-only sweep reaches.
 
 The timestamp rows are the interesting middle: both are narrower than zstd's
 0.26, by about a third, which is what a delta-of-delta predictor buys over a
@@ -420,20 +430,20 @@ Both sides see 64 KiB chunks, so only the coding model differs.
 
 | column | reference codec | reference | zpse | |
 | --- | --- | ---: | ---: | --- |
-| `ts_seq` | delta + varint | 4.00:1 | 5.38:1 | **zpse 1.3x smaller** |
-| `ts_ns` | double delta | 4.56:1 | 5.79:1 | **zpse 1.3x smaller** |
-| `float_sparse` | Gorilla XOR | 2.68:1 | 2.72:1 | tie |
-| `var_string` | *(none helps)* | — | 2.52:1 | block codec territory |
-| `sparse_mix` | null bitmap | 10.44:1 | 7.03:1 | zpse 1.5x bigger |
-| `geo_point` | zigzag + delta | 6.10:1 | 15.54:1 | **zpse 2.5x smaller** |
-| `struct_offsets` | frame of reference | 2.56:1 | 3.97:1 | **zpse 1.6x smaller** |
+| `ts_seq` | delta + varint | 4.00:1 | 5.65:1 | **zpse 1.4x smaller** |
+| `ts_ns` | double delta | 4.56:1 | 6.11:1 | **zpse 1.3x smaller** |
+| `float_sparse` | Gorilla XOR | 2.68:1 | 3.09:1 | **zpse 1.2x smaller** |
+| `var_string` | *(none helps)* | — | 2.96:1 | block codec territory |
+| `sparse_mix` | null bitmap | 10.44:1 | 8.08:1 | zpse 1.3x bigger |
+| `geo_point` | zigzag + delta | 6.10:1 | 18.59:1 | **zpse 3.0x smaller** |
+| `struct_offsets` | frame of reference | 2.56:1 | 4.45:1 | **zpse 1.7x smaller** |
 
 The reference codecs are deliberately plain reference points, not proposals —
 `tests/suites/test_colref.c` proves each one round-trips, so every size here
 is one a real codec reached rather than an estimate.
 
-Four rows deserve their own note. On `ts_seq`, `ts_ns`, `geo_point` and
-`struct_offsets` zpse *beats* the purpose-built codec, and the reason is
+Five rows deserve their own note. On `ts_seq`, `ts_ns`, `float_sparse`,
+`geo_point` and `struct_offsets` zpse *beats* the purpose-built codec, and the reason is
 visible in the stream: the encoder picks a delta transpose, which for a
 fixed-width record is exactly the column split a columnar format does by
 hand, and its stride and lane-delta predictors then replay the recurrence the
@@ -445,12 +455,12 @@ it is an accident worth naming.
 On `sparse_mix` the gap is real and it is the one that would cost something:
 null suppression is a typed feature zpse does not have, and a 92%-null
 column is worth 10.44:1 to a codec that knows the nulls are whole records.
-1.5x is what zpse pays for not knowing.
+1.3x is what zpse pays for not knowing.
 
-`float_sparse` is a tie -- 2.68 against 2.72 -- which is Gorilla's XOR and
-zpse's stride model arriving at the same place by different routes, and it is
-the one row where the specialist has nothing left to teach. The `var_string`
-row is the honest limit: no column codec helps there either, and the answer
+`float_sparse` used to be a tie -- 2.68 against 2.72 -- and is now 2.68
+against 3.09: Gorilla's XOR and zpse's stride model still arrive in the same
+place, but the stride model gets there with a fifth fewer bytes. The
+`var_string` row is the honest limit: no column codec helps there either, and the answer
 is a match finder -- which is what the intra-block LZ form gives it at levels
 5-9, inside the block and nowhere else.
 
@@ -548,11 +558,11 @@ difference between raw and compression:
 
 | case | `ZPSE_ENC_SPEED_BALANCED` | `ZPSE_ENC_MAX` | tile stream alone |
 | --- | ---: | ---: | ---: |
-| `json_rows` | 2.06:1 | 2.06:1 | 1.09:1 |
-| `log_lines` | 2.63:1 | 2.63:1 | 1.09:1 |
-| `var_string` | 2.52:1 | 2.52:1 | 1.09:1 |
-| `utf8_multi` | 1.64:1 | 2.00:1 | 1.00:1 |
-| `text_en` | 1.09:1 | 1.33:1 | 1.09:1 |
+| `json_rows` | 2.95:1 | 2.95:1 | 1.09:1 |
+| `log_lines` | 3.40:1 | 3.40:1 | 1.09:1 |
+| `var_string` | 2.96:1 | 2.96:1 | 1.09:1 |
+| `utf8_multi` | 3.11:1 | 3.11:1 | 1.00:1 |
+| `text_en` | 1.88:1 | 1.88:1 | 1.09:1 |
 
 The form is kept only when it is smaller than the best tile stream, so no
 level pays for it in size. Nor does a level pay for it in trials: the sweep
@@ -652,11 +662,11 @@ depend on it, decode over 64 KiB blocks:
 
 | column | ratio | decode |
 | --- | ---: | ---: |
-| `ts_gapped` (timestamp with gaps) | 2.06:1 | 2.5 GB/s |
-| `float_sparse` (f32 readings) | 2.72:1 | 3.5 GB/s |
-| `ts_us` (i64 µs timestamps) | 5.09:1 | 4.2 GB/s |
-| `sorted_near` | 3.82:1 | 4.8 GB/s |
-| `ts_seq` (i64 µs timestamps) | 5.38:1 | 5.8 GB/s |
+| `ts_gapped` (timestamp with gaps) | 2.88:1 | 1.8 GB/s |
+| `float_sparse` (f32 readings) | 3.09:1 | 3.7 GB/s |
+| `ts_us` (i64 µs timestamps) | 5.92:1 | 3.7 GB/s |
+| `sorted_near` | 4.80:1 | 2.1 GB/s |
+| `ts_seq` (i64 µs timestamps) | 5.65:1 | 5.2 GB/s |
 
 Two of the group's costs are the same lesson: a value the loop has already
 produced should not be read back out of memory. A group's `prev` -- the sixteen
@@ -823,18 +833,18 @@ constant" shape of the size corpus -- has a price that says flat and a trial
 that says otherwise, and the trial wins because it encodes the whole block. A
 block that compresses still gets its compression; only a block that really is
 noise stops after one trial. No case of the size corpus (768 cases) grows a
-byte for it, and the corpus mean encode rate is about 1.02 GB/s.
+byte for it, and the corpus mean encode rate is about 1.01 GB/s.
 
 The rows it is worth most on are the ones whose head and tail are noise:
 
 | case | encode |
 | --- | ---: |
-| `utf8_multi` | 470 MB/s |
-| `bools_nulls` | 1 980 MB/s |
-| `dna_2bit` | 1 940 MB/s |
+| `utf8_multi` | 477 MB/s |
+| `bools_nulls` | 1 660 MB/s |
+| `dna_2bit` | 2 000 MB/s |
 
 At the deepest level, where the match finder is the candidate that can still
-see such a block, `utf8_multi` encodes at 307 MB/s and `dna_2bit` at 949 MB/s,
+see such a block, `utf8_multi` encodes at 476 MB/s and `dna_2bit` at 1.47 GB/s,
 with the same ratio on every case.
 
 ## What it does
@@ -1296,23 +1306,24 @@ one.
 
 This is the one table in this file that is not one core and one thread. Six
 worker counts on the mixed columnar corpus, 64 KiB blocks, indexed frames,
-best of six, pinned to the host's six logical CPUs (`bench_parallel.c`); the
+best of two, pinned to the host's six logical CPUs (`bench_parallel.c`); the
 host reports three cores with two threads each, so the six-worker column is
 three cores with SMT. GB/s of uncompressed bytes, at the default level.
 
 | frame | encode 1 | 2 | 3 | 6 | decode 1 | 2 | 3 | 6 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 MiB | 1.40 | 1.71 | 2.28 | 2.58 | 5.36 | 5.46 | 5.44 | 5.51 |
-| 4 MiB | 1.31 | 1.70 | 3.00 | 3.99 | 4.56 | 6.06 | 7.78 | 7.70 |
-| 16 MiB | 0.43 | 0.84 | 1.18 | 2.59 | 3.02 | 4.90 | 6.55 | 12.29 |
-| 64 MiB | 0.49 | 0.89 | 1.27 | 2.18 | 3.50 | 5.97 | 8.13 | 11.91 |
+| 1 MiB | 1.05 | 1.31 | 1.62 | 1.79 | 5.43 | 4.34 | 4.32 | 5.38 |
+| 4 MiB | 1.04 | 1.76 | 2.36 | 2.97 | 5.19 | 7.63 | 7.16 | 5.77 |
+| 16 MiB | 0.65 | 1.25 | 1.80 | 2.29 | 3.63 | 6.58 | 8.59 | 11.23 |
+| 64 MiB | 0.77 | 1.48 | 1.98 | 3.32 | 3.99 | 7.16 | 7.84 | 11.79 |
 
 Encode scales better than decode because it has more to do: the encode column
 is the sweep and the match finder on four different column shapes, and the
 decode column is a block reconstruction that already runs at four to six
 gigabytes a second on one core. A 64 MiB frame goes from one worker to six at
-four and a half times on encode and three and a third on decode (its last
-row above), and a frame of a megabyte barely moves in either direction.
+four and a third times on encode and three times on decode (its last
+row above), and a frame of a megabyte thin to 1.7x on encode and no more on
+decode.
 
 The row that flattens soonest is the 1 MiB frame's encode, and the cause is the
 encoder's four-blocks-per-worker rule rather than the codec: sixteen blocks is
@@ -1571,7 +1582,7 @@ every round, median of the per-case throughput ratios, one pinned core):
 | --- | ---: | --- |
 | `-O2` | 1.000 | everything in this tree |
 | `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.029 | 14 KB more text; decode and every compressed size unchanged |
-| the amalgamation at `-O3` | 1.071 | same as `#pragma GCC optimize("O3")` at the top of `src/zpse_unity.c` (1.066) |
+| the amalgamation at `-O3` | 1.065 | same as `#pragma GCC optimize("O3")` at the top of `src/zpse_unity.c` (1.066) |
 | that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
 | `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
 
@@ -1591,10 +1602,10 @@ default is worth the warning it produces: the 7% is the amalgamation's, and it
 is not reproducible on every corpus. Same two builds, same sources, sizes
 identical byte for byte, best of interleaved rounds, one pinned core: on the
 17-file corpus `zpse_cli bench` reads (68 MiB, from random to all-zeros) the
-encode medians are 838 MB/s at `-O2` and 844 at `-O3`, which is the noise
-floor and no more. On Silesia, where the encode has actual text to work on,
-the same pair reads 330 and 341 MB/s -- about 3%, and decode is unchanged
-within the same spread.
+encode medians are 1,074 MB/s at `-O2` and 1,167 at `-O3` -- about 9%, the
+same direction as the level corpus. On Silesia, where the encode has actual
+text to work on, the same pair reads 365 and 366 MB/s, which is the noise
+floor and no more; decode is unchanged within the same spread.
 
 So the release is built at `-O3` because it is not slower, not because it is
 7% faster: that figure belongs to the level corpus in the table above, and the

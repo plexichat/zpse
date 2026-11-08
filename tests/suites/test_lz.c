@@ -422,6 +422,96 @@ static void no_match_cases(void)
     }
 }
 
+/* ZPSE_ENC_PAGE_FAST: a page gets one shape and no decision. Three things
+ * are pinned here: the block it writes is the identity tile stream (no RAW,
+ * no LZ form, one segment, transform 0), that block reads back, and the
+ * option is ignored above a page -- where it says nothing about the block
+ * and the sweep has to choose as it always did. */
+static void page_fast_cases(void)
+{
+    uint32_t cl = 0u;
+    uint32_t got = 0u;
+    ZpseBlockHeader h;
+    uint32_t i;
+
+    for (i = 0; i < 4096u; i++) {
+        plain[i] = (uint8_t)(i / 16u);
+    }
+    CHECK(zpse_compress_block_ex(plain, 4096u, comp, sizeof comp, &cl, 0u, 1,
+                                 (uint32_t)ZPSE_ENC_PAGE_FAST |
+                                     (uint32_t)ZPSE_ENC_SPEED_FASTEST,
+                                 ea) == PSE_OK,
+          "PAGE_FAST: the page did not compress");
+    CHECK(cl < 4096u + 64u, "PAGE_FAST: fell back to a verbatim copy (%u B)",
+          cl);
+    CHECK(zpse_block_header_parse(&h, comp, cl) == PSE_OK,
+          "PAGE_FAST: the header does not parse");
+    CHECK((h.block_flags &
+           (ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) == 0u &&
+              h.segment_count == 1u && h.transform_id == 0u,
+          "PAGE_FAST: not the identity tile stream (flags 0x%02x, %u "
+          "segments, transform %u)",
+          (unsigned)h.block_flags, (unsigned)h.segment_count,
+          (unsigned)h.transform_id);
+    CHECK(h.compressed_block_size == cl, "PAGE_FAST: size in header");
+    CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
+                  PSE_OK &&
+              got == 4096u && memcmp(out, plain, 4096u) == 0,
+          "PAGE_FAST: round-trip");
+
+    /* The contract is "one shape" at every level: the LZ forms and the
+     * LZ-over-tiles stage are decisions too, and a level deep enough to offer
+     * them must not offer them to a page under this flag. */
+    {
+        uint32_t cl6 = 0u;
+        uint32_t got6 = 0u;
+
+        for (i = 0; i < 4096u; i++) {
+            plain[i] = (uint8_t)(i / 16u);
+        }
+        CHECK(zpse_compress_block_ex(plain, 4096u, payload, sizeof payload,
+                                     &cl6, 0u, 1,
+                                     (uint32_t)ZPSE_ENC_PAGE_FAST |
+                                         (uint32_t)ZPSE_ENC_SPEED_MAX,
+                                     ea) == PSE_OK,
+              "PAGE_FAST level 9: the page did not compress");
+        CHECK(zpse_block_header_parse(&h, payload, cl6) == PSE_OK,
+              "PAGE_FAST level 9: the header does not parse");
+        CHECK((h.block_flags &
+               (ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) == 0u &&
+                  h.segment_count == 1u && h.transform_id == 0u,
+              "PAGE_FAST level 9: not one shape (flags 0x%02x, %u segments)",
+              (unsigned)h.block_flags, (unsigned)h.segment_count);
+        CHECK(zpse_decompress_block(payload, cl6, out, sizeof out, &got6,
+                                    da) == PSE_OK &&
+                  got6 == 4096u && memcmp(out, plain, 4096u) == 0,
+              "PAGE_FAST level 9: round-trip");
+    }
+
+    /* Above a page the flag must change nothing: the fastest level's own
+     * bytes, to the byte. */
+    {
+        uint32_t a = 0u;
+        uint32_t b = 0u;
+
+        for (i = 0; i < 8192u; i++) {
+            plain[i] = (uint8_t)(i % 251u);
+        }
+        CHECK(zpse_compress_block_ex(plain, 8192u, comp, sizeof comp, &a, 0u,
+                                     1, (uint32_t)ZPSE_ENC_SPEED_FASTEST,
+                                     ea) == PSE_OK,
+              "PAGE_FAST: the 8 KiB reference block did not compress");
+        CHECK(zpse_compress_block_ex(plain, 8192u, payload, sizeof payload,
+                                     &b, 0u, 1,
+                                     (uint32_t)(ZPSE_ENC_PAGE_FAST |
+                                                ZPSE_ENC_SPEED_FASTEST),
+                                     ea) == PSE_OK,
+              "PAGE_FAST: the 8 KiB block did not compress");
+        CHECK(a == b && memcmp(comp, payload, a) == 0,
+              "PAGE_FAST changed a block above a page (%u vs %u bytes)", a, b);
+    }
+}
+
 int main(void)
 {
     if (zpse_encoder_init(NULL, ea, sizeof ea) != PSE_BAD_ARG) {
@@ -433,6 +523,7 @@ int main(void)
     block_cases();
     table_size_cases();
     no_match_cases();
+    page_fast_cases();
     if (fails == 0) {
         printf("LZ: ALL OK (%d checks)\n", checks);
         return 0;

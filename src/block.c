@@ -3396,10 +3396,18 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * page the identity cannot beat a verbatim copy on still goes RAW. What
      * it gives up is the predictors -- on the Python heap's pages a width-16
      * transpose is 16.2% of the bytes at level 1 -- which is why it is an
-     * option and not a level. */
+     * option and not a level.
+     *
+     * The four LZ stages further down are decisions as well, so they too are
+     * declined for a page under this flag (page_fast_page below). Without
+     * that, levels 5 to 9 still offered the token and fast LZ forms and wrote
+     * a different page than the cheap rungs did -- 75,218,131 bytes against
+     * 104,827,267 on the library dump -- while claiming one shape. */    int page_fast_page = 0;
+
     if ((e->enc_flags & ZPSE_ENC_PAGE_FAST) != 0u &&
         n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
         ncand = 1;
+        page_fast_page = 1;
     }
     if (ncand > 1 && n >= ZPSE_PRICE_MIN_N) {
         uint32_t ex[ZPSE_MAX_CAND];
@@ -3962,7 +3970,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * the trial was going to produce -- not a guess. A block whose trial
      * could deviate from zpse_block_ascii_total never reaches this code
      * (the gate clears, or it is not the identity-only shape). */
-    if (e->ascii_gate != 0u && ncand == 1) {
+    if (!page_fast_page && e->ascii_gate != 0u && ncand == 1) {
         uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
         uint32_t atotal = zpse_block_ascii_total(n);
         uint32_t lz_floor = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
@@ -4452,7 +4460,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * text), and what they will trade for it is the level's acceleration
      * factor (see ZPSE_LZ_ACCEL_*): the match finder is a full pass over the
      * block, so it is the most expensive candidate in the sweep. */
-    if (!lz_done &&
+    if (!page_fast_page && !lz_done &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         e->lz != 0) {
@@ -4591,7 +4599,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * points -- a full point of ratio -- for 2% of encode, which a build that
      * changes nothing also spends. The body it compresses is already a tile
      * stream, so the finder is fast on it and there is no pass to save. */
-    if (!direct_out && have_best && e->lz != 0 &&
+    if (!page_fast_page && !direct_out && have_best && e->lz != 0 &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u + 64u) &&
@@ -4715,7 +4723,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_LZ2_MIN_LEVEL
 #define ZPSE_LZ2_MIN_LEVEL ZPSE_ENC_SPEED_LZ_MIN
 #endif
-    if (have_best && e->lz != 0 &&
+    if (!page_fast_page && have_best && e->lz != 0 &&
         zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
             (uint32_t)ZPSE_LZ2_MIN_LEVEL &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
