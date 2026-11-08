@@ -2907,10 +2907,8 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
  * Each sampled tile goes through exactly the pipeline the trial loop runs,
  * including the second candidate when it is competitive, so this is the
  * trial's own per-tile size rather than a proxy for it. Returns the price
- * INCLUDING the priced segment envelope (ZPSE_SEGMENT_PRICE_SIZE, which is
- * the 16 bytes the sweep's thresholds were swept with rather than the 8 the
- * format writes), or UINT32_MAX when a tile cannot be priced (the caller
- * then has no estimate). */
+ * INCLUDING the 8-byte segment header, or UINT32_MAX when a tile cannot be
+ * priced (the caller then has no estimate). */
 static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                                const uint8_t *plane, uint32_t plane_len,
                                uint32_t tc, unsigned tiles,
@@ -3037,20 +3035,20 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
          * not be priced", so the caller keeps the candidate -- a safe,
          * perf-only degradation, never a wrongly dropped winner. */
         if (limit != UINT32_MAX &&
-            (uint64_t)ZPSE_SEGMENT_PRICE_SIZE + (uint64_t)sum >=
+            (uint64_t)ZPSE_SEGMENT_HEADER_SIZE + (uint64_t)sum >=
                 (uint64_t)limit) {
             /* Convicted: return the proven floor (header + sum), a finite
              * value >= limit that is a valid lower bound on the true price.
              * UINT32_MAX stays reserved for "could not be priced" (keep),
              * so a convicted value is distinguishable from an unpriceable
              * one and the caller can drop the candidate instead. */
-            return (uint32_t)ZPSE_SEGMENT_PRICE_SIZE + sum;
+            return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + sum;
         }
     }
     if (nsum == 0u) {
         return UINT32_MAX;
     }
-    return (uint32_t)ZPSE_SEGMENT_PRICE_SIZE +
+    return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
            (uint32_t)(((uint64_t)sum * tc + nsum / 2u) / nsum);
 }
 
@@ -3129,7 +3127,7 @@ uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
      * tile); a plane priced above that cannot be constant and does not need
      * the scan at all. The test is therefore free on every plane that is
      * not all-hit, which is most of them. */
-    if (best == (uint32_t)ZPSE_SEGMENT_PRICE_SIZE + 10u * tc) {
+    if (best == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u * tc) {
         uint32_t d = zpse_segment_const_cost(plane, plane_len);
 
         if (d != UINT32_MAX && d < best) {

@@ -1078,7 +1078,7 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
     }
     return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + (uint32_t)meta_len +
            (uint32_t)sc * ((uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE +
-                           (uint32_t)ZPSE_SEGMENT_PRICE_SIZE) +
+                           (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) +
            records_bytes;
 }
 
@@ -1865,12 +1865,12 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
             if (c == UINT32_MAX) {
                 return UINT32_MAX;
             }
-            if (c == (uint32_t)ZPSE_SEGMENT_PRICE_SIZE + 10u) {
+            if (c == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u) {
                 /* All-hit first tile: the plane may still be constant, and
                  * the dense form prices that below ten bytes a tile. */
                 return ZPSE_PREFIX_NEED_FULL;
             }
-            records += (c - (uint32_t)ZPSE_SEGMENT_PRICE_SIZE) * tc;
+            records += (c - (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) * tc;
             npriced++;
             /* The sweep's running verdict, applied per plane exactly as the
              * full pass applies it: a bound already past `limit` cannot win,

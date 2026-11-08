@@ -86,7 +86,9 @@
  * can give up a byte for a later match that does not pay it back -- so the
  * only caller that asks for it past a page runs the pass twice and keeps the
  * smaller stream (src/block.c). 16 KiB is the next page size up. */
+#ifndef ZPSE_LZ_LAZY_MAX
 #define ZPSE_LZ_LAZY_MAX        16384u
+#endif
 
 /* The smallest payload zpse_lz_encode can produce for an n-byte block:
  * the two header words and one command -- a token byte and a one-byte

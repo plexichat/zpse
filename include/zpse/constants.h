@@ -50,17 +50,16 @@
  * every page's payload: 8 * 52 065 pages is 416 520 bytes on the dump corpus,
  * for no change in what a segment can express. */
 #define ZPSE_SEGMENT_HEADER_SIZE 8u
-/* The envelope the sweep's PRICES are charged for a segment, which is not the
- * one the format writes. Every pruning threshold in the sweep -- the
- * candidate floors, the sample's running limit, the all-hit test that reads a
- * price back -- was swept with sixteen bytes a segment, and a price eight
- * bytes lower moves them, because it moves the candidates with many segments
- * further than the ones with few: on the dump corpus 64 KiB level 6 grew
- * from 80 697 025 bytes to 81 043 247 when the header shrank, while 4 KiB
- * and 16 KiB fell. Charging the numbers the thresholds were tuned with keeps
- * their relative positions, and what is left of the eight bytes is the part
- * that never entered a comparison. */
-#define ZPSE_SEGMENT_PRICE_SIZE  16u
+/* Charging the sweep's prices sixteen bytes a segment instead -- the envelope
+ * every pruning threshold was swept with -- was measured and refused. It
+ * recovers the 64 KiB level-6 cost of the shorter header (81 043 247 ->
+ * 80 571 956 bytes) and buys 16 KiB 178 687, but eight bytes a segment that
+ * are not there also makes every multi-segment candidate look worse than it
+ * is, and levels 1 to 4 decide by that price and nothing else: 4 KiB level 1
+ * grew 124 889 146 -> 125 592 685 (0.33 points of ratio) and level 9 31 910,
+ * on the page size this format is for. Over seven cells it is a wash (34 KB
+ * the wrong way), so the prices stay exact and the 64 KiB regression is
+ * recorded as the price of the shorter header. */
 #define ZPSE_TILE_HEADER_SIZE    8u
 #define ZPSE_SEG_DIR_ENTRY_SIZE  8u
 

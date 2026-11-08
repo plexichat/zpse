@@ -96,35 +96,34 @@ smaller than it went in, one pinned core, best of five:
 
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 39.77% | 10.57% | 84.14% | 59.71% | 209 / 450 / 205 MB/s |
-| 6 (default) | 16.89% | 6.32% | 62.69% | **40.84%** | 109 / 167 / 118 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 16.84% | 6.32% | 62.01% | 40.44% | 96 / 168 / 106 MB/s |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.11% | 58.56% | 206 / 458 / 226 MB/s |
+| 6 (default) | 16.05% | 6.31% | 62.68% | **40.61%** | 103 / 150 / 107 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 16.01% | 6.31% | 61.97% | 40.20% | 92 / 150 / 98 MB/s |
 
-The default level's page costs about 120 MB/s of encode for 40.84%, and
-decodes at 1.9 to 5.7 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands). The deepest level buys 0.40 points of ratio for about 11%
-of the rate, because on a page the tier's extra margin and decode bill reach
+The default level's page costs about 111 MB/s of encode for 40.61%, and
+decodes at 1.8 to 5.6 GB/s (the C heap is all pointers, which the fast LZ form
+codes as commands).The deepest level buys 0.41 points of ratio for about 8% of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
-total where it is: two pages in five go out raw at level 1, and 84% of the dump
-survives there against 63% at the default level and 61% at the deepest.
+total where it is: two pages in five go out raw at level 1, and 83% of the dump
+survives there against 63% at the default level and 62% at the deepest.
 
 Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.05% | 54.64% | 53.16% |
-| encode | 255 MB/s | 114 MB/s | 98 MB/s |
+| ratio | 80.06% | 54.76% | 53.15% |
+| encode | 255 MB/s | 117 MB/s | 105 MB/s |
 | decode | 3.5 GB/s | 1.9 GB/s | 1.9 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-120 MB/s, against 54.64% at 114 and 40.84% at 120. What zpse keeps is decode --
-1.6 to 4.1 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
+120 MB/s, against 54.76% at 117 and 40.61% at 111. What zpse keeps is decode --
+1.5 to 4.2 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
-of the 9.91 points to zstd 6, which would leave the dumps at 33.9% against
+of the 9.68 points to zstd 6, which would leave the dumps at 33.7% against
 zstd's 30.9% while paying for the coder. At a page the format's problem is the
 ratio it starts from, not the last few bits of it.A mixed workload at the same page size -- 160 MB of programs, shared
 libraries, documentation and this project's own build outputs, which is the
@@ -132,20 +131,20 @@ shape a browser's or a build tree's footprint has:
 
 | 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ratio | 78.81% | 55.25% | 54.63% | 46.40% | 44.18% | 44.17% |
-| encode | 240 MB/s | 107 MB/s | 99 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
-| decode | 4.2 GB/s | 1.4 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
+| ratio | 78.42% | 55.36% | 54.62% | 46.40% | 44.18% | 44.17% |
+| encode | 244 MB/s | 104 MB/s | 99 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
+| decode | 4.2 GB/s | 1.5 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
 
-Where the dumps' 9.91-point gap to zstd sits, split by the form the default
+Where the dumps' 9.68-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
 
 | form at level 6 | pages | zpse | zstd | gap |
 | --- | ---: | ---: | ---: | ---: |
-| token LZ | 34 628 | 19.08% | 13.49% | 5.59 |
-| raw | 7 036 | 13.51% | 11.00% | 2.51 |
-| LZ + tiles | 7 524 | 5.00% | 3.97% | 1.03 |
-| tiles | 2 358 | 2.98% | 2.30% | 0.68 |
-| fast LZ | 519 | 0.27% | 0.17% | 0.10 |
+| token LZ | 32 581 | 18.08% | 12.88% | 5.20 |
+| raw | 6 965 | 13.38% | 10.89% | 2.49 |
+| LZ + tiles | 9 351 | 5.48% | 4.36% | 1.12 |
+| tiles | 2 651 | 3.41% | 2.63% | 0.78 |
+| fast LZ | 517 | 0.27% | 0.17% | 0.10 |
 
 Half of it is the token LZ form's own payload on half the pages, and a quarter
 is pages that go out raw; both are the same loss, bytes written as bytes. A
@@ -180,10 +179,10 @@ bytes, so a five-byte match here and a nine-byte match one byte on is a
 four-byte win the eight-byte test throws away. At page size the match is now
 measured first and the next position measured too, and the byte is given up
 only when the later match is strictly longer by more than it costs. That is
-1 118 807 bytes over the three dumps at the default level -- 41.37% to 40.84%,
-0.53 points -- for about 8% of the encode rate (132 to 120 MB/s), and
-1 014 016 bytes at level 9 (40.92% to 40.44%). The mixed workload gains 0.52
-points at the default level (55.77% to 55.25%) and gives up 8% of its rate. The
+1 162 857 bytes over the three dumps at the default level -- 41.16% to 40.61%,
+0.55 points -- for about 9% of the encode rate (123 to 111 MB/s), and
+1 019 393 bytes at level 9 (40.68% to 40.20%). The mixed workload gains 0.51
+points at the default level (55.87% to 55.36%) and gives up 5% of its rate. The
 streams are unchanged in form, so decode is untouched.
 
 What a page cannot afford is the full-size block's trial structure: a 4 KiB
