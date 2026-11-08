@@ -775,8 +775,12 @@ static const uint8_t zpse_block_screen[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
  * page it can misjudge is one whose middle reads as noise and whose rest does
  * not. Two samples, an eighth of the page, bought the same 4% on the dumps and
  * lost rate on the other two, and sixteen is the byte-identical setting. A
- * build that defines this 0 arms the abort with no probe at all, which costs
- * more ratio than one sample. The arms are measured on the page table in the
+ * build that defines this 0 arms the abort with no probe at all, and five
+ * paired rounds put it 2.2 to 7.4% ahead on five of the six page cells and
+ * 2.0% behind on the sixth, for 0.02 to 0.08 more ratio points (mixed 81.25
+ * to 81.33). So the sample stays: it is the cheaper point of the same curve,
+ * and the probe-free arm is the one to revisit if the rate ever matters more
+ * than the ratio it costs. The arms are measured on the page table in the
  * README. */
 #ifndef ZPSE_PAGE_NOISE_POINTS
 #define ZPSE_PAGE_NOISE_POINTS 1u

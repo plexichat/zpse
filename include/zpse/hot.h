@@ -12,7 +12,8 @@
  * round, against the same tree built with the macro empty; two builds of
  * identical sources read 1.000 in that harness), for a slightly larger
  * binary, with every size in that corpus unchanged.  It is not a
- * substitute for building the amalgamation at -O3 (+7% measured), and it
+ * substitute for building the amalgamation at -O3 -- +7% on the tree that
+ * took that number, 0.99 on the current one (see README.md) -- and it
  * cannot be: gcc runs its inliner and its interprocedural passes at the
  * compilation's own level, so a per-function
  * tag only reaches that function's passes, not the cross-function

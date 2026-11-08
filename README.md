@@ -1601,13 +1601,16 @@ every round, median of the per-case throughput ratios, one pinned core):
 | --- | ---: | --- |
 | `-O2` | 1.000 | everything in this tree |
 | `ZPSE_HOT` on the 18 hot functions (`include/zpse/hot.h`, gcc only) | 1.029 | 14 KB more text; decode and every compressed size unchanged |
-| the amalgamation at `-O3` | 1.065 | same as `#pragma GCC optimize("O3")` at the top of `src/zpse_unity.c` (1.066) |
+| the amalgamation at `-O3` | 0.99 | re-measured at the counts above on gcc 15.2.0: median 0.9895 of 75 per-case ratios; text 244 KB -> 344 KB |
 | that pragma scoped around the six hottest modules instead | 1.00 - 1.02 | 1.019, then 1.001 on a repeat |
 | `optimize("O3")` on one function inside a hot chain | 0.93 | `zpse_transform_inverse` alone |
 
+Only the `-O3` row has been re-run on the current tree; the `ZPSE_HOT` and
+pragma rows are measurements of the tree that predates the LZ2 and page work.
+
 Rows three to five are the same request made at three scopes, and why they
 differ is worth knowing before adding a tag. At `-O3` the text of the
-amalgamation grows from 152 KB to 249 KB: most of what `-O3` buys here is not
+amalgamation grows from 244 KB to 344 KB: most of what `-O3` buys here is not
 inside the loops -- those are hand-written SIMD already tuned at `-O2` -- it
 is the inliner and the interprocedural passes deciding more, and those run at
 the level the compilation was given, which a per-function attribute cannot
@@ -1616,20 +1619,21 @@ same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
 that function with its `-O2` neighbours, which is why the last row is slower
 than leaving the function untagged.
 
-The `-O3` row is the one the release uses, and re-checking it at the current
-default is worth the warning it produces: the 7% is the amalgamation's, and it
-is not reproducible on every corpus. Same two builds, same sources, sizes
-identical byte for byte, best of interleaved rounds, one pinned core: on the
-17-file corpus `zpse_cli bench` reads (68 MiB, from random to all-zeros) the
-encode medians are 1,074 MB/s at `-O2` and 1,167 at `-O3` -- about 9%, the
-same direction as the level corpus. On Silesia, where the encode has actual
-text to work on, the same pair reads 365 and 366 MB/s, which is the noise
-floor and no more; decode is unchanged within the same spread.
+The `-O3` row is the one the release uses, and it did not survive the tree it
+was measured on. Re-run at the counts above -- 25 cases x 4 MiB in 64 KiB
+blocks, 20 iterations and 3 repetitions per case, A/B interleaved with the
+order swapped every round, one pinned core, gcc 15.2.0 -- the level corpus
+reads a median of 0.9895 over 75 per-case ratios: `-O2` 887 MB/s against
+`-O3` 843. The three rounds read 1.000, 0.989 and 0.972, so the 7% is gone
+rather than buried in the noise. The 17-file corpus `zpse_cli bench` reads
+agrees over five interleaved rounds: 1,209 MB/s at `-O2` against 1,191 at
+`-O3`, with packed bytes identical (3,128,157 either way). Those earlier
+figures measured a different tree and a different inliner, not a property of
+this one.
 
-So the release is built at `-O3` because it is not slower, not because it is
-7% faster: that figure belongs to the level corpus in the table above, and the
-honest reading of the two measurements together is that `-O3` pays for the
-inliner on a corpus of generators and gets nothing back on real data.
+So the release still ships the `-O3` binary, but on this tree that is not a
+measured gain: it is about 1% of encode for 41% more text. Whether to keep it
+is worth deciding on the current measurement rather than inheriting it.
 
 `ZPSE_HOT` is gcc-only and it is a set, not a sprinkle: the 18 functions it
 marks were measured together, and a tag put on a function whose callees are
