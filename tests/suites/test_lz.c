@@ -512,6 +512,105 @@ static void page_fast_cases(void)
     }
 }
 
+/* Above a page: the length-measured lazy step, at the window sizes the block
+ * encoder arms it for (see ZPSE_LZ_LAZY_MAX).
+ *
+ * Nothing covered this before a 16 KiB block of mozilla decoded 78 bytes of
+ * the wrong history. roundtrip_cases() goes through zpse_lz_encode, whose
+ * lazy window is a page, so no case ever ran the step with `lazy_max >= n`
+ * -- and that step is the one place the finder stops being strictly forward:
+ * it can move the cursor back onto a position whose slot already holds the
+ * later one, which is how a candidate ahead of the cursor reached the emit.
+ * A stream it writes has to round-trip at every size it is offered, whatever
+ * it costs in ratio. */
+static void lazy_window_cases(void)
+{
+    static const uint32_t win[] = { 8192u, 12288u, 16384u };
+    unsigned wi;
+    int kind;
+
+    for (wi = 0; wi < sizeof win / sizeof win[0]; wi++) {
+        uint32_t n = win[wi];
+
+        for (kind = 0; kind < 8; kind++) {
+            uint32_t pl;
+
+            make_shape(kind, n);
+            pl = zpse_lz_encode_ex(plain, n, payload, sizeof payload, tab,
+                                   ZPSE_LZ_HASH_BITS, n);
+            CHECK(pl > 0u, "lazy shape %d size %u: no payload", kind, n);
+            if (pl == 0u) {
+                continue;
+            }
+            memset(out, 0xA5, sizeof out);
+            CHECK(zpse_lz_decode(payload, pl, out, n) == PSE_OK,
+                  "lazy shape %d size %u: decode refused", kind, n);
+            CHECK(memcmp(out, plain, n) == 0,
+                  "lazy shape %d size %u: bytes differ", kind, n);
+        }
+    }
+
+    /* The same window over segment soups: runs of one value beside structured
+     * and noisy segments, which is the shape that makes the finder come back
+     * to a position it has already inserted. The seeds are constants, so a
+     * failure names its own case. */
+    {
+        uint32_t seed;
+
+        for (seed = 1u; seed <= 24u; seed++) {
+            uint32_t pos = 0u;
+            uint32_t pl;
+
+            rng = 0x9E3779B97F4A7C15ULL ^
+                  (uint64_t)seed * 0xD1B54A32D192ED03ULL;
+            while (pos < 16384u) {
+                uint32_t len = 1u + (rnd() % 700u);
+                uint32_t seg = rnd() % 6u;
+                uint32_t i;
+
+                if (len > 16384u - pos) {
+                    len = 16384u - pos;
+                }
+                for (i = 0u; i < len; i++) {
+                    switch (seg) {
+                    case 0u:
+                        plain[pos + i] = 0u;
+                        break;
+                    case 1u:
+                        plain[pos + i] = (uint8_t)rnd();
+                        break;
+                    case 2u:
+                        plain[pos + i] = (uint8_t)i;
+                        break;
+                    case 3u:
+                        plain[pos + i] = (uint8_t)('a' + (i & 7u));
+                        break;
+                    case 4u:
+                        plain[pos + i] = (uint8_t)((i / 4u) & 0xFFu);
+                        break;
+                    default:
+                        plain[pos + i] =
+                            (uint8_t)((i & 3u) != 0u ? 0u : (rnd() & 0xFFu));
+                        break;
+                    }
+                }
+                pos += len;
+            }
+            pl = zpse_lz_encode_ex(plain, 16384u, payload, sizeof payload, tab,
+                                   ZPSE_LZ_HASH_BITS, 16384u);
+            CHECK(pl > 0u, "lazy soup seed %u: no payload", seed);
+            if (pl == 0u) {
+                continue;
+            }
+            memset(out, 0xA5, sizeof out);
+            CHECK(zpse_lz_decode(payload, pl, out, 16384u) == PSE_OK,
+                  "lazy soup seed %u: decode refused", seed);
+            CHECK(memcmp(out, plain, 16384u) == 0,
+                  "lazy soup seed %u: bytes differ", seed);
+        }
+    }
+}
+
 int main(void)
 {
     if (zpse_encoder_init(NULL, ea, sizeof ea) != PSE_BAD_ARG) {
@@ -519,6 +618,7 @@ int main(void)
         return 1;
     }
     roundtrip_cases();
+    lazy_window_cases();
     hostile_cases();
     block_cases();
     table_size_cases();
