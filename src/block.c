@@ -3436,13 +3436,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * sample_flat). Without the two probes the same cut was 10 to 22% faster and
  * turned 66 of tests/suites/test_sizes.c's 768 cases from compressed to raw.
  *
- * It is armed only where the sweep is cheap. The cheap rungs price a stride of
- * tiles per plane; BALANCED and deeper price every plane of every candidate,
- * which is what ranks a transpose correctly and is where the level's ratio is
- * decided, and there the cut is not worth what it saves: on the level corpus
- * it measured inside the noise band against the full list. So the gate is
- * !every_plane, the same line the pricing code already draws between the two
- * strategies. */
+ * It is armed at every level, and that is the second measurement here: an
+ * earlier version ran only where the sweep is cheap (!every_plane), on the
+ * argument that BALANCED's every-plane pricing is what decides that level's
+ * ratio and the cut was not worth what it saved. With both probes in place
+ * it is a win there too -- 4 KiB BALANCED reads 117.1 against 111.0 MB/s on
+ * the dumps, 109.0 against 92.5 on the mixed workload and 119.6 against
+ * 111.7 on Silesia, with packed bytes 0.009, 0.047 and 0.067% SMALLER -- so
+ * the gate is gone and the two probes alone decide. */
 #ifndef ZPSE_FLAT_PRICE
 #define ZPSE_FLAT_PRICE 1
 #endif
@@ -3589,7 +3590,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             const uint8_t *mb;
             uint32_t lim = UINT32_MAX;
 
-            if (flat_head && !every_plane && k >= (int)ZPSE_FLAT_PRICE) {
+            if (flat_head && k >= (int)ZPSE_FLAT_PRICE) {
                 break;
             }
 #if defined(ZPSE_BLOCK_STATS)

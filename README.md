@@ -211,11 +211,11 @@ the rest a small ramp). Without those probes the same cut was 10 to 22%
 faster and turned 66 of the sizes suite's 768 cases raw; with them the suite is
 back to `grew=0` and the 4 KiB level-1 CLI bench reads 11.5, 19.1 and 9.0%
 faster on the dumps, the mixed workload and Silesia for +0.078, +0.032 and
-+0.037% of packed bytes. BALANCED's stream does not move at all, because the
-cut is armed only below `ZPSE_ENC_SPEED_EVERY_PLANE_MIN`, where a candidate is
-priced on a stride of tiles and not on every plane -- the level above it is
-where the price ranking decides the ratio, and there the cut measured inside
-the host's own band.
++0.037% of packed bytes. BALANCED gets it too, and there it is a win on both
+sides: 117.1 against 111.0 MB/s on the dumps, 109.0 against 92.5 on the mixed
+workload and 119.6 against 111.7 on Silesia, with 0.009, 0.047 and 0.067%
+*fewer* packed bytes. It is armed at every level for that reason -- the two
+probes, not the price strategy, are what keep the sizes suite at `grew=0`.
 
 All twelve cells are one pass of one build on one pinned core; the host's own
 band across passes is about 5%, which is why the ratios are quoted to 0.01 of a
