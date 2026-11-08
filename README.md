@@ -1621,7 +1621,7 @@ same speed. Worse than merely ineffective, a tag makes gcc refuse to inline
 that function with its `-O2` neighbours, which is why the last row is slower
 than leaving the function untagged.
 
-The `-O3` row is the one the release uses, and it did not survive the tree it
+The `-O3` row was the one the release used, and it did not survive the tree it
 was measured on. Re-run at the counts above -- 25 cases x 4 MiB in 64 KiB
 blocks, 20 iterations and 3 repetitions per case, A/B interleaved with the
 order swapped every round, one pinned core, gcc 15.2.0 -- the level corpus
@@ -1653,8 +1653,8 @@ On clang and MSVC the macro is empty --
 clang does not implement `optimize` and diagnoses it as an unknown attribute,
 which `-Werror` would turn into a failed build, and MSVC has no per-function
 optimization level at all -- so those builds compile the same sources with no
-tag, and the 7% is theirs to take with `-O3` and above on the command line
-rather than with this header.
+tag, and a build that wants gcc's `-O3` passes has to ask for them on the
+command line rather than with this header.
 
 ```sh
 bash tests/runners/run.sh          # POSIX / Git Bash / WSL

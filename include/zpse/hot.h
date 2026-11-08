@@ -18,7 +18,7 @@
  * compilation's own level, so a per-function
  * tag only reaches that function's passes, not the cross-function
  * decisions where a unity build spends its -O3 budget (the object file's
- * text grows 152 KB -> 166 KB under these tags, against 152 KB -> 249 KB
+ * text grows 229 KB -> 245 KB under these tags, against 244 KB -> 344 KB
  * for -O3 on the whole translation unit).  See "Building and testing" in
  * README.md for the table.
  *
