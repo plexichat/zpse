@@ -1044,11 +1044,12 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
 /* Smallest size a trial with this (transform, segment count, metadata)
  * shape can possibly produce: the envelope (block header, metadata, the
- * segment directory, each segment's 16-byte header) plus 2 length-prefix
+ * segment directory, each segment's priced header -- zpse_segment_price, as
+ * the prices the floor is compared against charge it) plus 2 length-prefix
  * bytes and the 8-byte tile header for every tile. Used to stop the
  * transform sweep as soon as nothing left can beat the running best. */
 static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
-                                 uint16_t meta_len)
+                                 uint16_t meta_len, uint32_t price)
 {
     uint32_t lens[16];
     uint32_t records_bytes = 0u;
@@ -1077,8 +1078,7 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
         records_bytes += (tile_cost < dense_cost ? tile_cost : dense_cost);
     }
     return (uint32_t)ZPSE_BLOCK_HEADER_SIZE + (uint32_t)meta_len +
-           (uint32_t)sc * ((uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE +
-                           (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) +
+           (uint32_t)sc * ((uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE + price) +
            records_bytes;
 }
 
@@ -1865,12 +1865,12 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
             if (c == UINT32_MAX) {
                 return UINT32_MAX;
             }
-            if (c == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 10u) {
+            if (c == zpse_segment_price(e->enc_flags) + 10u) {
                 /* All-hit first tile: the plane may still be constant, and
                  * the dense form prices that below ten bytes a tile. */
                 return ZPSE_PREFIX_NEED_FULL;
             }
-            records += (c - (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) * tc;
+            records += (c - zpse_segment_price(e->enc_flags)) * tc;
             npriced++;
             /* The sweep's running verdict, applied per plane exactly as the
              * full pass applies it: a bound already past `limit` cannot win,
@@ -3518,8 +3518,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * is kept on purpose: the sweep must never drop something it
              * could not price). */
             if (lim != UINT32_MAX) {
-                uint32_t fl = zpse_block_floor(pn, tids[ci], scounts[ci],
-                                               meta_lens[ci]);
+                uint32_t fl = zpse_block_floor(
+                    pn, tids[ci], scounts[ci], meta_lens[ci],
+                    zpse_segment_price(e->enc_flags));
 
                 if (fl != UINT32_MAX && fl > lim) {
                     ex[ci] = fl;
@@ -4059,7 +4060,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
         for (fi = 0; fi < ncand; fi++) {
             fl[fi] = zpse_block_floor(n, tids[fi], scounts[fi],
-                                     meta_lens[fi]);
+                                     meta_lens[fi],
+                                     zpse_segment_price(e->enc_flags));
         }
     }
 

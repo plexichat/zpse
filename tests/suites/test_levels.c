@@ -13,7 +13,10 @@
  * contract:
  *
  *   - every level's block round-trips, at every level;
- *   - the sizes do not increase from the fastest level to the deepest;
+ *   - the sizes do not increase from the fastest level to the deepest, at
+ *     8 KiB and 16 KiB as well as at 64 KiB: those two sizes are where the
+ *     lazy step runs the pass twice and keeps the smaller of the two
+ *     streams, so a level that took the larger one would fail here;
  *   - the deepest level never writes a block larger than the balanced
  *     one (the LZ form competes on size, so it can only win);
  *   - the levels are ordered in time the same way they are in size --
@@ -72,6 +75,14 @@ static const uint32_t levels[9] = {
 static const char *const names[9] = {"fastest", "2", "faster", "4",
                                      "balanced", "6", "7", "8", "max"};
 
+/* The block sizes the ladder is pinned at. 64 KiB is the block the bench
+ * uses and keeps the time-ordering check; 8 and 16 KiB are the sizes above a
+ * page, where the length-measured lazy step is a heuristic and src/block.c
+ * therefore runs the pass twice and keeps the smaller stream. The sizes are
+ * what says a level cannot lose a byte to that arm: taking the other one would
+ * show up as a level writing a larger block than the one above it. */
+static const uint32_t blocks[3] = {8192u, 16384u, 65536u};
+
 static double now_ns(void)
 {
 #if defined(_WIN32)
@@ -97,70 +108,85 @@ int main(void)
     unsigned li;
 
     for (kind = 0; kind < (int)ZPSE_COL_KINDS; kind++) {
-        uint32_t sizes[9];
-        double times[9];
-        ZpseColGen g;
+        unsigned si;
 
-        zpse_col_gen_init(&g, kind);
-        zpse_col_gen_fill(&g, in, sizeof in);
+        for (si = 0u; si < sizeof blocks / sizeof blocks[0]; si++) {
+            uint32_t n = blocks[si];
+            int timed = (n == (uint32_t)sizeof in);
+            int reps = timed ? 3 : 1;
+            uint32_t sizes[9];
+            double times[9];
+            ZpseColGen g;
+
+            zpse_col_gen_init(&g, kind);
+            zpse_col_gen_fill(&g, in, n);
 
             for (li = 0; li < 9u; li++) {
-            uint32_t cl = 0u;
-            uint32_t ol = 0u;
-            double best = 1e18;
-            int r;
-            int rc;
+                uint32_t cl = 0u;
+                uint32_t ol = 0u;
+                double best = 1e18;
+                int r;
+                int rc;
 
-            for (r = 0; r < 3; r++) {
-                double t0 = now_ns();
-                double t1;
+                for (r = 0; r < reps; r++) {
+                    double t0 = now_ns();
+                    double t1;
 
-                rc = zpse_compress_block_ex(in, sizeof in, comp, sizeof comp,
-                                            &cl, 0, 1, levels[li], E);
-                t1 = now_ns();
+                    rc = zpse_compress_block_ex(in, n, comp, sizeof comp,
+                                                &cl, 0, 1, levels[li], E);
+                    t1 = now_ns();
+                    if (rc != PSE_OK) {
+                        break;
+                    }
+                    if (t1 - t0 < best) {
+                        best = t1 - t0;
+                    }
+                }
+                CHECK(rc == PSE_OK,
+                      "%s: the %s level did not compress %u bytes",
+                      zpse_col_names[kind], names[li], n);
                 if (rc != PSE_OK) {
-                    break;
+                    sizes[li] = 0xFFFFFFFFu;
+                    times[li] = 0.0;
+                    continue;
                 }
-                if (t1 - t0 < best) {
-                    best = t1 - t0;
-                }
-            }
-            CHECK(rc == PSE_OK, "%s: the %s level did not compress",
-                  zpse_col_names[kind], names[li]);
-            if (rc != PSE_OK) {
-                sizes[li] = 0xFFFFFFFFu;
-                times[li] = 0.0;
-                continue;
-            }
-            sizes[li] = cl;
-            times[li] = best;
+                sizes[li] = cl;
+                times[li] = best;
 
-            /* Every level's block must decode to the bytes it came from. */
-            rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, D);
-            CHECK(rc == PSE_OK && ol == sizeof in &&
-                      memcmp(out, in, sizeof in) == 0,
-                  "%s: the %s level did not round-trip", zpse_col_names[kind],
-                  names[li]);
-        }
+                /* Every level's block must decode to the bytes it came
+                 * from. */
+                rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, D);
+                CHECK(rc == PSE_OK && ol == n && memcmp(out, in, n) == 0,
+                      "%s: the %s level did not round-trip %u bytes",
+                      zpse_col_names[kind], names[li], n);
+            }
 
-        /* The sizes do not increase from the fastest level to the
-         * deepest. */
-        for (li = 1u; li < 9u; li++) {
-            CHECK(sizes[li] <= sizes[li - 1u],
-                  "%s: the %s level writes %u bytes, the %s level %u",
-                  zpse_col_names[kind], names[li], sizes[li], names[li - 1u],
-                  sizes[li - 1u]);
+            /* The sizes do not increase from the fastest level to the
+             * deepest. */
+            for (li = 1u; li < 9u; li++) {
+                CHECK(sizes[li] <= sizes[li - 1u],
+                      "%s: at %u bytes the %s level writes %u bytes, the "
+                      "%s level %u", zpse_col_names[kind], n, names[li],
+                      sizes[li], names[li - 1u], sizes[li - 1u]);
+            }
+            /* The deepest level never writes a block larger than the
+             * balanced one. */
+            CHECK(sizes[8] <= sizes[4],
+                  "%s: at %u bytes the deepest level writes %u bytes, the "
+                  "balanced level %u", zpse_col_names[kind], n, sizes[8],
+                  sizes[4]);
+            /* And the levels are ordered in time the same way they are in
+             * size. The fastest level is not allowed to be the slowest.
+             * Timed at the 64 KiB block only: the smaller sizes are here for
+             * the size ladder, and a nine-level timing race on an 8 KiB block
+             * would measure the clock as much as the encoder. */
+            if (timed) {
+                CHECK(times[0] <= times[4] * 4.0,
+                      "%s: the fastest level takes %.0f ns, the balanced "
+                      "level %.0f ns", zpse_col_names[kind], times[0],
+                      times[4]);
+            }
         }
-        /* The deepest level never writes a block larger than the
-         * balanced one. */
-        CHECK(sizes[8] <= sizes[4], "%s: the deepest level writes %u bytes, "
-              "the balanced level %u", zpse_col_names[kind], sizes[8],
-              sizes[4]);
-        /* And the levels are ordered in time the same way they are in
-         * size. The fastest level is not allowed to be the slowest. */
-        CHECK(times[0] <= times[4] * 4.0,
-              "%s: the fastest level takes %.0f ns, the balanced level "
-              "%.0f ns", zpse_col_names[kind], times[0], times[4]);
     }
 
     /* The level field is four bits, so 10-15 are representable and must be

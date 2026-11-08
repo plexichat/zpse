@@ -38,34 +38,34 @@ and is tested that way.
 ## Performance
 
 One core, 64 KiB blocks, the library linked directly into the benchmark
-(`tests/benchmarks/bench.c`), best of five runs. This is a Ryzen 5 5600X under
-WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
+(`tests/benchmarks/bench.c`), best of its five reps over four runs. This is a
+Ryzen 5 5600X under WSL2, decimal MB/s of uncompressed bytes (1e6 B/s).
 
 | pattern | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| `zeros` | 0.004 | 35 570 | **71 300** |
-| `const5A` | 0.004 | 35 660 | **70 360** |
-| `random` | 1.000 | 2 560 | **66 220** |
-| `lowentropy` (4-bit alphabet) | 0.508 | 860 | 50 210 |
-| `incr` (0..255 ramp) | 0.040 | 3 880 | 17 240 |
-| `strided` | 0.040 | 1 180 | 17 150 |
-| `alt00FF` | 0.004 | 13 330 | 32 280 |
-| `sparse2` | 0.018 | 1 720 | 17 920 |
-| `sparse` (1 byte per 97) | 0.052 | 370 | 14 970 |
-| `sawtooth` | 0.041 | 1 300 | 14 370 |
+| `zeros` | 0.001 | 6 130 | 64 490 |
+| `const5A` | 0.001 | 6 210 | **66 070** |
+| `random` | 1.000 | 2 410 | **66 410** |
+| `lowentropy` (4-bit alphabet) | 0.508 | 740 | 51 000 |
+| `incr` (0..255 ramp) | 0.002 | 3 240 | 13 440 |
+| `strided` | 0.002 | 1 100 | 13 650 |
+| `alt00FF` | 0.001 | 5 080 | 31 780 |
+| `sparse2` | 0.016 | 4 990 | 21 340 |
+| `sparse` (1 byte per 97) | 0.042 | 2 720 | 10 680 |
+| `sawtooth` | 0.002 | 1 090 | 12 760 |
 
 The encode column is the default level (6), which prices every plane of every
 candidate and also offers the intra-block LZ form. On these patterns the price
 buys the ratios and the finder finds nothing, so the sweep is most of the
-encode: the one-value rows are 36 GB/s against 98 to decode them, and they are
-that fast only because the ASCII gate's whole-block scan is skipped when the
-block's first two kilobytes are one value -- a constant sample cannot convict
-the gate, and the scan is a third of such a block's encode. That scan stops at
-the first byte with its high bit set, so a binary block pays almost nothing
-for it -- 1.25 us of the 7.3 us `alt00FF` takes to encode -- while a block that
-really is ASCII reads every byte at 32 bytes an iteration in AVX2, 1.19 us for
-a 64 KiB block. Decode is the same at every level, because the shapes written
-are. `random` is the row the tile classifier decides: every tile of every plane
+encode: the one-value rows are 67 bytes out of 64 KiB and still cost 10.7 us
+to encode against 64 GB/s to decode them, because nine planes still have to be
+priced and the shapes that survive the price still have to be written. The
+ASCII gate is not what costs them that: its whole-block scan is skipped when
+the block's first two kilobytes are one value, and it stops at the first byte
+with its high bit set, so a binary block pays almost nothing for it (`alt00FF`
+is 12.9 us a block) while a block that really is ASCII reads every byte at 32
+bytes an iteration in AVX2. Decode is the same at every level, because the
+shapes written are. `random` is the row the tile classifier decides: every tile of every plane
 is a dense one, and its encode roughly doubled once the vector classify covered
 a plane's first tile too -- the tile whose stride predictor has no earlier
 bytes in the plane to read, which used to drop the whole plane's first tile to
@@ -78,11 +78,11 @@ exactly a `memcpy`), `lowentropy` is a random stream over sixteen byte values,
 16-wide interleave, and `sparse` is zeros with a byte every 97.
 
 The interesting part is the ceilings: on the same machine and the same
-working set, `memcpy` is **61 500 MB/s** and `memset` **123 700 MB/s**. The
-one-value rows decode *above* `memcpy` because the decoder writes them with
-wide stores and never reads them back; `random` decoding at 66 200 MB/s is
-the raw path doing a copy plus a header check, i.e. right at the `memcpy`
-ceiling. Everything else is transform- and tile-bound, not memory-bound.
+working set, `memcpy` is **65 620 MB/s** and `memset` **127 370 MB/s**. The
+one-value rows decode within two percent of `memcpy` -- wide stores and never
+read back, but 64 KiB is too small for that to buy more than a couple of
+percent -- and `random` decoding at 66 410 MB/s is the raw path doing a copy
+plus a header check, i.e. right at the `memcpy` ceiling. Everything else is transform- and tile-bound, not memory-bound.
 
 ### 4 KiB pages
 
@@ -96,13 +96,13 @@ smaller than it went in, one pinned core, best of five:
 
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.11% | 58.56% | 206 / 458 / 226 MB/s |
-| 6 (default) | 16.05% | 6.31% | 62.68% | **40.61%** | 103 / 150 / 107 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 16.01% | 6.31% | 61.97% | 40.20% | 92 / 150 / 98 MB/s |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.11% | 58.56% | 213 / 456 / 218 MB/s |
+| 6 (default) | 16.05% | 6.31% | 62.67% | **40.61%** | 108 / 160 / 113 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 16.01% | 6.31% | 62.00% | 40.22% | 94 / 157 / 102 MB/s |
 
-The default level's page costs about 111 MB/s of encode for 40.61%, and
+The default level's page costs about 118 MB/s of encode for 40.61%, and
 decodes at 1.8 to 5.6 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands).The deepest level buys 0.41 points of ratio for about 8% of the rate, because on a page the tier's extra margin and decode bill reach
+codes as commands).The deepest level buys 0.39 points of ratio for about 10% of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 83% of the dump
@@ -112,14 +112,14 @@ Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.06% | 54.76% | 53.15% |
-| encode | 255 MB/s | 117 MB/s | 105 MB/s |
-| decode | 3.5 GB/s | 1.9 GB/s | 1.9 GB/s |
+| ratio | 80.06% | 54.64% | 53.16% |
+| encode | 247 MB/s | 118 MB/s | 104 MB/s |
+| decode | 3.3 GB/s | 1.9 GB/s | 1.9 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-120 MB/s, against 54.76% at 117 and 40.61% at 111. What zpse keeps is decode --
+120 MB/s, against 54.64% at 118 and 40.61% at 118. What zpse keeps is decode --
 1.5 to 4.2 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
@@ -131,8 +131,8 @@ shape a browser's or a build tree's footprint has:
 
 | 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ratio | 78.42% | 55.36% | 54.62% | 46.40% | 44.18% | 44.17% |
-| encode | 244 MB/s | 104 MB/s | 99 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
+| ratio | 78.42% | 55.12% | 54.49% | 46.40% | 44.18% | 44.17% |
+| encode | 242 MB/s | 106 MB/s | 98 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
 | decode | 4.2 GB/s | 1.5 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
 
 Where the dumps' 9.68-point gap to zstd sits, split by the form the default
@@ -140,11 +140,11 @@ level picked (zstd's column is its size over the same pages):
 
 | form at level 6 | pages | zpse | zstd | gap |
 | --- | ---: | ---: | ---: | ---: |
-| token LZ | 32 581 | 18.08% | 12.88% | 5.20 |
-| raw | 6 965 | 13.38% | 10.89% | 2.49 |
-| LZ + tiles | 9 351 | 5.48% | 4.36% | 1.12 |
-| tiles | 2 651 | 3.41% | 2.63% | 0.78 |
-| fast LZ | 517 | 0.27% | 0.17% | 0.10 |
+| token LZ | 32 925 | 18.42% | 13.13% | 5.29 |
+| raw | 6 969 | 13.38% | 10.90% | 2.49 |
+| LZ + tiles | 9 038 | 5.18% | 4.13% | 1.05 |
+| tiles | 2 614 | 3.35% | 2.60% | 0.76 |
+| fast LZ | 519 | 0.27% | 0.17% | 0.10 |
 
 Half of it is the token LZ form's own payload on half the pages, and a quarter
 is pages that go out raw; both are the same loss, bytes written as bytes. A
@@ -179,10 +179,10 @@ bytes, so a five-byte match here and a nine-byte match one byte on is a
 four-byte win the eight-byte test throws away. At page size the match is now
 measured first and the next position measured too, and the byte is given up
 only when the later match is strictly longer by more than it costs. That is
-1 162 857 bytes over the three dumps at the default level -- 41.16% to 40.61%,
-0.55 points -- for about 9% of the encode rate (123 to 111 MB/s), and
-1 019 393 bytes at level 9 (40.68% to 40.20%). The mixed workload gains 0.51
-points at the default level (55.87% to 55.36%) and gives up 5% of its rate. The
+1 118 460 bytes over the three dumps at the default level -- 41.13% to 40.61%,
+0.52 points -- for about 9% of the encode rate (129 to 118 MB/s), and
+1 025 625 bytes at level 9 (40.70% to 40.22%). The mixed workload gains 0.50
+points at the default level (55.62% to 55.12%) and gives up 4% of its rate. The
 streams are unchanged in form, so decode is untouched.
 
 What a page cannot afford is the full-size block's trial structure: a 4 KiB

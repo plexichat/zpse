@@ -50,16 +50,21 @@
  * every page's payload: 8 * 52 065 pages is 416 520 bytes on the dump corpus,
  * for no change in what a segment can express. */
 #define ZPSE_SEGMENT_HEADER_SIZE 8u
-/* Charging the sweep's prices sixteen bytes a segment instead -- the envelope
- * every pruning threshold was swept with -- was measured and refused. It
- * recovers the 64 KiB level-6 cost of the shorter header (81 043 247 ->
- * 80 571 956 bytes) and buys 16 KiB 178 687, but eight bytes a segment that
- * are not there also makes every multi-segment candidate look worse than it
- * is, and levels 1 to 4 decide by that price and nothing else: 4 KiB level 1
- * grew 124 889 146 -> 125 592 685 (0.33 points of ratio) and level 9 31 910,
- * on the page size this format is for. Over seven cells it is a wash (34 KB
- * the wrong way), so the prices stay exact and the 64 KiB regression is
- * recorded as the price of the shorter header. */
+/* A PRICE charges sixteen bytes a segment -- the envelope every pruning
+ * threshold was swept with -- but only at the levels where the price is a
+ * screen rather than the decision (see zpse_segment_price). Charging it
+ * everywhere was measured and refused: it recovers the 64 KiB level-6 cost of
+ * the shorter header (81 043 247 -> 80 571 956 bytes) and buys 16 KiB
+ * 178 687, but levels 1 to 4 decide by that price and nothing else, so the
+ * eight bytes a segment that are not there made 4 KiB level 1 grow 124 889 146
+ * -> 125 592 685 (0.33 points of ratio), on the page size this format is for.
+ * From level 5 up the price only orders candidates that are then encoded in
+ * full, so the same envelope is free there. */
+#ifndef ZPSE_SEGMENT_PRICE_MAX
+#define ZPSE_SEGMENT_PRICE_MAX 16u /* -DZPSE_SEGMENT_PRICE_MAX=8u charges the
+                                    * exact price at every level, which is the
+                                    * arm this gate was measured against. */
+#endif
 #define ZPSE_TILE_HEADER_SIZE    8u
 #define ZPSE_SEG_DIR_ENTRY_SIZE  8u
 
@@ -257,6 +262,31 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
  * tile side of a convicted block costs, and the LZ candidate is offered
  * afterwards whatever it decided, so no level can lose its LZ trial to it.
  * (MAX used to opt out of it, for nothing; see src/block.c.) */
+
+/* What a PRICE charges for a segment. The format writes eight bytes, and
+ * that is what a price charges wherever the price decides: levels 1 to 4 rank
+ * the candidates by it and encode only the winner, so an envelope eight bytes
+ * too small is a size decision, not a ranking one. Levels 5 to 9 price every
+ * candidate and then encode the survivors in full, so there the price only
+ * screens, and the sixteen bytes those thresholds were swept with are the
+ * ranking they were tuned against -- an eight-byte error costs a trial there,
+ * not a byte.
+ *
+ * Measured on the dump corpus, 213 MB, against the same build with the
+ * envelope set to the exact price everywhere: gated this way, 4 KiB level 1
+ * stays at its exact-price 124 889 146 bytes, while the envelope buys 11 190
+ * at 4 KiB level 6, 178 687 at 16 KiB level 6, 471 291 at 64 KiB level 6,
+ * 126 728 at 64 KiB level 9, 0.24 points of the mixed workload and 0.12 of
+ * Silesia, and costs 31 910 at 4 KiB level 9. Its price is on synthetic data:
+ * the one-value 64 KiB block encodes at 6.1 GB/s against 10.9 without it, for
+ * the same 67 output bytes, because more of its candidates survive the
+ * price. Real corpora show no encode cost -- 4 KiB level 6 is 118 MB/s either
+ * way -- so the trade is kept and the synthetic rate is the one it costs. */
+static inline uint32_t zpse_segment_price(uint32_t enc_flags) {
+    return (zpse_enc_speed(enc_flags) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN)
+               ? (uint32_t)ZPSE_SEGMENT_PRICE_MAX
+               : (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
+}
 
 /* Segment flags (Sec. 6.1). Only 0x01 is legal in v1. */
 #define ZPSE_S_LEN_PREFIX       (UINT8_C(1) << 0)
