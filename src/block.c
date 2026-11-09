@@ -1323,9 +1323,16 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * identity is never cut, so the price still orders the field and the trial
  * still decides.
  *
- * Four tiles loses on both axes (0.08% more bytes than eight on the dumps,
- * 121.5 against 125.8 MB/s on the mixed workload): it prices a width-16
- * candidate's planes at 64 bytes each, which is where the ranking breaks.
+ * Four tiles loses on both axes where every plane is priced (0.08% more
+ * bytes than eight on the dumps, 121.5 against 125.8 MB/s on the mixed
+ * workload): it prices a width-16 candidate's planes at 64 bytes each, which
+ * is where the ranking breaks. At the cheap rungs it is faster and dearer --
+ * level 1 reads 313 against 281 MB/s on the dumps for 1.45 points of ratio
+ * (60.05% against 58.61%), level 2 230 against 218 for 1.27 -- and six tiles
+ * is worse than eight in BOTH directions (0.18, 0.06 and 0.35 points on the
+ * dumps, mixed and Silesia at level 1, and slower: 273 against 281 MB/s on the
+ * dumps, 278 against 287 on Silesia), so eight is the local optimum either way
+ * rather than a guess.
  *
  * 0 restores the whole block. */
 #ifndef ZPSE_PROBE_SHORT_TILES

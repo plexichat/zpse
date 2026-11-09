@@ -112,14 +112,14 @@ Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.06% | 54.64% | 53.16% |
-| encode | 247 MB/s | 118 MB/s | 104 MB/s |
-| decode | 3.3 GB/s | 1.9 GB/s | 1.9 GB/s |
+| ratio | 80.08% | 54.61% | 53.18% |
+| encode | 288 MB/s | 139 MB/s | 120 MB/s |
+| decode | 3.7 GB/s | 1.9 GB/s | 1.9 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-120 MB/s, against 54.64% at 118 and 40.61% at 118. What zpse keeps is decode --
+120 MB/s, against 54.61% at 139 and 41.01% at 137. What zpse keeps is decode --
 1.5 to 4.2 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
@@ -131,9 +131,9 @@ shape a browser's or a build tree's footprint has:
 
 | 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ratio | 78.42% | 55.12% | 54.49% | 46.40% | 44.18% | 44.17% |
-| encode | 242 MB/s | 106 MB/s | 98 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
-| decode | 4.2 GB/s | 1.5 GB/s | 1.5 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
+| ratio | 78.45% | 55.07% | 54.49% | 46.40% | 44.18% | 44.17% |
+| encode | 320 MB/s | 130 MB/s | 119 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
+| decode | 4.5 GB/s | 1.6 GB/s | 1.6 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
 
 Where the dumps' 9.68-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
@@ -234,9 +234,11 @@ and Silesia 0.064% (119.6 to 134.0). With the whole-page price below in place
 it costs nothing measurable at all: the cap writes the same 88,111,603 /
 90,350,032 / 118,838,028 bytes with and without it on the three corpora, and
 the rate difference is inside this host's band (dumps 141.5 against 137.8 MB/s
-mean, mixed 130.5 against 130.3, Silesia 140.2 against 139.8). It stays for the
-pages where the price still cannot settle the field, not for a saving measured
-here.
+mean, mixed 130.5 against 130.3, Silesia 140.2 against 139.8). It stays as a ceiling rather than as a decision: at level 6 the sweep prices
+6.86, 6.90 and 5.62 candidates per page on the three dumps files, against a cap
+of seven, and raising the cap past the list length leaves the same counters
+(94,637 / 157,154 / 292,632 prices, 23,111 / 49,336 / 201,464 kept) and the same
+bytes -- the whole-page price convicts the field before the cap is reached.
 
 Which bytes a candidate is priced on is a separate trade, and it is not the
 same trade on every rung. A cheap rung acts on the price alone -- one or two
@@ -248,9 +250,15 @@ writes 0.16, 0.09 and 0.12% fewer bytes on the dumps, the mixed workload and
 Silesia (41.38% to 41.32% on the dumps) and encodes the mixed workload 2.8%
 faster, the other two inside this host's band; at levels 1 and 2 the same
 change costs 7.5 and 3.4% of encode on the dumps and grows the mixed workload
-by 0.18 and 0.21%, which is why the gate is the every-plane one. Pricing a page
-whole also needed one rule in the near-tie prune: the identity is never cut
-from the field, because the wider price can put a transpose eight bytes ahead
+by 0.18 and 0.21%, which is why the gate is the every-plane one. The sample
+either side of eight was measured at the cheap rungs too, and eight is the local
+optimum in both directions: six tiles costs 0.18, 0.06 and 0.35 points of ratio
+on the dumps, mixed and Silesia at level 1 and is *slower* there (273 against
+281 MB/s on the dumps, 278 against 287 on Silesia), because a mis-ranked page
+goes to a costlier transform; four tiles buys 11% of level 1 and 6% of level 2
+on the dumps for 1.45 and 1.27 points, over the one-point line these page
+trades are held to. Pricing a page whole also needed one rule in the near-tie
+prune: the identity is never cut from the field, because the wider price can put a transpose eight bytes ahead
 of it on a 4-bit-random page, and a cut that trusted that wrote 21 bytes more
 than the half-page price did (the size suite's case 579).
 
