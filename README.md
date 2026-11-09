@@ -297,7 +297,10 @@ all sweep: 48.5% pricing and 46.2% in trials, with the attempt-order sample at
 objects the tile path has to choose a shape for. Silesia is the other end: 37%
 of its pages are English and take the gate, and its encode is spread across four
 stages -- pricing 27.6%, trials 27.4%, the match-finder pass 26.3% and the gate
-itself 16.6%, with the sample at 2.1%. That is why the page trades in this
+itself 16.6%, with the sample at 2.1%. The trial stage is not a queue of
+candidates to trim either: a page runs 0.77 full encodes' worth of trials on
+Silesia and 1.39 on the dumps, because the price has already dropped theunner-ups, so what those cycles buy is the winner's own bytes and there is no
+second candidate's priced planes to share with it. That is why the page trades in this
 section are priced against the price and the trials: they are what the dumps
 pay, and no single stage on Silesia is worth a third of its encode. The split
 is reproducible from the `ZPSE_BLOCK_STATS` build, which times the gate and the
@@ -317,20 +320,27 @@ grows. Both samples stop at a page: the gate keeps its 2 KiB span and the
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
 
-A heap dump also repeats itself, and the repeats are exact: 16.4% of the dumps'
-4 KiB pages are byte-for-byte copies of a page already seen -- 35.0 MB of 213.3
-MB, and the C heap file on its own is 80% repeats. Serving such a page from a
-content table instead of encoding it is worth something real: with a
-65,536-entry table of content hash and encoded bytes, the dumps read 128.4 MB/s
-at level 6 against 109.8 for the same pages encoded one at a time (118.9 against
-106.9 over four interleaved passes), and the C heap file alone goes from 128 to
-571 MB/s. What it costs is memory: the table keeps the encoded page for every
-distinct page, so one entry reserves a page and the 65,536-entry arm reserves
-256 MB to serve a 213 MB corpus. A trade like that belongs to whatever already
-holds the compressed pages -- a zram store, not an encoder whose arena is 448
-KiB -- and a cache that remembered only the winning shape would not move it:
-skipping the price on those pages is under 8% of the dumps' encode and still
-hashes every page, and Silesia's 0.21% repeat rate never pays the hash back.
+A heap dump also repeats itself, and the repeats are exact: 17.9% of the dumps'
+4 KiB pages are byte-for-byte copies of a page already seen -- 35 MB of 213 MB,
+and the C heap file on its own is 78% repeats -- and the copies are scattered
+rather than consecutive, so only a content table finds them (the last 64 pages
+recall 1.26%, a 4,096-entry table 12.9%). The library supplies the caller's half
+of that trade rather than an encoder-side cache: `zpse_page_hash` tags a page in
+128 bits, a caller-owned `ZpsePageDict` maps the tag to the caller's own slot,
+and `zpse_block_retag` rewrites the sequence number and is-last flag a reused
+block needs -- in either header form, with the header checksum fixed -- so a hit
+writes exactly the bytes a miss wrote. Nothing in the format changes, and an
+entry costs 20 bytes instead of a page, because the encoded pages stay where the
+store already keeps them. Measured through that API at level 6, the dumps read
+173.5 MB/s against 149.4 for the same pages encoded one at a time (17.94% of
+pages served), the C heap 736 against 167, the Python heap 147.1 against 141,
+the mixed corpus 174.9 against 149.5, and packed bytes are identical in every
+arm. The hash is the whole cost on a corpus that does not repeat, and the first
+version of it was slower there than nothing: at 0.91% hits the library dump now
+reads 149.5 against 148.6 with no dictionary. `docs/page-dictionary.md` has the
+call sequence, the set-associativity measurements and what a store should verify
+before serving an entry; `tests/suites/test_pagedict.c` pins that a served block
+is byte-identical to a fresh encode of the page at its own position.
 
 What is left on a page that stays raw is the trial itself. On the library dump
 40.7% of the page bytes go out raw, and each of those pages used to encode all

@@ -1,24 +1,34 @@
 # A page dictionary for the caller, not the encoder
 
-*Design note. Nothing here is part of the stream format: a reused encode is an
-ordinary block, and every decoder reads it without changes.*
+*A page store writes the same 4 KiB page more than once. This document is what
+the library supplies for that (include/zpse/block.h), what it deliberately does
+not, and the measurements behind both. None of it is part of the stream format:
+a reused encode is an ordinary block, and every decoder reads it unchanged.*
 
 ## What it buys
 
-A page store writes the same 4 KiB page more than once. On the three dump
-corpora this codec is measured against, 16.42% of pages (8,548 of 52,065,
-35.0 MB of 213.3 MB) are byte-for-byte copies of a page already written, and
-the C heap file on its own is 80.4% repeats. The repeats are scattered rather
-than consecutive: a cache of the last 64 pages hits 1.26%, direct-mapped 1,024
-and 4,096-entry content tables hit 2.33% and 5.02%, and a 65,536-entry content
-table hits 16.05%. Only content addressing gets them.
+On the three dump corpora this codec is measured against, 16.4% of pages
+(8,548 of 52,065, 35.0 MB of 213.3 MB) are byte-for-byte copies of a page
+already written, and the C heap file on its own is 78% repeats. The repeats are
+scattered rather than consecutive: a cache of the last 64 pages hits 1.26%,
+direct-mapped 1,024 and 4,096-entry content tables hit 4.90% and 12.89%, and a
+65,536-entry content table hits 17.94%. Only content addressing gets them.
 
-Measured upper bound, level 6, 4 KiB pages, one pinned core: a 65,536-entry
-table that serves the stored encode instead of encoding takes the dumps from
-109.8 to 128.4 MB/s on a paired run (106.9 to 118.9 over four interleaved
-passes), the C heap file from 128 to 571 MB/s, the Python heap from 101.7 to
-106.3 and the library dump from 109.1 to 112.7. Packed bytes are identical in
-every arm, because a hit rewrites nothing.
+Measured through the shipped API (`build/pagedict.c`, level 6, 4 KiB pages, one
+pinned core, three interleaved passes, best of three; every hit retagged and
+every arm's first hit per file decoded and compared):
+
+| corpus | none | dictionary | hits |
+| --- | ---: | ---: | ---: |
+| Python heap | 141.0 MB/s | 147.1 | 7.74% |
+| C heap | 166.8 | 736.3 | 78.32% |
+| shared-library dump | 148.6 | 149.5 | 0.91% |
+| mixed | 149.5 | 174.9 | 20.51% |
+| **all** | **149.4** | **173.5** | **17.94%** |
+
+Packed bytes are identical in every arm (142,699,989), because a hit rewrites
+nothing but a header. That is the point of the feature: it is a rate trade with
+no ratio side at all.
 
 Silesia's pages repeat 0.21% of the time (110 of 51,746). A dictionary is a
 heap-store feature; on prose it is a hash and a miss.
@@ -31,49 +41,47 @@ page -- 700 bytes for a text page, several kilobytes for a literal-heavy one --
 so 65,536 entries is hundreds of megabytes of buffers. That is the page store's
 memory and the page store's lifetime, and the codec has neither.
 
-What the codec can offer is the two pieces a store cannot write itself: the
-content hash and the header rewrite.
+What the codec supplies is the two pieces a store cannot write itself: the
+content tag and the header rewrite.
 
 ## The API
 
 Caller-owned arrays, no allocation, no state in `ZpseEncoder`:
 
 ```c
-/* 128-bit content tag: a 64-bit tag is cheaper (8 bytes an entry) but the
- * codec's contract is byte-exact, and a 64-bit tag makes a collision a wrong
- * page rather than a rounding error. */
 typedef struct ZpsePageDict {
     uint64_t *tag_lo;   /* caller memory: entries * 8 */
     uint64_t *tag_hi;   /* caller memory: entries * 8 */
-    uint32_t *slot;     /* caller memory: entries * 4: the store's own id */
+    uint32_t *slot;     /* caller memory: entries * 4 -- the caller's own id */
     uint32_t  entries;  /* power of two, at least 16 */
 } ZpsePageDict;
 
-/* 0 iff the page is empty; a dictionary entry with tag 0/0 is unused. */
 void zpse_page_hash(const uint8_t *page, uint32_t n,
                     uint64_t *lo_out, uint64_t *hi_out);
-
 void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
                         uint32_t *slot, uint32_t entries);
-
-/* 1 when (lo, hi) is present and its slot is written to *slot_out. */
-int zpse_pagedict_find(const ZpsePageDict *d, uint64_t lo, uint64_t hi,
-                       uint32_t *slot_out);
-
-/* Direct-mapped insert: the entry at hash % entries is overwritten. */
+int  zpse_pagedict_find(const ZpsePageDict *d, uint64_t lo, uint64_t hi,
+                        uint32_t *slot_out);
 void zpse_pagedict_insert(ZpsePageDict *d, uint64_t lo, uint64_t hi,
                           uint32_t slot);
-
-/* Retag a stored block for a new position: rewrites seq and is_last and fixes
- * the header CRC. The payload and its checksum are over the page's bytes and
- * do not move. Returns PSE_OK, or PSE_CORRUPT for a bad header CRC. */
-int zpse_block_retag(uint8_t *block, uint32_t block_len,
-                     uint32_t seq, int is_last);
+int  zpse_block_retag(uint8_t *block, uint32_t block_len,
+                      uint32_t seq, int is_last);
 ```
 
 20 bytes an entry, so 65,536 entries is 1.25 MiB of index -- and the encoded
 pages themselves are already in the store, which is the whole point: the page
 store keeps them to write them out.
+
+`zpse_block_retag` rewrites `block_sequence_number` and the is-last flag in
+whichever header form the block carries -- the 32-byte one, or a page's 16-byte
+one -- and re-emits the header checksum, which is a CRC32-C over 28 bytes in the
+long form and a 16-bit truncation over 14 in the short one. The payload is not
+touched: it decodes to the page's bytes, which did not change, so a payload
+checksum written with the block still holds. It refuses a NULL block
+(`PSE_BAD_ARG`), a length below a page header (`PSE_TRUNCATED`), a length the
+header disagrees with or a block with no sync (`PSE_BAD_HEADER`) and a bad
+header CRC (`PSE_BAD_HEADER_CRC`), so a store cannot turn a corrupt entry into a
+stream that only fails at read time.
 
 ## The call sequence
 
@@ -83,14 +91,14 @@ uint32_t slot, blen;
 
 zpse_page_hash(page, 4096, &lo, &hi);
 if (zpse_pagedict_find(&d, lo, hi, &slot) &&
-    store_read(slot, blk, &blen) &&                        /* the stored block */
+    store_read(slot, blk, &blen) &&                  /* the stored block     */
     zpse_block_retag(blk, blen, seq, is_last) == PSE_OK) {
-    emit(blk, blen);                                       /* no arena touched */
+    emit(blk, blen);                                 /* no arena touched     */
 } else {
     zpse_compress_block(page, 4096, blk, cap, &blen, seq, is_last, arena);
-    if (blen < 4096) {                                     /* only worth storing */
-        store_write(new_slot, blk, blen);
-        zpse_pagedict_insert(&d, lo, hi, new_slot);
+    if (blen < 4096) {                               /* only if it compressed */
+        slot = store_write(blk, blen);
+        zpse_pagedict_insert(&d, lo, hi, slot);
     }
     emit(blk, blen);
 }
@@ -98,54 +106,77 @@ if (zpse_pagedict_find(&d, lo, hi, &slot) &&
 
 Two rules the sequence encodes:
 
-* **Insert only what compressed.** A raw page is not worth an index entry: it
-  will be a hit for the same bytes next time and save the sweep, but its block
-  is a full page and the store's slot is no cheaper than the page.
-* **Retag, never reuse verbatim.** A block carries `seq` in its header and its
-  header CRC covers it, so a stored block served for a new position without
-  `zpse_block_retag` produces a stream that decodes correctly and checks its
-  frame index wrongly. The prototype measured below copies blocks without the
-  retag, which is why its numbers are an upper bound.
+* **Insert only what compressed.** A raw page's block is longer than the page,
+  so an entry for it costs more than the hash it saves; the next copy of those
+  bytes still pays a full encode, which is what a page store does anyway.
+* **Retag, never reuse verbatim.** A block carries `seq` in its header and the
+  header checksum covers it, so a stored block served for a new position
+  without `zpse_block_retag` produces a stream that decodes correctly and
+  indexes itself wrongly.
+
+`tests/suites/test_pagedict.c` pins the whole loop: every served block is
+byte-identical to a fresh encode of that page at that position, in both header
+forms, and decodes to the page.
+
+## What the tag costs on a corpus that does not repeat
+
+A hash is paid before its lookup can miss, so on a store holding few repeats it
+is pure cost. The first version of `zpse_page_hash` was a two-lane, 8-byte
+loop, and on the shared-library dump (0.91% hits) it cost 4.5% of the encode
+rate: 148.6 MB/s with a dictionary against 151.8 without.
+
+The shipped version reads 32 bytes an iteration into four independent
+multiply-xor lanes and folds all four into *both* output halves before the
+finaliser -- a half that saw only its own two lanes would make the index (which
+uses lo's low bits) blind to half the page, and the suite catches exactly that.
+It reads 148.6 -> 149.5 MB/s on the same dump, i.e. the tag is inside the
+noise there, and the 4.5% is gone.
+
+## How wide the table should be
+
+The index is direct mapped: one tag per slot, 20 bytes an entry. Set
+associativity was measured at the same total tag count (FIFO victim per set)
+before deciding to keep it that way:
+
+| entries | direct | 2-way | 4-way |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 4.90% | 4.59% | 3.92% |
+| 4,096 | 12.89% | 14.93% | 16.77% |
+| 65,536 | 17.94% | 18.29% | 18.37% |
+
+Widening helps exactly where the table is small enough to collide: at 4,096
+entries 4-way is worth 3.9 points of hits and 2.6% of rate (157.4 -> 161.5 MB/s
+over the same pages), at 65,536 entries it is worth half a point and nothing
+measurable, and at 1,024 entries it loses a point because four ways mean a
+quarter of the distinct indices. A store that sizes its table at a few thousand
+entries should implement ways above this API -- the tags and the retag are
+unchanged, only the probe differs -- and a store at 65,536 should not pay the
+extra compares.
 
 ## What it deliberately is not
 
 * **Not a decision cache.** Remembering only the winning shape and re-running
   the trial on a hit skips the price on 16% of the dumps' pages -- under 8% of
-  their encode -- while still hashing every page. On Silesia it is a net loss.
-  The win here comes from not encoding the page at all.
+  their encode -- while still hashing every page. The win here comes from not
+  encoding the page at all.
 * **Not a decoder feature.** No new block type, no new header field, no format
   version: hits and misses are the same bytes a non-dictionary writer produces.
 * **Not in the arena.** Growing `ZPSE_ENC_ARENA_SIZE` would make every caller
   pay for a heap corpus's repeats, including the ones compressing prose.
 
-## Numbers this rests on
-
-| table entries | hits (dumps) | dumps MB/s | note |
-| ---: | ---: | ---: | --- |
-| none | -- | 106.9-109.8 | level 6, 4 KiB, pinned |
-| 1,024 | 4.85% | 115.0-115.4 | |
-| 4,096 | 11.58% | 111.1-121.5 | |
-| 65,536 | 16.08% | 118.9-128.4 | the arm the design needs |
-
-Per file at 65,536 entries: Python heap 7.78% hits, 101.7 -> 106.3 MB/s; C
-heap 78.41% hits, 128.3 -> 571.2 MB/s; library dump 0.91% hits, 109.1 -> 112.7
-MB/s. The prototype is `build/pagecache.c` (scratch, not part of the tree): it
-reserves one page-sized buffer per entry, copies a hit's stored bytes without
-the retag, and does not decode hits, so its rate is an upper bound and its
-memory (256 MB at 65,536 entries) is not the 1.25 MiB this design needs.
-
 ## Open questions
 
-* **Hit verification.** A 128-bit tag makes a collision ~2^-64 over 2^32 pages,
-  which is why the tag is 128 bits and not 64. A store that already detects
-  duplicate pages itself (zram does, for its own compression) can use its own
-  index and skip this API entirely.
+* **Hit verification.** The tag is 128 bits, so a collision over 2^32 pages is
+  ~2^-64, which this design treats as a safety level rather than a check: nothing
+  downstream compares the decompressed bytes. A store that needs an absolute
+  guarantee should compare the page, or use the duplicate detection it already
+  has (zram keeps one, for its own compression) and skip this API.
 * **Where `seq` comes from.** A store that compresses before it knows a page's
-  position needs the retag; a store that knows the position up front can pass
-  it to `zpse_compress_block` and store the block as written.
-* **Eviction.** Direct mapping is what the hit-rate table above measures. A
-  2-way or 4-way scheme costs a second tag compare and should raise the hit
-  rate on the scattered dumps; it is unmeasured.
+  position needs the retag; one that knows the position up front can pass it to
+  `zpse_compress_block` and store the block as written.
 * **Sizing.** The dictionary pays from about 1,024 entries on a heap dump and
   never on prose. A caller with a mixed workload should size it by the fraction
   of heap pages it holds, not by the page count of the device.
+* **The pages above the table.** At 65,536 entries the C heap is still 78% hits
+  and the mixed corpus 20%; the remaining repeats are further apart than any
+  table this size reaches. Bigger tables were not measured.

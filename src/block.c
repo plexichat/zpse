@@ -5234,3 +5234,237 @@ lz2_done:
 #endif
     return (int)best_total;
 }
+
+/* ---- Page dictionary ----------------------------------------------------
+ *
+ * The caller's half of the repeat-page trade (docs/page-dictionary.md): a
+ * store that already holds a page's compressed bytes serves them again when
+ * the same page comes back, instead of encoding it. What the codec can supply
+ * is the 128-bit content tag and the header rewrite, because both are format
+ * knowledge -- `seq` and the is-last flag live in the header, the header is
+ * what its CRC covers, and a page's block may carry the 16-byte header while
+ * everything else carries the 32-byte one. A caller writing that out by hand
+ * would have to know all three.
+ *
+ * Nothing here allocates, reads the encoder, or changes the format: a hit's
+ * block is an ordinary block, and a decoder cannot tell where it was written.
+ * The measurements behind the design -- 16.4% of the dump corpus's pages
+ * repeat, 109.8 -> 128.4 MB/s at 65 536 entries -- are in that document. */
+
+/* murmur3's finaliser: every input bit is spread over the output, so the low
+ * bits the index uses are as good as the high ones. */
+static uint64_t zpse_page_fmix(uint64_t v)
+{
+    v ^= v >> 33;
+    v *= UINT64_C(0xff51afd7ed558ccd);
+    v ^= v >> 29;
+    v *= UINT64_C(0x9E3779B97F4A7C15);
+    v ^= v >> 32;
+    return v;
+}
+
+void zpse_page_hash(const uint8_t *page, uint32_t n,
+                    uint64_t *lo_out, uint64_t *hi_out)
+{
+    uint64_t a;
+    uint64_t b;
+    uint32_t i = 0;
+
+    if (lo_out == 0 || hi_out == 0) {
+        return;
+    }
+    if (page == 0 || n == 0u) {
+        *lo_out = 0u;
+        *hi_out = 0u;
+        return;
+    }
+    /* Two independent 64-bit accumulators so one tag is 128 bits: the
+     * index compares both halves, and a page that differs anywhere changes
+     * both with the cost of one pass over the page.
+     *
+     * Four lanes, 32 bytes an iteration, because the pass is not free on a
+     * corpus that does not repeat: a page's hash is paid before its lookup
+     * can miss, and on the shared-library dump (0.9% of pages repeat) a
+     * two-lane 8-byte loop cost 4.5% of the encode rate while returning
+     * almost nothing. The lanes are independent multiply-xor chains, so the
+     * four multiplies issue back to back instead of waiting on each other,
+     * and the two output halves are folded from disjoint pairs -- a byte that
+     * changes `x2` still moves `lo` without touching `x1`, so both halves
+     * keep depending on every byte. */
+    a = UINT64_C(0x9E3779B97F4A7C15) ^
+        ((uint64_t)n * UINT64_C(0xff51afd7ed558ccd));
+    b = UINT64_C(0xC2B2AE3D27D4EB4F) ^
+        ((uint64_t)n * UINT64_C(0x9E3779B97F4A7C15));
+    {
+        uint64_t x2 = UINT64_C(0x165667B19E3779F9) ^ (uint64_t)n;
+        uint64_t x3 = UINT64_C(0x27D4EB2F165667C5) +
+                      ((uint64_t)n * UINT64_C(0x85EBCA77));
+
+        for (; i + 32u <= n; i += 32u) {
+            uint64_t v0, v1, v2, v3;
+
+            memcpy(&v0, page + i, 8u);
+            memcpy(&v1, page + i + 8u, 8u);
+            memcpy(&v2, page + i + 16u, 8u);
+            memcpy(&v3, page + i + 24u, 8u);
+            a = (a ^ v0) * UINT64_C(0xff51afd7ed558ccd);
+            a ^= a >> 29;
+            b = (b + v1) * UINT64_C(0xc4ceb9fe1a85ec53);
+            b ^= b >> 31;
+            x2 = (x2 ^ v2) * UINT64_C(0xff51afd7ed558ccd);
+            x2 ^= x2 >> 27;
+            x3 = (x3 + v3) * UINT64_C(0xc4ceb9fe1a85ec53);
+            x3 ^= x3 >> 33;
+        }
+        for (; i + 8u <= n; i += 8u) {
+            uint64_t v;
+
+            memcpy(&v, page + i, 8u);
+            a = (a ^ v) * UINT64_C(0xff51afd7ed558ccd);
+            a ^= a >> 32;
+        }
+        for (; i < n; i++) {
+            b = (b + (uint64_t)page[i] + 1u) *
+                UINT64_C(0x9E3779B97F4A7C15);
+            b ^= b >> 31;
+        }
+        /* Both halves are folded from all four lanes before they are
+         * finalised. A half that saw only its own two lanes would make the
+         * index (lo's low bits) blind to half the page -- and lo is what picks
+         * the entry, so two pages differing in a b-lane byte would land alike
+         * with nothing else to separate them. */
+        {
+            uint64_t m1 = a ^ ((x2 << 7) | (x2 >> 57)) ^
+                          (x3 * UINT64_C(0xff51afd7ed558ccd)) ^ (b >> 1);
+            uint64_t m2 = b ^ ((x3 << 23) | (x3 >> 41)) ^
+                          (x2 * UINT64_C(0xc4ceb9fe1a85ec53)) ^ (a >> 1);
+
+            a = zpse_page_fmix(m1);
+            b = zpse_page_fmix(m2);
+        }
+    }
+    /* 0/0 is the empty-entry tag; a real page that hashed to it would be a
+     * permanent miss, so it cannot be handed out. */
+    if ((a | b) == 0u) {
+        a = 1u;
+    }
+    *lo_out = a;
+    *hi_out = b;
+}
+
+void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
+                        uint32_t *slot, uint32_t entries)
+{
+    if (d == 0) {
+        return;
+    }
+    d->tag_lo = tag_lo;
+    d->tag_hi = tag_hi;
+    d->slot = slot;
+    d->entries = 0u;
+    /* A non-power-of-two size would make the mask wrong rather than slow, so
+     * the dictionary reports itself empty and every lookup misses. */
+    if (tag_lo == 0 || tag_hi == 0 || slot == 0 || entries < 16u ||
+        (entries & (entries - 1u)) != 0u) {
+        return;
+    }
+    memset(tag_lo, 0, (size_t)entries * sizeof *tag_lo);
+    memset(tag_hi, 0, (size_t)entries * sizeof *tag_hi);
+    memset(slot, 0, (size_t)entries * sizeof *slot);
+    d->entries = entries;
+}
+
+int zpse_pagedict_find(const ZpsePageDict *d, uint64_t lo, uint64_t hi,
+                       uint32_t *slot_out)
+{
+    uint32_t i;
+
+    if (d == 0 || d->entries == 0u || slot_out == 0) {
+        return 0;
+    }
+    if ((lo | hi) == 0u) {
+        return 0;
+    }
+    /* The tag is already a hash, so its low bits are uniform; the mask is the
+     * whole of the index arithmetic. */
+    i = (uint32_t)(lo & (uint64_t)(d->entries - 1u));
+    if (d->tag_lo[i] == lo && d->tag_hi[i] == hi) {
+        *slot_out = d->slot[i];
+        return 1;
+    }
+    return 0;
+}
+
+void zpse_pagedict_insert(ZpsePageDict *d, uint64_t lo, uint64_t hi,
+                          uint32_t slot)
+{
+    uint32_t i;
+
+    if (d == 0 || d->entries == 0u) {
+        return;
+    }
+    if ((lo | hi) == 0u) {
+        lo = 1u;
+    }
+    i = (uint32_t)(lo & (uint64_t)(d->entries - 1u));
+    d->tag_lo[i] = lo;
+    d->tag_hi[i] = hi;
+    d->slot[i] = slot;
+}
+
+int zpse_block_retag(uint8_t *block, uint32_t block_len,
+                     uint32_t seq, int is_last)
+{
+    ZpseBlockHeader h;
+    uint32_t hsz;
+    int last;
+    int rc;
+
+    if (block == 0) {
+        return PSE_BAD_ARG;
+    }
+    if (block_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return PSE_TRUNCATED;
+    }
+    hsz = zpse_block_header_size(block, block_len);
+    if (hsz == 0u) {
+        return PSE_BAD_HEADER;
+    }
+    if (block_len < hsz) {
+        return PSE_TRUNCATED;
+    }
+    /* The parser is the validator: magic/version/flags/size/transform checks
+     * and the header CRC, so a block that has been corrupted, or that is not a
+     * block at all, is refused before a byte of it is rewritten. */
+    rc = zpse_block_header_parse(&h, block, block_len);
+    if (rc != PSE_OK) {
+        return rc;
+    }
+    /* `block_len` is the length the caller has, and the header says how long
+     * the block is; a disagreement means the caller is holding a prefix or a
+     * block with trailing bytes, and either way the payload is not what the
+     * header describes. */
+    if (h.compressed_block_size != block_len) {
+        return PSE_BAD_HEADER;
+    }
+    last = (is_last != 0) ? 1 : 0;
+    if (h.block_sequence_number == seq &&
+        (((h.block_flags & ZPSE_B_LAST) != 0u) ? 1 : 0) == last) {
+        return PSE_OK;
+    }
+    h.block_sequence_number = seq;
+    if (last != 0) {
+        h.block_flags = (uint8_t)(h.block_flags | ZPSE_B_LAST);
+    } else {
+        h.block_flags = (uint8_t)(h.block_flags & ~ZPSE_B_LAST);
+    }
+    /* Both serialisers write the header checksum last, over everything they
+     * wrote -- the 32-byte form's CRC32-C over 28 bytes, a page's 16-bit
+     * truncation over 14 -- so no separate fixup is paid here. */
+    if (hsz == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        zpse_block_header_serialize_short(block, &h);
+    } else {
+        zpse_block_header_serialize(block, &h);
+    }
+    return PSE_OK;
+}
