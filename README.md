@@ -296,12 +296,26 @@ all sweep: 48.5% pricing and 46.2% in trials, with the attempt-order sample at
 3.7% and the ASCII gate at 1.0%, because those pages are records and heap
 objects the tile path has to choose a shape for. Silesia is the other end: 37%
 of its pages are English and take the gate, and its encode is spread across four
-stages -- pricing 28.5%, trials 24.4%, the match-finder pass 24.7% and the gate
-itself 20.8%, with the sample at 1.5%. That is why the page trades in this
+stages -- pricing 27.6%, trials 27.4%, the match-finder pass 26.3% and the gate
+itself 16.6%, with the sample at 2.1%. That is why the page trades in this
 section are priced against the price and the trials: they are what the dumps
 pay, and no single stage on Silesia is worth a third of its encode. The split
 is reproducible from the `ZPSE_BLOCK_STATS` build, which times the gate and the
 sample alongside the probe, the trials and the LZ pass.
+
+The two samples a page prices before the sweep were sized for a 64 KiB block,
+and on a page they are the two cheapest things on the path to halve. The ASCII
+gate prices a kilobyte at each end of a page instead of two, and the match
+finder's screen samples 512 bytes instead of 1 KiB on a page. Together, level 6
+reads 12 to 14% faster on all three corpora and level 1 13% faster on Silesia
+(medians of four interleaved passes on one pinned core), and the bytes go DOWN
+0.21 of a ratio point on the dumps and 0.22 on the mixed corpus for 0.09 of a
+point up on Silesia -- 186 KB of 212 MB -- because a shorter screen refuses
+passes the tiles were going to beat. All 768 size cases are unchanged by the
+gate's sample; the screen's writes 125 bytes fewer across the suite and no case
+grows. Both samples stop at a page: the gate keeps its 2 KiB span and the
+screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
+is byte-identical to what it was.
 
 A heap dump also repeats itself, and the repeats are exact: 16.4% of the dumps'
 4 KiB pages are byte-for-byte copies of a page already seen -- 35.0 MB of 213.3

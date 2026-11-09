@@ -2414,6 +2414,27 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  * actually has. */
 #define ZPSE_LZ_SCREEN_BYTES 1024u
 #endif
+/* The screen's sample on a PAGE, and a measurement rather than a default.
+ *
+ * The 1 KiB above is tuned on 64 KiB blocks, where it is a sixty-fourth of
+ * the block; a 4 KiB page hands the same sample a quarter of its bytes, and
+ * the screen runs twice per page (token form, then fast form) before either
+ * pass. At 4 KiB level 6, over four interleaved passes, a 512-byte sample
+ * writes FEWER bytes than the 1 KiB one on the dumps (87 026 427 against
+ * 87 463 512, 0.21 of a ratio point) and on the mixed corpus (55 671 320
+ * against 56 016 700), costs Silesia 123 368 bytes (0.058 of a point), and
+ * reads faster on all three (dumps 95.7 against 86.7 MB/s, mixed 96.4
+ * against 92.6, Silesia 93.2 against 90.5 on that host). A 2 KiB sample is
+ * the ratio arm and it is refused: Silesia goes 115 738 128 -> 114 802 639
+ * (-0.8%, the finder stream the corpus wants) at 73.5 against 90.5 MB/s, and
+ * the dumps grow 113 963 bytes for it. All 768 size cases are unchanged by
+ * the 512-byte sample (no case grows).
+ *
+ * 0 keeps the long sample. Only pages take it: every 16 KiB and 64 KiB
+ * block's screen is byte-identical to what it was. */
+#ifndef ZPSE_LZ_SCREEN_PAGE_BYTES
+#define ZPSE_LZ_SCREEN_PAGE_BYTES 512u
+#endif
 #ifndef ZPSE_LZ_SCREEN_DEN
 #define ZPSE_LZ_SCREEN_DEN 16u
 #endif
@@ -2497,6 +2518,13 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint32_t lz_s;
     uint32_t tile_s;
 
+#if ZPSE_LZ_SCREEN_PAGE_BYTES
+    if (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+        uint32_t pb = (uint32_t)ZPSE_LZ_SCREEN_PAGE_BYTES;
+
+        sn = n < pb ? n : pb;
+    }
+#endif
     if (sn < ZPSE_LZ_MIN_MATCH + 1u) {
         return 1;
     }
@@ -2606,6 +2634,13 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint32_t lz_s;
     uint32_t tile_s;
 
+#if ZPSE_LZ_SCREEN_PAGE_BYTES
+    if (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+        uint32_t pb = (uint32_t)ZPSE_LZ_SCREEN_PAGE_BYTES;
+
+        sn = n < pb ? n : pb;
+    }
+#endif
     if (sn < ZPSE_LZ2_MIN_MATCH + 1u || e->cand == 0) {
         return 1;
     }
@@ -2863,15 +2898,36 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return PSE_OK;
 }
 
-/* The ASCII gate's sample: how many bytes of the block are priced, and with
- * how many tiles. Eight tiles is enough for the prescreen to tell prose
- * from structure, and small enough that the whole decision costs a few
- * thousand cycles against the ~200,000 a 64 KiB sweep spends. */
+/* The ASCII gate's sample: how many bytes of the block are priced against
+ * what the seven-bit form would cost over the same span, and with how many
+ * tiles. On a full-size block the sample is a 32nd of the block and four
+ * 512-byte tiles is enough for the prescreen to tell prose from structure.
+ *
+ * A page pays the same sample against a sixteenth of its bytes, so on a page
+ * the sample IS the gate's cost: two samples (head and tail) times the three
+ * shapes, and the gate is 20.8% of a Silesia page's encode. Halving the span
+ * to two 512-byte tiles is the measured knee -- at 4 KiB level 6 Silesia goes
+ * 117.0 -> 135.0 MB/s, the dumps 112.5 -> 121.5 and the mixed corpus 122.7 ->
+ * 127.7, for 0.018 of a ratio point over Silesia (39 050 bytes), 0.001 over
+ * mixed and 57 bytes FEWER over the dumps, with all 768 size cases unchanged
+ * to the byte. The tile size the price ranks with matters more than the span:
+ * four 256-byte tiles on the same 1 KiB span reads 120.8 on Silesia, and a
+ * 2 KiB span at two 1 KiB tiles 111.2, both slower than this setting.
+ *
+ * Only pages take it. Above a page the gate keeps the 2 KiB span and four
+ * tiles, so every 16 KiB and 64 KiB block this flag judges is byte-identical
+ * to what it was. */
 #ifndef ZPSE_ASCII_SAMPLE
 #define ZPSE_ASCII_SAMPLE 2048u
 #endif
 #ifndef ZPSE_ASCII_SAMPLE_TILES
 #define ZPSE_ASCII_SAMPLE_TILES 4u
+#endif
+#ifndef ZPSE_ASCII_PAGE_SAMPLE
+#define ZPSE_ASCII_PAGE_SAMPLE 1024u
+#endif
+#ifndef ZPSE_ASCII_PAGE_TILES
+#define ZPSE_ASCII_PAGE_TILES 2u
 #endif
 #ifndef ZPSE_ASCII_MIN_BLOCK
 #define ZPSE_ASCII_MIN_BLOCK 4096u
@@ -2941,8 +2997,13 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
     static const uint8_t tids[3] = {0u, 1u, 4u};
     static const uint8_t scs[3] = {1u, 1u, 4u};
     static const uint16_t metas[3] = {0u, 1u, 0u};
-    uint32_t pn = n < (uint32_t)ZPSE_ASCII_SAMPLE ? n
-                                                  : (uint32_t)ZPSE_ASCII_SAMPLE;
+    uint32_t sample = (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX)
+                          ? (uint32_t)ZPSE_ASCII_PAGE_SAMPLE
+                          : (uint32_t)ZPSE_ASCII_SAMPLE;
+    uint32_t tiles = (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX)
+                         ? (uint32_t)ZPSE_ASCII_PAGE_TILES
+                         : (uint32_t)ZPSE_ASCII_SAMPLE_TILES;
+    uint32_t pn = n < sample ? n : sample;
     uint32_t alim = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + zpse_ascii_len(pn);
     unsigned j;
 
@@ -2959,8 +3020,7 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
             continue;
         }
         h = zpse_block_proxy_exact(e, in, pn, n, tids[j], scs[j], in,
-                                   metas[j], ZPSE_ASCII_SAMPLE_TILES, alim, 1,
-                                   &prefix_ok);
+                                   metas[j], tiles, alim, 1, &prefix_ok);
         if (h == UINT32_MAX || h <= alim) {
             return 0;
         }
@@ -2969,8 +3029,7 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
 
             prefix_ok = 1;
             t = zpse_block_proxy_exact(e, in + (n - pn), pn, n, tids[j],
-                                       scs[j], in, metas[j],
-                                       ZPSE_ASCII_SAMPLE_TILES, alim, 1,
+                                       scs[j], in, metas[j], tiles, alim, 1,
                                        &prefix_ok);
 
             if (t == UINT32_MAX || t <= alim) {
