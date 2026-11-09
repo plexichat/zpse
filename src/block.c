@@ -1339,6 +1339,39 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_SHORT_TILES 8u
 #endif
 
+/* Ordering the field behind the identity by a coarse price was measured and
+ * refused, because it does not buy what it looks like it should. The price
+ * counter reads the same either way -- 94,637 candidates for the dumps' 13,802
+ * pages, 141,460 for the mixed workload's 39,063 -- since the sweep's cost is
+ * the field it has to price, not the order it prices it in, and a screen is a
+ * second price on every candidate. On a four-tile screen the dumps wrote 1.14%
+ * fewer bytes (41.01% to 40.54%) but encoded at 105 against 139 MB/s, the mixed
+ * workload grew 0.11 points, and the order it imposed also changed WHICH
+ * candidates the flat cut prices, so it was not byte-neutral either. Two tiles
+ * is the same trade with less of both. */
+
+#ifndef ZPSE_CONVICT_SHIFT
+/* The margin a running best convicts a later candidate by: a candidate priced
+ * above ex[pick] + (ex[pick] >> SHIFT) cannot be a survivor and the probe
+ * stops it at the plane that proved it. 4 is a sixteenth (6.25%). A larger
+ * shift convicts sooner (fewer prices and trials, worse ratio); a smaller one
+ * keeps more of the field.
+ *
+ * A page was measured with a wider field -- the trial it keeps is a quarter of
+ * the block rather than a sixty-fourth, so a candidate the margin drops could
+ * still have won -- and it is not worth what it costs. A twelfth (shift 3)
+ * writes 0.021, 0.013 and 0.017% fewer bytes on the dumps, mixed and Silesia
+ * corpora at level 6 for 0.7, 0.0 and 1.5% of encode rate; a quarter (shift 2)
+ * writes 0.037, 0.033 and 0.038% fewer for 1.4, 1.6 and 2.2%. All three
+ * corpora move the same way, so the rate is real rather than the host, and two
+ * per cent of encode for four hundredths of a point is not the trade these
+ * pages are held to. The 64 KiB blocks were byte-identical under a page gate,
+ * so this is the page's own trade. Level 1 barely moves either way (0.0002
+ * points, and the mixed workload 0.003 points LARGER at shift 2): the cheap
+ * rungs act on the price, not on the field behind it. */
+#define ZPSE_CONVICT_SHIFT 4
+#endif
+
 
 #ifndef ZPSE_FLAT_TRIALS
 /* The trial cap for a block the 12 KiB window price convicts of being flat.
@@ -3666,7 +3699,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * never UINT32_MAX, so it reads as priced-and-lost rather than
              * unpriced. */
             if (pick >= 0 && ex[pick] != UINT32_MAX) {
-                lim = ex[pick] + (ex[pick] >> 4);
+                lim = ex[pick] + (ex[pick] >> ZPSE_CONVICT_SHIFT);
             }
             /* Arithmetic floor before any staging: a shape's smallest
              * possible total over the window is a function of its plane
@@ -3781,7 +3814,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * one bounded trial only on blocks where the two orders actually
              * disagree. The winner is always kept, so the loss there is a
              * trial, never a different block. */
-            uint32_t limit = ex[pick] + (ex[pick] >> 4);
+            uint32_t limit = ex[pick] + (ex[pick] >> ZPSE_CONVICT_SHIFT);
             int kept = 0;
             int win = -1;
             uint8_t win_idx = idx[pick];
