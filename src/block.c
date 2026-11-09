@@ -164,6 +164,12 @@ uint32_t zpse_block_probe_correct;
  * to wall-clock time. */
 uint64_t zpse_block_probe_cycles;
 uint64_t zpse_block_trial_cycles;
+/* Cycles spent in the two decisions taken before any candidate is priced:
+ * the ASCII gate and the attempt-order sample. Together with the probe, the
+ * trials and the LZ stages they account for the block's encode; the rest is
+ * header work, the shrink and the histogram. */
+uint64_t zpse_block_gate_cycles;
+uint64_t zpse_block_sample_cycles;
 /* A serialising cycle read: the counter must not be reordered across the
  * work it measures. LFENCE is enough on every x86-64 that runs this
  * build's AVX2 paths. */
@@ -2061,6 +2067,27 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
                                 every_plane, pstep);
 }
 
+/* ---- Why the price is the encoder's own cost model ---------------- *
+ * The ranking pass runs the segment encoder's classify, mode search and pack
+ * on a tile of every plane, which is half the dumps' encode (48.5% of the
+ * cycles at level 6, 5.6 candidates a page). A cheap estimator in its place
+ * looks like the next stage to buy, and one was built and measured: per plane,
+ * two order-0 histograms (the plane and its difference chain), charged at the
+ * smaller entropy in bits plus the same envelope and ten bytes a tile the
+ * exact price charges.
+ *
+ * It is refused on rate, and the margin is not close. The histogram scan is
+ * algebraically cheaper than a classify but it is a scalar byte loop with two
+ * counter increments a byte, while the classify is SIMD and reads the same
+ * 4 KiB the histogram does; pricing 360 361 candidates a corpus pass instead
+ * of 292 432 (the estimator's prices do not convict as early) puts the dumps
+ * at 41 MB/s against 111-115 and Silesia at 54 against 113. What it does show
+ * is that the ranking is not what limits the ratio -- it writes 0.41, 0.68 and
+ * 0.85 points FEWER bytes on the dumps, mixed and Silesia -- but three times
+ * the encode for bytes bought back by a different shortlist is not the trade
+ * these pages are held to, and the sweep's trials, not its prices, are what
+ * a page is actually paying for. */
+
 /* Exchange two candidate slots, moving the candidate itself in every array
  * that describes it -- including idx[], which carries its original list
  * index and is what the winner's tie-break compares. The attempt order is
@@ -3358,6 +3385,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * at MAX, text_en 88 -> 294 MB/s, json_rows 101 -> 407, var_string 91 ->
      * 410 on 4 MiB blocks, with the streams identical -- and identical too
      * over the 779-case size corpus at levels 5, 7, 8 and 9. */
+#if defined(ZPSE_BLOCK_STATS)
+    {
+        uint64_t t_gate0 = blk_rdtsc();
+#endif
     e->ascii_gate = 0u;
     if (n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK &&
         !zpse_block_head_one_value(
@@ -3373,6 +3404,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         ncand = 1;
         sample_flat = 0;
     }
+#if defined(ZPSE_BLOCK_STATS)
+        zpse_block_gate_cycles += blk_rdtsc() - t_gate0;
+    }
+#endif
 
     /* Attempt order: identity first unless the sample says DELTA8's plane
      * is much more predictable, and never anything but a swap of those
@@ -3385,7 +3420,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             idx[i] = (uint8_t)i;
         }
     }
+#if defined(ZPSE_BLOCK_STATS)
+    {
+        uint64_t t_sample = blk_rdtsc();
+
+        sample = (ncand >= 2) ? zpse_block_delta_trial_first(in, n) : 0;
+        zpse_block_sample_cycles += blk_rdtsc() - t_sample;
+    }
+#else
     sample = (ncand >= 2) ? zpse_block_delta_trial_first(in, n) : 0;
+#endif
     if (ncand >= 2) {
         int swap = (sample == 1);
 

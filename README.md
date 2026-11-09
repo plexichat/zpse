@@ -291,6 +291,33 @@ Two and a quarter to three and a half times the encode for 2.6 to 7.5 points of 
 decode improves with it (3.4 GB/s on the dumps) because a page written as one
 identity segment is one plane the decoder walks straight through.
 
+Where a page's cycles go depends on the corpus. At level 6 the dumps are almost
+all sweep: 48.5% pricing and 46.2% in trials, with the attempt-order sample at
+3.7% and the ASCII gate at 1.0%, because those pages are records and heap
+objects the tile path has to choose a shape for. Silesia is the other end: 37%
+of its pages are English and take the gate, and its encode is spread across four
+stages -- pricing 28.5%, trials 24.4%, the match-finder pass 24.7% and the gate
+itself 20.8%, with the sample at 1.5%. That is why the page trades in this
+section are priced against the price and the trials: they are what the dumps
+pay, and no single stage on Silesia is worth a third of its encode. The split
+is reproducible from the `ZPSE_BLOCK_STATS` build, which times the gate and the
+sample alongside the probe, the trials and the LZ pass.
+
+A heap dump also repeats itself, and the repeats are exact: 16.4% of the dumps'
+4 KiB pages are byte-for-byte copies of a page already seen -- 35.0 MB of 213.3
+MB, and the C heap file on its own is 80% repeats. Serving such a page from a
+content table instead of encoding it is worth something real: with a
+65,536-entry table of content hash and encoded bytes, the dumps read 128.4 MB/s
+at level 6 against 109.8 for the same pages encoded one at a time (118.9 against
+106.9 over four interleaved passes), and the C heap file alone goes from 128 to
+571 MB/s. What it costs is memory: the table keeps the encoded page for every
+distinct page, so one entry reserves a page and the 65,536-entry arm reserves
+256 MB to serve a 213 MB corpus. A trade like that belongs to whatever already
+holds the compressed pages -- a zram store, not an encoder whose arena is 448
+KiB -- and a cache that remembered only the winning shape would not move it:
+skipping the price on those pages is under 8% of the dumps' encode and still
+hashes every page, and Silesia's 0.21% repeat rate never pays the hash back.
+
 What is left on a page that stays raw is the trial itself. On the library dump
 40.7% of the page bytes go out raw, and each of those pages used to encode all
 sixteen of its noise tiles to learn what the first four already said. The
