@@ -42,13 +42,23 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
  * the encoder's. What the codec supplies is the content hash and the header
  * rewrite a block needs before it can stand at a new position. */
 
-/* Caller-owned index, direct mapped: 20 bytes an entry, so 65,536 entries is
- * 1.25 MiB. A tag of 0/0 means "empty", so insertion maps it to 1/0. */
+/* Caller-owned index: 20 bytes an entry, so 65,536 entries is 1.25 MiB, plus
+ * one byte a set when it is set associative. A tag of 0/0 means "empty", so
+ * insertion maps it to 1/0.
+ *
+ * Set associativity is worth having where the table is small enough to
+ * collide, and not where it is not: measured over the dump corpora at level 6,
+ * four ways turn a 4,096-entry table's 12.89% of pages served into 16.77% for
+ * 2.6% of the encode rate, half a point at 65,536 entries, and a point WORSE at
+ * 1,024 because four ways mean a quarter of the distinct sets. See
+ * docs/page-dictionary.md. */
 typedef struct ZpsePageDict {
     uint64_t *tag_lo;   /* caller memory: entries * 8 */
     uint64_t *tag_hi;   /* caller memory: entries * 8 */
     uint32_t *slot;     /* caller memory: entries * 4, the caller's own id */
-    uint32_t entries;   /* power of two, at least 16 */
+    uint8_t *victim;    /* caller memory: (entries / ways) bytes, or NULL */
+    uint32_t entries;   /* total tags, a power of two, at least 16 */
+    uint32_t ways;      /* 1, 2, 4 or 8; 0 means the dictionary is empty */
 } ZpsePageDict;
 
 /* 128-bit content tag of `n` bytes. 128 and not 64 on purpose: a tag
@@ -63,6 +73,16 @@ void zpse_page_hash(const uint8_t *page, uint32_t n,
  * `entries` leaves the dictionary permanently missing. */
 void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
                         uint32_t *slot, uint32_t entries);
+
+/* The same, with `ways` tags a set and a caller-owned cursor array for the
+ * eviction order. `victim` is (entries / ways) bytes, one per set, holding
+ * which way that set overwrites next, so the four tags of a set are replaced
+ * in turn instead of the first one being sticky. ways must be 1, 2, 4 or 8 and
+ * leave at least four sets; a dictionary that cannot be built this way reports
+ * itself empty and every lookup misses, exactly as a bad `entries` does. */
+void zpse_pagedict_init_set(ZpsePageDict *d, uint64_t *tag_lo,
+                            uint64_t *tag_hi, uint32_t *slot, uint8_t *victim,
+                            uint32_t entries, uint32_t ways);
 
 /* 1 when (lo, hi) is present and its slot was stored; 0 on a miss, on an
  * empty dictionary, or when either pointer is NULL. */

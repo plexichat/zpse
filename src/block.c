@@ -2430,6 +2430,13 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  * the dumps grow 113 963 bytes for it. All 768 size cases are unchanged by
  * the 512-byte sample (no case grows).
  *
+ * 512 is the corner, and the arm between it and 1 KiB is the proof: at 768
+ * bytes Silesia gives back 171 723 of its 212 MB (0.081 of a point) while the
+ * dumps grow 48 286 and the mixed corpus 321 509 (0.21 of a point worse), and
+ * all three read slower (dumps 143.9 against 148.5 MB/s, mixed 150.6 against
+ * 153.9, Silesia 147.3 against 156.4) -- a longer screen convicts fewer blocks,
+ * and some of the passes it then pays for lose to the tiles.
+ *
  * 0 keeps the long sample. Only pages take it: every 16 KiB and 64 KiB
  * block's screen is byte-identical to what it was. */
 #ifndef ZPSE_LZ_SCREEN_PAGE_BYTES
@@ -2926,6 +2933,25 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_ASCII_PAGE_SAMPLE
 #define ZPSE_ASCII_PAGE_SAMPLE 1024u
 #endif
+#ifndef ZPSE_ASCII_PAGE_MID
+/* Price the middle of a page as well as its two ends.
+ *
+ * Two 512-byte tiles at each end are the cheap conviction the page gate was
+ * measured at, and on Silesia that costs 186 KB of a 212 MB corpus against the
+ * 2 KiB span that was sized for a 64 KiB block. The question this knob exists
+ * for is whether a third sample in the middle recovers that difference at less
+ * than the 16.6% of the page's cycles the gate costs: a page whose ends are
+ * prose and whose middle is a literal run is the case two ends cannot see, and
+ * convicting it writes the seven-bit form over a shape the sweep would have
+ * priced better.
+ *
+ * Measured, and refused: Silesia goes 115 924 420 -> 115 874 767 (-49 653
+ * bytes, 0.023 of a point) and the mixed corpus -1 445 with the dumps byte
+ * identical, but the gate is a sixth of those pages' encodes and the third
+ * window costs half again as much: Silesia reads 149.5 against 156.4 MB/s
+ * (-4.4%). A fortieth of a point is not worth 4% of the rate, so 0 ships. */
+#define ZPSE_ASCII_PAGE_MID 0
+#endif
 #ifndef ZPSE_ASCII_PAGE_TILES
 #define ZPSE_ASCII_PAGE_TILES 2u
 #endif
@@ -3035,6 +3061,20 @@ static int zpse_block_ascii_gate(ZpseEncoder *e, const uint8_t *in,
             if (t == UINT32_MAX || t <= alim) {
                 return 0;
             }
+#if ZPSE_ASCII_PAGE_MID
+            /* A third window, halfway along, on a block long enough for it not
+             * to overlap either end (see ZPSE_ASCII_PAGE_MID). */
+            if (n > 2u * pn) {
+                prefix_ok = 1;
+                t = zpse_block_proxy_exact(e, in + (n - pn) / 2u, pn, n,
+                                           tids[j], scs[j], in, metas[j],
+                                           tiles, alim, 1, &prefix_ok);
+
+                if (t == UINT32_MAX || t <= alim) {
+                    return 0;
+                }
+            }
+#endif
         }
     }
     return 1;
@@ -5352,8 +5392,9 @@ void zpse_page_hash(const uint8_t *page, uint32_t n,
     *hi_out = b;
 }
 
-void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
-                        uint32_t *slot, uint32_t entries)
+void zpse_pagedict_init_set(ZpsePageDict *d, uint64_t *tag_lo,
+                            uint64_t *tag_hi, uint32_t *slot, uint8_t *victim,
+                            uint32_t entries, uint32_t ways)
 {
     if (d == 0) {
         return;
@@ -5361,36 +5402,65 @@ void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
     d->tag_lo = tag_lo;
     d->tag_hi = tag_hi;
     d->slot = slot;
+    d->victim = victim;
     d->entries = 0u;
+    d->ways = 0u;
     /* A non-power-of-two size would make the mask wrong rather than slow, so
      * the dictionary reports itself empty and every lookup misses. */
     if (tag_lo == 0 || tag_hi == 0 || slot == 0 || entries < 16u ||
         (entries & (entries - 1u)) != 0u) {
         return;
     }
+    if (ways != 1u) {
+        /* A way needs a victim cursor, and four sets is the smallest table the
+         * measured 2.6% at 4,096 entries was taken on; below that the mapping
+         * loses more to its own collisions than the ways recover. */
+        if (victim == 0 || ways < 2u || ways > 8u ||
+            (ways & (ways - 1u)) != 0u || (entries / ways) < 4u) {
+            return;
+        }
+        memset(victim, 0, (size_t)(entries / ways));
+    }
     memset(tag_lo, 0, (size_t)entries * sizeof *tag_lo);
     memset(tag_hi, 0, (size_t)entries * sizeof *tag_hi);
     memset(slot, 0, (size_t)entries * sizeof *slot);
     d->entries = entries;
+    d->ways = ways;
+}
+
+void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
+                        uint32_t *slot, uint32_t entries)
+{
+    /* Direct mapped: every set is one slot, so there is no eviction order to
+     * keep and no cursor array to own. */
+    zpse_pagedict_init_set(d, tag_lo, tag_hi, slot, 0, entries, 1u);
 }
 
 int zpse_pagedict_find(const ZpsePageDict *d, uint64_t lo, uint64_t hi,
                        uint32_t *slot_out)
 {
-    uint32_t i;
+    uint32_t sets;
+    uint32_t base;
+    uint32_t w;
 
-    if (d == 0 || d->entries == 0u || slot_out == 0) {
+    if (d == 0 || d->entries == 0u || d->ways == 0u || slot_out == 0) {
         return 0;
     }
     if ((lo | hi) == 0u) {
         return 0;
     }
     /* The tag is already a hash, so its low bits are uniform; the mask is the
-     * whole of the index arithmetic. */
-    i = (uint32_t)(lo & (uint64_t)(d->entries - 1u));
-    if (d->tag_lo[i] == lo && d->tag_hi[i] == hi) {
-        *slot_out = d->slot[i];
-        return 1;
+     * whole of the index arithmetic. A set's ways are contiguous, so the
+     * compare is one cache line per two tags on the common sizes. */
+    sets = d->entries / d->ways;
+    base = (uint32_t)(lo & (uint64_t)(sets - 1u)) * d->ways;
+    for (w = 0; w < d->ways; w++) {
+        uint32_t i = base + w;
+
+        if (d->tag_lo[i] == lo && d->tag_hi[i] == hi) {
+            *slot_out = d->slot[i];
+            return 1;
+        }
     }
     return 0;
 }
@@ -5398,18 +5468,39 @@ int zpse_pagedict_find(const ZpsePageDict *d, uint64_t lo, uint64_t hi,
 void zpse_pagedict_insert(ZpsePageDict *d, uint64_t lo, uint64_t hi,
                           uint32_t slot)
 {
-    uint32_t i;
+    uint32_t sets;
+    uint32_t set;
+    uint32_t base;
+    uint32_t w;
 
-    if (d == 0 || d->entries == 0u) {
+    if (d == 0 || d->entries == 0u || d->ways == 0u) {
         return;
     }
     if ((lo | hi) == 0u) {
         lo = 1u;
     }
-    i = (uint32_t)(lo & (uint64_t)(d->entries - 1u));
-    d->tag_lo[i] = lo;
-    d->tag_hi[i] = hi;
-    d->slot[i] = slot;
+    sets = d->entries / d->ways;
+    set = (uint32_t)(lo & (uint64_t)(sets - 1u));
+    base = set * d->ways;
+    /* A tag that is already in the set updates its slot in place: the store is
+     * re-inserting the same content, and spending a second way on it would evict
+     * a live entry and then find the page twice over. */
+    for (w = 0; w < d->ways; w++) {
+        uint32_t i = base + w;
+
+        if (d->tag_lo[i] == lo && d->tag_hi[i] == hi) {
+            d->slot[i] = slot;
+            return;
+        }
+    }
+    w = base;
+    if (d->ways != 1u) {
+        w += d->victim[set];
+        d->victim[set] = (uint8_t)((d->victim[set] + 1u) & (d->ways - 1u));
+    }
+    d->tag_lo[w] = lo;
+    d->tag_hi[w] = hi;
+    d->slot[w] = slot;
 }
 
 int zpse_block_retag(uint8_t *block, uint32_t block_len,

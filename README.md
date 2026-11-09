@@ -316,7 +316,12 @@ reads 12 to 14% faster on all three corpora and level 1 13% faster on Silesia
 point up on Silesia -- 186 KB of 212 MB -- because a shorter screen refuses
 passes the tiles were going to beat. All 768 size cases are unchanged by the
 gate's sample; the screen's writes 125 bytes fewer across the suite and no case
-grows. Both samples stop at a page: the gate keeps its 2 KiB span and the
+grows. Both halves of that give-back were then measured and refused: a third
+gate window halfway along the page recovers 49 653 bytes of Silesia (0.023 of a
+point) for 4.4% of its rate, and a 768-byte screen gives Silesia back 171 723
+while growing the dumps by 48 286 and the mixed corpus by 321 509 (0.21 of a
+point) and reading 4% slower. The 1 KiB gate and the 512-byte screen are the
+corner of both trades. Both samples stop at a page: the gate keeps its 2 KiB span and the
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
 
@@ -324,7 +329,8 @@ A heap dump also repeats itself, and the repeats are exact: 17.9% of the dumps'
 4 KiB pages are byte-for-byte copies of a page already seen -- 35 MB of 213 MB,
 and the C heap file on its own is 78% repeats -- and the copies are scattered
 rather than consecutive, so only a content table finds them (the last 64 pages
-recall 1.26%, a 4,096-entry table 12.9%). The library supplies the caller's half
+recall 1.26%, a 4,096-entry table 12.72%, four ways at that size 16.57%). The
+library supplies the caller's half
 of that trade rather than an encoder-side cache: `zpse_page_hash` tags a page in
 128 bits, a caller-owned `ZpsePageDict` maps the tag to the caller's own slot,
 and `zpse_block_retag` rewrites the sequence number and is-last flag a reused
@@ -334,8 +340,11 @@ entry costs 20 bytes instead of a page, because the encoded pages stay where the
 store already keeps them. Measured through that API at level 6, the dumps read
 173.5 MB/s against 149.4 for the same pages encoded one at a time (17.94% of
 pages served), the C heap 736 against 167, the Python heap 147.1 against 141,
-the mixed corpus 174.9 against 149.5, and packed bytes are identical in every
-arm. The hash is the whole cost on a corpus that does not repeat, and the first
+the mixed corpus 194.3 against 159.2, and packed bytes are identical in every
+arm. Ways are an option rather than the default because they pay only where the
+table is small: at 4,096 entries four ways serve 3.85 more points of pages and
+read 4.6% faster, while at 65,536 the extra tag compares buy 0.43 of a point and
+nothing measurable. The hash is the whole cost on a corpus that does not repeat, and the first
 version of it was slower there than nothing: at 0.91% hits the library dump now
 reads 149.5 against 148.6 with no dictionary. `docs/page-dictionary.md` has the
 call sequence, the set-associativity measurements and what a store should verify

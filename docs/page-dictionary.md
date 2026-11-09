@@ -7,24 +7,24 @@ a reused encode is an ordinary block, and every decoder reads it unchanged.*
 
 ## What it buys
 
-On the three dump corpora this codec is measured against, 16.4% of pages
-(8,548 of 52,065, 35.0 MB of 213.3 MB) are byte-for-byte copies of a page
-already written, and the C heap file on its own is 78% repeats. The repeats are
-scattered rather than consecutive: a cache of the last 64 pages hits 1.26%,
-direct-mapped 1,024 and 4,096-entry content tables hit 4.90% and 12.89%, and a
-65,536-entry content table hits 17.94%. Only content addressing gets them.
+On the three dump corpora this codec is measured against, 17.9% of pages are
+byte-for-byte copies of a page already written, and the C heap file on its own
+is 78%. The repeats are scattered rather than consecutive: a cache of the last
+64 pages hits 1.26%, direct-mapped 1,024 and 4,096-entry content tables hit
+4.90% and 12.72%, and a 65,536-entry content table hits 17.94%. Only content
+addressing gets them.
 
 Measured through the shipped API (`build/pagedict.c`, level 6, 4 KiB pages, one
-pinned core, three interleaved passes, best of three; every hit retagged and
-every arm's first hit per file decoded and compared):
+pinned core, four interleaved passes with the arm order rotated, best of four;
+every arm's first hit in every file decoded and compared):
 
-| corpus | none | dictionary | hits |
+| corpus | none | dictionary | pages served |
 | --- | ---: | ---: | ---: |
-| Python heap | 141.0 MB/s | 147.1 | 7.74% |
-| C heap | 166.8 | 736.3 | 78.32% |
-| shared-library dump | 148.6 | 149.5 | 0.91% |
-| mixed | 149.5 | 174.9 | 20.51% |
-| **all** | **149.4** | **173.5** | **17.94%** |
+| Python heap | 143.5 MB/s | 149.4 | 7.74% |
+| C heap | 170.0 | 731.8 | 78.32% |
+| shared-library dump | 153.3 | 152.3 | 0.91% |
+| mixed | 159.2 | 194.3 | 20.51% |
+| **all** | **155.7** | **182.9** | **17.94%** |
 
 Packed bytes are identical in every arm (142,699,989), because a hit rewrites
 nothing but a header. That is the point of the feature: it is a rate trade with
@@ -53,13 +53,18 @@ typedef struct ZpsePageDict {
     uint64_t *tag_lo;   /* caller memory: entries * 8 */
     uint64_t *tag_hi;   /* caller memory: entries * 8 */
     uint32_t *slot;     /* caller memory: entries * 4 -- the caller's own id */
-    uint32_t  entries;  /* power of two, at least 16 */
+    uint8_t  *victim;   /* caller memory: (entries / ways) bytes, or NULL */
+    uint32_t  entries;  /* total tags, a power of two, at least 16 */
+    uint32_t  ways;     /* 1, 2, 4 or 8; 0 means the dictionary is empty */
 } ZpsePageDict;
 
 void zpse_page_hash(const uint8_t *page, uint32_t n,
                     uint64_t *lo_out, uint64_t *hi_out);
 void zpse_pagedict_init(ZpsePageDict *d, uint64_t *tag_lo, uint64_t *tag_hi,
                         uint32_t *slot, uint32_t entries);
+void zpse_pagedict_init_set(ZpsePageDict *d, uint64_t *tag_lo,
+                            uint64_t *tag_hi, uint32_t *slot, uint8_t *victim,
+                            uint32_t entries, uint32_t ways);
 int  zpse_pagedict_find(const ZpsePageDict *d, uint64_t lo, uint64_t hi,
                         uint32_t *slot_out);
 void zpse_pagedict_insert(ZpsePageDict *d, uint64_t lo, uint64_t hi,
@@ -68,9 +73,12 @@ int  zpse_block_retag(uint8_t *block, uint32_t block_len,
                       uint32_t seq, int is_last);
 ```
 
-20 bytes an entry, so 65,536 entries is 1.25 MiB of index -- and the encoded
-pages themselves are already in the store, which is the whole point: the page
-store keeps them to write them out.
+20 bytes an entry plus one byte a set, so 65,536 entries is 1.25 MiB of index --
+and the encoded pages themselves are already in the store, which is the whole
+point: the page store keeps them to write them out. `zpse_pagedict_init` is the
+direct-mapped case; `zpse_pagedict_init_set` takes `ways` and a cursor array
+holding which way each set overwrites next, so a set's tags are replaced in
+turn rather than the first one being sticky.
 
 `zpse_block_retag` rewrites `block_sequence_number` and the is-last flag in
 whichever header form the block carries -- the 32-byte one, or a page's 16-byte
@@ -129,29 +137,28 @@ The shipped version reads 32 bytes an iteration into four independent
 multiply-xor lanes and folds all four into *both* output halves before the
 finaliser -- a half that saw only its own two lanes would make the index (which
 uses lo's low bits) blind to half the page, and the suite catches exactly that.
-It reads 148.6 -> 149.5 MB/s on the same dump, i.e. the tag is inside the
-noise there, and the 4.5% is gone.
+Against the same base it reads 153.3 -> 152.3 MB/s on that dump, i.e. the tag is
+inside the run-to-run band, and the 4.5% is gone.
 
 ## How wide the table should be
 
-The index is direct mapped: one tag per slot, 20 bytes an entry. Set
-associativity was measured at the same total tag count (FIFO victim per set)
-before deciding to keep it that way:
+Ways are worth having exactly where the table is small enough to collide, which
+is why they are an option rather than the default. Measured at the same total
+tag count, arm order rotated between rounds:
 
 | entries | direct | 2-way | 4-way |
 | ---: | ---: | ---: | ---: |
 | 1,024 | 4.90% | 4.59% | 3.92% |
-| 4,096 | 12.89% | 14.93% | 16.77% |
-| 65,536 | 17.94% | 18.29% | 18.37% |
+| 4,096 | 12.72% / 171.3 MB/s | 14.79% / 174.9 | 16.57% / 179.2 |
+| 65,536 | 17.94% / 182.9 MB/s | 18.29% / 183.4 | 18.37% / 183.5 |
 
-Widening helps exactly where the table is small enough to collide: at 4,096
-entries 4-way is worth 3.9 points of hits and 2.6% of rate (157.4 -> 161.5 MB/s
-over the same pages), at 65,536 entries it is worth half a point and nothing
-measurable, and at 1,024 entries it loses a point because four ways mean a
-quarter of the distinct indices. A store that sizes its table at a few thousand
-entries should implement ways above this API -- the tags and the retag are
-unchanged, only the probe differs -- and a store at 65,536 should not pay the
-extra compares.
+At 4,096 entries four ways serve 3.85 more points of pages for 4.6% of the rate
+(171.3 -> 179.2 MB/s over the same pages), and on the C heap alone the difference
+is 356 against 584 MB/s. At 65,536 entries the three extra tag compares buy 0.43
+of a point and nothing measurable, and at 1,024 they lose a point because four
+ways mean a quarter of the distinct sets. So: a store whose table is a few
+thousand entries should ask for four ways, and a store at 65,536 should keep the
+direct mapping -- which is what the two inits are for.
 
 ## What it deliberately is not
 

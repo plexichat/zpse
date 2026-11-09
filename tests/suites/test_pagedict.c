@@ -209,6 +209,85 @@ static void test_index(void)
     CHECK(d.entries == 0u, "a NULL array must be refused");
 }
 
+/* ---- set associativity -------------------------------------------------- */
+
+static uint8_t victim[NENT];
+
+/* Three tags that land on one direct-mapped slot (their low bits are the same
+ * modulo both NENT and NENT/2, which is what makes them share a set either
+ * way): a ways-wide set must hold two of them at once, and a direct mapping
+ * must not hold any two. */
+#define TAG_A 5u
+#define TAG_B ((uint64_t)NENT + 5u)
+#define TAG_C (2u * (uint64_t)NENT + 5u)
+
+static void test_set_assoc(void)
+{
+    ZpsePageDict d;
+    uint32_t s = 0xFFFFFFFFu;
+
+    zpse_pagedict_init(&d, tag_lo, tag_hi, tag_slot, NENT);
+    CHECK(d.ways == 1u, "the plain init must be direct mapped");
+    zpse_pagedict_insert(&d, TAG_A, 1u, 1u);
+    zpse_pagedict_insert(&d, TAG_B, 2u, 2u);
+    CHECK(zpse_pagedict_find(&d, TAG_A, 1u, &s) == 0,
+          "direct mapping cannot hold both tags of one slot");
+
+    zpse_pagedict_init_set(&d, tag_lo, tag_hi, tag_slot, victim, NENT, 2u);
+    CHECK(d.entries == NENT && d.ways == 2u, "2-way must be accepted");
+    zpse_pagedict_insert(&d, TAG_A, 1u, 1u);
+    zpse_pagedict_insert(&d, TAG_B, 2u, 2u);
+    CHECK(zpse_pagedict_find(&d, TAG_A, 1u, &s) == 1 && s == 1u,
+          "2-way must keep the first tag of a set");
+    CHECK(zpse_pagedict_find(&d, TAG_B, 2u, &s) == 1 && s == 2u,
+          "2-way must keep the second tag of a set");
+
+    /* Both ways are full: the third tag takes the oldest, in FIFO order. */
+    zpse_pagedict_insert(&d, TAG_C, 3u, 3u);
+    CHECK(zpse_pagedict_find(&d, TAG_A, 1u, &s) == 0,
+          "the oldest tag of a full set must be evicted");
+    CHECK(zpse_pagedict_find(&d, TAG_B, 2u, &s) == 1 && s == 2u,
+          "the newer tag must survive");
+    CHECK(zpse_pagedict_find(&d, TAG_C, 3u, &s) == 1 && s == 3u,
+          "the evicting tag must be found");
+
+    /* Re-inserting a tag that is present updates its slot instead of spending
+     * a way, so the other way's tag stays. */
+    zpse_pagedict_insert(&d, TAG_B, 2u, 77u);
+    CHECK(zpse_pagedict_find(&d, TAG_B, 2u, &s) == 1 && s == 77u,
+          "re-insertion must update the slot");
+    CHECK(zpse_pagedict_find(&d, TAG_C, 3u, &s) == 1 && s == 3u,
+          "re-insertion must not evict");
+
+    /* Sizes and shapes that cannot be built report themselves empty. */
+    zpse_pagedict_init_set(&d, tag_lo, tag_hi, tag_slot, 0, NENT, 2u);
+    CHECK(d.entries == 0u, "2-way without a victim cursor must be refused");
+    zpse_pagedict_init_set(&d, tag_lo, tag_hi, tag_slot, victim, NENT, 3u);
+    CHECK(d.entries == 0u, "three ways is not a power of two");
+    zpse_pagedict_init_set(&d, tag_lo, tag_hi, tag_slot, victim, 16u, 8u);
+    CHECK(d.entries == 0u, "a set of two slots is too small");
+    zpse_pagedict_init_set(&d, tag_lo, tag_hi, tag_slot, victim, NENT, 4u);
+    CHECK(d.entries == NENT && d.ways == 4u, "4-way must be accepted");
+    {
+        /* Four tags on one set: all four are found, the fifth evicts the
+         * first in insertion order. */
+        uint32_t k;
+
+        for (k = 0; k < 4u; k++) {
+            zpse_pagedict_insert(&d, TAG_A + (uint64_t)k * NENT, 10u + k, k);
+        }
+        for (k = 0; k < 4u; k++) {
+            CHECK(zpse_pagedict_find(&d, TAG_A + (uint64_t)k * NENT,
+                                     10u + k, &s) == 1 &&
+                      s == k,
+                  "4-way must hold all four tags of a set (way %u)", k);
+        }
+        zpse_pagedict_insert(&d, TAG_A + 4u * (uint64_t)NENT, 20u, 4u);
+        CHECK(zpse_pagedict_find(&d, TAG_A, 10u, &s) == 0,
+              "the fifth tag must evict the first of the set");
+    }
+}
+
 /* ---- the store loop ----------------------------------------------------- */
 
 static void test_store(void)
@@ -414,6 +493,7 @@ int main(void)
 {
     test_hash();
     test_index();
+    test_set_assoc();
     test_store();
     test_retag_edges();
     printf("PAGEDICT: checks=%d fails=%d %s\n", checks, fails,
