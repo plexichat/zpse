@@ -1339,6 +1339,34 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_PROBE_SHORT_TILES 8u
 #endif
 
+#ifndef ZPSE_PROBE_PAGE_TILES
+/* The window an every-plane level prices a page on: 0 prices the whole page.
+ *
+ * The whole page is the shipped arm (see ZPSE_PROBE_SHORT_TILES): it ranks the
+ * candidates on all 4 KiB and it also convicts more of them, which is why the
+ * price count fell when it went in. This knob exists to measure the points
+ * between the cheap rungs' eight tiles and the whole page, since the curve is
+ * not monotone on both axes -- eight tiles is worse on bytes than sixteen at
+ * BALANCED, while the cheap rungs prefer eight.
+ *
+ * Twelve was measured and the curve is monotone in the window at these levels,
+ * which is what makes the whole page the right end of it: at level 6 twelve
+ * tiles writes 41.1552% on the dumps against the whole page's 41.0067%, and
+ * 55.1459 and 54.6719% on the mixed and Silesia corpora against 55.0729 and
+ * 54.6093 -- more bytes on all three with no rate returned (141/124/136 against
+ * 141/128/135 MB/s). 0 stays the shipped arm. */
+#define ZPSE_PROBE_PAGE_TILES 0u
+#endif
+
+/* The tail price samples the block's own window, and shrinking it was measured
+ * and refused: the price is a boolean ("does the back compress?"), so a shorter
+ * sample looked like free staging, but it is not where a page's time goes. Eight
+ * tiles writes 41.0070% against 41.0067% on the dumps, 55.0723 against 55.0729 on
+ * the mixed workload and 54.6089 against 54.6093 on Silesia -- a thousandth of a
+ * point either way, which is the flat detection flipping on a handful of pages --
+ * and the rate does not move (136 against 135 MB/s on the dumps, 125 against 129
+ * on the mixed workload). Four tiles is the same trade with less of both. */
+
 /* Ordering the field behind the identity by a coarse price was measured and
  * refused, because it does not buy what it looks like it should. The price
  * counter reads the same either way -- 94,637 candidates for the dumps' 13,802
@@ -1457,6 +1485,12 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * field and not good enough to be free: keeping the runner-up costs a whole
  * page encode and recovers half of what the cut cost. Short of 8 KiB only --
  * 16 KiB and 64 KiB blocks are byte-identical to the gate's own behaviour.
+ *
+ * 2 was measured across the three page corpora at level 6 and refused: it
+ * writes 40.9956, 55.0468 and 54.5652% against 41.0067, 55.0729 and 54.6093 --
+ * 0.011, 0.026 and 0.044 points -- for 5, 2 and 2% of encode rate. The runner-up
+ * is a real byte at a page, but it is not worth a twentieth of the rate, so a
+ * page keeps the winner alone.
  *
  * 0 keeps the full-size gate as the only cut. */
 #ifndef ZPSE_TIE_SHORT_KEEP
@@ -3498,7 +3532,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * on 64 KiB blocks at BALANCED the same cut costs 0.35% of packed bytes
  * (80,583,972 -> 80,868,755 over the dump corpus) and 5% of rate, because a
  * big block's body is where the sweep's trials earn what they cost. So the
- * cut is gated to n <= ZPSE_BLOCK_SHORT_MAX, which is the size a page is. */
+ * cut is gated to n <= ZPSE_BLOCK_SHORT_MAX, which is the size a page is.
+ *
+ * Pricing more of a flat page's field was measured at 2 and 3 and changes
+ * nothing: the dumps are byte-identical (0.0002 points), the mixed workload is
+ * 0.006 points larger at 2, and Silesia 0.034 larger, with no rate difference.
+ * A page whose head and tail both price at raw is written by the identity or
+ * goes out raw; the candidates behind it are not what that decision is waiting
+ * on, which is the same finding as the cap's. */
 #ifndef ZPSE_FLAT_PRICE
 #define ZPSE_FLAT_PRICE 1
 #endif
@@ -3580,6 +3621,17 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             pn > (uint32_t)ZPSE_PROBE_SHORT_TILES *
                      (uint32_t)ZPSE_TILE_SIZE) {
             pn = (uint32_t)ZPSE_PROBE_SHORT_TILES *
+                 (uint32_t)ZPSE_TILE_SIZE;
+        }
+#endif
+#if ZPSE_PROBE_PAGE_TILES > 0
+        /* The same sample on an every-plane level, where the shipped arm is
+         * the whole page (see ZPSE_PROBE_PAGE_TILES). */
+        if (zpse_enc_speed(speed) >= ZPSE_ENC_SPEED_EVERY_PLANE_MIN &&
+            n < (uint32_t)ZPSE_PROBE_WINDOW &&
+            pn > (uint32_t)ZPSE_PROBE_PAGE_TILES *
+                     (uint32_t)ZPSE_TILE_SIZE) {
+            pn = (uint32_t)ZPSE_PROBE_PAGE_TILES *
                  (uint32_t)ZPSE_TILE_SIZE;
         }
 #endif
