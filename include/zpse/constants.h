@@ -279,7 +279,11 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
  * last. On the dump corpus that is 1.1% of packed bytes for a fifth of the
  * encode rate; the mixed and Silesia corpora pay 0.008 and 0.064% for 13 and
  * 12%. Only a page: a 64 KiB block's body is where the candidates behind the
- * seventh earn their price. And only a level that prices every plane (5-9): a
+ * seventh earn their price. With the whole-page price (see
+ * ZPSE_PROBE_SHORT_TILES) even that cost is gone -- the cap writes the same
+ * bytes with and without it on all three corpora, rate inside the host's band
+ * -- so it is kept for the pages the price cannot settle, not for a measured
+ * saving here. And only a level that prices every plane (5-9): a
  * cheap rung acts on the price alone, and the same two shapes are worth 2.5
  * points of ratio there (1.0-1.1% for BALANCED). */
 #define ZPSE_PAGE_CAND_CAP 7u

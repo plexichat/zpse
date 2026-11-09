@@ -96,13 +96,13 @@ smaller than it went in, one pinned core, best of five:
 
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.19% | 58.61% | 213 / 442 / 255 MB/s |
-| 6 (default) | 17.68% | 6.31% | 62.71% | **41.06%** | 130 / 166 / 136 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 17.65% | 6.31% | 62.04% | 40.68% | 116 / 167 / 123 MB/s |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.19% | 58.61% | 220 / 470 / 261 MB/s |
+| 6 (default) | 17.68% | 6.31% | 62.61% | **41.01%** | 128 / 159 / 136 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 17.65% | 6.31% | 62.02% | 40.67% | 116 / 158 / 125 MB/s |
 
-The default level's page costs about 138 MB/s of encode for 41.06%, and
-decodes at 1.9 to 5.7 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands). The deepest level buys 0.38 points of ratio for about 9% of the rate, because on a page the tier's extra margin and decode bill reach
+The default level's page costs about 137 MB/s of encode for 41.01%, and
+decodes at 2.0 to 5.8 GB/s (the C heap is all pointers, which the fast LZ form
+codes as commands). The deepest level buys 0.34 points of ratio for about 7% of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 83% of the dump
@@ -197,9 +197,9 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | plain L2 | plain BALANCED | `PAGE_FAST` L1 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| dumps | 58.61% at 253 MB/s | 57.32% at 195 MB/s | 41.38% at 126 MB/s | 66.09% at 879 MB/s | 65.96% at 877 MB/s |
-| mixed | 78.45% at 279 MB/s | 77.37% at 230 MB/s | 56.52% at 116 MB/s | 81.06% at 743 MB/s | 80.54% at 738 MB/s |
-| Silesia | 80.08% at 273 MB/s | 77.54% at 221 MB/s | 56.14% at 131 MB/s | 82.85% at 563 MB/s | 80.24% at 575 MB/s |
+| dumps | 58.61% at 268 MB/s | 57.32% at 208 MB/s | 41.32% at 138 MB/s | 66.09% at 982 MB/s | 65.96% at 954 MB/s |
+| mixed | 78.45% at 300 MB/s | 77.37% at 261 MB/s | 56.47% at 127 MB/s | 81.06% at 843 MB/s | 80.54% at 853 MB/s |
+| Silesia | 80.08% at 275 MB/s | 77.54% at 238 MB/s | 56.07% at 141 MB/s | 82.85% at 608 MB/s | 80.24% at 624 MB/s |
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
@@ -227,10 +227,32 @@ per page. `ZPSE_PAGE_CAND_CAP` stops the sweep at seven and drops the
 candidates it left unpriced -- not the ones it could not price, which it still
 never drops -- and the count falls to 6.9. What the cap costs is the shape the
 eighth and ninth candidates would have won with, and where the level prices
-every plane that is a shape the trial was rejecting anyway: the dumps pay
+every plane that is a shape the trial was rejecting anyway: the dumps paid
 1.13% of packed bytes for a fifth of the rate back (40.92% to 41.38%, 112.0 to
-136.2 MB/s at five paired passes), the mixed workload pays 0.008% (104.2 to
-118.0) and Silesia 0.064% (119.6 to 134.0).
+136.2 MB/s at five paired passes), the mixed workload 0.008% (104.2 to 118.0)
+and Silesia 0.064% (119.6 to 134.0). With the whole-page price below in place
+it costs nothing measurable at all: the cap writes the same 88,111,603 /
+90,350,032 / 118,838,028 bytes with and without it on the three corpora, and
+the rate difference is inside this host's band (dumps 141.5 against 137.8 MB/s
+mean, mixed 130.5 against 130.3, Silesia 140.2 against 139.8). It stays for the
+pages where the price still cannot settle the field, not for a saving measured
+here.
+
+Which bytes a candidate is priced on is a separate trade, and it is not the
+same trade on every rung. A cheap rung acts on the price alone -- one or two
+trials and no more -- so a page there is priced on its first 2 KiB, which is
+what `ZPSE_PROBE_SHORT_TILES` samples. Where every plane is priced the page is
+priced whole: the price is then exact for the page rather than for half of it,
+and the trials behind it repair what the extra 2 KiB costs. On 4 KiB pages that
+writes 0.16, 0.09 and 0.12% fewer bytes on the dumps, the mixed workload and
+Silesia (41.38% to 41.32% on the dumps) and encodes the mixed workload 2.8%
+faster, the other two inside this host's band; at levels 1 and 2 the same
+change costs 7.5 and 3.4% of encode on the dumps and grows the mixed workload
+by 0.18 and 0.21%, which is why the gate is the every-plane one. Pricing a page
+whole also needed one rule in the near-tie prune: the identity is never cut
+from the field, because the wider price can put a transpose eight bytes ahead
+of it on a 4-bit-random page, and a cut that trusted that wrote 21 bytes more
+than the half-page price did (the size suite's case 579).
 
 A cheap rung cannot pay that price, and capping one was a mistake worth
 recording. Levels 1 to 4 act on the price alone -- one, two or three trials

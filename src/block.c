@@ -1297,26 +1297,35 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * check -- keeps reading a price of `pn` bytes, which is what they are
  * written against.
  *
- * Eight, not four, and the four is the measurement. On 4 KiB pages the dump
- * total at level 1 goes 126.5 -> 144.7 MB/s at eight tiles and 114.0 -> 148.0
- * on the shared-library dump alone (best of five rounds, one pinned core,
- * with a build that changes nothing -- sixteen tiles -- reporting the same
- * bytes 122-131 MB/s, so the host's band is about 7%). Four tiles roughly
- * doubles the win and is not affordable: it prices a width-16 candidate's
- * planes at 64 bytes each, which is where the ranking breaks, and the dump
- * total grows 2.21 points (59.50 -> 61.71%) against eight's 0.32 (59.82).
- * The cost at eight is 0.48 points on the shared-library dump alone and 0.06
- * at level 6, where the trials behind the price repair it; Silesia's pages
- * move the other way (83.96 -> 83.91% at level 1).
+ * Eight tiles on a CHEAP RUNG, the whole block where every plane is priced,
+ * and both halves are the measurement. On the cheap rungs the price IS the
+ * decision -- one or two trials, no more -- so a wider price is neither free
+ * nor safe: against eight tiles, the whole page costs levels 1 and 2 7.5 and
+ * 3.4% of encode on the dumps and GROWS the mixed workload by 0.18 and 0.21%
+ * of bytes. At BALANCED, where every plane is priced and the trials behind the
+ * price can repair a coarser list, the same change wins on bytes and is
+ * neutral to better on rate: three paired passes read the dumps at 88,111,603
+ * against 88,253,809 bytes (41.32 against 41.38%) with the rate inside this
+ * host's band, the mixed workload 0.09% smaller and 2.8% faster, and Silesia
+ * 0.12% smaller at the same rate.
  *
- * Four, five and six were tried at the CHEAP rungs too, on the argument that
- * levels 2-4 have trials left to repair a coarser list: four is +1.24, +1.04
- * and +0.66 points of ratio at levels 2, 3 and 4 for 17.7, 15.1 and 10.0% of
- * encode, and five and six buy 0.13-0.60 points for +2.7, -1.4 and -4% --
- * inside this host's band. Four also costs the deep rungs speed (81.9 against
- * 83.2 MB/s at level 6 on 4 KiB pages), because the price of a page is not
- * what level 6 spends its time on. So the sample is eight at every level and
- * the coarse-list idea is refused here rather than on the shelf.
+ * The whole block is the natural end of the knob: `pn` is a prefix of the
+ * block, so a page's price is then taken on the page itself and a larger
+ * value changes nothing there. What it buys is a ranking on the whole of the
+ * block -- eight tiles rank the candidates on what the first half of the page
+ * says, and on these corpora the second half sometimes disagrees -- at the
+ * cost of one price over at most 2 KiB more per candidate.
+ *
+ * It needs one thing to be honest at a page, and that is the identity rule in
+ * the near-tie cut: on a 4-bit-random page the whole-page price puts a
+ * transpose eight bytes ahead of the identity, and a cut that trusted it wrote
+ * 21 bytes more than the half-page price did (the size gate's case 579). The
+ * identity is never cut, so the price still orders the field and the trial
+ * still decides.
+ *
+ * Four tiles loses on both axes (0.08% more bytes than eight on the dumps,
+ * 121.5 against 125.8 MB/s on the mixed workload): it prices a width-16
+ * candidate's planes at 64 bytes each, which is where the ranking breaks.
  *
  * 0 restores the whole block. */
 #ifndef ZPSE_PROBE_SHORT_TILES
@@ -3519,11 +3528,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                           ? n
                           : (uint32_t)ZPSE_PROBE_WINDOW;
 #if ZPSE_PROBE_SHORT_TILES > 0
-        /* A block shorter than the window is priced on a sample of itself
-         * (see ZPSE_PROBE_SHORT_TILES). Only a short block: a 64 KiB block's
+        /* A short block on a CHEAP RUNG is priced on a sample of itself (see
+         * ZPSE_PROBE_SHORT_TILES). Only a short block: a 64 KiB block's
          * window is already a fraction of the block, and shrinking it is the
-         * separate trade ZPSE_PROBE_WINDOW records. */
-        if (n < (uint32_t)ZPSE_PROBE_WINDOW &&
+         * separate trade ZPSE_PROBE_WINDOW records. Where every plane is
+         * priced the block's own window is kept: it is the exact price of a
+         * page, it ranks the candidates on the whole of one, and the trials
+         * behind the price repair what the extra 2 KiB costs. */
+        if (zpse_enc_speed(speed) < ZPSE_ENC_SPEED_EVERY_PLANE_MIN &&
+            n < (uint32_t)ZPSE_PROBE_WINDOW &&
             pn > (uint32_t)ZPSE_PROBE_SHORT_TILES *
                      (uint32_t)ZPSE_TILE_SIZE) {
             pn = (uint32_t)ZPSE_PROBE_SHORT_TILES *
@@ -3997,7 +4010,54 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                         !content_kept && third != UINT32_MAX &&
                         (row->tie_field != 0u ||
                          third - best <= best >> ZPSE_TIE_BAND_SHIFT)) {
-                        ncand = (int)keep;
+                        /* ...but not the identity, whatever the price says.
+                         * Its stream carries the smallest envelope any shape
+                         * has and its trial is the cheapest the sweep can run
+                         * (no staging), so a field it survives the margin in
+                         * is a field whose cut is being decided by bytes the
+                         * price cannot resolve: on a 4-bit-random page the
+                         * whole-page price puts a transpose eight bytes ahead
+                         * of it, and cutting the identity there grew the size
+                         * gate's case 579 by 21 bytes. The survivor is moved
+                         * into the slot the cut would have filled, so the
+                         * field stays ordered by price. */
+                        int ji = -1;
+                        int a;
+
+                        for (a = (int)keep; a < ncand; a++) {
+                            if (idx[a] == 0u) {
+                                ji = a;
+                                break;
+                            }
+                        }
+                        if (ji < 0) {
+                            ncand = (int)keep;
+                        } else {
+                            uint8_t  tt = tids[keep], ts = scounts[keep];
+                            uint8_t  ti = idx[keep];
+                            uint16_t tl = meta_lens[keep];
+                            uint32_t tx = ex[keep];
+                            uint8_t  tb[ZPSE_MAX_CAND_META];
+                            unsigned m;
+
+                            for (m = 0; m < ZPSE_MAX_CAND_META; m++)
+                                tb[m] = meta_bufs[keep][m];
+                            tids[keep] = tids[ji];
+                            scounts[keep] = scounts[ji];
+                            idx[keep] = idx[ji];
+                            meta_lens[keep] = meta_lens[ji];
+                            ex[keep] = ex[ji];
+                            for (m = 0; m < ZPSE_MAX_CAND_META; m++)
+                                meta_bufs[keep][m] = meta_bufs[ji][m];
+                            tids[ji] = tt;
+                            scounts[ji] = ts;
+                            idx[ji] = ti;
+                            meta_lens[ji] = tl;
+                            ex[ji] = tx;
+                            for (m = 0; m < ZPSE_MAX_CAND_META; m++)
+                                meta_bufs[ji][m] = tb[m];
+                            ncand = (int)keep + 1;
+                        }
                     }
                 }
             }
