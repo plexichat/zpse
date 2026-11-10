@@ -1164,6 +1164,23 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
  * ------------------------------------------------------------------ */
 #define ZPSE_ORDER_SAMPLES 6
 #define ZPSE_ORDER_MIN_TILES 16u
+/* Does the attempt-order sample run on a PAGE?
+ *
+ * A page is sixteen tiles -- exactly the size the sample's own gate admits --
+ * and its sweep attempts 1.11 trials, so what the estimate buys there is the
+ * order of one or two attempts the price has already ranked. On a 64 KiB block
+ * the same estimate orders up to ten attempts and several of them run, which is
+ * the case it was built for.
+ *
+ * Measured at 4 KiB level 6 over four interleaved rounds on one pinned core:
+ * the dumps read 166.5 against 162.5 MB/s by mean and Silesia 161.7 against
+ * 160.2, and BOTH corpora are byte-identical (145 419 823 and 116 259 698
+ * either way) -- the price has already ranked the field, so the estimate only
+ * re-orders attempts that end up running once. 0 runs it everywhere, as it
+ * always has. */
+#ifndef ZPSE_ORDER_PAGE
+#define ZPSE_ORDER_PAGE 1
+#endif
 
 static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 {
@@ -1184,6 +1201,11 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
     if (tc < ZPSE_ORDER_MIN_TILES) {
         return 0;
     }
+#if ZPSE_ORDER_PAGE
+    if (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+        return 0;
+    }
+#endif
     ns = (tc >= 8u * ZPSE_ORDER_MIN_TILES) ? (unsigned)ZPSE_ORDER_SAMPLES : 3u;
 
     for (i = 0; i < ns; i++) {

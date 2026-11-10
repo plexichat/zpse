@@ -96,13 +96,14 @@ smaller than it went in, one pinned core, best of five:
 
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.77% | 10.36% | 83.19% | 58.61% | 220 / 470 / 261 MB/s |
-| 6 (default) | 17.68% | 6.31% | 62.61% | **41.01%** | 128 / 159 / 136 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 17.65% | 6.31% | 62.02% | 40.67% | 116 / 158 / 125 MB/s |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.62% | 10.36% | 83.19% | 58.57% | 164 / 348 / 193 MB/s |
+| 6 (default) | 19.72% | 6.32% | 62.61% | **41.54%** | 140 / 186 / 140 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 19.69% | 6.32% | 62.17% | 41.29% | 112 / 148 / 115 MB/s |
 
-The default level's page costs about 137 MB/s of encode for 41.01%, and
-decodes at 2.0 to 5.8 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands). The deepest level buys 0.34 points of ratio for about 7% of the rate, because on a page the tier's extra margin and decode bill reach
+The default level's page costs about 140 MB/s of encode for 41.54%, and
+decodes at 1.8 to 5.0 GB/s (the C heap is all pointers, which the fast LZ form
+codes as commands). The deepest level buys a quarter of a point of ratio for
+16% of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 83% of the dump
@@ -112,14 +113,14 @@ Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.08% | 54.61% | 53.18% |
-| encode | 288 MB/s | 139 MB/s | 120 MB/s |
-| decode | 3.7 GB/s | 1.9 GB/s | 1.9 GB/s |
+| ratio | 80.25% | 54.86% | 53.28% |
+| encode | 244 MB/s | 150 MB/s | 122 MB/s |
+| decode | 2.8 GB/s | 1.9 GB/s | 1.7 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-120 MB/s, against 54.61% at 139 and 41.01% at 137. What zpse keeps is decode --
+120 MB/s, against 54.86% at 150 and 41.54% at 140. What zpse keeps is decode --
 1.5 to 4.2 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
@@ -292,12 +293,14 @@ decode improves with it (3.4 GB/s on the dumps) because a page written as one
 identity segment is one plane the decoder walks straight through.
 
 Where a page's cycles go depends on the corpus. At level 6 the dumps are almost
-all sweep: 48.5% pricing and 46.2% in trials, with the attempt-order sample at
-3.7% and the ASCII gate at 1.0%, because those pages are records and heap
-objects the tile path has to choose a shape for. Silesia is the other end: 37%
+all sweep: 50.9% pricing and 49.1% in trials, with the ASCII gate at 0.3 to
+0.8% and the attempt-order sample at 0.2%, because those pages are records and
+heap objects the tile path has to choose a shape for -- and a page no longer
+runs the order sample at all. Silesia is the other end: 37%
 of its pages are English and take the gate, and its encode is spread across four
-stages -- pricing 27.6%, trials 27.4%, the match-finder pass 26.3% and the gate
-itself 16.6%, with the sample at 2.1%. The trial stage is not a queue of
+stages -- pricing 27 to 44%, trials 30 to 50%, the match-finder pass 5 to 33%
+and the gate itself 6 to 14% (one binary page set pays 47%), with the sample at
+0.1%. The trial stage is not a queue of
 candidates to trim either: a page runs 0.77 full encodes' worth of trials on
 Silesia and 1.39 on the dumps, because the price has already dropped theunner-ups, so what those cycles buy is the winner's own bytes and there is no
 second candidate's priced planes to share with it. That is why the page trades in this
@@ -326,15 +329,12 @@ screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
 
 The candidate field a page prices is the other knob, and it is dearer per
-point of ratio than either sample: at level 6 a page prices at most seven
-candidates, six writes 1.28 more points over the dumps for 5 to 10% of the
-rate, five is the same bytes as six at 7.8% more by mean, four costs 1.46
-points for 17%, and three is the same bytes as four and the fastest of them.
-All of those are over the one-point line these page trades used to be held to,
-and six is the arm the line was moved for: it is the default now, at 1.28
-points over the dumps and 0.154 over Silesia for 5 to 10% of the page
-encoder's rate, which nothing else on the price has offered without costing
-both corpora at once. `ZPSE_PAGE_CAND_CAP` sets it -- a knob the header
+point of ratio than either sample: a page prices at most six candidates now,
+and the seventh it used to price is worth 1.276 points over the dumps and
+0.154 over Silesia for 5 to 10% of the page encoder's rate -- the arm the
+one-point line was moved for. Below six the field is nearly free to cut (the
+sixth is worth 0.003 of a point) and then expensive again (the fifth, 0.18 for
+another 9%), so six is where the ratio the sweep still earns meets the rate. `ZPSE_PAGE_CAND_CAP` sets it -- a knob the header
 documents and, until this round, a plain `#define` that quietly ignored every
 `-D` aimed at it -- and seven is still buildable for a caller whose bytes
 matter more.
@@ -346,7 +346,11 @@ page runs two trials instead of three: 7.9% over the dumps and 6.6% over
 Silesia for 210 bytes on Silesia and a byte-identical dumps corpus. Together
 at level 6 the page encoder reads 143.8 against 127.3 MB/s over the dumps and
 142.2 against 134.5 on Silesia -- 13.0% and 5.7% -- for 1.275 and 0.158 ratio
-points, and the 768-case size suite still reports no case grew. Its neighbours on the price were measured and refused
+points, and the 768-case size suite still reports no case grew. Removing the
+attempt-order sample from a page, where it cannot change a byte because the
+price has already ranked the field and one attempt runs, is a further 162.5 to
+166.5 MB/s by mean on the dumps and 160.2 to 161.7 on Silesia, with output
+identical to the byte on both corpora. Its neighbours on the price were measured and refused
 too: a third gate window in the middle of the page (0.023 points for 4.4% of
 the rate), a 768-byte gate sample (slower on both corpora, 110.7 against 117.3
 MB/s on the dumps and 109.6 against 117.6 on Silesia, and 228 bytes larger on
