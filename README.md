@@ -1113,9 +1113,11 @@ On high-cardinality text it is the difference between falling back to raw and
 compressing at all -- the case the tile model cannot see, because nothing in
 it repeats four bytes apart, only further back.
 
-A block is written in one of five forms, and the block flags say which: the
+A block is written in one of six forms, and the block flags say which: the
 tile form above (every form flag clear), a verbatim copy (`ZPSE_B_RAW`),
-intra-block LZ (`ZPSE_B_LZ`), **LZ over the tile body** (`ZPSE_B_LZ_TILE`), or
+intra-block LZ (`ZPSE_B_LZ`), **LZ over the tile body** (`ZPSE_B_LZ_TILE`),
+the **hexadecimal LZ form** (both LZ bits set -- an experiment no level writes,
+see below), or
 the **fast LZ form** (`ZPSE_B_LZ2`) -- the same literal-and-command shape with
 a fixed 16-bit distance, a four-entry repeat distance coded in one byte, no
 lookahead and no distance varint, which is what lz4 writes and why its decoder
@@ -1200,6 +1202,43 @@ caller's page faults:
 | level 9 `ZPSE_ENC_SPEED_MAX` | 2.25:1 | 0.23 GB/s | 1.70 GB/s | 94,248,419 |
 | level 6 (default) | 2.08:1 | 0.36 GB/s | 1.72 GB/s | 101,858,449 |
 | level 6 + `ZPSE_ENC_LZ_FAST` | 2.19:1 | 0.41 GB/s | 2.30 GB/s | 96,661,814 |
+
+A third command encoding, the **hexadecimal form** (`ZPSE_ENC_LZ_HEX`, bit 7 of
+`enc_flags`), ships off: no level writes it and no default path changed. It is
+the fast form's finder and screen with a different token -- a command's
+(literal run, match length) pair becomes one 4-bit code from a fifteen-entry
+table taken from the fast form's own command stream over these corpora. The
+table is measured, not guessed: the sixteen most frequent pairs cover 50.09%
+of 24,234,323 commands of the dumps and nine Silesia files, and fifteen is the
+book because code 15 escapes to the fast form's byte token. Two commands then
+share a byte, and a pair of table hits costs half a byte less than either
+existing form. Measured as a straight swap for the fast form's encoding, on the
+same finder pass, one pinned core, warmed buffers (packed bytes are exact):
+
+| block | form | packed | encode | decode |
+| --- | --- | ---: | ---: | ---: |
+| 4 KiB, dumps | fast | 90,691,356 | 464 MB/s | 2676 MB/s |
+| 4 KiB, dumps | hex | 91,552,548 | 310 MB/s | 1579 MB/s |
+| 4 KiB, Silesia | fast | 120,248,161 | 338 MB/s | 2250 MB/s |
+| 4 KiB, Silesia | hex | 122,120,236 | 239 MB/s | 1161 MB/s |
+| 64 KiB, dumps | fast | 75,301,175 | 674 MB/s | 2928 MB/s |
+| 64 KiB, dumps | hex | 75,850,156 | 432 MB/s | 1686 MB/s |
+| 64 KiB, Silesia | fast | 96,661,430 | 391 MB/s | 2299 MB/s |
+| 64 KiB, Silesia | hex | 96,194,530 | 254 MB/s | 1054 MB/s |
+
+It is smaller only on 64 KiB prose, by 0.48%, and larger everywhere else by
+0.73 to 1.56%. Offered as a candidate at level 6, where it is kept only when it
+is strictly smaller, the swap moves the dumps 4 KiB total by -49,828 bytes and
+Silesia by +749,044; at 64 KiB it moves Silesia by -361,327 and the dumps by
++4,527 -- +342,416 bytes net over the four cells, for a quarter less encode and
+decode. Half the commands miss the table, and a miss costs the nibble it sat in
+and then the whole byte token, which is exactly what a hit saved; that is the
+part of the design the numbers settle and no estimate could. So the form is an
+option with its own suite (`tests/suites/test_lzh.c`: the codec round-trips
+every shape from 5 bytes to 64 KiB, every truncation of a payload is refused,
+every single-byte corruption either decodes completely or is refused, and a
+block the option writes names the form in its flags) rather than a rung of the
+ladder.
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default

@@ -6,6 +6,7 @@
 #include "zpse/crc32c.h"
 #include "zpse/dense.h"
 #include "zpse/lz.h"
+#include "zpse/lzh.h"
 #include "zpse/predictor.h"
 #include "zpse/segment.h"
 #include "zpse/status.h"
@@ -420,6 +421,37 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             }
         } else {
             memcpy(output, in + hdr, n);
+        }
+        if (out_len_out != 0) {
+            *out_len_out = n;
+        }
+        return (int)n;
+    }
+
+    /* The hexadecimal form: both LZ class bits set, which is the form id the
+     * two forms after this one never write (each refuses the other's bit). It
+     * has their envelope -- transform 0, one segment, no metadata -- and its
+     * own payload codec, so it is dispatched before them. See
+     * include/zpse/lzh.h. */
+    if ((h.block_flags & (uint8_t)ZPSE_B_LZ_HEX) ==
+        (uint8_t)ZPSE_B_LZ_HEX) {
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
+            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
+            return PSE_BAD_HEADER;
+        }
+        if (c <= hdr) {
+            return PSE_BAD_BLOCK_SIZE;
+        }
+        rc = zpse_lzh_decode(in + hdr, c - hdr, output, n);
+        if (rc != PSE_OK) {
+            return rc;
+        }
+        if ((h.block_flags & ZPSE_B_CRC) != 0) {
+            uint32_t calc = zpse_crc32c(output, n);
+
+            if (calc != h.decoded_crc32c) {
+                return PSE_BAD_PAYLOAD_CRC;
+            }
         }
         if (out_len_out != 0) {
             *out_len_out = n;
@@ -2836,9 +2868,19 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             tab = e->cand;
             hb = 15u;
         }
-        payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                                  cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
-                                  hb);
+        /* ZPSE_ENC_LZ_HEX writes the hexadecimal form wherever the fast one
+         * would go: same finder, same table choice, same screen, different
+         * command encoding (src/lzh.c). The two are otherwise the same trade,
+         * which is what makes the option a paired A/B of the encoding alone. */
+        if ((e->enc_flags & ZPSE_ENC_LZ_HEX) != 0u) {
+            payload = zpse_lzh_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                                      cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE,
+                                      tab, hb);
+        } else {
+            payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                                      cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE,
+                                      tab, hb);
+        }
     }
     if (payload == 0u) {
         return PSE_OUTPUT_OVERFLOW;
@@ -2847,7 +2889,10 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
     }
     total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
-    flags = (uint8_t)(ZPSE_B_LZ2 | ZPSE_B_RESET |
+    flags = (uint8_t)(((e->enc_flags & ZPSE_ENC_LZ_HEX) != 0u
+                           ? (uint8_t)ZPSE_B_LZ_HEX
+                           : (uint8_t)ZPSE_B_LZ2) |
+                      ZPSE_B_RESET |
                       (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
                            ? ZPSE_B_CRC : 0u));
     if (is_last) {

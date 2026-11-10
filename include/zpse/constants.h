@@ -116,6 +116,20 @@
  * its size shows. Bit 7 was the reserved mask and is now the last form, so
  * the mask is empty rather than wrong. */
 #define ZPSE_B_LZ2              (UINT8_C(1) << 7)
+/* The two LZ bits are one two-bit form id, not two independent flags: 1 (bit 5
+ * alone) is the token form, 2 (bit 7 alone) the fast form, and 3 -- both bits,
+ * a combination neither of the first two ever writes -- is the hexadecimal
+ * form (src/lzh.c). It is spelled this way because the flags byte has no bit
+ * left: the reserved mask is empty, so the third codec had to be named with
+ * the space the first two already had rather than by widening the header. A
+ * block whose bits say 3 is an LZH block and nothing else.
+ *
+ * The hex form codes a command's two fields as one 4-bit code from a table of
+ * the sixteen (literal run, match length) pairs the corpus asks for most, so
+ * two commands share a byte; a pair outside the table costs a byte token after
+ * a 15 nibble. It exists as a measured experiment (see the README's LZ section
+ * for the numbers), not as a replacement for either form. */
+#define ZPSE_B_LZ_HEX           (UINT8_C(ZPSE_B_LZ) | UINT8_C(ZPSE_B_LZ2))
 #define ZPSE_B_RESERVED_MASK    (UINT8_C(0x00))
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
@@ -149,6 +163,14 @@
  * Python heap's page bytes at level 1). A caller who wants the rate and can
  * afford the ratio asks for this; every existing level is unchanged. */
 #define ZPSE_ENC_PAGE_FAST      (UINT32_C(1) << 6)
+
+/* Write the hexadecimal LZ form wherever this encoder would write the fast
+ * form: the same finder and the same screen, a different command encoding
+ * (src/lzh.c). It exists so the two command encodings can be measured against
+ * each other on the same parse -- the paired A/B in the README's LZ section
+ * uses it -- and a decoder needs to know nothing about the option, since the
+ * form is named in the block header. */
+#define ZPSE_ENC_LZ_HEX         (UINT32_C(1) << 7)
 
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
