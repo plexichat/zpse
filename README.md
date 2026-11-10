@@ -325,6 +325,22 @@ corner of both trades. Both samples stop at a page: the gate keeps its 2 KiB spa
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
 
+The candidate field a page prices is the other knob, and it is dearer per
+point of ratio than either sample: at level 6 a page prices at most seven
+candidates, six writes 1.28 more points over the dumps for 5 to 10% of the
+rate, five is the same bytes as six at 7.8% more by mean, four costs 1.46
+points for 17%, and three is the same bytes as four and the fastest of them.
+All of those are over the one-point line, so seven stays the default and
+`ZPSE_PAGE_CAND_CAP` -- a knob the header documents and, until this round, a
+plain `#define` that quietly ignored every `-D` aimed at it -- is where a
+caller buys the rate. Its neighbours on the price were measured and refused
+too: a third gate window in the middle of the page (0.023 points for 4.4% of
+the rate), a 768-byte gate sample (slower on both corpora, 110.7 against 117.3
+MB/s on the dumps and 109.6 against 117.6 on Silesia, and 228 bytes larger on
+Silesia), a 3.1% conviction margin (5 421 bytes larger on the dumps, 1 672 on
+Silesia), and three priced planes of sixteen (79 117 bytes smaller on the
+dumps, 9 240 larger on Silesia, slower there).
+
 A heap dump also repeats itself, and the repeats are exact: 17.9% of the dumps'
 4 KiB pages are byte-for-byte copies of a page already seen -- 35 MB of 213 MB,
 and the C heap file on its own is 78% repeats -- and the copies are scattered

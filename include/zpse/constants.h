@@ -285,8 +285,23 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
  * -- so it is kept for the pages the price cannot settle, not for a measured
  * saving here. And only a level that prices every plane (5-9): a
  * cheap rung acts on the price alone, and the same two shapes are worth 2.5
- * points of ratio there (1.0-1.1% for BALANCED). */
+ * points of ratio there (1.0-1.1% for BALANCED).
+ *
+ * It is a knob now, and it was not one before: the value was a plain #define
+ * in this header, so a build passing the macro on the command line silently
+ * kept seven and every arm measured against it ran the same binary. Measured
+ * as one at 4 KiB level 6, four interleaved rounds on one pinned core, seven
+ * against six: six writes 145 420 891 bytes over the dumps against 142 699 989,
+ * i.e. 1.276 ratio points, for 118.8/126.7/122.3/128.3 MB/s against
+ * 118.5/114.9/121.4/118.1, and Silesia pays 0.154 points for 3-5%. Five is the
+ * same bytes as six (145 427 697) and reads 125.6 against 116.5 MB/s by mean
+ * in the same run, four costs 1.459 points for +17%, and three is the
+ * same bytes as four and the fastest of the four (+20%). Every arm below seven
+ * is above the one-point line these page trades are held to, so seven stays the
+ * default and this is where a caller buys the rate instead. */
+#ifndef ZPSE_PAGE_CAND_CAP
 #define ZPSE_PAGE_CAND_CAP 7u
+#endif
 /* Levels that run the match finder at all (5-9). */
 #define ZPSE_ENC_SPEED_LZ_MIN 5u
 /* Levels whose segment prescreen is cut to the three uniform predictors (1

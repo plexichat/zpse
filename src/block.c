@@ -1402,7 +1402,13 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * pages are held to. The 64 KiB blocks were byte-identical under a page gate,
  * so this is the page's own trade. Level 1 barely moves either way (0.0002
  * points, and the mixed workload 0.003 points LARGER at shift 2): the cheap
- * rungs act on the price, not on the field behind it. */
+ * rungs act on the price, not on the field behind it.
+ *
+ * The other direction was measured and refused as well: shift 5, a 3.1%
+ * margin instead of 6.25%, convicts earlier and prices less, and it writes
+ * 5,421 bytes MORE on the dumps and 1,672 more on Silesia at level 6 with no
+ * rate returned. A wider margin saves prices and costs bytes; a narrower one
+ * costs the same bytes without saving them, which is this. */
 #define ZPSE_CONVICT_SHIFT 4
 #endif
 
@@ -1585,6 +1591,13 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * third of the cost), two planes +41% for +0.20, so four is where the trade
  * flattens out at the default level. The cheap rungs price six, for the
  * reason in ZPSE_PLANE_STRIDE_PLANES_FAST below.
+ *
+ * Three planes of a page's sixteen (step 6) was measured as the rung past four
+ * and refused: it writes 79 117 bytes FEWER over the dumps -- the price is not
+ * monotone in the planes it reads, and a coarser stride can even help a heap
+ * page -- but it costs Silesia 9 240 bytes and reads 102.2 against 107.7 MB/s
+ * there, while the dumps read 114.3 against 107.4. A setting that moves the
+ * two corpora in opposite directions on both axes is not a corner.
  *
  * 0 disables it (every plane, everywhere), which is what this encoder did
  * before. */
@@ -2920,6 +2933,14 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * to the byte. The tile size the price ranks with matters more than the span:
  * four 256-byte tiles on the same 1 KiB span reads 120.8 on Silesia, and a
  * 2 KiB span at two 1 KiB tiles 111.2, both slower than this setting.
+ *
+ * A 768-byte span -- the point between this and the 1 KiB it replaced -- was
+ * measured on the same terms and refused, and it is slower: over five
+ * interleaved pairings on one pinned core it reads 110.7 against 117.3 MB/s on
+ * the dumps and 109.6 against 117.6 on Silesia, behind in four of the five
+ * pairings on both corpora, for 350 bytes FEWER over the dumps and 228 more
+ * over Silesia. The span is not free to set to any size: the gate prices whole
+ * tiles, so two 384-byte windows are not two of anything it can name.
  *
  * Only pages take it. Above a page the gate keeps the 2 KiB span and four
  * tiles, so every 16 KiB and 64 KiB block this flag judges is byte-identical
