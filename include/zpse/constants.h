@@ -164,12 +164,14 @@
  * afford the ratio asks for this; every existing level is unchanged. */
 #define ZPSE_ENC_PAGE_FAST      (UINT32_C(1) << 6)
 
-/* Write the hexadecimal LZ form wherever this encoder would write the fast
- * form: the same finder and the same screen, a different command encoding
- * (src/lzh.c). It exists so the two command encodings can be measured against
- * each other on the same parse -- the paired A/B in the README's LZ section
- * uses it -- and a decoder needs to know nothing about the option, since the
- * form is named in the block header. */
+/* Force the hexadecimal LZ form wherever this encoder would write the fast
+ * one: the same finder and the same screen, a different command encoding
+ * (src/lzh.c). From ZPSE_LZH_PAGE_LEVEL up a page takes the hex form without
+ * this bit, because it is the smaller stream there (see zpse_block_try_lz2);
+ * the option is what makes the two encodings measurable against each other at
+ * any block size, and it is how the 64 KiB cells in the README's table were
+ * taken. A decoder needs to know nothing about it: the form is named in the
+ * block header. */
 #define ZPSE_ENC_LZ_HEX         (UINT32_C(1) << 7)
 
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =

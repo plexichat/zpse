@@ -123,6 +123,20 @@ typedef struct LzhWr {
     int have;
 } LzhWr;
 
+/* How many bytes this distance takes, by the code it will be written with.
+ * A repeat is one byte, a distance that fits 240 values is one byte, and the
+ * two wider forms are two and three. The split matters at a page, where the
+ * distances are small: the fast form spends two bytes on every fresh distance
+ * because its first byte has to leave room for the repeat codes, and this
+ * form does not. */
+static uint32_t lzh_dist_len(uint32_t off, uint32_t ridx)
+{
+    if (ridx < 4u || off <= 224u) {
+        return 1u;
+    }
+    return (off <= 4320u) ? 2u : 3u;
+}
+
 /* One command's body: the byte token when the book did not have the pair, its
  * escapes, its literals and its distance. `code` is the nibble this command
  * was given in the pair token -- 15 means the decoder is waiting for the byte
@@ -142,7 +156,7 @@ static int lzh_body(LzhWr *w, const uint8_t *in, const LzhCmd *c,
     }
     if (c->len != 0u) {
         need += (c->len >= 18u ? 1u : 0u);
-        need += (c->ridx < 4u) ? 1u : 2u;
+        need += lzh_dist_len(c->off, c->ridx);
     }
     if (need > w->cap - w->pos) {
         return 0;
@@ -165,11 +179,23 @@ static int lzh_body(LzhWr *w, const uint8_t *in, const LzhCmd *c,
         w->lit_total += c->run;
     }
     if (c->len != 0u) {
+        /* The distance: one byte for a repeat or for 1..224, two for 225..4320,
+         * three above that. See the layout in include/zpse/lzh.h. */
         if (c->ridx < 4u) {
             *t++ = (uint8_t)(LZH_REP_BASE | c->ridx);
+        } else if (c->off <= 224u) {
+            *t++ = (uint8_t)(c->off - 1u);
+        } else if (c->off <= 4320u) {
+            uint32_t v = c->off - 225u;
+
+            *t++ = (uint8_t)(0xE0u | (v >> 8));
+            *t++ = (uint8_t)(v & 0xFFu);
         } else {
-            *t++ = (uint8_t)(c->off & 0xFFu);
-            *t++ = (uint8_t)((c->off >> 8) & 0xFFu);
+            uint32_t v = c->off - 4321u;
+
+            *t++ = 0xF0u;
+            *t++ = (uint8_t)(v & 0xFFu);
+            *t++ = (uint8_t)((v >> 8) & 0xFFu);
         }
     }
     w->pos = (uint32_t)(t - w->dst);
@@ -363,24 +389,9 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         {
             uint32_t run = mpos - anchor;
             uint32_t off = mpos - mcand;
-            uint32_t ridx = lzh_rep_index(rep, off);
             uint32_t rem = len;
             uint32_t lit_off = anchor;
 
-            /* A fresh distance whose low byte is one of the four repeat
-             * codes cannot be written as itself, so the position becomes a
-             * literal and the search resumes one byte on -- the same bounded
-             * loss the fast form takes. */
-            if (ridx == 4u && (off & 0xFFu) >= LZH_REP_BASE) {
-                pos++;
-                misses++;
-                if (pos + ZPSE_LZH_MIN_MATCH > n) {
-                    break;
-                }
-                cur = zpse_load_u32le(in + pos);
-                h = lzh_hash(cur, hash_bits);
-                continue;
-            }
             /* The literal run in front of the match is chunked here as well as
              * in the tail: one command carries at most ZPSE_LZH_MAX_LIT of
              * them, and a longer run is several literal-only commands before
@@ -621,28 +632,36 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             return lzh_bad(__LINE__);
         }
         {
-            uint32_t c0 = (uint32_t)in[pos];
-            uint32_t isrep = (c0 >= (uint32_t)LZH_REP_BASE) ? 1u : 0u;
-            uint32_t ri = c0 & 3u;
-            uint32_t n1, n2, n3, off;
+            uint32_t b0 = (uint32_t)in[pos];
+            uint32_t off;
 
-            if (isrep == 0u) {
+            if (b0 >= (uint32_t)LZH_REP_BASE) {
+                off = rep[b0 & 3u];
+                lzh_rep_move(rep, off, b0 & 3u);
+                pos += 1u;
+            } else if (b0 <= 0xDFu) {
+                off = b0 + 1u;
+                lzh_rep_move(rep, off, 4u);
+                pos += 1u;
+            } else if (b0 <= 0xEFu) {
                 if (in_len - pos < 2u) {
                     return lzh_bad(__LINE__);
                 }
-                off = c0 | ((uint32_t)in[pos + 1u] << 8u);
+                off = 225u + (((b0 & 15u) << 8) | (uint32_t)in[pos + 1u]);
+                lzh_rep_move(rep, off, 4u);
+                pos += 2u;
+            } else if (b0 == 0xF0u) {
+                if (in_len - pos < 3u) {
+                    return lzh_bad(__LINE__);
+                }
+                off = 4321u + ((uint32_t)in[pos + 1u] |
+                               ((uint32_t)in[pos + 2u] << 8u));
+                lzh_rep_move(rep, off, 4u);
+                pos += 3u;
             } else {
-                off = rep[ri];
-            }
-            n1 = isrep != 0u ? ((ri >= 1u) ? rep[0] : rep[1]) : rep[0];
-            n2 = isrep != 0u ? ((ri >= 2u) ? rep[1] : rep[2]) : rep[1];
-            n3 = isrep != 0u ? ((ri == 3u) ? rep[2] : rep[3]) : rep[2];
-            pos += isrep != 0u ? 1u : 2u;
-            if (off != 0u) {
-                rep[0] = off;
-                rep[1] = n1;
-                rep[2] = n2;
-                rep[3] = n3;
+                /* 0xF1..0xFB are reserved: a stream that names one is not
+                 * one this encoder wrote. */
+                return lzh_bad(__LINE__);
             }
             if (off == 0u || off > op || len > n - op) {
                 return lzh_bad(__LINE__);

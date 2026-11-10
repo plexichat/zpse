@@ -3,12 +3,25 @@
 
 /* Intra-block LZ, hexadecimal form (block flags ZPSE_B_LZ | ZPSE_B_LZ2).
  *
- * The third codec in the LZ family, and an experiment with one idea in it:
- * a command's two fields -- the literal run and the match length -- are
- * written as ONE HEX DIGIT when they are one of the sixteen pairs the corpus
- * actually asks for, and two commands then share a byte. The first two forms
- * spend a whole byte on every command's token (0xLR, one hex digit a field),
- * so the eighth of a byte this saves is the only reason the form exists.
+ * The third codec in the LZ family. Two commands share a byte because a
+ * command's two fields -- the literal run and the match length -- are written
+ * as ONE HEX DIGIT when they are one of the fifteen pairs the corpus actually
+ * asks for; the first two forms spend a whole byte on every command's token
+ * (0xLR, one hex digit a field). The nibble book alone is a wash: half the
+ * commands miss it and a miss costs the nibble it sat in plus the byte token,
+ * which is exactly what a hit saved, and measured as a swap for the fast form
+ * it was 0.73 to 1.56% LARGER at 4 KiB and 64 KiB.
+ *
+ * What makes the form pay is the distance code below it. The fast form spends
+ * two bytes on every fresh distance because its first byte has to leave room
+ * for four repeat codes; this form leaves only the top sixteen codes for them,
+ * so a fresh distance of 1..224 is one byte and one of 225..4320 is two. A 4
+ * KiB page's distances are mostly small, and there the form is 2.51% smaller
+ * than the fast one over the dumps and 2.10% over Silesia on the same finder
+ * pass; at 64 KiB the three-byte wide form costs more than the short codes
+ * save (Silesia grows 3.2%), which is why a page is the only block size that
+ * takes it -- from level 7 up, where size is the point (see
+ * ZPSE_LZH_PAGE_LEVEL in src/block.c).
  *
  * The fifteen codes are not guessed: they are the most frequent (literal run,
  * match length) pairs in the fast form's own command stream, measured over
@@ -39,10 +52,13 @@
  *   length escape            one byte, only when the length code is 15:
  *                            match length = 18 + byte
  *   literals                 run bytes, verbatim
- *   distance                 one byte when it repeats one of the four most
- *                            recent distances (0xFC..0xFF, slot in the low
- *                            two bits), else u16 little endian; absent
- *                            entirely when the command has no match
+ *   distance                 one byte 0xFC..0xFF for one of the four most
+ *                            recent distances (slot in the low two bits); one
+ *                            byte 0x00..0xDF for a fresh distance of 1..224;
+ *                            two bytes 0xE0..0xEF + low byte for 225..4320;
+ *                            three bytes 0xF0 + u16 little endian above that.
+ *                            0xF1..0xFB are reserved and refused. Absent
+ *                            entirely when the command has no match.
  *
  * Field codes, shared by the nibble and the byte token:
  *

@@ -98,14 +98,17 @@ smaller than it went in, one pinned core, best of five:
 | --- | ---: | ---: | ---: | ---: | --- |
 | 1 `ZPSE_ENC_SPEED_FASTEST` | 37.79% | 10.29% | 83.22% | 58.62% | 222 / 528 / 287 MB/s |
 | 6 (default) | 19.72% | 6.32% | 62.61% | **41.55%** | 163 / 214 / 160 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 19.69% | 6.32% | 62.17% | 41.29% | 137 / 200 / 142 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 18.33% | 6.31% | 62.05% | 40.86% | 118 / 192 / 134 MB/s |
 
 The default level's page costs about 168 MB/s of encode for 41.55%, and
 decodes at 2.0 to 5.6 GB/s (the C heap is all pointers, which the fast LZ form
-codes as commands). The deepest level buys a quarter of a point of ratio for
-12% of the rate, because on a page the tier's extra margin and decode bill reach
-the blocks the default level leaves to the tiles rather than finding a
-smaller shape for them. The shared-library dump is what holds every level's
+codes as commands). The deepest level pays 22% of that rate for 0.69 of a ratio
+point (41.55 -> 40.86%) on the dumps and 26% for 2.29 points on Silesia
+(54.86 -> 52.57%), and most of that is not the tier's extra margin: from level 7
+up a page's LZ candidate is written in the hexadecimal form, which is 2.5 to
+2.1% smaller than the fast one on the blocks it reaches at this size (see the
+LZ section), at the cost of the slower decoder. The default level's own page
+bytes are unchanged to the byte. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 83% of the dump
 survives there against 63% at the default level and 62% at the deepest.
 
@@ -113,9 +116,9 @@ Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.33% | 54.86% | 53.27% |
-| encode | 329 MB/s | 169 MB/s | 146 MB/s |
-| decode | 3.5 GB/s | 2.0 GB/s | 2.0 GB/s |
+| ratio | 80.33% | 54.86% | 52.57% |
+| encode | 322 MB/s | 168 MB/s | 124 MB/s |
+| decode | 3.5 GB/s | 2.0 GB/s | 1.3 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
@@ -1116,8 +1119,8 @@ it repeats four bytes apart, only further back.
 A block is written in one of six forms, and the block flags say which: the
 tile form above (every form flag clear), a verbatim copy (`ZPSE_B_RAW`),
 intra-block LZ (`ZPSE_B_LZ`), **LZ over the tile body** (`ZPSE_B_LZ_TILE`),
-the **hexadecimal LZ form** (both LZ bits set -- an experiment no level writes,
-see below), or
+the **hexadecimal LZ form** (both LZ bits set -- a page's LZ candidate from
+level 7 up, see below), or
 the **fast LZ form** (`ZPSE_B_LZ2`) -- the same literal-and-command shape with
 a fixed 16-bit distance, a four-entry repeat distance coded in one byte, no
 lookahead and no distance varint, which is what lz4 writes and why its decoder
@@ -1204,41 +1207,43 @@ caller's page faults:
 | level 6 + `ZPSE_ENC_LZ_FAST` | 2.19:1 | 0.41 GB/s | 2.30 GB/s | 96,661,814 |
 
 A third command encoding, the **hexadecimal form** (`ZPSE_ENC_LZ_HEX`, bit 7 of
-`enc_flags`), ships off: no level writes it and no default path changed. It is
-the fast form's finder and screen with a different token -- a command's
-(literal run, match length) pair becomes one 4-bit code from a fifteen-entry
-table taken from the fast form's own command stream over these corpora. The
-table is measured, not guessed: the sixteen most frequent pairs cover 50.09%
-of 24,234,323 commands of the dumps and nine Silesia files, and fifteen is the
-book because code 15 escapes to the fast form's byte token. Two commands then
-share a byte, and a pair of table hits costs half a byte less than either
-existing form. Measured as a straight swap for the fast form's encoding, on the
-same finder pass, one pinned core, warmed buffers (packed bytes are exact):
+`enc_flags`), is what a page's LZ candidate uses from level 7 up. It is the fast
+form's finder and screen with two changes: a command's (literal run, match
+length) pair is one 4-bit code from a fifteen-entry table taken from the fast
+form's own command stream over these corpora (the top fifteen pairs cover
+48.53% of 24,234,323 commands, code 15 escaping to the fast form's byte token,
+so two commands share a byte), and the distance leaves only the top sixteen
+codes for the four repeat distances -- one byte for a fresh distance of 1..224
+and two for 225..4320, where the fast form pays two for every fresh one. The
+token on its own was not enough: with a fixed 16-bit distance the form was
+0.95% LARGER over page-sized dumps and 1.56% over page-sized Silesia, because
+half the commands miss the table and a miss costs the nibble it sat in plus the
+byte token. The distance code is what turns it around, and on the same finder
+pass, one pinned core, warmed buffers (packed bytes are exact):
 
 | block | form | packed | encode | decode |
 | --- | --- | ---: | ---: | ---: |
-| 4 KiB, dumps | fast | 90,691,356 | 464 MB/s | 2676 MB/s |
-| 4 KiB, dumps | hex | 91,552,548 | 310 MB/s | 1579 MB/s |
-| 4 KiB, Silesia | fast | 120,248,161 | 338 MB/s | 2250 MB/s |
-| 4 KiB, Silesia | hex | 122,120,236 | 239 MB/s | 1161 MB/s |
-| 64 KiB, dumps | fast | 75,301,175 | 674 MB/s | 2928 MB/s |
-| 64 KiB, dumps | hex | 75,850,156 | 432 MB/s | 1686 MB/s |
-| 64 KiB, Silesia | fast | 96,661,430 | 391 MB/s | 2299 MB/s |
-| 64 KiB, Silesia | hex | 96,194,530 | 254 MB/s | 1054 MB/s |
+| 4 KiB, dumps | fast | 90,691,356 | 452 MB/s | 2541 MB/s |
+| 4 KiB, dumps | hex | 88,418,390 | 322 MB/s | 1440 MB/s |
+| 4 KiB, Silesia | fast | 120,248,161 | 339 MB/s | 2265 MB/s |
+| 4 KiB, Silesia | hex | 117,724,698 | 221 MB/s | 1069 MB/s |
+| 64 KiB, dumps | fast | 75,301,175 | 576 MB/s | 2704 MB/s |
+| 64 KiB, dumps | hex | 75,688,310 | 402 MB/s | 1476 MB/s |
+| 64 KiB, Silesia | fast | 96,661,430 | 385 MB/s | 2239 MB/s |
+| 64 KiB, Silesia | hex | 99,758,977 | 234 MB/s | 846 MB/s |
 
-It is smaller only on 64 KiB prose, by 0.48%, and larger everywhere else by
-0.73 to 1.56%. Offered as a candidate at level 6, where it is kept only when it
-is strictly smaller, the swap moves the dumps 4 KiB total by -49,828 bytes and
-Silesia by +749,044; at 64 KiB it moves Silesia by -361,327 and the dumps by
-+4,527 -- +342,416 bytes net over the four cells, for a quarter less encode and
-decode. Half the commands miss the table, and a miss costs the nibble it sat in
-and then the whole byte token, which is exactly what a hit saved; that is the
-part of the design the numbers settle and no estimate could. So the form is an
-option with its own suite (`tests/suites/test_lzh.c`: the codec round-trips
-every shape from 5 bytes to 64 KiB, every truncation of a payload is refused,
-every single-byte corruption either decodes completely or is refused, and a
-block the option writes names the form in its flags) rather than a rung of the
-ladder.
+So it is 2.51% smaller over page-sized dumps and 2.10% over page-sized Silesia,
+and 0.51% and 3.2% LARGER at 64 KiB: a 64 KiB block reaches distances above
+4320 routinely and those cost three bytes where the fast form pays two, so the
+form stops at the page. That is the rule level 7 up encodes (`ZPSE_LZH_PAGE_LEVEL`
+in `src/block.c` is the threshold): it is worth 0.69 of a ratio point over the
+dumps and 2.29 over Silesia at level 9, against 22% and 26% of that level's page
+rate. Level 6 and below keep the fast form, so their page bytes are unchanged to
+the byte (88,600,950 over the dumps, 116,268,437 over Silesia). The form has its
+own suite (`tests/suites/test_lzh.c`, 1,145 checks: the codec round-trips every
+shape from 5 bytes to 64 KiB, every truncation of a payload is refused, every
+single-byte corruption either decodes completely or is refused, and a block the
+option writes names the form in its flags).
 
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default

@@ -2815,6 +2815,21 @@ static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
     return 1;
 }
 
+/* The level from which a PAGE takes the hexadecimal LZ encoding instead of the
+ * fast one (see zpse_block_try_lz2).
+ *
+ * 7, and not 5 or 6, because the form is a ratio trade rather than a win on
+ * both axes: at 4 KiB over the dumps and Silesia it is 0.07 and 0.59 of a
+ * ratio point smaller than the fast form, for 11 to 15% of the Silesia page
+ * encode and 30% of its decode. The default level is the one whose rate this
+ * whole format is measured on, so it keeps the fast form and is byte-identical
+ * to the build before this pass (88 600 950 over the dumps, 116 268 437 over
+ * Silesia). The rungs from 7 up are where size is the point: level 9 goes
+ * 41.29 -> 40.86% over the dumps and 53.27 -> 52.57% over Silesia. */
+#ifndef ZPSE_LZH_PAGE_LEVEL
+#define ZPSE_LZH_PAGE_LEVEL 7u
+#endif
+
 /* The fast LZ form's block: same header, same 'is_last' and CRC handling as
  * zpse_block_try_lz, different payload codec. */
 static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -2826,6 +2841,7 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint8_t flags;
     uint32_t payload;
     uint32_t total;
+    int hex_form;
 
     if (e->lz == 0 || dst == 0 || total_out == 0) {
         return PSE_BAD_ARG;
@@ -2833,6 +2849,15 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ2_MIN_PAYLOAD) {
         return PSE_OUTPUT_OVERFLOW;
     }
+    /* One decision, read by both the writer and the header. They have to agree
+     * or the decoder dispatches to the other codec: the first version of the
+     * page rule switched the encoder here and left the header saying LZ2, and
+     * every page it wrote was an LZ2 header over a hex payload. */
+    hex_form = ((e->enc_flags & ZPSE_ENC_LZ_HEX) != 0u ||
+                (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+                 zpse_enc_speed(e->enc_flags) >= ZPSE_LZH_PAGE_LEVEL))
+                   ? 1
+                   : 0;
     {
         /* Which table the finder uses depends on who asked for it.
          *
@@ -2868,11 +2893,22 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             tab = e->cand;
             hb = 15u;
         }
-        /* ZPSE_ENC_LZ_HEX writes the hexadecimal form wherever the fast one
-         * would go: same finder, same table choice, same screen, different
-         * command encoding (src/lzh.c). The two are otherwise the same trade,
-         * which is what makes the option a paired A/B of the encoding alone. */
-        if ((e->enc_flags & ZPSE_ENC_LZ_HEX) != 0u) {
+        /* A page gets the hexadecimal encoding; anything larger keeps the fast
+         * one, and ZPSE_ENC_LZ_HEX forces the hex form at every size (the
+         * switch the measurement was taken with).
+         *
+         * The split is a measurement, not a preference. On the same finder
+         * pass at 4 KiB the hex form is 2.51% smaller over the dumps and 2.10%
+         * over Silesia -- its distance code leaves only the top sixteen codes
+         * for the repeat cache, so a page's 1..224 distances cost one byte
+         * where the fast form's cost two -- and at level 6 that turns into
+         * -146,139 bytes over the dumps and -1,265,654 over Silesia (0.60 of a
+         * ratio point) for 9.4% of the Silesia page rate. At 64 KiB the same
+         * distance code pays three bytes above 4320, which is a distance a
+         * 64 KiB block reaches routinely: Silesia grows 1.27 MB and the dumps
+         * 301 bytes. So the short blocks take the smaller stream and the long
+         * ones keep the faster decoder. */
+        if (hex_form != 0) {
             payload = zpse_lzh_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
                                       cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE,
                                       tab, hb);
@@ -2889,9 +2925,8 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
     }
     total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
-    flags = (uint8_t)(((e->enc_flags & ZPSE_ENC_LZ_HEX) != 0u
-                           ? (uint8_t)ZPSE_B_LZ_HEX
-                           : (uint8_t)ZPSE_B_LZ2) |
+    flags = (uint8_t)((hex_form != 0 ? (uint8_t)ZPSE_B_LZ_HEX
+                                     : (uint8_t)ZPSE_B_LZ2) |
                       ZPSE_B_RESET |
                       (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
                            ? ZPSE_B_CRC : 0u));
