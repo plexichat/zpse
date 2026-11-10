@@ -330,10 +330,23 @@ point of ratio than either sample: at level 6 a page prices at most seven
 candidates, six writes 1.28 more points over the dumps for 5 to 10% of the
 rate, five is the same bytes as six at 7.8% more by mean, four costs 1.46
 points for 17%, and three is the same bytes as four and the fastest of them.
-All of those are over the one-point line, so seven stays the default and
-`ZPSE_PAGE_CAND_CAP` -- a knob the header documents and, until this round, a
-plain `#define` that quietly ignored every `-D` aimed at it -- is where a
-caller buys the rate. Its neighbours on the price were measured and refused
+All of those are over the one-point line these page trades used to be held to,
+and six is the arm the line was moved for: it is the default now, at 1.28
+points over the dumps and 0.154 over Silesia for 5 to 10% of the page
+encoder's rate, which nothing else on the price has offered without costing
+both corpora at once. `ZPSE_PAGE_CAND_CAP` sets it -- a knob the header
+documents and, until this round, a plain `#define` that quietly ignored every
+`-D` aimed at it -- and seven is still buildable for a caller whose bytes
+matter more.
+
+Two more page knobs were swept with that cap and both ship. The gate prices
+one 1 KiB window at each end instead of two 512-byte ones: 6.9% on both
+corpora, 1 068 bytes fewer over the dumps and 9 275 more over Silesia. A flat
+page runs two trials instead of three: 7.9% over the dumps and 6.6% over
+Silesia for 210 bytes on Silesia and a byte-identical dumps corpus. Together
+at level 6 the page encoder reads 143.8 against 127.3 MB/s over the dumps and
+142.2 against 134.5 on Silesia -- 13.0% and 5.7% -- for 1.275 and 0.158 ratio
+points, and the 768-case size suite still reports no case grew. Its neighbours on the price were measured and refused
 too: a third gate window in the middle of the page (0.023 points for 4.4% of
 the rate), a 768-byte gate sample (slower on both corpora, 110.7 against 117.3
 MB/s on the dumps and 109.6 against 117.6 on Silesia, and 228 bytes larger on

@@ -1422,7 +1422,13 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * where a build that changes nothing occupies the same band. The blocks this
  * fires on are cheap either way; the cap stays where the size corpus was
  * tuned against it. */
-#define ZPSE_FLAT_TRIALS 3
+/* Two, measured against three: the survivors of a flat page are the shapes the
+ * price has already convicted, so the third trial is a full page encode spent
+ * on one of them. At 4 KiB level 6 over four interleaved rounds it buys 210
+ * bytes over Silesia's 212 MB (0.0099 of a point) and nothing at all on the
+ * dumps, which are byte-identical, against 6.6% of Silesia's rate and 7.9% of
+ * the dumps'. */
+#define ZPSE_FLAT_TRIALS 2
 #endif
 
 /* The margin the fast form's screen asks for on a block shorter than
@@ -2973,8 +2979,19 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
  * (-4.4%). A fortieth of a point is not worth 4% of the rate, so 0 ships. */
 #define ZPSE_ASCII_PAGE_MID 0
 #endif
+/* One tile an end on a page, and it is a measurement.
+ *
+ * Two 512-byte windows per end was the knee when the span itself was chosen
+ * (see ZPSE_ASCII_PAGE_SAMPLE); the tile COUNT had never been swept, and it
+ * was the page's remaining gate cost. At 4 KiB level 6 over four interleaved
+ * rounds on one pinned core, one 1 KiB window per end reads 140.3 against
+ * 131.3 MB/s on the dumps and 140.1 against 131.1 on Silesia -- 6.9% on both
+ * -- for 1 068 bytes FEWER over the dumps and 9 275 more over Silesia (0.044
+ * of a point). The gate answers one question about the block, and one window
+ * covering the whole span answers it as well as two covering half each, at
+ * half the pricing. */
 #ifndef ZPSE_ASCII_PAGE_TILES
-#define ZPSE_ASCII_PAGE_TILES 2u
+#define ZPSE_ASCII_PAGE_TILES 1u
 #endif
 #ifndef ZPSE_ASCII_MIN_BLOCK
 #define ZPSE_ASCII_MIN_BLOCK 4096u

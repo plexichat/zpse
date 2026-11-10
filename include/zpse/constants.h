@@ -296,11 +296,17 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
  * 118.5/114.9/121.4/118.1, and Silesia pays 0.154 points for 3-5%. Five is the
  * same bytes as six (145 427 697) and reads 125.6 against 116.5 MB/s by mean
  * in the same run, four costs 1.459 points for +17%, and three is the
- * same bytes as four and the fastest of the four (+20%). Every arm below seven
- * is above the one-point line these page trades are held to, so seven stays the
- * default and this is where a caller buys the rate instead. */
+ * same bytes as four and the fastest of the four (+20%).
+ *
+ * Six is the default now, and it is the one arm below seven the ratio line was
+ * moved for: 1.276 points over the dumps and 0.154 over Silesia is what the
+ * last priced shape costs, and it buys 5-10% of the page encoder's rate, which
+ * no other knob on the price has offered without costing both corpora at once.
+ * Seven is still buildable (-DZPSE_PAGE_CAND_CAP=7u) for a caller whose bytes
+ * matter more than that, and the arms below six remain refused: they buy their
+ * extra rate by dropping a shape the sweep has to be able to reach. */
 #ifndef ZPSE_PAGE_CAND_CAP
-#define ZPSE_PAGE_CAND_CAP 7u
+#define ZPSE_PAGE_CAND_CAP 6u
 #endif
 /* Levels that run the match finder at all (5-9). */
 #define ZPSE_ENC_SPEED_LZ_MIN 5u
