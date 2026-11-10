@@ -96,14 +96,14 @@ smaller than it went in, one pinned core, best of five:
 
 | level | Python heap | C heap | shared libraries | total | encode (py / c / lib) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.62% | 10.36% | 83.19% | 58.57% | 164 / 348 / 193 MB/s |
-| 6 (default) | 19.72% | 6.32% | 62.61% | **41.54%** | 140 / 186 / 140 MB/s |
-| 9 `ZPSE_ENC_SPEED_MAX` | 19.69% | 6.32% | 62.17% | 41.29% | 112 / 148 / 115 MB/s |
+| 1 `ZPSE_ENC_SPEED_FASTEST` | 37.79% | 10.29% | 83.22% | 58.62% | 222 / 528 / 287 MB/s |
+| 6 (default) | 19.72% | 6.32% | 62.61% | **41.55%** | 163 / 214 / 160 MB/s |
+| 9 `ZPSE_ENC_SPEED_MAX` | 19.69% | 6.32% | 62.17% | 41.29% | 137 / 200 / 142 MB/s |
 
-The default level's page costs about 140 MB/s of encode for 41.54%, and
-decodes at 1.8 to 5.0 GB/s (the C heap is all pointers, which the fast LZ form
+The default level's page costs about 168 MB/s of encode for 41.55%, and
+decodes at 2.0 to 5.6 GB/s (the C heap is all pointers, which the fast LZ form
 codes as commands). The deepest level buys a quarter of a point of ratio for
-16% of the rate, because on a page the tier's extra margin and decode bill reach
+12% of the rate, because on a page the tier's extra margin and decode bill reach
 the blocks the default level leaves to the tiles rather than finding a
 smaller shape for them. The shared-library dump is what holds every level's
 total where it is: two pages in five go out raw at level 1, and 83% of the dump
@@ -113,14 +113,14 @@ Silesia's twelve files put the same shape on a general corpus:
 
 | 4 KiB pages | level 1 | level 6 | level 9 |
 | --- | ---: | ---: | ---: |
-| ratio | 80.25% | 54.86% | 53.28% |
-| encode | 244 MB/s | 150 MB/s | 122 MB/s |
-| decode | 2.8 GB/s | 1.9 GB/s | 1.7 GB/s |
+| ratio | 80.33% | 54.86% | 53.27% |
+| encode | 329 MB/s | 169 MB/s | 146 MB/s |
+| decode | 3.5 GB/s | 2.0 GB/s | 2.0 GB/s |
 
 Against zstd on the same pages (one process, one reused context, the same
 keep-it-if-it-is-smaller rule) the page size is where zstd is the better
 default: zstd 6 writes 41.27% of Silesia at 88 MB/s and 30.93% of the dumps at
-120 MB/s, against 54.86% at 150 and 41.54% at 140. What zpse keeps is decode --
+120 MB/s, against 54.86% at 169 and 41.55% at 168. What zpse keeps is decode --
 1.5 to 4.2 GB/s against zstd's 0.7 to 2.9 -- and the deep rungs' encode rate,
 twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
@@ -350,7 +350,10 @@ points, and the 768-case size suite still reports no case grew. Removing the
 attempt-order sample from a page, where it cannot change a byte because the
 price has already ranked the field and one attempt runs, is a further 162.5 to
 166.5 MB/s by mean on the dumps and 160.2 to 161.7 on Silesia, with output
-identical to the byte on both corpora. Its neighbours on the price were measured and refused
+identical to the byte on both corpora. A page's single-plane candidates are
+priced on two tiles instead of four as well: 166.6 against 159.8 MB/s by mean
+on the dumps (167.3 against 161.7 on Silesia) for 0.0023 and 0.0041 of a point,
+with 16 KiB and 64 KiB blocks byte-identical either way. Its neighbours on the price were measured and refused
 too: a third gate window in the middle of the page (0.023 points for 4.4% of
 the rate), a 768-byte gate sample (slower on both corpora, 110.7 against 117.3
 MB/s on the dumps and 109.6 against 117.6 on Silesia, and 228 bytes larger on

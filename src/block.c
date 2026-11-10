@@ -1294,6 +1294,24 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_DECIDE_TILES 4u
 #endif
 
+/* ...and how many a PAGE prices, which is two rather than four.
+ *
+ * A page's single-plane candidates are priced on the whole of it, so four tiles
+ * there is a quarter of the page per candidate against a 64 KiB block's
+ * sixteenth. Two ranks the field the price can already order -- measured at
+ * 4 KiB level 6 over four interleaved rounds on one pinned core: 88 600 950
+ * bytes over the dumps against 88 596 075 (+0.0023 of a point) and 116 268 437
+ * over Silesia against 116 259 698 (+0.0041), for 166.6 against 159.8 MB/s by
+ * mean on the dumps and 167.3 against 161.7 on Silesia -- 4%. That is four
+ * thousandths of a point for four percent, which is the cheapest trade any knob
+ * on this price has offered. Three is a wash on both axes (1 296 bytes fewer on
+ * the dumps, 36 661 on Silesia, rate inside the band) and is not taken.
+ *
+ * 0 leaves a page on ZPSE_DECIDE_TILES. Above a page the value is untouched: */
+#ifndef ZPSE_DECIDE_PAGE_TILES
+#define ZPSE_DECIDE_PAGE_TILES 2u
+#endif
+
 /* Full block encodes the sweep may spend on a block whose own probe says it
  * does not compress at all -- the winner's price over the 16 KiB window is at
  * or above the same window written raw. Such a block falls back to RAW unless
@@ -2080,6 +2098,18 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
     uint32_t lens[16];
     uint8_t *planes[16];
     unsigned pstep = zpse_block_plane_step(e, blk_n, sc);
+
+#if ZPSE_DECIDE_PAGE_TILES > 0
+    /* A page prices its single-plane candidates on a shorter spread than a
+     * 64 KiB block does (see ZPSE_DECIDE_PAGE_TILES). Only the probe's own
+     * default is remapped, so a caller asking for a specific tile count --
+     * zero means the probe's default, a larger number the narrow search -- is
+     * still honored. */
+    if (blk_n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+        tiles == (unsigned)ZPSE_DECIDE_TILES) {
+        tiles = (unsigned)ZPSE_DECIDE_PAGE_TILES;
+    }
+#endif
 
     /* A multi-plane candidate is priced with one tile in every plane, at
      * every level (the cheap levels fill nothing in for a transpose any
