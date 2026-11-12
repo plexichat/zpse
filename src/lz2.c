@@ -265,6 +265,23 @@ static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
 #define ZPSE_LZ2_PROBE_EARLY 1
 #endif
 
+/* Whether the lazy probe may take its candidate from the slot the loop has
+ * just filed for the current position. When the four bytes at pos and at
+ * pos + 1 hash to the same slot, that entry IS the cursor, so the probe's
+ * candidate is a self-reference at distance one rather than a real earlier
+ * occurrence -- a run, where the match is long enough that the ceiling
+ * usually refuses the probe anyway.
+ *
+ * 0 refuses those probes: a self-reference is not a candidate. Measured on
+ * whole 64 KiB Silesia blocks against the shipped 1, best of two alternating
+ * rounds: `dickens` 285 -> 276 MB/s, `webster` 332 -> 324, `mozilla` 421 ->
+ * 415 with its payload 190 bytes LARGER, `nci` 886 -> 876, `osdb` 403 -> 405,
+ * `xml` 685 -> 688. So it is neither faster nor the same size -- the probe is
+ * right to take a distance-one candidate -- and 1 stays. */
+#ifndef ZPSE_LZ2_PROBE_SELF
+#define ZPSE_LZ2_PROBE_SELF 1
+#endif
+
 /* Tagged with the rest of the hot set: this finder is the whole of the F
  * form's encode, and it was the one kernel in the tree left at the build's
  * own level. */
@@ -431,7 +448,8 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * when the match starts where the cursor is. */
 #if ZPSE_LZ2_PROBE_EARLY
         if (p_ok && mpos == pos && len <= (uint32_t)ZPSE_LZ2_LAZY_MAX) {
-            if (p_c1 != LZ2_EMPTY && p_c1 <= mpos &&
+            if ((ZPSE_LZ2_PROBE_SELF != 0 || p_h != h) &&
+                p_c1 != LZ2_EMPTY && p_c1 <= mpos &&
                 zpse_load_u32le(in + p_c1) == p_cur &&
                 lz2_extend(in, n, mpos + 1u, p_c1, ZPSE_LZ2_MIN_MATCH) > len) {
                 pos = mpos + 1u;

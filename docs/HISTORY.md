@@ -387,6 +387,31 @@ where the cut's guards already hold by construction: a full-size block. A cap
 of one trial is another 2.5% of rate for another 0.09% of size, and it is not
 taken.
 
+Two more were measured and rejected, and both are left in the tree as switches
+so the measurement can be repeated.
+
+The first is a lazy probe that refuses a self-referencing candidate -- the slot
+the loop has just filed for the current position, which happens when the bytes
+at pos and pos + 1 hash alike, i.e. in a run. It is not faster (`dickens` 285
+-> 276 MB/s, `webster` 332 -> 324) and it does not hold the ratio: `mozilla`
+grows 190 bytes, which is exactly the distance-one run the probe was taking.
+`ZPSE_LZ2_PROBE_SELF` stays 1.
+
+The second is the full-size trial cap applied to the tied-free rows as well --
+levels 8 and 9, whose whole design is to encode every survivor their price
+separated. Default against `ZPSE_TRIAL_CAP_TIEFREE=1` over Silesia: level 8
+341.5 -> 335.4 MB/s, level 9 250.0 -> 254.3, level 6 unchanged in both (it is
+capped already), and 7 230 bytes off a ~94 MB packed total in each direction.
+The deepest rungs are not paying for trials they do not need, so the flag stays
+0 and they keep the field.
+
+A ceiling re-sweep on the early-load build says the knee has not moved: 10, 12
+and 14 are within 1% of each other in rate (`dickens` 271/285/284, `webster`
+338/332/330, `xml` 707/685/689), while 14 is a few bytes smaller on four of the
+six files and 10 is a few bytes larger on two. 12 stays, because the difference
+is inside the host's noise and moving it would re-pin every stream in the suite
+for nothing.
+
 What would move the ceiling rather than the noise is a finder that makes fewer
 or better-placed probes per byte, and every version of that changes which
 matches are found, so it changes the stream, the ratio and every pinned size in

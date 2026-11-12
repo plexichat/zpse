@@ -352,6 +352,18 @@ uncompressed bytes; this host has six physical cores and no SMT to disable.
 | 4 MiB | 4 | 3.10 GB/s | 2.75x | 8.45 GB/s | 2.05x | yes |
 | 4 MiB | 5 | 3.84 GB/s | 3.42x | 8.15 GB/s | 1.98x | yes |
 | 4 MiB | 6 | 3.78 GB/s | 3.36x | 8.46 GB/s | 2.05x | yes |
+| 16 MiB | 1 | 0.65 GB/s | 1.00x | 2.53 GB/s | 1.00x | yes |
+| 16 MiB | 2 | 1.17 GB/s | 1.81x | 6.14 GB/s | 2.43x | yes |
+| 16 MiB | 3 | 1.88 GB/s | 2.90x | 8.76 GB/s | 3.47x | yes |
+| 16 MiB | 4 | 2.58 GB/s | 3.98x | 11.65 GB/s | 4.61x | yes |
+| 16 MiB | 5 | 3.10 GB/s | 4.79x | 10.21 GB/s | 4.04x | yes |
+| 16 MiB | 6 | 3.39 GB/s | 5.23x | 11.76 GB/s | 4.65x | yes |
+| 64 MiB | 1 | 0.90 GB/s | 1.00x | 3.65 GB/s | 1.00x | yes |
+| 64 MiB | 2 | 1.59 GB/s | 1.78x | 6.82 GB/s | 1.87x | yes |
+| 64 MiB | 3 | 2.32 GB/s | 2.59x | 9.77 GB/s | 2.68x | yes |
+| 64 MiB | 4 | 3.04 GB/s | 3.40x | 10.25 GB/s | 2.81x | yes |
+| 64 MiB | 5 | 3.36 GB/s | 3.76x | 13.05 GB/s | 3.57x | yes |
+| 64 MiB | 6 | 3.84 GB/s | 4.29x | 12.42 GB/s | 3.40x | yes |
 
 Encode scales better than decode because it has more work to divide; decode
 already reconstructs a block in a few microseconds. Every frame in the table
@@ -359,12 +371,8 @@ was checked byte-for-byte against the one-worker frame and every decode was
 compared whole with the input.
 
 A worker decodes straight into the caller's buffer at its block's offset, so a
-block decode writes exactly its own bytes and nothing else. That is a property
-the decoder holds and the harness checks: every frame in the table is compared
-byte-for-byte with the one-worker frame, and every decode is compared whole with
-the input. The 16 MiB and 64 MiB frames are byte-identical at every worker
-count from one to six -- at 16 MiB, 0.67 to 1.28 GB/s of encode and 3.15 to
-5.93 GB/s of decode from one worker to two.
+block decode writes exactly its own bytes and nothing else; that is what makes
+every row above byte-identical at every worker count.
 
 ## What it does
 

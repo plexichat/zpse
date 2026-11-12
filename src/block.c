@@ -2479,6 +2479,20 @@ typedef struct {
 #define ZPSE_TRIAL_CAP_FULL 2
 #endif
 
+/* Whether the trial cap also applies to a level whose row does NOT cut tied
+ * fields (8 and 9, which encode every survivor their price separated).
+ *
+ * 0 leaves those rungs alone: their whole point is the field the price could
+ * not order, and the cap is the one thing that would stop them paying for it.
+ * 1 is the measurement, and the measurement says no. Over Silesia, default
+ * against 1: level 8 341.5 -> 335.4 MB/s, level 9 250.0 -> 254.3, level 6
+ * unchanged either way (it is capped already), and 7 230 bytes off a ~94 MB
+ * packed total in both directions -- noise. The deepest rungs are not paying
+ * for trials they do not need, so 0 stays and they keep the field. */
+#ifndef ZPSE_TRIAL_CAP_TIEFREE
+#define ZPSE_TRIAL_CAP_TIEFREE 0
+#endif
+
 static const ZpseLevel zpse_level[10] = {
     /* 0: never used -- an empty level field normalises to BALANCED. */
     { 0u, 0u, 0u, 0u, 0u },
@@ -5185,7 +5199,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * the remaining field cancels the cap outright -- which is the same
          * rule the floor skip and the history stop use, and the reason the
          * stream cannot depend on attempt order. */
-        if (!direct_out && cap_row->tie_field != 0u &&
+        if (!direct_out &&
+            (cap_row->tie_field != 0u || ZPSE_TRIAL_CAP_TIEFREE != 0) &&
             ntried >= ZPSE_TRIAL_CAP_FULL &&
             n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
             int clear = 1;
