@@ -34,12 +34,13 @@ is tested that way.
 ## Performance
 
 All ratios are **uncompressed:compressed** (`x:1`); all rates are decimal MB/s
-of uncompressed bytes. Unless a table says otherwise: one pinned core, 64 KiB
-blocks, default level 6, gcc 15.2, on a Ryzen 5 5600X under WSL2 (three
-physical cores, six threads). Every corpus is generated or fetched by a script
-under `tests/benchmarks/`, so the rows can be re-measured from a checkout.
-Rates move by roughly 10% between runs on this host; ratios are exact byte
-counts.
+of uncompressed bytes. Unless a table says otherwise: **one pinned core**,
+64 KiB blocks, default level 6, gcc 15.2, on a Ryzen 5 5600X under WSL2 (three
+physical cores, six threads). Every number in this section is single-core; the
+only multi-core measurement is the parallel-frames table, which names its
+worker counts. Every corpus is generated or fetched by a script under
+`tests/benchmarks/`, so the rows can be re-measured from a checkout. Rates move
+by roughly 10% between runs on this host; ratios are exact byte counts.
 
 ### At a glance
 
@@ -191,6 +192,8 @@ framing, with two length bytes charged to a raw lz4 block.
 | zpse 6 (default) | 2.40:1 | 146 | 1860 |
 | zpse 9 `MAX` | 2.41:1 | 128 | 1839 |
 | zpse 6 `PAGE_FAST` | 1.52:1 | 988 | 3503 |
+| zpse 6 `LZ_FAST` | 2.22:1 | 605 | 1826 |
+| zpse 6 `LZ_HEX` | 2.40:1 | 150 | 1870 |
 | zstd 1 | 2.87:1 | 315 | 719 |
 | zstd 6 | 2.98:1 | 96 | 855 |
 | zstd 19 | 3.14:1 | 5 | 705 |
@@ -198,6 +201,13 @@ framing, with two length bytes charged to a raw lz4 block.
 | lz4hc 4 | 2.26:1 | 191 | 4314 |
 | lz4hc 9 | 2.30:1 | 76 | 4202 |
 | lz4hc 12 | 2.31:1 | 25 | 4222 |
+
+`LZ_FAST` is the cheap way to a page: one finder pass, no decision, 605 MB/s
+of encode, and it gives up a fifth of the ratio (2.22:1 against 2.40:1) for
+four times the rate. `LZ_HEX` is the same finder with the hexadecimal command
+encoding, which is what level 7 and up write for a page anyway; it costs
+nothing in ratio against the default and decodes at the same rate, so it is a
+row for the codec comparison rather than a suggestion.
 
 **Zero pages are a separate class.** Untouched anonymous pages are a large
 share of a real footprint and compress to almost nothing. On the same stream
@@ -362,6 +372,24 @@ No build system: the library is a set of `.c` files plus headers, and
 gcc -std=c11 -O2 -Iinclude src/zpse_unity.c your_program.c -o your_program
 ```
 
+### Binary size
+
+The unity object is the whole library, so the figures below are what an
+executable carries when it links `zpse_unity.c`. Measured on x86-64 with
+gcc 15.2 on the Performance host; `tests/benchmarks/binary_size.sh`
+regenerates the table.
+
+| build | text | data | bss | object file |
+| --- | ---: | ---: | ---: | ---: |
+| `-O2` | 229,678 B (224 KiB) | 48 B | 12,384 B (12 KiB) | 273,088 B |
+| `-Os` | 172,601 B (169 KiB) | 40 B | 12,384 B (12 KiB) | 215,896 B |
+
+The unity build links as one object, so a program that uses any entry point
+gets all of it. A per-file build, or `-ffunction-sections -fdata-sections
+-Wl,--gc-sections`, drops the paths a caller never touches. The reference CLI
+is larger than the library alone: `tests/tools/zpse_cli.c` links to 280,752 B
+stripped with the same compiler.
+
 The parallel frame encoder is the one part behind a switch: add `-DZPSE_MT
 -pthread` (POSIX; Win32 uses `CreateThread`). `tests/runners/run.sh` builds
 `test_parallel` both ways and requires the same frames from each.
@@ -389,6 +417,7 @@ under `tests/benchmarks/`:
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
 | `bench_pagedict.c` | page-dictionary hit rate and encode rate on repeat pages |
 | `bench_parallel.c` | worker scaling and byte-identity |
+| `binary_size.sh` | compiled library size |
 | `refresh_tables.sh` | regenerates the reproducible tables in one pass |
 
 None of them writes into the repository; corpora and tools that are not already

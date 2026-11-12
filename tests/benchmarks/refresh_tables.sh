@@ -570,4 +570,9 @@ else
     missing "bench_levels build"
 fi
 
+# ---- Binary size ------------------------------------------------------
+
+say "binary size"
+"$repo/tests/benchmarks/binary_size.sh" "$CC" || missing "size"
+
 exit "$rc"
