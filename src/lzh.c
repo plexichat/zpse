@@ -75,23 +75,30 @@ static void lzh_rep_move(uint32_t *rep, uint32_t off, uint32_t idx)
     rep[0] = off;
 }
 
-/* The nibble for this (run, length) pair, or 15 when the book does not have
- * it and the byte token has to spell the fields out. Only a handful of runs
- * and lengths are in the book, so the scan stops as soon as either field is
- * out of range rather than walking all sixteen. */
+/* The book above, indexed [run][len]: the nibble for that pair, or 15 when
+ * the book does not carry it and the byte token has to spell the fields out.
+ * This is the same answer the writer used to search for -- the scan walked up
+ * to fifteen two-byte entries, twice per token -- in one load. The table is
+ * transposed from zpse_lzh_book, which the decoder reads; a pair the book
+ * misses spells itself out, so a disagreement between the two would change
+ * bytes but never break a round trip, which is why the escaped and unescaped
+ * spellings' packed totals are compared whenever either table is touched. */
+static const uint8_t lzh_book_code[5][16] = {
+    { 15u, 15u, 15u, 15u, 1u, 5u, 9u, 8u,
+      2u, 13u, 15u, 15u, 15u, 15u, 15u, 15u },
+    { 4u, 15u, 15u, 15u, 15u, 7u, 11u, 0u,
+      15u, 15u, 15u, 15u, 15u, 15u, 15u, 6u },
+    { 10u, 15u, 15u, 15u, 15u, 15u, 3u, 15u,
+      15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u },
+    { 14u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
+      15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u },
+    { 12u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
+      15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u }
+};
+
 static uint32_t lzh_code_of(uint32_t run, uint32_t len)
 {
-    uint32_t i;
-
-    if (run > 4u || len > 15u) {
-        return LZH_TOK_ESC;
-    }
-    for (i = 0; i < ZPSE_LZH_CODES; i++) {
-        if (zpse_lzh_book[i].run == run && zpse_lzh_book[i].len == len) {
-            return i;
-        }
-    }
-    return LZH_TOK_ESC;
+    return (run > 4u || len > 15u) ? LZH_TOK_ESC : (uint32_t)lzh_book_code[run][len];
 }
 
 /* A command: the literal run in front of it (a byte offset into the input,
