@@ -660,10 +660,11 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                  * compute both candidates and select, on the argument that
                  * the answer is data and the test mispredicts. It is data,
                  * but it is lopsided: over a census of the twelve Silesia
-                 * files at 64 KiB, a rep code is 0-26% of commands and under
-                 * 5% on nine of them, because this form is the one the cheap
-                 * rungs take on every block and its finder only names a
-                 * recent distance when the match is fresh. So the branch is
+                 * files at 64 KiB, a rep code is 0-26% of commands, under 10%
+                 * on nine of them and at most 5% on eight, because this form
+                 * is the one the cheap rungs take on every block and its
+                 * finder only names a recent distance when the match is
+                 * fresh. So the branch is
                  * almost never taken, while the select chain ran on every
                  * command. Measured decode-only, prebuilt -F frames, best of
                  * nine passes, alternated: dickens 2 080 -> 2 106 MB/s,
