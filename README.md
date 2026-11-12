@@ -426,6 +426,22 @@ doubled gate sample 985,050 bytes more (1.47) at rate inside the band -- both
 refused by the host corpora, where the cap is worth 1.19 points for 15 to 19%
 and the doubled sample hundredths of a point in opposite directions.
 
+All of these are mixture averages, and each shape owns one page in twenty, so a
+knob that re-ranks a single shape's pages shows a twentieth of its effect here.
+Four page tiles move the 2-bit-alphabet-against-records page by 1.06 points of
+its own bytes (713,284 of 64 MiB) against 0.051 in the mixture, the third flat
+trial moves text against a noise prologue by 0.81 (542,281) against 0.040, and
+the eight-tile probe moves ragged text with a noisy tile 1.67 points the wrong
+way (1,122,773) against 0.018 in the mixture, where the shapes' opposite
+responses cancel -- a page in twenty is also why a shape-local response of up
+to two points can sit under a tenth of a point here. Measured one shape at a
+time with `--probe-shape=N`, the mixture is the average of the twenty
+single-shape deltas to within 2% on all thirteen arms, so the aggregate hides
+shape-local responses by construction but never misreports one, and the arms
+refused above are refused on mixtures. A caller whose pages all look like one
+shape should read the arm against that shape: four page tiles are worth a point
+there, and cost 14% of its rate in the mixture.
+
 Every page knob, one build each, two passes on one pinned core, 4 KiB pages at
 level 6 -- the ratio of one pass and the rate it read, so the bytes are exact
 and the rates are this host's:
