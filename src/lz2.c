@@ -637,19 +637,23 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         cmd_left--;
         /* Fast region: enough payload left for the largest command this path
          * can take (a token, fourteen literals and the two offset bytes) and
-         * enough output for the longest match it can code, so a command whose
+         * enough output for the widest store the copy below makes (twenty-four
+         * bytes, against a match of at most eighteen), so a command whose
          * two nibbles are both literal needs no room test of its own -- and
          * that is four commands in five on prose. Everything else falls
          * through to the careful path, which is what a truncated or hostile
          * stream needs anyway. */
-        if ((size_t)(tend - lp) >= 18u && (n - op) >= 19u) {
+        if ((size_t)(tend - lp) >= 18u && (n - op) >= 24u) {
             tok = *lp;
             if (((tok >> 4) != 15u) && ((tok & 15u) != 15u)) {
                 lit = tok >> 4;
                 lp++;
-                /* One store covers any run this token carries, and the bytes
-                 * past it are output a later command overwrites. */
-                memcpy(out + op, lp, 16u);
+                /* Two eight-byte stores rather than one sixteen: the run is
+                 * at most fourteen bytes, both stores land inside the output
+                 * (the room test above reserves twenty-four bytes), and the
+                 * bytes past the run are output a later command overwrites. */
+                memcpy(out + op, lp, 8u);
+                memcpy(out + op + 8u, lp + 8u, 8u);
                 op += lit;
                 lp += lit;
                 lit_seen += lit;
@@ -710,15 +714,34 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 if (off > op) {
                     return PSE_BAD_LZ;
                 }
-                /* A short match at a distance at least as wide as the store:
-                 * the whole match is one store, and the bytes past it are
-                 * output a later command overwrites. Thirty-two bytes covers
-                 * the longest match a two-nibble token can name, which is
-                 * what this region is restricted to. */
-                if (off >= 32u && mlen <= 32u && op + 32u <= n) {
-                    memcpy(out + op, out + op - off, 32u);
-                } else if (off >= 16u && mlen <= 16u && op + 16u <= n) {
-                    memcpy(out + op, out + op - off, 16u);
+                /* Eight-byte steps, lz4's wildcopy shape. At a distance of
+                 * eight or more each step reads only bytes already written,
+                 * so two steps cover the ordinary match and a third covers
+                 * the seventeen and eighteen byte ones this region can still
+                 * name (its nibbles are under fifteen, so the match is at
+                 * most eighteen). The steps may run past the match; the bytes
+                 * they write are output a later command overwrites, and the
+                 * room test above reserves the twenty-four they reach.
+                 *
+                 * This is the shape that closed the prose gap. The same two
+                 * files decoded with one 32-byte match store and one 16-byte
+                 * literal store are 2 134 and 2 133 MB/s (dickens, mozilla),
+                 * medians of ten alternated runs of prebuilt blocks; with
+                 * these eight-byte steps, 2 247 and 2 226. A 32-byte store
+                 * followed a few bytes later by another store into the same
+                 * line is what the store buffer forwards badly, and it was
+                 * the cost that no branch count could reach: a decoder
+                 * rewritten to five branches per command from thirteen was
+                 * 5-14% slower, and dropping those tests without changing the
+                 * stores was 1-3% slower. xml 2 673 -> 2 723, x-ray 5 675 ->
+                 * 5 707, nci 2 636 -> 2 606 (its commands are 40% escapes,
+                 * which take the careful path, so it barely moves either way). */
+                if (off >= 8u) {
+                    memcpy(out + op, out + op - off, 8u);
+                    memcpy(out + op + 8u, out + op + 8u - off, 8u);
+                    if (mlen > 16u) {
+                        memcpy(out + op + 16u, out + op + 16u - off, 8u);
+                    }
                 } else {
                     lz2_copy_match(out, op, n, off, mlen);
                 }

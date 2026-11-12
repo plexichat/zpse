@@ -192,7 +192,7 @@ framing, with two length bytes charged to a raw lz4 block.
 | zpse 6 (default) | 2.40:1 | 146 | 1860 |
 | zpse 9 `MAX` | 2.41:1 | 128 | 1839 |
 | zpse 6 `PAGE_FAST` | 1.52:1 | 988 | 3503 |
-| zpse 6 `LZ_FAST` | 2.22:1 | 605 | 1826 |
+| zpse 6 `LZ_FAST` | 2.22:1 | 616 | 1994 |
 | zpse 6 `LZ_HEX` | 2.40:1 | 150 | 1870 |
 | zstd 1 | 2.87:1 | 315 | 719 |
 | zstd 6 | 2.98:1 | 96 | 855 |
@@ -202,7 +202,7 @@ framing, with two length bytes charged to a raw lz4 block.
 | lz4hc 9 | 2.30:1 | 76 | 4202 |
 | lz4hc 12 | 2.31:1 | 25 | 4222 |
 
-`LZ_FAST` is the cheap way to a page: one finder pass, no decision, 605 MB/s
+`LZ_FAST` is the cheap way to a page: one finder pass, no decision, 616 MB/s
 of encode, and it gives up a fifth of the ratio (2.22:1 against 2.40:1) for
 four times the rate. `LZ_HEX` is the same finder with the hexadecimal command
 encoding, which is what level 7 and up write for a page anyway; it costs
