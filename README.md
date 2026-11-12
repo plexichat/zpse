@@ -130,7 +130,8 @@ reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
 of the 9.68 points to zstd 6, which would leave the dumps at 33.7% against
 zstd's 30.9% while paying for the coder. At a page the format's problem is the
 ratio it starts from, not the last few bits of it.A mixed workload at the same page size -- 160 MiB written by
-`tests/corpus/corpus_write.c DIR 167772160 --mixed`, which interleaves
+`tests/corpus/corpus_write.c DIR 167772160 --mixed` (`--probe` writes the page
+shapes the price's knobs are measured on, see below), which interleaves
 documentation, source, executable-like bytes, library-like blobs, records and
 opaque data one 64 KiB chunk at a time:
 
@@ -376,22 +377,27 @@ halved sample is no better anywhere it was measured: 41 more bytes over the
 dumps and 45,411 more over Silesia at level 6, 130,451 more over Silesia at
 level 1. So the kilobyte stays.
 
-The other knobs were given the shapes they price: `corpus_write --probe` writes
-`probe.bin` (64 MiB, sha256 `2ee39ff2…`), one 4 KiB page per shape -- a noisy
-middle inside a compressible block, a flat 4-bit page, a stride-4 record,
-interleaved planes, text against noise, sparse holes, and a ramp with a noisy
-tile per kilobyte. Even there the noise probe writes the same bytes at zero,
-one and sixteen samples (44,116,378 with `PAGE_FAST` at level 1, 34,487,046 at
-level 6, the sixteen-sample arm 1 KB smaller), and the probe tile count writes
-the same bytes at two, four and eight (24,619,611 at level 6), so neither is
-even refuted, let alone paid for; the probe-free arm is 8% *slower* at level 1
-here, the opposite of the dumps. The third flat trial is the one arm that
-moves: 24,551,925 against 24,619,611 bytes, 0.10 of a point, with encode
-inside this host's band (221 against 224 MB/s), where Silesia's arm bought 210
-bytes for 6.6% of its rate, so the cap stays at two on the real corpus. The
-single-plane price's two tiles have no switch of their own -- `ZPSE_DECIDE_TILES`
-is the decide pass's count, not that sample -- so it cannot be re-measured this
-way at all.
+`corpus_write --probe` writes `probe.bin` (64 MiB, sha256 `3754c151…`), one
+4 KiB page per shape, sixteen shapes cycling: a noisy middle inside a
+compressible block, a flat 4-bit page, a stride-4 record, interleaved planes,
+text against noise, sparse holes, a ramp with a noisy tile per kilobyte, four
+quarters of different shapes, a tail-only compressible page, stride-5 records,
+a 2-bit alphabet, alternating compressible and noisy blocks, pointer words into
+zeros, and ragged text. That is enough to exercise the knobs the mixed corpus
+leaves inert. Across a thousand pages of each shape at level 6 under
+`PAGE_FAST`, the midpoint sample writes 36,790,132 bytes and no probe at all
+38,670,125 -- 2.80 points, which is what the sample is for -- for 1,087 against
+1,207 MB/s, and all sixteen samples write 36,547,075, 0.36 of a point fewer for
+16% of that rate, so the shipped sample sits between the two ends and costs
+less than either. The probe tile count (`ZPSE_PROBE_TILES`) stays byte-inert
+even here (29,752,418 plain at level 6 for two, four and eight tiles), and the
+third flat trial is worth 34,342 bytes, 0.05 of a point, with encode inside
+this host's band, against 210 bytes for 6.6% of Silesia's rate, so the cap
+stays at two. The single-plane page price does have its own switch
+(`ZPSE_DECIDE_PAGE_TILES`): four tiles against the shipped two writes 4,884
+fewer bytes over the dumps (0.0023) and 8,739 over Silesia (0.0041) for 4 and
+6% of their rate, and 53 *more* on the probe corpus -- four thousandths of a
+point for four percent, refused.
 
 The candidate field a page prices is the other knob, and it is dearer per
 point of ratio than either sample: a page prices at most six candidates now,

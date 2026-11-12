@@ -271,8 +271,11 @@ static void mix_fill(uint8_t *o, size_t n, uint32_t chunk)
  * probe, the flat trial cap and the single-plane tile count price -- a page
  * whose middle is noise inside an otherwise compressible block, a flat 4-bit
  * page, a record whose stride the identity cannot see, interleaved planes, a
- * text end against a noise end, sparse bytes with holes, and a ramp with one
- * noisy tile per kilobyte. */
+ * text end against a noise end, sparse bytes with holes, a ramp with one
+ * noisy tile per kilobyte, four quarters of different shapes, a tail-only
+ * compressible page, stride-5 records, a 2-bit alphabet, alternating
+ * compressible and noisy blocks, pointer words into zeros, and text with
+ * ragged lines. Sixteen shapes, so a run meets each twice per 64 KiB. */
 static void probe_fill(uint8_t *o, size_t n, uint32_t page)
 {
     uint32_t s = 0x9E37u ^ page * 2654435761u;
@@ -285,7 +288,7 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
         "the page encoder prices every plane of a page before it trials one "
         "of them, which is the point of the price; ";
 
-    switch (page % 8u) {
+    switch (page % 16u) {
     case 0: /* compressible ends, a noisy middle third */
         memset(o, 0, n);
         for (i = n / 3u; i < (2u * n) / 3u; i++)
@@ -329,7 +332,7 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
         memset(o, 0, n);
         for (i = 0; i < n; i += 251u) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
         break;
-    default: /* a ramp with one noisy 256-byte tile per kilobyte */
+    case 7: /* a ramp with one noisy 256-byte tile per kilobyte */
         for (i = 0; i < n; i++) o[i] = (uint8_t)((page + i) * 7u);
         for (i = 0; i + 256u <= n; i += 1024u) {
             size_t k;
@@ -337,6 +340,71 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
             for (k = 0; k < 256u; k++)
                 o[i + k] = (uint8_t)(mix_rnd(&s) >> 24);
         }
+        break;
+    case 8: { /* four quarters: zeros, ramp, noise, records */
+        size_t q = n / 4u;
+
+        for (i = 0; i < n; i++) {
+            size_t k = (q == 0u) ? 0u : i / q;
+
+            if (k == 0u) o[i] = 0u;
+            else if (k == 1u) o[i] = (uint8_t)(page + i);
+            else if (k == 2u) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+            else o[i] = (i % 16u == 0u) ? (uint8_t)(mix_rnd(&s) >> 24)
+                                        : (uint8_t)(i * 3u);
+        }
+        break;
+    }
+    case 9: /* noise everywhere, one compressible tile at the tail */
+        for (i = 0; i < n; i++) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+        for (i = (n > 512u) ? n - 512u : 0u; i < n; i++)
+            o[i] = (uint8_t)(i & 0xFFu);
+        break;
+    case 10: /* stride-5 records */
+        for (i = 0; i + 5u <= n; i += 5u) {
+            o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+            o[i + 1u] = (uint8_t)(page + i);
+            o[i + 2u] = (uint8_t)((page + i) >> 8);
+            o[i + 3u] = (uint8_t)((page + i) * 3u);
+            o[i + 4u] = (uint8_t)((page + i) * 7u);
+        }
+        break;
+    case 11: /* a 2-bit alphabet */
+        for (i = 0; i < n; i++)
+            o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x03u);
+        break;
+    case 12: /* alternating compressible and noisy 512-byte blocks */
+        for (i = 0; i < n; i++)
+            o[i] = ((i / 512u) & 1u) ? (uint8_t)(mix_rnd(&s) >> 24)
+                                     : 0u;
+        break;
+    case 13: /* pointer-like words, then zeros */
+        for (i = 0; i + 8u <= n; i += 8u) {
+            uint64_t v = (uint64_t)(page * 4096u + i) * 16u + 0x5555u;
+
+            if (i >= n / 2u) v = 0u;
+            memcpy(o + i, &v, 8u);
+        }
+        break;
+    case 14: { /* text with ragged line lengths */
+        size_t col = 0u;
+
+        for (i = 0; i < n; i++) {
+            if (col > 40u + mix_rnd(&s) % 32u) {
+                o[i] = '\n';
+                col = 0u;
+                continue;
+            }
+            o[i] = (uint8_t)line[mix_rnd(&s) % (sizeof line - 1u)];
+            col++;
+        }
+        break;
+    }
+    default: /* a ramp with one random hole in thirty-two */
+        for (i = 0; i < n; i++)
+            o[i] = ((mix_rnd(&s) & 31u) == 0u)
+                       ? (uint8_t)(mix_rnd(&s) >> 24)
+                       : (uint8_t)((page + i) * 7u);
         break;
     }
 }

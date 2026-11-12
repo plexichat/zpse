@@ -327,6 +327,63 @@ else
     missing "mixed corpus (corpus_write --mixed)"
 fi
 
+# ---- Probe page tables ------------------------------------------------
+
+# probe.bin is the page shapes the price's knobs are supposed to separate
+# (corpus_write --probe). Its rows are the baseline the knob arms in the
+# README are measured against, and the digest pins the bytes those numbers
+# were taken on.
+prob="$work/probe"
+pfile="$prob/probe.bin"
+mkdir -p "$prob" || exit 1
+if "$work/corpus_write" "$prob" 67108864 --probe && [ -s "$pfile" ]; then
+    pdig=$(sha256sum "$pfile" | cut -d' ' -f1)
+    if [ "$pdig" != "3754c151016acb46113a021ed6aded00b7edd0dcd248bbd18e75be1c14bd31ac" ]; then
+        echo "note: probe.bin sha256 $pdig; the README's arms were taken on 3754c151..." >&2
+    fi
+    pp=()
+    for l in 1 6 9; do
+        pp+=("$("$cli" bench -q -b 4096 -l "$l" -r "$REPS" "$pfile" |
+            awk '/TOTAL/ {printf "%.2f|%.0f|%.1f", 100.0*$3/$2, $5, $6}')")
+    done
+    # $1 label, $2 field of "ratio|enc|dec", $3 suffix; rest = cells.
+    prow() {
+        local label="$1" field="$2" suffix="$3" c v out=""
+        shift 3
+        for c in "$@"; do
+            v=$(printf '%s' "$c" | cut -d'|' -f"$field")
+            if [ "$suffix" = " GB/s" ]; then
+                v=$(awk -v x="$v" 'BEGIN { printf "%.1f", x / 1000.0 }')
+            fi
+            out="$out $v$suffix |"
+        done
+        printf '| %s |%s\n' "$label" "$out"
+    }
+    say "probe 4 KiB pages"
+    echo "| 4 KiB pages, probe | level 1 | level 6 | level 9 |"
+    echo "| --- | ---: | ---: | ---: |"
+    prow ratio 1 "%" "${pp[@]}"
+    prow encode 2 " MB/s" "${pp[@]}"
+    prow decode 3 " GB/s" "${pp[@]}"
+
+    say "probe PAGE_FAST rows"
+    echo "| 4 KiB pages | plain L1 | plain L6 | \`PAGE_FAST\` L1 | \`PAGE_FAST\` L6 |"
+    echo "| --- | ---: | ---: | ---: | ---: |"
+    pf=""
+    for spec in "-l 1" "-l 6" "-l 1 -P" "-l 6 -P"; do
+        # The spec is a pair of bench options and is meant to split here.
+        pf="$pf $("$cli" bench -q -b 4096 $spec -r "$REPS" "$pfile" |
+            awk '/TOTAL/ {printf "%.2f%%|%.0f", 100.0*$3/$2, $5}')"
+    done
+    pfr=""
+    for c in $pf; do
+        pfr="$pfr $(printf '%s' "$c" | cut -d'|' -f1) at $(printf '%s' "$c" | cut -d'|' -f2) MB/s |"
+    done
+    printf '| probe |%s\n' "$pfr"
+else
+    missing "probe corpus (corpus_write --probe)"
+fi
+
 # ---- colcheck ---------------------------------------------------------
 
 if [ -f "$titanic" ] && [ -f "$uber" ]; then
