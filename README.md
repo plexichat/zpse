@@ -396,8 +396,9 @@ quarters alternate two shapes -- zeros against noise and its mirror, a 2-bit
 alphabet against records and its mirror. Those last four separate the
 single-plane tile counts, because the sample takes one tile per quarter: two
 tiles see quarters one and three only. Every shape is one a page arm can flip:
-audited one shape per corpus against all thirteen arms at level 6, none of the
-twenty is byte-identical under all of them. The five homogeneous pages this
+audited one shape per corpus (`corpus_write --probe-shape=N`) against all
+thirteen arms at level 6, none of the twenty is byte-identical under all of
+them. The five homogeneous pages this
 corpus started with -- a flat 4-bit page, a 2-bit alphabet, stride-5 records,
 text against a noise half and ragged text -- were priced the same by every arm,
 and were replaced by the ambiguous pages above.
@@ -452,8 +453,9 @@ sample writes 1.47 more there for hundredths of a point in opposite directions
 on the dumps and Silesia. The candidate cap is 0.24 on these pages but 1.19
 over the dumps. Everything else is thousandths or a tenth of a point, which is
 why those knobs ship at the value the earlier paragraphs chose. `refresh_tables.sh` prints this table as `page knob arms`,
-with the dumps column only when `ZPSE_DUMPS` names them and Silesia only when
-the fetch succeeded.
+with the dumps column only when `ZPSE_DUMPS` names them (`ZPSE_DUMPS="/tmp/ram/*.bin"`
+before the script, a space-separated list) and Silesia only when the fetch
+succeeded.
 
 The candidate field a page prices is the other knob, and it is dearer per
 point of ratio than either sample: a page prices at most six candidates now,

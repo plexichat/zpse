@@ -1,6 +1,6 @@
 /* Write the benchmark corpora to files, for the cross-tool comparison.
  *
- * Usage: corpus_write DIR [SIZE] [--mixed | --probe]
+ * Usage: corpus_write DIR [SIZE] [--mixed | --probe [--probe-shape=N]]
  *
  * --mixed writes only `mixed.bin`, the generated workload the README's mixed
  * tables are measured on (see mix_fill); at the default SIZE it is 4 MiB, and
@@ -9,6 +9,10 @@
  * --probe writes only `probe.bin`, one 4 KiB page per shape (see probe_fill):
  * the page shapes the price's knobs are supposed to separate, which the mixed
  * workload does not contain.
+ *
+ * --probe-shape=N writes `probe-shapeN.bin` instead: every page the same
+ * shape, which is how one shape is audited against the knob arms on its own
+ * (a shape no arm moves is dead weight in probe.bin).
  *
  * Two families of corpus live here.
  *
@@ -486,10 +490,12 @@ int main(int argc, char **argv)
     static uint8_t block[BLOCK];
     unsigned long size = 4u * 1024u * 1024u;
     char path[1024];
-    int i, mixed = 0, probe = 0, ai;
+    int i, mixed = 0, probe = 0, probe_shape = -1, ai;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: corpus_write DIR [SIZE] [--mixed | --probe]\n");
+        fprintf(stderr,
+                "usage: corpus_write DIR [SIZE] [--mixed | --probe "
+                "[--probe-shape=N]]\n");
         return 2;
     }
     for (ai = 2; ai < argc; ai++) {
@@ -497,6 +503,15 @@ int main(int argc, char **argv)
             mixed = 1;
         } else if (strcmp(argv[ai], "--probe") == 0) {
             probe = 1;
+        } else if (strncmp(argv[ai], "--probe-shape=", 14) == 0) {
+            long v = strtol(argv[ai] + 14, NULL, 10);
+
+            if (v < 0 || v > 19) {
+                fprintf(stderr, "--probe-shape must be 0 to 19\n");
+                return 2;
+            }
+            probe = 1;
+            probe_shape = (int)v;
         } else {
             size = strtoul(argv[ai], NULL, 10);
             if (size == 0u || size % BLOCK != 0u) {
@@ -512,8 +527,11 @@ int main(int argc, char **argv)
     }
     if (mixed || probe) {
         uint64_t base = 0u;
-        int n = snprintf(path, sizeof path, "%s/%s.bin", argv[1],
-                         mixed ? "mixed" : "probe");
+        int n = (probe_shape >= 0)
+                    ? snprintf(path, sizeof path, "%s/probe-shape%d.bin",
+                               argv[1], probe_shape)
+                    : snprintf(path, sizeof path, "%s/%s.bin", argv[1],
+                               mixed ? "mixed" : "probe");
         FILE *f;
 
         if (n <= 0 || (size_t)n >= sizeof path) {
@@ -536,6 +554,11 @@ int main(int argc, char **argv)
                     size_t pn = chunk - off;
                     uint32_t page = (uint32_t)((base + off) / 4096u);
 
+                    /* A pinned shape keeps every page on the same case: the
+                     * shape is chosen by page % 20, so stepping the page by
+                     * twenty holds it and still varies the bytes. */
+                    if (probe_shape >= 0)
+                        page = (uint32_t)probe_shape + 20u * page;
                     if (pn > 4096u) pn = 4096u;
                     probe_fill(block + off, pn, page);
                 }
