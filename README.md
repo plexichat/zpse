@@ -201,9 +201,14 @@ the raw comparison, and the rate follows:
 
 | 4 KiB pages | plain L1 | plain L2 | plain BALANCED | `PAGE_FAST` L1 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| dumps | 58.61% at 268 MB/s | 57.32% at 208 MB/s | 41.32% at 138 MB/s | 66.09% at 982 MB/s | 65.96% at 954 MB/s |
+| dumps | 58.71% at 290 MB/s | 57.44% at 228 MB/s | 42.04% at 172 MB/s | 66.13% at 1104 MB/s | 65.98% at 1051 MB/s |
 | mixed | 78.45% at 300 MB/s | 77.37% at 261 MB/s | 56.47% at 127 MB/s | 81.06% at 843 MB/s | 80.54% at 853 MB/s |
-| Silesia | 80.08% at 275 MB/s | 77.54% at 238 MB/s | 56.07% at 141 MB/s | 82.85% at 608 MB/s | 80.24% at 624 MB/s |
+| Silesia | 80.39% at 329 MB/s | 77.71% at 278 MB/s | 57.17% at 176 MB/s | 83.09% at 802 MB/s | 80.42% at 832 MB/s |
+
+The dumps and Silesia rows are re-measured on this build, two rounds of the CLI's
+own bench; the mixed row is the earlier session's, because its 160 MB corpus is
+a set of host programs, libraries and documents this tree cannot regenerate,
+and a row re-derived from a different corpus would be a different measurement.
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
@@ -1242,12 +1247,14 @@ and 3.2% LARGER at 64 KiB: a 16 KiB or 64 KiB block reaches distances above
 4320 routinely and those cost three bytes where the fast form pays two, so the
 form stops at the page. Its decoder has the fast form's fast region: while
 sixteen payload bytes and thirty-two output bytes remain, a command the book
-carries -- or a byte token whose nibbles are both below fifteen -- at a
-distance of at most two bytes takes one sixteen-byte literal store, no escape
-chain and no bounds test of its own. Three paired rounds put that at 16% of
-the decode rate over page-sized dumps and 32% over page-sized Silesia, with
-every stream byte-identical, and a command the region refuses leaves no trace
-for the careful path behind it. That is the rule level 7 up encodes (`ZPSE_LZH_PAGE_LEVEL`
+carries -- or a byte token whose nibbles are both below fifteen -- at any
+distance the form spells in three bytes or fewer takes one sixteen-byte
+literal store, no escape chain and no bounds test of its own. Three paired
+rounds put the one- and two-byte forms at 16% of the decode rate over
+page-sized dumps and 32% over page-sized Silesia, with
+every stream byte-identical; the three-byte form adds 9% to a 64 KiB Silesia
+decode and nothing measurable at the page, and a command the region refuses
+leaves no trace for the careful path behind it. That is the rule level 7 up encodes (`ZPSE_LZH_PAGE_LEVEL`
 in `src/block.c` is the threshold): it is worth 0.69 of a ratio point over the
 dumps and 2.29 over Silesia at level 9, against 22% and 26% of that level's page
 rate. Level 6 and below keep the fast form, so their page bytes are unchanged to
@@ -1318,6 +1325,9 @@ question, and it keeps its table. 2^11, 2^10 and 2^9 all write MORE bytes
 rate this host can resolve, because the sample is 512 bytes on a page and 2^13
 already has sixteen slots per byte; 2^15 would have nothing left to collide and
 does not fit in the page's 16 KiB region, which is where the knob is capped.
+The sample was re-checked at the rung that reads pages in the hex form: at
+level 7 a 1 KiB sample writes 0.60% more bytes over the dumps and 0.15% more
+over Silesia and reads about 6% slower, so a page keeps the 512-byte one.
 
 The frame layer costs a decode nothing measurable. Walking a frame's block
 headers without decoding — parse, header CRC, size checks — runs at thousands
