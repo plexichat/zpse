@@ -653,37 +653,50 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 op += lit;
                 lp += lit;
                 lit_seen += lit;
-                /* The distance, without a branch on which kind it is.
+                /* The distance, with one branch on which kind it is.
                  *
                  * `lp[0] >= 0xFC` asks whether this command names one of the
-                 * four recent distances or an explicit one, and the answer
-                 * is data: on prose it is a run, on the binaries -- which is
-                 * where this form is the default level's choice -- it is
-                 * close to a coin toss, so the test mispredicts and the
-                 * pointer advance it guards sits on the critical path of
-                 * every command. Both candidates are computed and selected
-                 * instead, which is four cheap ALU operations against a
-                 * branch that costs fifteen cycles when it is wrong. */
+                 * four recent distances or an explicit one. This used to
+                 * compute both candidates and select, on the argument that
+                 * the answer is data and the test mispredicts. It is data,
+                 * but it is lopsided: over a census of the twelve Silesia
+                 * files at 64 KiB, a rep code is 0-26% of commands and under
+                 * 5% on nine of them, because this form is the one the cheap
+                 * rungs take on every block and its finder only names a
+                 * recent distance when the match is fresh. So the branch is
+                 * almost never taken, while the select chain ran on every
+                 * command. Measured decode-only, prebuilt -F frames, best of
+                 * nine passes, alternated: dickens 2 080 -> 2 106 MB/s,
+                 * mozilla 2 099 -> 2 162, x-ray 4 346 -> 4 521, nci
+                 * 2 632 -> 2 645, xml 2 736 -> 2 752. The rep path keeps the
+                 * select chain it needs. */
                 {
                     uint32_t c0 = (uint32_t)lp[0];
-                    uint32_t isrep = (c0 >= (uint32_t)LZ2_REP_BASE) ? 1u : 0u;
-                    uint32_t ri = c0 & 3u;
-                    uint32_t roff = rep[ri];
-                    uint32_t eoff = c0 | ((uint32_t)lp[1] << 8u);
-                    uint32_t n1, n2, n3;
 
-                    off = isrep != 0u ? roff : eoff;
-                    n1 = isrep != 0u ? ((ri >= 1u) ? rep[0] : rep[1]) : rep[0];
-                    n2 = isrep != 0u ? ((ri >= 2u) ? rep[1] : rep[2]) : rep[1];
-                    n3 = isrep != 0u ? ((ri == 3u) ? rep[2] : rep[3]) : rep[2];
-                    lp += isrep != 0u ? 1u : 2u;
-                    /* A literal-only command (an explicit zero) names no
-                     * distance and leaves the cache alone. */
-                    if (off != 0u) {
+                    if (c0 < (uint32_t)LZ2_REP_BASE) {
+                        off = c0 | ((uint32_t)lp[1] << 8u);
+                        lp += 2u;
+                        /* A literal-only command (an explicit zero) names no
+                         * distance and leaves the cache alone. */
+                        if (off != 0u) {
+                            rep[3] = rep[2];
+                            rep[2] = rep[1];
+                            rep[1] = rep[0];
+                            rep[0] = off;
+                        }
+                    } else {
+                        uint32_t ri = c0 & 3u;
+                        uint32_t n1, n2, n3;
+
+                        off = rep[ri];
+                        n1 = (ri >= 1u) ? rep[0] : rep[1];
+                        n2 = (ri >= 2u) ? rep[1] : rep[2];
+                        n3 = (ri == 3u) ? rep[2] : rep[3];
                         rep[0] = off;
                         rep[1] = n1;
                         rep[2] = n2;
                         rep[3] = n3;
+                        lp += 1u;
                     }
                 }
                 mlen = (uint32_t)(tok & 15u) + ZPSE_LZ2_MIN_MATCH;
