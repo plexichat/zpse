@@ -2460,6 +2460,29 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
 #endif
 }
 
+/* The match table the screen samples with.
+ *
+ * The screen runs the finder over 512 bytes on a page and 1 KiB on a larger
+ * block, but it was handed the page's 2^13-entry table: clearing 16 KiB to
+ * look at 512 bytes, twice per page, before either pass. The knob exists so
+ * the table can be sized to the sample instead of to the block; 13 is the
+ * table as it was.
+ *
+ * Smaller was measured and refused: 2^11, 2^10 and 2^9 all write MORE bytes
+ * (dumps level 6 +16K/+39K/+77K, Silesia +197K/+197K/+442K, and the hex pages
+ * move the same way) for no rate the host can resolve, because a table too
+ * small to hold the sample changes which blocks the screen convicts. Bigger is
+ * not available and would not pay: the sample is 512 bytes on a page, so 2^13
+ * already has sixteen slots per byte and nothing left to collide, and the
+ * 2^15 table the sweep's own passes use does not fit in the page's 16 KiB
+ * region -- a build with 15 wrote past it and crashed. Hence the ceiling. */
+#ifndef ZPSE_LZ_SCREEN_HASH_BITS
+#define ZPSE_LZ_SCREEN_HASH_BITS ZPSE_LZ_HASH_BITS
+#endif
+#if ZPSE_LZ_SCREEN_HASH_BITS > 13
+#error "the screen's table is the page's 16 KiB region; more bits do not fit"
+#endif
+
 /* ---- The sample screen the LZ candidate passes first ---------------- *
  *
  * The match finder is the most expensive candidate in the sweep: measured
@@ -2652,7 +2675,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     lz_s = zpse_lz_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
                           lvl == 1u
                               ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                              : (uint32_t)ZPSE_LZ_HASH_BITS);
+                              : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
     if (lz_s == 0u) {
         return 1;
     }
@@ -2703,7 +2726,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                        (uint32_t)ZPSE_E_SZ_CAND, e->lz,
                                        lvl == 1u
                                            ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                           : (uint32_t)ZPSE_LZ_HASH_BITS);
+                                           : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -2762,7 +2785,7 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
               (uint32_t)ZPSE_LZ2_SHORT_MARGIN_DEN;
     }
     lz_s = zpse_lz2_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                           (uint32_t)ZPSE_LZ_HASH_BITS);
+                           (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
     if (lz_s == 0u) {
         return 1;
     }
@@ -2784,7 +2807,7 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t off = (n - sn) / 2u;
         uint32_t lz_m = zpse_lz2_encode(in + off, sn, e->cand,
                                         (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                                        (uint32_t)ZPSE_LZ_HASH_BITS);
+                                        (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {

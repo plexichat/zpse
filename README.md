@@ -1223,19 +1223,31 @@ pass, one pinned core, warmed buffers (packed bytes are exact):
 
 | block | form | packed | encode | decode |
 | --- | --- | ---: | ---: | ---: |
-| 4 KiB, dumps | fast | 90,691,356 | 452 MB/s | 2541 MB/s |
-| 4 KiB, dumps | hex | 88,418,390 | 322 MB/s | 1440 MB/s |
-| 4 KiB, Silesia | fast | 120,248,161 | 339 MB/s | 2265 MB/s |
-| 4 KiB, Silesia | hex | 117,724,698 | 221 MB/s | 1069 MB/s |
-| 64 KiB, dumps | fast | 75,301,175 | 576 MB/s | 2704 MB/s |
-| 64 KiB, dumps | hex | 75,688,310 | 402 MB/s | 1476 MB/s |
-| 64 KiB, Silesia | fast | 96,661,430 | 385 MB/s | 2239 MB/s |
-| 64 KiB, Silesia | hex | 99,758,977 | 234 MB/s | 846 MB/s |
+| 4 KiB, dumps | fast | 90,691,356 | 459 MB/s | 2691 MB/s |
+| 4 KiB, dumps | hex | 88,418,390 | 357 MB/s | 2043 MB/s |
+| 4 KiB, Silesia | fast | 120,248,161 | 339 MB/s | 2266 MB/s |
+| 4 KiB, Silesia | hex | 117,724,698 | 260 MB/s | 1418 MB/s |
+| 16 KiB, dumps | fast | 83,494,008 | 690 MB/s | 3006 MB/s |
+| 16 KiB, dumps | hex | 82,432,387 | 483 MB/s | 1920 MB/s |
+| 16 KiB, Silesia | fast | 106,610,942 | 415 MB/s | 2307 MB/s |
+| 16 KiB, Silesia | hex | 106,758,252 | 289 MB/s | 1164 MB/s |
+| 64 KiB, dumps | fast | 75,301,175 | 702 MB/s | 2987 MB/s |
+| 64 KiB, dumps | hex | 75,688,310 | 486 MB/s | 1768 MB/s |
+| 64 KiB, Silesia | fast | 96,661,430 | 407 MB/s | 2274 MB/s |
+| 64 KiB, Silesia | hex | 99,758,977 | 274 MB/s | 985 MB/s |
 
 So it is 2.51% smaller over page-sized dumps and 2.10% over page-sized Silesia,
-and 0.51% and 3.2% LARGER at 64 KiB: a 64 KiB block reaches distances above
+1.27% smaller over 16 KiB dumps but 0.14% LARGER over 16 KiB Silesia, and 0.51%
+and 3.2% LARGER at 64 KiB: a 16 KiB or 64 KiB block reaches distances above
 4320 routinely and those cost three bytes where the fast form pays two, so the
-form stops at the page. That is the rule level 7 up encodes (`ZPSE_LZH_PAGE_LEVEL`
+form stops at the page. Its decoder has the fast form's fast region: while
+sixteen payload bytes and thirty-two output bytes remain, a command the book
+carries -- or a byte token whose nibbles are both below fifteen -- at a
+distance of at most two bytes takes one sixteen-byte literal store, no escape
+chain and no bounds test of its own. Three paired rounds put that at 16% of
+the decode rate over page-sized dumps and 32% over page-sized Silesia, with
+every stream byte-identical, and a command the region refuses leaves no trace
+for the careful path behind it. That is the rule level 7 up encodes (`ZPSE_LZH_PAGE_LEVEL`
 in `src/block.c` is the threshold): it is worth 0.69 of a ratio point over the
 dumps and 2.29 over Silesia at level 9, against 22% and 26% of that level's page
 rate. Level 6 and below keep the fast form, so their page bytes are unchanged to
@@ -1295,7 +1307,17 @@ entries, and a page keeps the small table because clearing 64 KiB for a 4 KiB
 block costs more than the collisions it removes (dumps 455 to 388 MB/s at 15
 bits, and 0.03 more ratio points). Over Silesia at 64 KiB the default level
 writes 101,858,449 -> 101,791,194 bytes and level 9 94,248,419 -> 94,204,004,
-and 4 KiB pages are byte-identical.
+and 4 KiB pages are byte-identical. The 16 KiB rows move the same way:
+80,147,098 -> 80,127,261 bytes over the dumps and 106,108,422 -> 106,102,167
+over Silesia at the default level, 79,280,746 -> 79,245,487 and
+100,164,723 -> 100,093,930 at level 9.
+
+The screen that samples before either pass is the other side of the same
+question, and it keeps its table. 2^11, 2^10 and 2^9 all write MORE bytes
+(+16K/+39K/+77K on the dumps at level 6, +197K/+197K/+442K on Silesia) with no
+rate this host can resolve, because the sample is 512 bytes on a page and 2^13
+already has sixteen slots per byte; 2^15 would have nothing left to collide and
+does not fit in the page's 16 KiB region, which is where the knob is capped.
 
 The frame layer costs a decode nothing measurable. Walking a frame's block
 headers without decoding — parse, header CRC, size checks — runs at thousands

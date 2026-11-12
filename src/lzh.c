@@ -585,6 +585,88 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         } else {
             nib = tok & 15u;
         }
+        /* Fast region: every command whose fields are carried without an
+         * escape -- a book hit, or a byte token whose two nibbles are below
+         * fifteen -- at a distance of at most two bytes. That is nearly every
+         * command on a page, and this path needs no escape chain, no bounds
+         * test of its own and no call per literal run: a sixteen-byte store
+         * covers the longest run these forms carry, and the bytes past it are
+         * output a later command overwrites. The two conditions are
+         * conservative -- sixteen payload bytes is the widest body this path
+         * reads (a byte token, fourteen literals and a two-byte distance),
+         * thirty-two output bytes is the longest command it can take (fourteen
+         * literals and a seventeen-byte match with the wide stores' slack).
+         * Everything outside them falls through to the careful path, which is
+         * what a truncated or hostile stream needs anyway. */
+        if ((in_len - pos) >= 16u && (n - op) >= 32u) {
+            uint32_t run, len, p = pos;
+            int fast = 1;
+
+            if (nib == LZH_TOK_ESC) {
+                uint32_t bt = (uint32_t)in[p];
+
+                run = bt >> 4u;
+                len = bt & 15u;
+                if (run == 15u || len == 15u) {
+                    fast = 0; /* an escape byte: the careful path's */
+                } else {
+                    p += 1u;
+                    len = len == 0u ? 0u : len + 3u;
+                }
+            } else {
+                run = (uint32_t)zpse_lzh_book[nib].run;
+                len = (uint32_t)zpse_lzh_book[nib].len;
+            }
+            /* The cursor is local until the command is taken, because a byte
+             * token whose distance is the three-byte form has already been
+             * stepped over above: the careful path has to see it where it is.
+             * Every branch below that mutates the output is past the distance
+             * test, so a command this path will not take leaves no trace. */
+            if (fast && (run != 0u || len != 0u)) {
+                uint32_t b0 = (uint32_t)in[p + run];
+
+                /* One-byte distances and the four repeat codes; the two-byte
+                 * form is included, the three-byte one and the reserved codes
+                 * are not. */
+                if (len == 0u || b0 <= 0xEFu || b0 >= (uint32_t)LZH_REP_BASE) {
+                    uint32_t off = 0u;
+
+                    memcpy(out + op, in + p, 16u);
+                    op += run;
+                    p += run;
+                    lit_seen += run;
+                    if (len != 0u) {
+                        if (b0 >= (uint32_t)LZH_REP_BASE) {
+                            off = rep[b0 & 3u];
+                            lzh_rep_move(rep, off, b0 & 3u);
+                        } else if (b0 <= 0xDFu) {
+                            off = b0 + 1u;
+                            lzh_rep_move(rep, off, 4u);
+                        } else {
+                            off = 225u + (((b0 & 15u) << 8u) |
+                                          (uint32_t)in[p + 1u]);
+                            lzh_rep_move(rep, off, 4u);
+                            p += 1u;
+                        }
+                        p += 1u;
+                        if (off > op) {
+                            return lzh_bad(__LINE__);
+                        }
+                        /* A match no longer than a store and at least a
+                         * store away is one store; the bytes past it are
+                         * overwritten later. */
+                        if (off >= 16u && len <= 16u) {
+                            memcpy(out + op, out + op - off, 16u);
+                        } else {
+                            lzh_copy_match(out, op, n, off, len);
+                        }
+                        op += len;
+                    }
+                    pos = p;
+                    continue;
+                }
+            }
+        }
         if (nib == LZH_TOK_ESC) {
             uint32_t bt, lc;
 
@@ -624,7 +706,14 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             return lzh_bad(__LINE__);
         }
         if (run != 0u) {
-            memcpy(out + op, in + pos, run);
+            /* One store covers any run without an escape when both sides have
+             * the room; the bytes past the run are output a later command
+             * overwrites. */
+            if (run < 15u && (n - op) >= 16u && (in_len - pos) >= 16u) {
+                memcpy(out + op, in + pos, 16u);
+            } else {
+                memcpy(out + op, in + pos, run);
+            }
             op += run;
             pos += run;
             lit_seen += run;
