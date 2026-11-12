@@ -156,6 +156,53 @@ of explicit distances, and a per-page dictionary. Each is recorded in the
 README only where it still explains a shipped choice; the numbers live with
 the harness that produced them.
 
+## The fast LZ decoder, and where its time actually went
+
+`LZ_FAST` is the form the page table quotes first, and on prose it decoded
+30-45% slower than lz4 per 64 KiB block while issuing 5-15% *fewer* commands --
+about 11.5 cycles per command against 7.5. Tile blocks on the same file decode
+at 5 782 MB/s against 2 115 for the command stream, so the gap was in the shape
+of the commands, not in the frame around them. Three attempts followed, and
+only the last one paid.
+
+* The distance's kind was a select chain (`c0 < 0xFC`), on the argument that
+  its answer is data and therefore mispredicts. A census said otherwise: a
+  repeat code is 0-26% of commands over the twelve Silesia files, under 10% on
+  nine of them and at most 5% on eight, so the branch is almost never taken
+  while the select chain ran on every command. Making it a branch measured
+  2 080 -> 2 106 MB/s on dickens, 2 099 -> 2 162 on mozilla, 4 346 -> 4 521 on
+  x-ray, and flat on nci and xml.
+
+* The next plan was the branch count itself: fold the payload and output room
+  tests into one budget per run, merge the two nibble tests into one with
+  `(((tok & 15) + 1) | ((tok >> 4) + 1)) & 16`, drop the match-length tests the
+  region's own restriction makes dead, merge "zero distance" and "distance
+  past the output" into one unsigned compare, and hand every escape to a
+  single caretaker -- five branches per command. It was 5-14% slower: nci
+  -14%, xml -13%, x-ray -11%, mozilla -5%, dickens +4%. Keeping the loop and
+  taking only the tests that could go without restructuring it was still 1-3%
+  slower. The decoder is not front-end bound, and the branch count was the
+  wrong metric for it.
+
+* What remained was the shape of the stores. The region wrote a match with one
+  32-byte store (a 16-byte one at nearer distances) and its literals with one
+  16-byte store, and a few bytes later another store landed in the same cache
+  line -- the pattern store-to-load forwarding handles worst. Eight-byte steps
+  instead, two for an ordinary match and a third only for the seventeen and
+  eighteen byte matches the region can still name, plus two eight-byte literal
+  stores, with the room test raised from nineteen bytes to the twenty-four the
+  last step reaches. Best of ten alternated runs on prebuilt blocks: dickens
+  2 134 -> 2 247 MB/s, mozilla 2 133 -> 2 226, xml 2 673 -> 2 723, x-ray
+  5 675 -> 5 707, nci 2 636 -> 2 606 (its commands are 40% escapes and take the
+  careful path). The 4 KiB page row moved from 1 826 to 1 994 MB/s, and the
+  parity and fuzz digests did not move at all.
+
+The three together say something worth keeping: on this decoder the
+per-command tests were never the cost, so an idea that removes them is worth
+nothing until the copy changes. The remaining gap to lz4 on prose is about a
+quarter, and it sits on the escape-heavy side, where the careful path still
+uses the rle-table copy helper.
+
 ## What measurement changed
 
 The project converged on a small set of rules:
