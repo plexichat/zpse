@@ -2912,6 +2912,15 @@ static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
 #ifndef ZPSE_LZ_TABLE_BIG_MIN
 #define ZPSE_LZ_TABLE_BIG_MIN 16384u
 #endif
+/* The F form's table at page size, in hash bits. The 64 KiB arm is 2^16
+ * entries because a 64 KiB block inserts up to 65,532 positions there -- a
+ * load factor of one. A 4 KiB page inserts at most 4,092, and clearing the
+ * same 128 KiB for it costs 32 bytes of store per input byte; this is the
+ * table a page gets instead (see the LZ_FAST arm in zpse_block_lz_body for
+ * the measurement, and ZPSE_LZ_TABLE_BIG_MIN above for the 64 KiB side). */
+#ifndef ZPSE_LZ2_PAGE_BITS
+#define ZPSE_LZ2_PAGE_BITS 13u
+#endif
 
 /* The fast LZ form's block: same header, same 'is_last' and CRC handling as
  * zpse_block_try_lz, different payload codec. */
@@ -2962,8 +2971,23 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t hb = (uint32_t)ZPSE_LZ_HASH_BITS;
 
         if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u) {
+            /* ... but not at a page's size. The 2^16 table above was measured
+             * on 64 KiB blocks; on a 4 KiB page it is 32 bytes of clear per
+             * input byte, and the table only ever holds 4,092 positions.
+             * ZPSE_LZ2_PAGE_BITS is the page's table: on the generated page
+             * corpus, 4 KiB blocks, level 6 with LZ_FAST, 13 bits encodes
+             * +9.6% faster on the mixed page stream (518 -> 567 MB/s) and
+             * +6.5% on the repeated-page stream (551 -> 587), for +0.073% of
+             * packed bytes there (5,528 of 7,534,944) and at most +0.19% on
+             * any class (float-series); the mixed page stream and the zero
+             * pages are byte-identical to the 16-bit arm. 12 bits, the load
+             * factor a 64 KiB block runs at, was no faster than 16 in the
+             * same alternation (510 against 518 MB/s) and cost 0.21 points
+             * more on float-series, so 13 is the arm. */
             tab = e->cand;
-            hb = 16u;
+            hb = n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX
+                     ? (uint32_t)ZPSE_LZ2_PAGE_BITS
+                     : 16u;
         } else if (dst != e->cand) {
             /* The caller is holding the candidate staging for something
              * else, so its 64 KiB are free: 2^15 entries instead of 2^13.
