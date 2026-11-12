@@ -293,7 +293,7 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 {
     uint16_t *tab = (uint16_t *)table;
     uint32_t entries = 1u << hash_bits;
-    uint32_t pos, anchor, misses, i;
+    uint32_t pos, anchor, misses;
     uint32_t cur, h, limit;
     uint32_t rep[4] = { 1u, 1u, 1u, 1u };
     LzhWr w;
@@ -307,16 +307,11 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < ZPSE_LZH_MIN_PAYLOAD) {
         return 0u;
     }
-    {
-        uint64_t fill = UINT64_C(0xFFFFFFFFFFFFFFFF);
-
-        for (i = 0; i + 4u <= entries; i += 4u) {
-            memcpy(tab + i, &fill, 8u);
-        }
-        for (; i < entries; i++) {
-            tab[i] = (uint16_t)LZH_EMPTY;
-        }
-    }
+    /* LZH_EMPTY is 0xFFFF and the table is uint16_t, so all-ones bytes are
+     * exactly the empty marker. One memset beats the 16-bit fill loop, which
+     * gcc does not vectorise at -O2, and the clear is paid once per block;
+     * src/lz.c has the measurement and the same change. */
+    memset(tab, 0xFF, (size_t)entries * sizeof *tab);
     w.dst = dst;
     w.cap = cap;
     w.pos = LZH_HDR;
@@ -338,9 +333,8 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t mcand = cand;
 
         tab[h] = (uint16_t)pos;
-        if (__builtin_expect(cand == LZH_EMPTY ||
-                                 zpse_load_u32le(in + cand) != cur,
-                             1)) {
+        if (ZPSE_LIKELY(cand == LZH_EMPTY ||
+                        zpse_load_u32le(in + cand) != cur)) {
             pos += 1u + (misses >> 5u);
             misses++;
             if (pos > limit) {

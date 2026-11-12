@@ -364,15 +364,13 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
     if (cap < ZPSE_LZ_MIN_PAYLOAD) {
         return 0u;
     }
-    /* Four entries per store. The loop this replaces was one 16-bit store per
-     * iteration, and at -O2 gcc does not vectorise it: 8192 iterations of
-     * store, increment, compare and branch, per block, on a table whose only
-     * purpose at that moment is to be overwritten. The table is 16 KiB and
-     * the pass around it reads it constantly, so the clear is paid every
-     * block of every file. */
-    /* The table is 16 KiB and the pass around it reads it constantly, so the
-     * clear is paid every block of every file. LZ_EMPTY is 0xFFFF and the
-     * table is uint16_t, so all-ones bytes are exactly the empty marker. */
+    /* The loop this replaces was one 16-bit store per iteration, and at -O2
+     * gcc does not vectorise it: 8192 iterations of store, increment, compare
+     * and branch, per block, on a table whose only purpose at that moment is
+     * to be overwritten. The table is 16 KiB and the pass around it reads it
+     * constantly, so the clear is paid every block of every file. LZ_EMPTY is
+     * 0xFFFF and the table is uint16_t, so all-ones bytes are exactly the
+     * empty marker. */
     memset(tab, 0xFF, (size_t)entries * sizeof *tab);
     o.dst = dst;
     o.cap = cap;

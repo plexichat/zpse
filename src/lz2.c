@@ -226,7 +226,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 {
     uint16_t *tab = (uint16_t *)table;
     uint32_t entries = 1u << hash_bits;
-    uint32_t pos, anchor, misses, i;
+    uint32_t pos, anchor, misses;
     uint32_t lit_total = 0u, cmds = 0u, out = LZ2_HDR;
     uint32_t cur, h, limit;
     uint32_t rep[4] = { 1u, 1u, 1u, 1u };
@@ -240,19 +240,11 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < ZPSE_LZ2_MIN_PAYLOAD) {
         return 0u;
     }
-    /* Four entries per store, for the same reason src/lz.c's clear has it:
-     * at -O2 the 16-bit fill is not vectorised, and this table is cleared
-     * once per block. */
-    {
-        uint64_t fill = UINT64_C(0xFFFFFFFFFFFFFFFF);
-
-        for (i = 0; i + 4u <= entries; i += 4u) {
-            memcpy(tab + i, &fill, 8u);
-        }
-        for (; i < entries; i++) {
-            tab[i] = (uint16_t)LZ2_EMPTY;
-        }
-    }
+    /* LZ2_EMPTY is 0xFFFF and the table is uint16_t, so all-ones bytes are
+     * exactly the empty marker. One memset beats the 16-bit fill loop, which
+     * gcc does not vectorise at -O2, for the same reason src/lz.c's clear
+     * does (see the comment there). */
+    memset(tab, 0xFF, (size_t)entries * sizeof *tab);
     pos = 0u;
     anchor = 0u;
     misses = 0u;
@@ -269,9 +261,8 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t mcand = cand;
 
         tab[h] = (uint16_t)pos;
-        if (__builtin_expect(cand == LZ2_EMPTY ||
-                                 zpse_load_u32le(in + cand) != cur,
-                             1)) {
+        if (ZPSE_LIKELY(cand == LZ2_EMPTY ||
+                        zpse_load_u32le(in + cand) != cur)) {
             /* Two misses are a coincidence; a run of them means the data has
              * no match here, so the cursor accelerates. */
             pos += 1u + (misses >> ZPSE_LZ2_SKIP_BITS);
