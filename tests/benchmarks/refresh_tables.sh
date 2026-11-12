@@ -232,6 +232,101 @@ else
     missing "lz4 CLI (built from source if the fetch works) or zstd"
 fi
 
+# ---- Mixed page tables ------------------------------------------------
+
+# The page tables quote a mixed workload. It is generated here rather than
+# scraped from the host, so these rows mean the same thing on every machine:
+# 160 MiB interleaving prose, source, executable-like bytes, library-like
+# blobs, records and opaque chunks, one 64 KiB chunk at a time.
+mixed="$work/mixed"
+mfile="$mixed/mixed.bin"
+mkdir -p "$mixed" || exit 1
+if "$work/corpus_write" "$mixed" 167772160 --mixed && [ -s "$mfile" ]; then
+    msize=$(wc -c <"$mfile")
+    # Best wall time in ns over REPS runs; fails if any run fails.
+    timed() {
+        local best="" t0 t1 dt r
+        for ((r = 0; r < REPS; r++)); do
+            t0=$(date +%s%N)
+            "$@" >/dev/null 2>&1 || return 1
+            t1=$(date +%s%N)
+            dt=$((t1 - t0))
+            if [ -z "$best" ] || [ "$dt" -lt "$best" ]; then best=$dt; fi
+        done
+        printf '%s\n' "$best"
+    }
+    # One frame per file at 4 KiB blocks -- the method the caption names.
+    zcell() { # level -> ratio|encode MB/s|decode MB/s
+        local zf="$mixed/m$1.zst" sz te td
+        "$zstd" -q -T1 -B4K -"$1" -c "$mfile" >"$zf" || return 1
+        sz=$(wc -c <"$zf")
+        te=$(timed "$zstd" -q -T1 -B4K -"$1" -c "$mfile") || return 1
+        td=$(timed "$zstd" -q -d -c "$zf") || return 1
+        awk -v s="$sz" -v n="$msize" -v e="$te" -v d="$td" 'BEGIN {
+            printf "%.2f|%.0f|%.1f", 100.0 * s / n,
+                n * 1000.0 / e, n * 1000.0 / d }'
+    }
+    P=()
+    for l in 1 6 9; do
+        P+=("$("$cli" bench -q -b 4096 -l "$l" -r "$REPS" "$mfile" |
+            awk '/TOTAL/ {printf "%.2f|%.0f|%.1f", 100.0*$3/$2, $5, $6}')")
+    done
+    Z=()
+    if [ -n "$zstd" ]; then
+        for l in 1 6 9; do
+            c=$(zcell "$l") || break
+            Z+=("$c")
+        done
+    fi
+    if [ "${#Z[@]}" -eq 3 ]; then
+        all=("${P[@]}" "${Z[@]}")
+        hdr="| 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |"
+        sep="| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+    else
+        all=("${P[@]}")
+        hdr="| 4 KiB pages, mixed | level 1 | level 6 | level 9 |"
+        sep="| --- | ---: | ---: | ---: |"
+    fi
+    # $1 label, $2 field of "ratio|enc|dec", $3 suffix; rest = cells.
+    row() {
+        local label="$1" field="$2" suffix="$3" c v out=""
+        shift 3
+        for c in "$@"; do
+            v=$(printf '%s' "$c" | cut -d'|' -f"$field")
+            if [ "$suffix" = " GB/s" ]; then
+                v=$(awk -v x="$v" 'BEGIN { printf "%.1f", x / 1000.0 }')
+            fi
+            out="$out $v$suffix |"
+        done
+        printf '| %s |%s\n' "$label" "$out"
+    }
+    say "mixed 4 KiB pages"
+    echo "$hdr"
+    echo "$sep"
+    row ratio 1 "%" "${all[@]}"
+    row encode 2 " MB/s" "${all[@]}"
+    row decode 3 " GB/s" "${all[@]}"
+
+    # The PAGE_FAST row alone: the other rows of that table are the host
+    # corpora, which this tree cannot regenerate.
+    say "mixed PAGE_FAST row"
+    echo "| 4 KiB pages | plain L1 | plain L2 | plain BALANCED | \`PAGE_FAST\` L1 | \`PAGE_FAST\` L2 |"
+    echo "| --- | ---: | ---: | ---: | ---: | ---: |"
+    pf=""
+    for spec in "-l 1" "-l 2" "-l 5" "-l 1 -P" "-l 2 -P"; do
+        # The spec is a pair of bench options and is meant to split here.
+        pf="$pf $("$cli" bench -q -b 4096 $spec -r "$REPS" "$mfile" |
+            awk '/TOTAL/ {printf "%.2f%%|%.0f", 100.0*$3/$2, $5}')"
+    done
+    pfr=""
+    for c in $pf; do
+        pfr="$pfr $(printf '%s' "$c" | cut -d'|' -f1) at $(printf '%s' "$c" | cut -d'|' -f2) MB/s |"
+    done
+    printf '| mixed |%s\n' "$pfr"
+else
+    missing "mixed corpus (corpus_write --mixed)"
+fi
+
 # ---- colcheck ---------------------------------------------------------
 
 if [ -f "$titanic" ] && [ -f "$uber" ]; then

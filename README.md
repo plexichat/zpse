@@ -142,9 +142,9 @@ opaque data one 64 KiB chunk at a time:
 
 The zstd columns are one frame per file with 4 KiB blocks (`zstd -B4K -T1`),
 size and both rates from the same run. The corpus is generated here, so the
-table is re-measurable on any host; figures earlier in this document that name
-the mixed workload come from a corpus that is neither this one nor
-reproducible from this tree.
+table is re-measurable on any host. Figures earlier in this document that name
+the mixed workload without saying they were re-measured here come from that
+table's original host-file corpus, which this tree cannot regenerate.
 
 Where the dumps' 9.68-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
@@ -243,12 +243,15 @@ never drops -- and the count falls to 6.9. What the cap costs is the shape the
 eighth and ninth candidates would have won with, and where the level prices
 every plane that is a shape the trial was rejecting anyway: the dumps paid
 1.13% of packed bytes for a fifth of the rate back (40.92% to 41.38%, 112.0 to
-136.2 MB/s at five paired passes), the mixed workload 0.008% (104.2 to 118.0)
+136.2 MB/s at five paired passes), the mixed workload 0.045% (96,731,301 to
+96,806,099 bytes)
 and Silesia 0.064% (119.6 to 134.0). With the whole-page price below in place
-it costs nothing measurable at all: the cap writes the same 88,111,603 /
-90,350,032 / 118,838,028 bytes with and without it on the three corpora, and
-the rate difference is inside this host's band (dumps 141.5 against 137.8 MB/s
-mean, mixed 130.5 against 130.3, Silesia 140.2 against 139.8). It stays as a ceiling rather than as a decision: at level 6 the sweep prices
+it was free on the dumps and Silesia (the same 88,111,603 / 90,350,032 bytes
+with and without it, rates inside this host's band: 141.5 against 137.8 MB/s
+mean, 140.2 against 139.8), but on the generated corpus it is a small real
+trade: at level 6 the shipped cap writes 96,806,099 bytes against 96,731,301
+with the cap raised to nine -- 0.045 of a point -- for 184.0 against 160.5 MB/s
+of encode (two passes each). It stays as a ceiling rather than as a decision: at level 6 the sweep prices
 6.86, 6.90 and 5.62 candidates per page on the three dumps files, against a cap
 of seven, and raising the cap past the list length leaves the same counters
 (94,637 / 157,154 / 292,632 prices, 23,111 / 49,336 / 201,464 kept) and the same
@@ -328,15 +331,16 @@ gate prices a kilobyte at each end of a page instead of two, and the match
 finder's screen samples 512 bytes instead of 1 KiB on a page. Together, level 6
 reads 12 to 14% faster on all three corpora and level 1 13% faster on Silesia
 (medians of four interleaved passes on one pinned core), and the bytes go DOWN
-0.21 of a ratio point on the dumps and 0.22 on the mixed corpus for 0.09 of a
-point up on Silesia -- 186 KB of 212 MB -- because a shorter screen refuses
-passes the tiles were going to beat. All 768 size cases are unchanged by the
+0.21 of a ratio point on the dumps and 0.001 on the generated mixed corpus
+(1,383 bytes) for 0.09 of a point up on Silesia -- 186 KB of 212 MB -- because
+a shorter screen refuses passes the tiles were going to beat. All 768 size cases are unchanged by the
 gate's sample; the screen's writes 125 bytes fewer across the suite and no case
 grows. Both halves of that give-back were then measured and refused: a third
 gate window halfway along the page recovers 49 653 bytes of Silesia (0.023 of a
 point) for 4.4% of its rate, and a 768-byte screen gives Silesia back 171 723
-while growing the dumps by 48 286 and the mixed corpus by 321 509 (0.21 of a
-point) and reading 4% slower. The 1 KiB gate and the 512-byte screen are the
+while growing the dumps by 48 286 and the generated mixed corpus by 2 096
+(0.001 of a point) and reading 9% slower there (195.0 to 177.4 MB/s, two
+passes each). The 1 KiB gate and the 512-byte screen are the
 corner of both trades. Both samples stop at a page: the gate keeps its 2 KiB span and the
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
