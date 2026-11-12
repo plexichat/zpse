@@ -142,6 +142,13 @@ page work therefore changed decisions rather than the format:
   page has no sweep behind its trial to repair a wrong verdict.
 * The hexadecimal LZ form from level 7 up, where distances above 4320 are
   rare enough that its shorter distance codes win.
+* A page-sized hash table for `ZPSE_ENC_LZ_FAST`. The fast form's 2^16 entries
+  were chosen on 64 KiB blocks, where they hold a load factor of one; on a
+  page that cannot insert 4,092 positions the same table is 128 KiB of clear,
+  or 32 bytes of store per input byte. Thirteen bits buys 9.6% of encode on
+  the mixed page stream and 6.5% on the repeated-page stream for 0.073% of
+  packed bytes there and at most 0.19% on any single class; twelve bits, the
+  load factor the 64 KiB arm runs at, was slower and larger.
 
 Many page ideas were measured and refused: a middle gate window, a larger gate
 sample, four page tiles, a third flat trial, extra noise samples, delta coding
