@@ -318,6 +318,9 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     w.lit_total = 0u;
     w.cmds = 0u;
     w.have = 0;
+    /* pend is only read once `have` says a command is waiting, but MSVC's
+     * flow analysis cannot see that lzh_put fills it through a pointer. */
+    memset(&w.pend, 0, sizeof w.pend);
 
     pos = 0u;
     anchor = 0u;
@@ -594,43 +597,43 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
          * Everything outside them falls through to the careful path, which is
          * what a truncated or hostile stream needs anyway. */
         if ((in_len - pos) >= 18u && (n - op) >= 32u) {
-            uint32_t run, len, p = pos;
+            uint32_t frun, flen, p = pos;
             int fast = 1;
 
             if (nib == LZH_TOK_ESC) {
                 uint32_t bt = (uint32_t)in[p];
 
-                run = bt >> 4u;
-                len = bt & 15u;
-                if (run == 15u || len == 15u) {
+                frun = bt >> 4u;
+                flen = bt & 15u;
+                if (frun == 15u || flen == 15u) {
                     fast = 0; /* an escape byte: the careful path's */
                 } else {
                     p += 1u;
-                    len = len == 0u ? 0u : len + 3u;
+                    flen = flen == 0u ? 0u : flen + 3u;
                 }
             } else {
-                run = (uint32_t)zpse_lzh_book[nib].run;
-                len = (uint32_t)zpse_lzh_book[nib].len;
+                frun = (uint32_t)zpse_lzh_book[nib].run;
+                flen = (uint32_t)zpse_lzh_book[nib].len;
             }
             /* The cursor is local until the command is taken, because a byte
              * token whose distance is the three-byte form has already been
              * stepped over above: the careful path has to see it where it is.
              * Every branch below that mutates the output is past the distance
              * test, so a command this path will not take leaves no trace. */
-            if (fast && (run != 0u || len != 0u)) {
-                uint32_t b0 = (uint32_t)in[p + run];
+            if (fast && (frun != 0u || flen != 0u)) {
+                uint32_t b0 = (uint32_t)in[p + frun];
 
                 /* Every distance form but the reserved codes: one byte,
                  * two bytes, the three-byte form and the four repeats. */
-                if (len == 0u || b0 <= 0xEFu || b0 == 0xF0u ||
+                if (flen == 0u || b0 <= 0xEFu || b0 == 0xF0u ||
                     b0 >= (uint32_t)LZH_REP_BASE) {
                     uint32_t off = 0u;
 
                     memcpy(out + op, in + p, 16u);
-                    op += run;
-                    p += run;
-                    lit_seen += run;
-                    if (len != 0u) {
+                    op += frun;
+                    p += frun;
+                    lit_seen += frun;
+                    if (flen != 0u) {
                         if (b0 >= (uint32_t)LZH_REP_BASE) {
                             off = rep[b0 & 3u];
                             lzh_rep_move(rep, off, b0 & 3u);
@@ -655,12 +658,12 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                         /* A match no longer than a store and at least a
                          * store away is one store; the bytes past it are
                          * overwritten later. */
-                        if (off >= 16u && len <= 16u) {
+                        if (off >= 16u && flen <= 16u) {
                             memcpy(out + op, out + op - off, 16u);
                         } else {
-                            lzh_copy_match(out, op, n, off, len);
+                            lzh_copy_match(out, op, n, off, flen);
                         }
-                        op += len;
+                        op += flen;
                     }
                     pos = p;
                     continue;

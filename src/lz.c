@@ -507,11 +507,12 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
              * on hex, text and URL blocks. Only a match that runs past
              * the head reaches the wide loop, which is what long runs
              * want. `hit` says the length is already final. */
-            uint32_t cap = (n - pos - len) < 24u ? (n - pos - len) : 24u;
+            /* min(remaining, 24) bytes of match head to compare. */
+            uint32_t head = (n - pos - len) < 24u ? (n - pos - len) : 24u;
             uint32_t m = 0u;
             int hit = 0;
 
-            while (m + 8u <= cap) {
+            while (m + 8u <= head) {
                 uint64_t x = lz_load64(in + pos + len + m) ^
                              lz_load64(in + cand + len + m);
 

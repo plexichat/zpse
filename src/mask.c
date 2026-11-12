@@ -65,17 +65,6 @@ static void zpse_mask_set_range(uint32_t words[8], uint32_t from,
 /* Population count on one dense word. The builtin is available on both
  * compilers this codebase targets through gcc/clang; the fallback keeps
  * the file buildable elsewhere without changing the result. */
-static int zpse_mask_popcount32(uint32_t w)
-{
-    /* Branch-free SWAR popcount. __builtin_popcount lowers to a libgcc
-     * call (__popcountdi2) unless the whole build is compiled with
-     * -mpopcnt, which this portable codebase is not. */
-    w = w - ((w >> 1) & 0x55555555u);
-    w = (w & 0x33333333u) + ((w >> 2) & 0x33333333u);
-    w = (w + (w >> 4)) & 0x0F0F0F0Fu;
-    return (int)((w * 0x01010101u) >> 24);
-}
-
 /* Index of the lowest set bit. Caller guarantees w != 0. */
 static unsigned zpse_mask_ctz32(uint32_t w)
 {
@@ -194,6 +183,22 @@ int zpse_mask_test(const uint32_t words[8], uint16_t pos)
 #define ZPSE_MASK_HAVE_SIMD 0
 #endif
 
+#if !ZPSE_MASK_HAVE_SIMD
+/* Population count on one dense word. The builtin is available on both
+ * compilers this codebase targets through gcc/clang; the fallback keeps
+ * the file buildable elsewhere without changing the result. */
+static int zpse_mask_popcount32(uint32_t w)
+{
+    /* Branch-free SWAR popcount. __builtin_popcount lowers to a libgcc
+     * call (__popcountdi2) unless the whole build is compiled with
+     * -mpopcnt, which this portable codebase is not. */
+    w = w - ((w >> 1) & 0x55555555u);
+    w = (w & 0x33333333u) + ((w >> 2) & 0x33333333u);
+    w = (w + (w >> 4)) & 0x0F0F0F0Fu;
+    return (int)((w * 0x01010101u) >> 24);
+}
+#endif
+
 #if ZPSE_MASK_HAVE_SIMD
 #include <emmintrin.h>
 
@@ -231,9 +236,6 @@ static ZPSE_MASK_SIMD int zpse_mask_popcount256_sse2(const uint32_t words[8])
 
 int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
 {
-    int n = 0;
-    int i;
-
     if (words == 0 || nt == 0)
         return 0;
     if (nt > 256)
@@ -266,21 +268,29 @@ int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
         w[last] &= keep;
         return zpse_mask_popcount256_sse2(w);
     }
-#endif
-    for (i = 0; i < 8; i++) {
-        uint32_t w = words[i];
-        uint16_t base = (uint16_t)(i * 32);
-        uint32_t m;
+#else
+    /* The scalar reference: eight SWAR popcounts, the fallback for a build
+     * without the SSE2 kernels. */
+    {
+        int n = 0;
+        int i;
 
-        if (base >= nt) {
-            break;
-        } else if (nt - base < 32) {
-            m = (uint32_t)(((uint64_t)1u << (nt - base)) - 1u);
-            w &= m;
+        for (i = 0; i < 8; i++) {
+            uint32_t w = words[i];
+            uint16_t base = (uint16_t)(i * 32);
+            uint32_t m;
+
+            if (base >= nt) {
+                break;
+            } else if (nt - base < 32) {
+                m = (uint32_t)(((uint64_t)1u << (nt - base)) - 1u);
+                w &= m;
+            }
+            n += zpse_mask_popcount32(w);
         }
-        n += zpse_mask_popcount32(w);
+        return n;
     }
-    return n;
+#endif
 }
 
 int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,

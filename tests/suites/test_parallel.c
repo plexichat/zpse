@@ -246,7 +246,8 @@ typedef struct {
     int bad;
 } StrmSink;
 
-static int stream_emit(void *ctx, uint32_t seq, const uint8_t *blk, size_t len)
+static int stream_emit(void *ctx, uint32_t seq, const uint8_t *bytes,
+                       size_t len)
 {
     StrmSink *s = (StrmSink *)ctx;
 
@@ -254,7 +255,7 @@ static int stream_emit(void *ctx, uint32_t seq, const uint8_t *blk, size_t len)
         s->bad = 1;
         return PSE_BAD_ARG;
     }
-    memcpy(strm + s->len, blk, len);
+    memcpy(strm + s->len, bytes, len);
     s->len += len;
     s->next = seq + 1u;
     return 0;

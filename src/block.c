@@ -2055,9 +2055,8 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
         return ZPSE_PREFIX_NEED_FULL;
     }
     w = (uint32_t)wb;
-    if (zpse_segment_lengths(n, w, lens) != PSE_OK) {
+    if (zpse_segment_lengths(n, wb, lens) != PSE_OK)
         return ZPSE_PREFIX_NEED_FULL;
-    }
     /* Every plane has to hold one whole tile for the fold to be the one
      * exact_sum makes, and the prefix has to sit inside the window. */
     for (s = 0u; s < sc; s++) {

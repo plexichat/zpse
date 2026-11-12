@@ -674,9 +674,9 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                 uint32_t i;
 
                 for (i = 0; i < seed; i++) {
-                    uint32_t d = produced + i;
+                    uint32_t idx = produced + i;
 
-                    base[i] = (d < s) ? literal : decoded_out[d - s];
+                    base[i] = (idx < s) ? literal : decoded_out[idx - s];
                 }
                 filled = seed;
                 while (filled < run_len) {
