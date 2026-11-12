@@ -474,24 +474,54 @@ static void gen_ts_gapped(void)
     }
 }
 
+/* DNA alphabet: {A,C,G,T} packed 2-bit (4 bases/byte). Fixed lane phase:
+ * four consecutive bases go into one byte, lane q is bit pair 2q..2q+1,
+ * and the phase never breaks, so each lane is its own aligned 2-bit symbol
+ * stream. A motif of 20-100 skewed bases repeats 4-15 times, so a tandem
+ * repeat spans 80-1500 bases and the predictor/LZ paths actually have
+ * structure to find; between repeats the lanes fill with fresh skewed
+ * bases. (GC bias: A ~50%, C ~19%, G ~12%, T ~6%.)
+ *
+ * The old version reseeded the motif every 64 bases and restarted the
+ * byte assembly at q == 0 inside every 64-base block, so each byte mixed
+ * four unrelated lanes and the plane was incompressible noise: RAW form,
+ * 1.00:1, identical to the `random` row. That was not what the comment
+ * promised; this is. */
 static void gen_dna_2bit(void)
 {
-    static const uint8_t ab[] = { 0, 1, 2, 3 };
+    static const uint8_t skew[16] = {
+        0, 0, 0, 0, 0, 0, 0, 0, /* A ~50%  */
+        1, 1, 1,                 /* C ~19%  */
+        2, 2,                    /* G ~12%  */
+        3                        /* T ~6%   */
+    };
     size_t i = 0;
+    uint8_t motif[512];
+    size_t ml = 0, copies = 0, left = 0, pos = 0;
+
     while (i < CORPUS_BYTES) {
-        uint8_t motif[9], b = 0;
-        size_t ml = 3u + rnd() % 7u, bl = 0, k;
+        uint8_t b = 0;
         int q;
-        for (k = 0; k < ml; k++) motif[k] = ab[rnd() % 4u];
-        while (bl < 64 && i < CORPUS_BYTES) {
-            b = 0;
-            for (q = 0; q < 4 && bl < 64 && i < CORPUS_BYTES; q++, bl++) {
-                uint8_t base = (bl < ml * 3u) ? motif[bl % ml] : ab[rnd() % 4u];
-                b |= (uint8_t)(base << (2 * q));
-                if (q == 3) g_in[i++] = b;
-            }
-            if (bl % 4u && i < CORPUS_BYTES) g_in[i++] = b;
+        if (left == 0) {
+            ml = 20u + rnd() % 81u;     /* 20..100 bases per motif */
+            for (size_t k = 0; k < ml; k++)
+                motif[k] = skew[rnd() % 16u];
+            copies = 4u + rnd() % 12u;  /* 4..15 tandem repeats */
+            left = ml * copies;
+            pos = 0;
         }
+        for (q = 0; q < 4; q++) {
+            uint8_t base;
+            if (left > 0) {
+                base = motif[pos % ml];
+                pos++;
+                left--;
+            } else {
+                base = skew[rnd() % 16u]; /* pad a short final byte */
+            }
+            b |= (uint8_t)(base << (2 * q));
+        }
+        g_in[i++] = b;
     }
 }
 
