@@ -1,6 +1,10 @@
 /* Write the benchmark corpora to files, for the cross-tool comparison.
  *
- * Usage: corpus_write DIR [SIZE]
+ * Usage: corpus_write DIR [SIZE] [--mixed]
+ *
+ * --mixed writes only `mixed.bin`, the generated workload the README's mixed
+ * tables are measured on (see mix_fill); at the default SIZE it is 4 MiB, and
+ * the page tables use 160 MiB.
  *
  * Two families of corpus live here.
  *
@@ -128,23 +132,181 @@ static int write_column(FILE *f, int kind, size_t size)
     return 0;
 }
 
+/* A mixed workload: text, source, executable-like bytes, library-like blobs,
+ * records and opaque data, one kind per 64 KiB chunk and the kind indexed by
+ * the chunk number. It stands in for the shape a browser's or a build tree's
+ * footprint has -- programs, shared libraries, documentation and build
+ * output -- but it is generated rather than scraped from the host, so the
+ * table it feeds can be re-measured from this tree alone. Every chunk is a
+ * pure function of its index and the chunk's bytes never depend on how the
+ * file was handed to the writer, so the same SIZE always writes the same
+ * bytes on any host. */
+static const char *const mix_words[] = {
+    "the", "of", "and", "to", "in", "a", "is", "that", "for", "it",
+    "with", "as", "was", "on", "be", "by", "this", "are", "from", "or",
+    "value", "buffer", "length", "offset", "header", "table", "block",
+    "page", "match", "literal", "distance", "window", "stream", "code",
+    "read", "write", "return", "static", "const", "uint32_t", "if", "while"
+};
+
+static uint32_t mix_rnd(uint32_t *s)
+{
+    *s = *s * 1664525u + 1013904223u;
+    return *s;
+}
+
+static void mix_fill(uint8_t *o, size_t n, uint32_t chunk)
+{
+    uint32_t s = 0x5EEDu ^ chunk * 2654435761u;
+    size_t i = 0;
+
+    switch (chunk % 6u) {
+    case 0: /* prose: sentences of common words, broken into lines */
+        while (i < n) {
+            uint32_t col = 0u;
+            uint32_t words = 12u + mix_rnd(&s) % 40u;
+            uint32_t w;
+
+            for (w = 0; w < words && i < n; w++) {
+                const char *word = mix_words[mix_rnd(&s) %
+                    (sizeof mix_words / sizeof mix_words[0])];
+                size_t len = strlen(word);
+
+                if (i + len + 1u >= n || col + len + 1u > 72u) break;
+                memcpy(o + i, word, len);
+                i += len;
+                o[i++] = ' ';
+                col += (uint32_t)len + 1u;
+            }
+            if (i < n) o[i++] = '\n';
+        }
+        break;
+    case 1: /* source: indented lines over a small identifier set */
+        while (i < n) {
+            uint32_t ind = (mix_rnd(&s) % 5u) * 4u;
+            uint32_t w = 2u + mix_rnd(&s) % 6u;
+            uint32_t k;
+
+            for (k = 0; k < ind && i < n; k++) o[i++] = ' ';
+            for (k = 0; k < w && i < n; k++) {
+                const char *word = mix_words[mix_rnd(&s) %
+                    (sizeof mix_words / sizeof mix_words[0])];
+                size_t len = strlen(word);
+                size_t take = len;
+
+                if (i + take > n) take = n - i;
+                memcpy(o + i, word, take);
+                i += take;
+                if (i < n) o[i++] = (k + 1u == w) ? ';' : ' ';
+            }
+            if (i < n) o[i++] = '\n';
+        }
+        break;
+    case 2: /* executable-like: opcode soup with the prologues repeated */
+        for (i = 0; i < n; i++) {
+            if ((i % 23u) == 0u && i + 16u < n) {
+                static const uint8_t pro[16] = {
+                    0x55u, 0x48u, 0x89u, 0xE5u, 0x41u, 0x57u, 0x41u, 0x56u,
+                    0x53u, 0x48u, 0x83u, 0xECu, 0x08u, 0xE8u, 0x00u, 0x00u
+                };
+                memcpy(o + i, pro, 16u);
+                i += 15u;
+            } else {
+                o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+            }
+        }
+        break;
+    case 3: /* library-like: dense bytes with a string table every 96 */
+        for (i = 0; i < n; i++) {
+            if ((i % 96u) == 0u && i + 12u + 8u < n) {
+                static const char *const sym[4] = {
+                    "GLIBC_2.34", "libc.so.6", "_ITM_deregister", "malloc"
+                };
+                const char *name = sym[(i / 96u) % 4u];
+                size_t len = strlen(name);
+
+                memset(o + i, 0, 4u);
+                memcpy(o + i + 4u, name, len);
+                i += len + 4u;
+            } else {
+                o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+            }
+        }
+        break;
+    case 4: /* records: id, small int, ramp, string offset */
+        for (i = 0; i + 16u <= n; i += 16u) {
+            uint32_t id = chunk * (uint32_t)(BLOCK / 16u) +
+                          (uint32_t)(i / 16u);
+            uint32_t v = 1u + mix_rnd(&s) % 9u;
+            float f = (float)(id % 997u) / 8.0f;
+
+            o[i] = (uint8_t)id;
+            o[i + 1u] = (uint8_t)(id >> 8);
+            o[i + 2u] = (uint8_t)(id >> 16);
+            o[i + 3u] = 0u;
+            o[i + 4u] = (uint8_t)v;
+            o[i + 5u] = (uint8_t)(v >> 8);
+            o[i + 6u] = 0u;
+            o[i + 7u] = 0u;
+            memcpy(o + i + 8u, &f, 4u);
+            o[i + 12u] = (uint8_t)(id * 3u);
+            o[i + 13u] = (uint8_t)(id >> 5);
+            o[i + 14u] = 0u;
+            o[i + 15u] = 0u;
+        }
+        break;
+    default: /* opaque: embedded compressed resources */
+        for (i = 0; i < n; i++) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+        break;
+    }
+}
+
 int main(int argc, char **argv)
 {
     static uint8_t block[BLOCK];
     unsigned long size = 4u * 1024u * 1024u;
     char path[1024];
-    int i;
+    int i, mixed = 0;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: corpus_write DIR [SIZE]\n");
+        fprintf(stderr, "usage: corpus_write DIR [SIZE] [--mixed]\n");
         return 2;
     }
-    if (argc > 2) {
+    if (argc > 2 && strcmp(argv[2], "--mixed") != 0) {
         size = strtoul(argv[2], NULL, 10);
         if (size == 0u || size % BLOCK != 0u) {
             fprintf(stderr, "SIZE must be a non-zero multiple of %u\n", BLOCK);
             return 2;
         }
+    }
+    if (argc > 2 && strcmp(argv[argc - 1], "--mixed") == 0) mixed = 1;
+    if (mixed) {
+        uint64_t base = 0u;
+        int n = snprintf(path, sizeof path, "%s/mixed.bin", argv[1]);
+        FILE *f;
+
+        if (n <= 0 || (size_t)n >= sizeof path) {
+            fprintf(stderr, "path too long\n");
+            return 2;
+        }
+        f = fopen(path, "wb");
+        if (f == NULL) {
+            fprintf(stderr, "cannot write %s\n", path);
+            return 1;
+        }
+        while (base < (uint64_t)size) {
+            size_t chunk = (size_t)((uint64_t)size - base);
+
+            if (chunk > BLOCK) chunk = BLOCK;
+            mix_fill(block, chunk, (uint32_t)(base / BLOCK));
+            if (fwrite(block, 1u, chunk, f) != chunk) {
+                fprintf(stderr, "short write on %s\n", path);
+                fclose(f);
+                return 1;
+            }
+            base += chunk;
+        }
+        return fclose(f) != 0;
     }
     for (i = 0; i < 10; i++) {
         uint64_t base = 0u;

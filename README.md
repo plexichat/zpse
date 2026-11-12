@@ -129,15 +129,22 @@ twice zstd 9's at a ratio ten to twelve points worse. That gap is also the
 reason no entropy stage sits on top: order-0 over zpse's own wire closes 6.95
 of the 9.68 points to zstd 6, which would leave the dumps at 33.7% against
 zstd's 30.9% while paying for the coder. At a page the format's problem is the
-ratio it starts from, not the last few bits of it.A mixed workload at the same page size -- 160 MB of programs, shared
-libraries, documentation and this project's own build outputs, which is the
-shape a browser's or a build tree's footprint has:
+ratio it starts from, not the last few bits of it.A mixed workload at the same page size -- 160 MiB written by
+`tests/corpus/corpus_write.c DIR 167772160 --mixed`, which interleaves
+documentation, source, executable-like bytes, library-like blobs, records and
+opaque data one 64 KiB chunk at a time:
 
 | 4 KiB pages, mixed | level 1 | level 6 | level 9 | zstd 1 | zstd 6 | zstd 9 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ratio | 78.45% | 55.07% | 54.49% | 46.40% | 44.18% | 44.17% |
-| encode | 320 MB/s | 130 MB/s | 119 MB/s | 290 MB/s | 87 MB/s | 46 MB/s |
-| decode | 4.5 GB/s | 1.6 GB/s | 1.6 GB/s | 0.7 GB/s | 0.7 GB/s | 0.7 GB/s |
+| ratio | 82.90% | 57.70% | 54.68% | 51.74% | 50.18% | 49.27% |
+| encode | 405 MB/s | 194 MB/s | 159 MB/s | 382 MB/s | 79 MB/s | 50 MB/s |
+| decode | 4.8 GB/s | 2.0 GB/s | 1.7 GB/s | 1.2 GB/s | 1.1 GB/s | 1.2 GB/s |
+
+The zstd columns are one frame per file with 4 KiB blocks (`zstd -B4K -T1`),
+size and both rates from the same run. The corpus is generated here, so the
+table is re-measurable on any host; figures earlier in this document that name
+the mixed workload come from a corpus that is neither this one nor
+reproducible from this tree.
 
 Where the dumps' 9.68-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
@@ -202,13 +209,11 @@ the raw comparison, and the rate follows:
 | 4 KiB pages | plain L1 | plain L2 | plain BALANCED | `PAGE_FAST` L1 | `PAGE_FAST` L2 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | dumps | 58.71% at 290 MB/s | 57.44% at 228 MB/s | 42.04% at 172 MB/s | 66.13% at 1104 MB/s | 65.98% at 1051 MB/s |
-| mixed | 78.45% at 300 MB/s | 77.37% at 261 MB/s | 56.47% at 127 MB/s | 81.06% at 843 MB/s | 80.54% at 853 MB/s |
+| mixed | 82.90% at 405 MB/s | 83.08% at 372 MB/s | 64.41% at 195 MB/s | 91.91% at 1264 MB/s | 91.99% at 1206 MB/s |
 | Silesia | 80.39% at 329 MB/s | 77.71% at 278 MB/s | 57.17% at 176 MB/s | 83.09% at 802 MB/s | 80.42% at 832 MB/s |
 
-The dumps and Silesia rows are re-measured on this build, two rounds of the CLI's
-own bench; the mixed row is the earlier session's, because its 160 MB corpus is
-a set of host programs, libraries and documents this tree cannot regenerate,
-and a row re-derived from a different corpus would be a different measurement.
+All three rows are two rounds of the CLI's own bench on this build, the mixed
+one over the generated corpus described above.
 
 The plain columns pay less for the decision than they used to. A block whose
 identity window prices at raw at *both* ends is one the sweep has been told
