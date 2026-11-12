@@ -147,7 +147,11 @@ table is re-measurable on any host. Figures that name *the generated mixed
 corpus* were measured on it; figures that name `mixed` or *the mixed workload*
 without it -- the flat-cut rates, the cheap rungs' tile sample, the
 delta-coding points -- come from this table's original host-file corpus, which
-this tree cannot regenerate.
+this tree cannot regenerate. Three measurements in the page section cannot be
+re-run from a checkout at all and are kept as taken: the refused delta-coding
+comparison (no arm), the flat-cut rates (the cut is unconditional, so the off
+build is gone), and the page dictionary's 173.5 against 149.4 MB/s (only the
+byte-exactness suite is in the tree).
 
 Where the dumps' 9.68-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
@@ -393,10 +397,13 @@ one tile per quarter: two tiles see quarters one and three only.
 Across eight hundred pages of each shape at level 6 under `PAGE_FAST`, the
 midpoint sample writes 36,953,922 bytes, no probe at all 39,961,191 -- 4.48
 points, at 1,157 against 1,102 MB/s -- and all sixteen tiles 35,255,247, 2.53
-points fewer for 7 to 20% of the rate. That last arm is past the one-point
-line, and the thousand-byte default does not answer it: the host corpora are
-byte-identical across one, zero and sixteen samples, so these pages are the
-only witness, and re-pricing the default on them is open. The probe tile count
+points fewer for 7 to 20% of the rate. That arm is past the one-point line, and
+the host corpora answer it the other way: all sixteen tiles saves only 13,332
+and 15,952 bytes over the dumps at levels 1 and 6 (0.006 and 0.008 of a point)
+and 22,150 and 20,933 over Silesia (0.010), for up to 7.7% of Silesia's level-6
+rate and the dumps' level 6 inside this host's band, and writes the mixed corpus
+byte-identically. A hundredth of a point is not what five percent of the rate is
+for, so the sample stays at one and the arm stays a knob. The probe tile count
 (`ZPSE_PROBE_TILES`) stays byte-inert even here (29,036,416 plain at level 6
 for two, four and eight tiles), and the third flat trial is worth 27,056 bytes,
 0.04 of a point, at flat rate, so the cap stays at two. Four page tiles
@@ -404,6 +411,34 @@ for two, four and eight tiles), and the third flat trial is worth 27,056 bytes,
 over these pages (0.051) for about 4% of the rate, and 4,884 and 8,739 fewer
 over the dumps and Silesia (0.0023 and 0.0041) for 4 and 6% -- thousandths of a
 point for percent of rate, refused with either sign.
+
+Every page knob, one build each, two passes on one pinned core, 4 KiB pages at
+level 6 -- the ratio of one pass and the rate it read, so the bytes are exact
+and the rates are this host's:
+
+| arm | dumps | dumps `PAGE_FAST` | Silesia | Silesia `PAGE_FAST` | probe | probe `PAGE_FAST` | mixed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| shipped | 41.60% at 162 MB/s | 65.99% at 1021 MB/s | 54.88% at 166 MB/s | 80.42% at 796 MB/s | 43.27% at 242 MB/s | 55.07% at 1076 MB/s | 57.70% at 192 MB/s |
+| `ZPSE_DECIDE_PAGE_TILES=3` | 41.59% at 156 MB/s | 65.99% at 1002 MB/s | 54.85% at 160 MB/s | 80.42% at 788 MB/s | 43.23% at 222 MB/s | 55.07% at 1074 MB/s | 57.70% at 184 MB/s |
+| `ZPSE_DECIDE_PAGE_TILES=4` | 41.59% at 156 MB/s | 65.99% at 1002 MB/s | 54.87% at 154 MB/s | 80.42% at 753 MB/s | 43.22% at 232 MB/s | 55.07% at 1070 MB/s | 57.70% at 165 MB/s |
+| `ZPSE_PROBE_TILES=2` | 41.60% at 160 MB/s | 65.99% at 1010 MB/s | 54.88% at 164 MB/s | 80.42% at 802 MB/s | 43.27% at 231 MB/s | 55.07% at 1120 MB/s | 57.70% at 194 MB/s |
+| `ZPSE_PROBE_TILES=4` | 41.60% at 164 MB/s | 65.99% at 1021 MB/s | 54.88% at 166 MB/s | 80.42% at 808 MB/s | 43.27% at 244 MB/s | 55.07% at 1108 MB/s | 57.70% at 182 MB/s |
+| `ZPSE_PROBE_PAGE_TILES=8` | 41.62% at 152 MB/s | 65.99% at 962 MB/s | 54.88% at 156 MB/s | 80.42% at 772 MB/s | 43.20% at 226 MB/s | 55.07% at 1010 MB/s | 57.70% at 184 MB/s |
+| `ZPSE_PAGE_CAND_CAP=9` | 40.41% at 135 MB/s | 65.99% at 1015 MB/s | 54.69% at 144 MB/s | 80.42% at 802 MB/s | 43.21% at 196 MB/s | 55.07% at 1010 MB/s | 57.66% at 166 MB/s |
+| `ZPSE_ASCII_PAGE_SAMPLE=512` | 41.60% at 160 MB/s | 65.99% at 982 MB/s | 54.90% at 152 MB/s | 80.52% at 809 MB/s | 43.27% at 242 MB/s | 55.07% at 1060 MB/s | 57.84% at 178 MB/s |
+| `ZPSE_ASCII_PAGE_SAMPLE=2048` | 41.60% at 164 MB/s | 65.99% at 994 MB/s | 54.87% at 162 MB/s | 80.41% at 779 MB/s | 43.27% at 246 MB/s | 55.07% at 1085 MB/s | 57.65% at 179 MB/s |
+| `ZPSE_PAGE_NOISE_POINTS=0` | 41.60% at 152 MB/s | 66.02% at 980 MB/s | 54.88% at 143 MB/s | 80.44% at 730 MB/s | 43.27% at 236 MB/s | 59.55% at 1162 MB/s | 57.70% at 183 MB/s |
+| `ZPSE_PAGE_NOISE_POINTS=16` | 41.60% at 159 MB/s | 65.98% at 971 MB/s | 54.88% at 160 MB/s | 80.41% at 693 MB/s | 43.27% at 239 MB/s | 52.53% at 1002 MB/s | 57.70% at 174 MB/s |
+| `ZPSE_FLAT_TRIALS=3` | 41.60% at 156 MB/s | 65.99% at 985 MB/s | 54.88% at 158 MB/s | 80.42% at 782 MB/s | 43.23% at 230 MB/s | 55.07% at 1096 MB/s | 57.70% at 186 MB/s |
+| `ZPSE_LZ_LAZY_LEN=2` | 41.90% at 164 MB/s | 65.99% at 960 MB/s | 55.11% at 167 MB/s | 80.42% at 761 MB/s | 43.28% at 232 MB/s | 55.07% at 1084 MB/s | 57.79% at 185 MB/s |
+
+Two arms move a ratio the table can see. The noise sample without a probe costs
+4.48 points on the probe pages and 0.03 on the dumps; all sixteen tiles buys
+2.53 there and a hundredth on the host corpora. Everything else is thousandths
+or a tenth of a point, which is why those knobs ship at the value the earlier
+paragraphs chose. `refresh_tables.sh` prints this table as `page knob arms`,
+with the dumps column only when `ZPSE_DUMPS` names them and Silesia only when
+the fetch succeeded.
 
 The candidate field a page prices is the other knob, and it is dearer per
 point of ratio than either sample: a page prices at most six candidates now,
@@ -474,9 +509,10 @@ probes one sample at the page's midpoint instead of all sixteen tiles, which
 is 4.6 to 11.9% of the page rate at levels 1 and 2 (dumps 876 to 917, mixed
 720 to 805, Silesia 536 to 571 MB/s at level 1) for 0.009 to 0.013% of the
 packed bytes -- a hundredth of a ratio point -- because the page the sample can
-misjudge is one whose midpoint reads as noise and whose rest does not. All
-sixteen samples is the byte-identical setting, and it is the row above that
-pays the rate for it. Pages of pure random bytes go from 688 to 1,473 MB/s,
+misjudge is one whose midpoint reads as noise and whose rest does not.All sixteen samples is the widest setting: it saves 13 332 and 15 952 bytes over
+the dumps at levels 1 and 6 and 22 150 and 20 933 over Silesia -- a hundredth of
+a point -- for up to 7.7% of Silesia's level-6 rate, which the arm table above
+records. Pages of pure random bytes go from 688 to 1,473 MB/s,
 and the abort on its own was worth 9% on the mixed corpus.
 The plain encoder is untouched: without the flag the abort keeps its 8 KiB
 gate, and 4 KiB level 1 writes the same 125,077,793 bytes it did before. What it

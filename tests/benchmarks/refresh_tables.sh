@@ -392,20 +392,42 @@ fi
 if [ -s "$pfile" ]; then
     km="$mixed/mixed.bin"
     [ -s "$km" ] || km=""
-    say "page knob arms"
-    if [ -n "$km" ]; then
-        echo "| arm | probe L6 | probe \`PAGE_FAST\` L6 | mixed L6 | mixed \`PAGE_FAST\` L6 |"
-        echo "| --- | ---: | ---: | ---: | ---: |"
-    else
-        echo "| arm | probe L6 | probe \`PAGE_FAST\` L6 |"
-        echo "| --- | ---: | ---: |"
+    # The dumps are the author's, so that column needs ZPSE_DUMPS; Silesia is
+    # here whenever the fetch or SILESIA_DIR produced it.
+    kd="${ZPSE_DUMPS:-}"
+    ks=""
+    if [ -n "$silesia" ] && ls "$silesia"/ >/dev/null 2>&1; then
+        ks=$(ls "$silesia"/* 2>/dev/null | tr '\n' ' ')
     fi
-    knob_cells() { # file -> "ratio at rate"
-        "$1" bench -q -b 4096 -l 6 -r "$REPS" "$2" |
+    say "page knob arms"
+    khdr="| arm |"
+    ksep="| --- |"
+    if [ -n "$kd" ]; then
+        khdr="$khdr dumps L6 | dumps \`PAGE_FAST\` L6 |"
+        ksep="$ksep ---: | ---: |"
+    fi
+    if [ -n "$ks" ]; then
+        khdr="$khdr Silesia L6 | Silesia \`PAGE_FAST\` L6 |"
+        ksep="$ksep ---: | ---: |"
+    fi
+    khdr="$khdr probe L6 | probe \`PAGE_FAST\` L6 |"
+    ksep="$ksep ---: | ---: |"
+    if [ -n "$km" ]; then
+        khdr="$khdr mixed L6 |"
+        ksep="$ksep ---: |"
+    fi
+    echo "$khdr"
+    echo "$ksep"
+    knob_cells() { # binary, file... -> "ratio at rate"
+        local b="$1"
+        shift
+        "$b" bench -q -b 4096 -l 6 -r "$REPS" "$@" |
             awk '/TOTAL/ {printf "%.2f%% at %.0f MB/s", 100.0*$3/$2, $5}'
     }
-    knob_fast() {
-        "$1" bench -q -b 4096 -l 6 -P -r "$REPS" "$2" |
+    knob_fast() { # binary, file...
+        local b="$1"
+        shift
+        "$b" bench -q -b 4096 -l 6 -P -r "$REPS" "$@" |
             awk '/TOTAL/ {printf "%.2f%% at %.0f MB/s", 100.0*$3/$2, $5}'
     }
     while IFS='|' read -r label def; do
@@ -418,14 +440,21 @@ if [ -s "$pfile" ]; then
             missing "page knob arm $label ($def)"
             continue
         fi
-        printf '| `%s` | %s | %s |' "$label" \
-            "$(knob_cells "$bin" "$pfile")" "$(knob_fast "$bin" "$pfile")"
-        if [ -n "$km" ]; then
-            printf ' %s | %s |\n' "$(knob_cells "$bin" "$km")" \
-                "$(knob_fast "$bin" "$km")"
-        else
-            printf '\n'
+        # The label is formatted at the printf below, not here: a backtick in
+        # a double-quoted string would run the label as a command.
+        krow="|"
+        if [ -n "$kd" ]; then
+            # The corpus lists split into words here on purpose.
+            krow="$krow $(knob_cells "$bin" $kd) | $(knob_fast "$bin" $kd) |"
         fi
+        if [ -n "$ks" ]; then
+            krow="$krow $(knob_cells "$bin" $ks) | $(knob_fast "$bin" $ks) |"
+        fi
+        krow="$krow $(knob_cells "$bin" "$pfile") | $(knob_fast "$bin" "$pfile") |"
+        if [ -n "$km" ]; then
+            krow="$krow $(knob_cells "$bin" "$km") |"
+        fi
+        printf '| `%s` %s\n' "$label" "$krow"
     done <<'ARMS'
 shipped|
 ZPSE_DECIDE_PAGE_TILES=3|-DZPSE_DECIDE_PAGE_TILES=3u

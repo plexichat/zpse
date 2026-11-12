@@ -813,7 +813,15 @@ static const uint8_t zpse_block_screen[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
  * medians of five paired rounds) for 0.009 to 0.013% of the packed bytes: the
  * page it can misjudge is one whose middle reads as noise and whose rest does
  * not. Two samples, an eighth of the page, bought the same 4% on the dumps and
- * lost rate on the other two, and sixteen is the byte-identical setting. A
+ * lost rate on the other two. Sixteen is not byte-identical after all: three
+ * rounds put it 13 332 and 15 952 bytes ahead on the dumps at levels 1 and 6,
+ * 22 150 and 20 933 ahead on Silesia, and the mixed corpus identical -- a
+ * hundredth of a point across the host corpora -- for up to 7.7% of Silesia's
+ * level-6 rate, the dumps' level 6 inside the band. The probe corpus is where
+ * the sample is worth points instead of hundredths: 3.25 at level 1 and 2.53
+ * at level 6 for 15 and 4% of that corpus's rate. A hundredth of a point is
+ * not what percent of the rate is for, so the default stays one and the arm
+ * stays buildable for callers whose pages look like those shapes. A
  * build that defines this 0 arms the abort with no probe at all, and five
  * paired rounds put it 2.2 to 7.4% ahead on five of the six page cells and
  * 2.0% behind on the sixth, for 0.02 to 0.08 more ratio points (mixed 81.25
