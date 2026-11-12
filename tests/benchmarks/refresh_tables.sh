@@ -16,7 +16,10 @@
 # not measure. The exit status is 0 only when every section ran.
 #
 # Env: CC (default cc), REPS (2), ZPSE_LEVELS ("1 5 6 9 F"),
-#      SILESIA_DIR, LZ4, ZSTD, KEEP=1 (keep the temp directory and print it).
+#      SILESIA_DIR, LZ4, ZSTD, KEEP=1 (keep the temp directory and print it),
+#      ZPSE_DUMPS (heap-dump files, space separated; adds the dumps columns to
+#      the page knob arms). Nothing else in the tree can regenerate a dump, so
+#      without it those columns are simply left out.
 set -uo pipefail
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -338,8 +341,8 @@ pfile="$prob/probe.bin"
 mkdir -p "$prob" || exit 1
 if "$work/corpus_write" "$prob" 67108864 --probe && [ -s "$pfile" ]; then
     pdig=$(sha256sum "$pfile" | cut -d' ' -f1)
-    if [ "$pdig" != "3754c151016acb46113a021ed6aded00b7edd0dcd248bbd18e75be1c14bd31ac" ]; then
-        echo "note: probe.bin sha256 $pdig; the README's arms were taken on 3754c151..." >&2
+    if [ "$pdig" != "f6c4ffd0e804751816ff5d422903bbc92b588f16eb7dca70786b187f842b60cd" ]; then
+        echo "note: probe.bin sha256 $pdig; the README's arms were taken on f6c4ffd0..." >&2
     fi
     pp=()
     for l in 1 6 9; do

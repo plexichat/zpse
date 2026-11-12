@@ -383,34 +383,47 @@ halved sample is no better anywhere it was measured: 41 more bytes over the
 dumps and 45,411 more over Silesia at level 6, 130,451 more over Silesia at
 level 1. So the kilobyte stays.
 
-`corpus_write --probe` writes `probe.bin` (64 MiB, sha256 `621c4309…`), one
+`corpus_write --probe` writes `probe.bin` (64 MiB, sha256 `f6c4ffd0…`), one
 4 KiB page per shape, twenty shapes cycling: a noisy middle inside a
-compressible block, a flat 4-bit page, a stride-4 record, interleaved planes,
-text against noise, sparse holes, a ramp with a noisy tile per kilobyte, four
-quarters of different shapes, a tail-only compressible page, stride-5 records,
-a 2-bit alphabet, alternating compressible and noisy blocks, pointer words into
-zeros, ragged text, and four pages whose quarters alternate two shapes -- zeros
-against noise and its mirror, a 2-bit alphabet against records and its mirror.
-Those last four separate the single-plane tile counts, because the sample takes
-one tile per quarter: two tiles see quarters one and three only.
+compressible block, 4-byte counters that restart every 32 bytes, a stride-4
+record, interleaved planes, ragged text in two quarters against a 2-bit
+alphabet in the other two, sparse holes, a ramp with a noisy tile per
+kilobyte, four quarters of different shapes, a tail-only compressible page,
+records whose stride alternates four and eight bytes, a 2-bit alphabet behind
+a text head, alternating compressible and noisy blocks, pointer words into
+zeros, ragged text with a noisy tile at a quarter, and four pages whose
+quarters alternate two shapes -- zeros against noise and its mirror, a 2-bit
+alphabet against records and its mirror. Those last four separate the
+single-plane tile counts, because the sample takes one tile per quarter: two
+tiles see quarters one and three only. Every shape is one a page arm can flip:
+audited one shape per corpus against all thirteen arms at level 6, none of the
+twenty is byte-identical under all of them. The five homogeneous pages this
+corpus started with -- a flat 4-bit page, a 2-bit alphabet, stride-5 records,
+text against a noise half and ragged text -- were priced the same by every arm,
+and were replaced by the ambiguous pages above.
 
 Across eight hundred pages of each shape at level 6 under `PAGE_FAST`, the
-midpoint sample writes 36,953,922 bytes, no probe at all 39,961,191 -- 4.48
-points, at 1,157 against 1,102 MB/s -- and all sixteen tiles 35,255,247, 2.53
-points fewer for 7 to 20% of the rate. That arm is past the one-point line, and
+midpoint sample writes 34,190,649 bytes, no probe at all 37,197,918 -- 4.48
+points, at 1,060 against 954 MB/s -- and all sixteen tiles 32,491,974, 2.53
+points fewer for 10% of the rate. That arm is past the one-point line, and
 the host corpora answer it the other way: all sixteen tiles saves only 13,332
-and 15,952 bytes over the dumps at levels 1 and 6 (0.006 and 0.008 of a point)
+and 15,952 bytes over the dumps at levels 1, 2 and 6 (0.006 to 0.008 of a point)
 and 22,150 and 20,933 over Silesia (0.010), for up to 7.7% of Silesia's level-6
 rate and the dumps' level 6 inside this host's band, and writes the mixed corpus
 byte-identically. A hundredth of a point is not what five percent of the rate is
 for, so the sample stays at one and the arm stays a knob. The probe tile count
-(`ZPSE_PROBE_TILES`) stays byte-inert even here (29,036,416 plain at level 6
-for two, four and eight tiles), and the third flat trial is worth 27,056 bytes,
-0.04 of a point, at flat rate, so the cap stays at two. Four page tiles
-(`ZPSE_DECIDE_PAGE_TILES`) against the shipped two write 34,267 fewer bytes
-over these pages (0.051) for about 4% of the rate, and 4,884 and 8,739 fewer
-over the dumps and Silesia (0.0023 and 0.0041) for 4 and 6% -- thousandths of a
-point for percent of rate, refused with either sign.
+(`ZPSE_PROBE_TILES`) stays byte-inert even here (25,948,825 plain at level 6
+for two and four tiles, eight being the default), and the third flat trial is
+worth 27,056 bytes, 0.04 of a point, at flat rate, so the cap stays at two.
+Four page tiles (`ZPSE_DECIDE_PAGE_TILES`) against the shipped two write 34,267
+fewer bytes over these pages (0.051) for 14% of the rate, and 4,884 and 8,739
+fewer over the dumps and Silesia (0.0023 and 0.0041) for 4 and 6% -- thousandths
+of a point for percent of rate, refused with either sign. Two knobs the page
+arms are meant to separate now show here at all: the candidate cap at nine
+writes 161,176 bytes fewer (0.24 of a point) for 17% of the rate, and the
+doubled gate sample 985,050 bytes more (1.47) at rate inside the band -- both
+refused by the host corpora, where the cap is worth 1.19 points for 15 to 19%
+and the doubled sample hundredths of a point in opposite directions.
 
 Every page knob, one build each, two passes on one pinned core, 4 KiB pages at
 level 6 -- the ratio of one pass and the rate it read, so the bytes are exact
@@ -418,25 +431,27 @@ and the rates are this host's:
 
 | arm | dumps | dumps `PAGE_FAST` | Silesia | Silesia `PAGE_FAST` | probe | probe `PAGE_FAST` | mixed |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| shipped | 41.60% at 162 MB/s | 65.99% at 1021 MB/s | 54.88% at 166 MB/s | 80.42% at 796 MB/s | 43.27% at 242 MB/s | 55.07% at 1076 MB/s | 57.70% at 192 MB/s |
-| `ZPSE_DECIDE_PAGE_TILES=3` | 41.59% at 156 MB/s | 65.99% at 1002 MB/s | 54.85% at 160 MB/s | 80.42% at 788 MB/s | 43.23% at 222 MB/s | 55.07% at 1074 MB/s | 57.70% at 184 MB/s |
-| `ZPSE_DECIDE_PAGE_TILES=4` | 41.59% at 156 MB/s | 65.99% at 1002 MB/s | 54.87% at 154 MB/s | 80.42% at 753 MB/s | 43.22% at 232 MB/s | 55.07% at 1070 MB/s | 57.70% at 165 MB/s |
-| `ZPSE_PROBE_TILES=2` | 41.60% at 160 MB/s | 65.99% at 1010 MB/s | 54.88% at 164 MB/s | 80.42% at 802 MB/s | 43.27% at 231 MB/s | 55.07% at 1120 MB/s | 57.70% at 194 MB/s |
-| `ZPSE_PROBE_TILES=4` | 41.60% at 164 MB/s | 65.99% at 1021 MB/s | 54.88% at 166 MB/s | 80.42% at 808 MB/s | 43.27% at 244 MB/s | 55.07% at 1108 MB/s | 57.70% at 182 MB/s |
-| `ZPSE_PROBE_PAGE_TILES=8` | 41.62% at 152 MB/s | 65.99% at 962 MB/s | 54.88% at 156 MB/s | 80.42% at 772 MB/s | 43.20% at 226 MB/s | 55.07% at 1010 MB/s | 57.70% at 184 MB/s |
-| `ZPSE_PAGE_CAND_CAP=9` | 40.41% at 135 MB/s | 65.99% at 1015 MB/s | 54.69% at 144 MB/s | 80.42% at 802 MB/s | 43.21% at 196 MB/s | 55.07% at 1010 MB/s | 57.66% at 166 MB/s |
-| `ZPSE_ASCII_PAGE_SAMPLE=512` | 41.60% at 160 MB/s | 65.99% at 982 MB/s | 54.90% at 152 MB/s | 80.52% at 809 MB/s | 43.27% at 242 MB/s | 55.07% at 1060 MB/s | 57.84% at 178 MB/s |
-| `ZPSE_ASCII_PAGE_SAMPLE=2048` | 41.60% at 164 MB/s | 65.99% at 994 MB/s | 54.87% at 162 MB/s | 80.41% at 779 MB/s | 43.27% at 246 MB/s | 55.07% at 1085 MB/s | 57.65% at 179 MB/s |
-| `ZPSE_PAGE_NOISE_POINTS=0` | 41.60% at 152 MB/s | 66.02% at 980 MB/s | 54.88% at 143 MB/s | 80.44% at 730 MB/s | 43.27% at 236 MB/s | 59.55% at 1162 MB/s | 57.70% at 183 MB/s |
-| `ZPSE_PAGE_NOISE_POINTS=16` | 41.60% at 159 MB/s | 65.98% at 971 MB/s | 54.88% at 160 MB/s | 80.41% at 693 MB/s | 43.27% at 239 MB/s | 52.53% at 1002 MB/s | 57.70% at 174 MB/s |
-| `ZPSE_FLAT_TRIALS=3` | 41.60% at 156 MB/s | 65.99% at 985 MB/s | 54.88% at 158 MB/s | 80.42% at 782 MB/s | 43.23% at 230 MB/s | 55.07% at 1096 MB/s | 57.70% at 186 MB/s |
-| `ZPSE_LZ_LAZY_LEN=2` | 41.90% at 164 MB/s | 65.99% at 960 MB/s | 55.11% at 167 MB/s | 80.42% at 761 MB/s | 43.28% at 232 MB/s | 55.07% at 1084 MB/s | 57.79% at 185 MB/s |
+| shipped | 41.60% at 162 MB/s | 65.99% at 1021 MB/s | 54.88% at 166 MB/s | 80.42% at 796 MB/s | 38.67% at 223 MB/s | 50.95% at 980 MB/s | 57.70% at 192 MB/s |
+| `ZPSE_DECIDE_PAGE_TILES=3` | 41.59% at 156 MB/s | 65.99% at 1002 MB/s | 54.85% at 160 MB/s | 80.42% at 788 MB/s | 38.63% at 212 MB/s | 50.95% at 861 MB/s | 57.70% at 184 MB/s |
+| `ZPSE_DECIDE_PAGE_TILES=4` | 41.59% at 156 MB/s | 65.99% at 1002 MB/s | 54.87% at 154 MB/s | 80.42% at 753 MB/s | 38.62% at 176 MB/s | 50.95% at 851 MB/s | 57.70% at 165 MB/s |
+| `ZPSE_PROBE_TILES=2` | 41.60% at 160 MB/s | 65.99% at 1010 MB/s | 54.88% at 164 MB/s | 80.42% at 802 MB/s | 38.67% at 163 MB/s | 50.95% at 871 MB/s | 57.70% at 194 MB/s |
+| `ZPSE_PROBE_TILES=4` | 41.60% at 164 MB/s | 65.99% at 1021 MB/s | 54.88% at 166 MB/s | 80.42% at 808 MB/s | 38.67% at 197 MB/s | 50.95% at 998 MB/s | 57.70% at 182 MB/s |
+| `ZPSE_PROBE_PAGE_TILES=8` | 41.62% at 152 MB/s | 65.99% at 962 MB/s | 54.88% at 156 MB/s | 80.42% at 772 MB/s | 38.68% at 215 MB/s | 50.95% at 886 MB/s | 57.70% at 184 MB/s |
+| `ZPSE_PAGE_CAND_CAP=9` | 40.41% at 135 MB/s | 65.99% at 1015 MB/s | 54.69% at 144 MB/s | 80.42% at 802 MB/s | 38.43% at 185 MB/s | 50.95% at 954 MB/s | 57.66% at 166 MB/s |
+| `ZPSE_ASCII_PAGE_SAMPLE=512` | 41.60% at 160 MB/s | 65.99% at 982 MB/s | 54.90% at 152 MB/s | 80.52% at 809 MB/s | 38.67% at 222 MB/s | 50.95% at 986 MB/s | 57.84% at 178 MB/s |
+| `ZPSE_ASCII_PAGE_SAMPLE=2048` | 41.60% at 164 MB/s | 65.99% at 994 MB/s | 54.87% at 162 MB/s | 80.41% at 779 MB/s | 40.13% at 222 MB/s | 52.42% at 941 MB/s | 57.65% at 179 MB/s |
+| `ZPSE_PAGE_NOISE_POINTS=0` | 41.60% at 152 MB/s | 66.02% at 980 MB/s | 54.88% at 143 MB/s | 80.44% at 730 MB/s | 38.67% at 211 MB/s | 55.43% at 953 MB/s | 57.70% at 183 MB/s |
+| `ZPSE_PAGE_NOISE_POINTS=16` | 41.60% at 159 MB/s | 65.98% at 971 MB/s | 54.88% at 160 MB/s | 80.41% at 693 MB/s | 38.67% at 214 MB/s | 48.42% at 913 MB/s | 57.70% at 174 MB/s |
+| `ZPSE_FLAT_TRIALS=3` | 41.60% at 156 MB/s | 65.99% at 985 MB/s | 54.88% at 158 MB/s | 80.42% at 782 MB/s | 38.63% at 211 MB/s | 50.95% at 989 MB/s | 57.70% at 186 MB/s |
+| `ZPSE_LZ_LAZY_LEN=2` | 41.90% at 164 MB/s | 65.99% at 960 MB/s | 55.11% at 167 MB/s | 80.42% at 761 MB/s | 38.68% at 225 MB/s | 50.95% at 912 MB/s | 57.79% at 185 MB/s |
 
-Two arms move a ratio the table can see. The noise sample without a probe costs
-4.48 points on the probe pages and 0.03 on the dumps; all sixteen tiles buys
-2.53 there and a hundredth on the host corpora. Everything else is thousandths
-or a tenth of a point, which is why those knobs ship at the value the earlier
-paragraphs chose. `refresh_tables.sh` prints this table as `page knob arms`,
+Three arms move more than a tenth of a point on the probe pages. The noise
+sample without a probe costs 4.48 there and 0.03 on the dumps; all sixteen
+tiles buys 2.53 there and a hundredth on the host corpora; the doubled gate
+sample writes 1.47 more there for hundredths of a point in opposite directions
+on the dumps and Silesia. The candidate cap is 0.24 on these pages but 1.19
+over the dumps. Everything else is thousandths or a tenth of a point, which is
+why those knobs ship at the value the earlier paragraphs chose. `refresh_tables.sh` prints this table as `page knob arms`,
 with the dumps column only when `ZPSE_DUMPS` names them and Silesia only when
 the fetch succeeded.
 

@@ -268,15 +268,24 @@ static void mix_fill(uint8_t *o, size_t n, uint32_t chunk)
 /* A page workload aimed at the knobs the mixed corpus leaves inert: one
  * 4 KiB page per shape, the shape indexed by the page number, so a page run
  * meets every shape once per twenty pages. The shapes are the ones the noise
- * probe, the flat trial cap and the single-plane tile count price -- a page
- * whose middle is noise inside an otherwise compressible block, a flat 4-bit
- * page, a record whose stride the identity cannot see, interleaved planes, a
- * text end against a noise end, sparse bytes with holes, a ramp with one
+ * probe, the flat trial cap, the candidate cap, the gate's sample and the
+ * single-plane tile count price -- a page whose middle is noise inside an
+ * otherwise compressible block, counters that restart every 32 bytes, a
+ * stride-4 record, interleaved planes, ragged text in two quarters against a
+ * 2-bit alphabet in the other two, sparse bytes with holes, a ramp with one
  * noisy tile per kilobyte, four quarters of different shapes, a tail-only
- * compressible page, stride-5 records, a 2-bit alphabet, alternating
- * compressible and noisy blocks, pointer words into zeros, text with ragged
- * lines, and four pages whose quarters alternate two shapes. Twenty shapes,
- * so a 64 MiB run meets each about eight hundred times. */
+ * compressible page, records whose stride alternates four and eight bytes, a
+ * 2-bit alphabet behind a text head, alternating compressible and noisy
+ * blocks, pointer words into zeros, ragged text with a noisy tile at a
+ * quarter, and four pages whose quarters alternate two shapes. Twenty shapes,
+ * so a 64 MiB run meets each about eight hundred times.
+ *
+ * Every shape has to be one a page arm can flip. A shape every arm prices the
+ * same is dead weight here, however realistic it looks: the five homogeneous
+ * pages this file started with (a flat 4-bit page, a 2-bit alphabet, stride-5
+ * records, text against a noise half, ragged text) were byte-identical under
+ * all thirteen arms at level 6, and were replaced by the ambiguous pages
+ * above. */
 static void probe_fill(uint8_t *o, size_t n, uint32_t page)
 {
     uint32_t s = 0x9E37u ^ page * 2654435761u;
@@ -300,9 +309,15 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
         for (i = (n * 3u) / 4u; i + 16u <= n; i += 16u)
             memcpy(o + i, pro, 16u);
         break;
-    case 2: /* flat: 4-bit noise */
-        for (i = 0; i < n; i++)
-            o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x0Fu);
+    case 2: /* 4-byte counters that restart every 32 bytes, so the delta
+             * form fits inside a run and not across the restarts */
+        memset(o, 0, n);
+        for (i = 0; i + 4u <= n; i += 4u) {
+            uint32_t v = ((i % 32u) == 0u) ? (mix_rnd(&s) >> 8)
+                                           : (uint32_t)((i / 4u) & 7u);
+
+            memcpy(o + i, &v, 4u);
+        }
         break;
     case 3: /* records: every fourth byte random, the rest a ramp */
         for (i = 0; i + 4u <= n; i += 4u) {
@@ -324,11 +339,26 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
             memset(o + i + 64u, 0, 64u);
         }
         break;
-    case 5: /* text at one end, noise at the other */
-        for (i = 0; i < n / 2u; i++)
-            o[i] = (uint8_t)line[i % (sizeof line - 1u)];
-        for (; i < n; i++) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+    case 5: { /* ragged text in two quarters, a 2-bit alphabet in the other
+               * two: a page-level choice no single tile shape explains */
+        size_t q = n / 4u;
+        size_t col = 0u;
+
+        for (i = 0; i < n; i++) {
+            if (((i / (q == 0u ? 1u : q)) & 1u) == 0u) {
+                if (col > 40u + mix_rnd(&s) % 32u) {
+                    o[i] = '\n';
+                    col = 0u;
+                    continue;
+                }
+                o[i] = (uint8_t)line[mix_rnd(&s) % (sizeof line - 1u)];
+                col++;
+            } else {
+                o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x03u);
+            }
+        }
         break;
+    }
     case 6: /* sparse with single-byte holes */
         memset(o, 0, n);
         for (i = 0; i < n; i += 251u) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
@@ -361,18 +391,30 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
         for (i = (n > 512u) ? n - 512u : 0u; i < n; i++)
             o[i] = (uint8_t)(i & 0xFFu);
         break;
-    case 10: /* stride-5 records */
-        for (i = 0; i + 5u <= n; i += 5u) {
-            o[i] = (uint8_t)(mix_rnd(&s) >> 24);
-            o[i + 1u] = (uint8_t)(page + i);
-            o[i + 2u] = (uint8_t)((page + i) >> 8);
-            o[i + 3u] = (uint8_t)((page + i) * 3u);
-            o[i + 4u] = (uint8_t)((page + i) * 7u);
+    case 10: /* records whose stride changes between four and eight bytes
+              * every 64 bytes, so no single width transposes them */
+        for (i = 0; i + 8u <= n; i += 8u) {
+            if (((i / 64u) & 1u) == 0u) {
+                o[i] = (uint8_t)(page + i);
+                o[i + 1u] = (uint8_t)((page + i) >> 8);
+                o[i + 2u] = (uint8_t)(i * 3u);
+                o[i + 3u] = 0u;
+                memcpy(o + i + 4u, o + i, 4u);
+            } else {
+                size_t k;
+
+                for (k = 0; k < 8u; k++)
+                    o[i + k] = (k == 7u)
+                                  ? 0u
+                                  : (uint8_t)((page + i) * (k + 3u));
+            }
         }
         break;
-    case 11: /* a 2-bit alphabet */
+    case 11: /* a 2-bit alphabet with a kilobyte of text at the head */
         for (i = 0; i < n; i++)
             o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x03u);
+        for (i = 0; i < n / 4u; i++)
+            o[i] = (uint8_t)line[i % (sizeof line - 1u)];
         break;
     case 12: /* alternating compressible and noisy 512-byte blocks */
         for (i = 0; i < n; i++)
@@ -387,7 +429,7 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
             memcpy(o + i, &v, 8u);
         }
         break;
-    case 14: { /* text with ragged line lengths */
+    case 14: { /* ragged text with a noisy 256-byte tile per kilobyte */
         size_t col = 0u;
 
         for (i = 0; i < n; i++) {
@@ -399,6 +441,8 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
             o[i] = (uint8_t)line[mix_rnd(&s) % (sizeof line - 1u)];
             col++;
         }
+        for (i = n / 4u; i < n / 4u + 256u && i < n; i++)
+            o[i] = (uint8_t)(mix_rnd(&s) >> 24);
         break;
     }
     case 16: /* quarters alternate zeros and noise: a two-tile sample sees

@@ -815,11 +815,15 @@ static const uint8_t zpse_block_screen[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
  * not. Two samples, an eighth of the page, bought the same 4% on the dumps and
  * lost rate on the other two. Sixteen is not byte-identical after all: three
  * rounds put it 13 332 and 15 952 bytes ahead on the dumps at levels 1 and 6,
- * 22 150 and 20 933 ahead on Silesia, and the mixed corpus identical -- a
- * hundredth of a point across the host corpora -- for up to 7.7% of Silesia's
- * level-6 rate, the dumps' level 6 inside the band. The probe corpus is where
- * the sample is worth points instead of hundredths: 3.25 at level 1 and 2.53
- * at level 6 for 15 and 4% of that corpus's rate. A hundredth of a point is
+ * 22 150 and 20 933 ahead on Silesia at levels 1 and 2, and the mixed corpus
+ * identical -- a hundredth of a point across the host corpora at either level --
+ * for up to 7.7% of Silesia's level-6 rate and 8.1% of its level 2, the dumps
+ * inside the band. Two samples saves 11 076 and 13 357 bytes over the dumps and
+ * 14 182 and 13 881 over Silesia (0.005 to 0.007 of a point) at rate inside the
+ * band, and a whole point on the probe pages at level 1 (670 706 bytes) for 6%
+ * of their rate. The probe corpus is where the sample is worth points instead
+ * of hundredths: 3.25 at level 1 and 2.53 at level 6 for 8 and 10% of that
+ * corpus's rate. A hundredth of a point is
  * not what percent of the rate is for, so the default stays one and the arm
  * stays buildable for callers whose pages look like those shapes. A
  * build that defines this 0 arms the abort with no probe at all, and five
