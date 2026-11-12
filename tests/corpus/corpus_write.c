@@ -1,10 +1,14 @@
 /* Write the benchmark corpora to files, for the cross-tool comparison.
  *
- * Usage: corpus_write DIR [SIZE] [--mixed]
+ * Usage: corpus_write DIR [SIZE] [--mixed | --probe]
  *
  * --mixed writes only `mixed.bin`, the generated workload the README's mixed
  * tables are measured on (see mix_fill); at the default SIZE it is 4 MiB, and
  * the page tables use 160 MiB.
+ *
+ * --probe writes only `probe.bin`, one 4 KiB page per shape (see probe_fill):
+ * the page shapes the price's knobs are supposed to separate, which the mixed
+ * workload does not contain.
  *
  * Two families of corpus live here.
  *
@@ -261,28 +265,115 @@ static void mix_fill(uint8_t *o, size_t n, uint32_t chunk)
     }
 }
 
+/* A page workload aimed at the knobs the mixed corpus leaves inert: one
+ * 4 KiB page per shape, the shape indexed by the page number, so a page run
+ * meets every shape once per eight pages. The shapes are the ones the noise
+ * probe, the flat trial cap and the single-plane tile count price -- a page
+ * whose middle is noise inside an otherwise compressible block, a flat 4-bit
+ * page, a record whose stride the identity cannot see, interleaved planes, a
+ * text end against a noise end, sparse bytes with holes, and a ramp with one
+ * noisy tile per kilobyte. */
+static void probe_fill(uint8_t *o, size_t n, uint32_t page)
+{
+    uint32_t s = 0x9E37u ^ page * 2654435761u;
+    size_t i;
+    static const uint8_t pro[16] = {
+        0x55u, 0x48u, 0x89u, 0xE5u, 0x41u, 0x57u, 0x41u, 0x56u,
+        0x53u, 0x48u, 0x83u, 0xECu, 0x08u, 0xE8u, 0x00u, 0x00u
+    };
+    static const char line[] =
+        "the page encoder prices every plane of a page before it trials one "
+        "of them, which is the point of the price; ";
+
+    switch (page % 8u) {
+    case 0: /* compressible ends, a noisy middle third */
+        memset(o, 0, n);
+        for (i = n / 3u; i < (2u * n) / 3u; i++)
+            o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+        break;
+    case 1: /* noise, with the prologue repeated at the tail */
+        for (i = 0; i < n; i++) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+        for (i = (n * 3u) / 4u; i + 16u <= n; i += 16u)
+            memcpy(o + i, pro, 16u);
+        break;
+    case 2: /* flat: 4-bit noise */
+        for (i = 0; i < n; i++)
+            o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x0Fu);
+        break;
+    case 3: /* records: every fourth byte random, the rest a ramp */
+        for (i = 0; i + 4u <= n; i += 4u) {
+            o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+            o[i + 1u] = (uint8_t)(page + i);
+            o[i + 2u] = (uint8_t)((page + i) >> 8);
+            o[i + 3u] = (uint8_t)((page + i) * 5u);
+        }
+        break;
+    case 4: /* interleaved planes: sixteen ramped floats, then zeros */
+        for (i = 0; i + 128u <= n; i += 128u) {
+            uint32_t k;
+
+            for (k = 0; k < 16u; k++) {
+                float f = (float)((page * 16u + (i / 128u)) % 997u) / 8.0f +
+                          (float)k;
+                memcpy(o + i + k * 4u, &f, 4u);
+            }
+            memset(o + i + 64u, 0, 64u);
+        }
+        break;
+    case 5: /* text at one end, noise at the other */
+        for (i = 0; i < n / 2u; i++)
+            o[i] = (uint8_t)line[i % (sizeof line - 1u)];
+        for (; i < n; i++) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+        break;
+    case 6: /* sparse with single-byte holes */
+        memset(o, 0, n);
+        for (i = 0; i < n; i += 251u) o[i] = (uint8_t)(mix_rnd(&s) >> 24);
+        break;
+    default: /* a ramp with one noisy 256-byte tile per kilobyte */
+        for (i = 0; i < n; i++) o[i] = (uint8_t)((page + i) * 7u);
+        for (i = 0; i + 256u <= n; i += 1024u) {
+            size_t k;
+
+            for (k = 0; k < 256u; k++)
+                o[i + k] = (uint8_t)(mix_rnd(&s) >> 24);
+        }
+        break;
+    }
+}
+
 int main(int argc, char **argv)
 {
     static uint8_t block[BLOCK];
     unsigned long size = 4u * 1024u * 1024u;
     char path[1024];
-    int i, mixed = 0;
+    int i, mixed = 0, probe = 0, ai;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: corpus_write DIR [SIZE] [--mixed]\n");
+        fprintf(stderr, "usage: corpus_write DIR [SIZE] [--mixed | --probe]\n");
         return 2;
     }
-    if (argc > 2 && strcmp(argv[2], "--mixed") != 0) {
-        size = strtoul(argv[2], NULL, 10);
-        if (size == 0u || size % BLOCK != 0u) {
-            fprintf(stderr, "SIZE must be a non-zero multiple of %u\n", BLOCK);
-            return 2;
+    for (ai = 2; ai < argc; ai++) {
+        if (strcmp(argv[ai], "--mixed") == 0) {
+            mixed = 1;
+        } else if (strcmp(argv[ai], "--probe") == 0) {
+            probe = 1;
+        } else {
+            size = strtoul(argv[ai], NULL, 10);
+            if (size == 0u || size % BLOCK != 0u) {
+                fprintf(stderr, "SIZE must be a non-zero multiple of %u\n",
+                        BLOCK);
+                return 2;
+            }
         }
     }
-    if (argc > 2 && strcmp(argv[argc - 1], "--mixed") == 0) mixed = 1;
-    if (mixed) {
+    if (mixed && probe) {
+        fprintf(stderr, "--mixed and --probe are separate corpora\n");
+        return 2;
+    }
+    if (mixed || probe) {
         uint64_t base = 0u;
-        int n = snprintf(path, sizeof path, "%s/mixed.bin", argv[1]);
+        int n = snprintf(path, sizeof path, "%s/%s.bin", argv[1],
+                         mixed ? "mixed" : "probe");
         FILE *f;
 
         if (n <= 0 || (size_t)n >= sizeof path) {
@@ -298,7 +389,19 @@ int main(int argc, char **argv)
             size_t chunk = (size_t)((uint64_t)size - base);
 
             if (chunk > BLOCK) chunk = BLOCK;
-            mix_fill(block, chunk, (uint32_t)(base / BLOCK));
+            if (probe) {
+                size_t off;
+
+                for (off = 0; off < chunk; off += 4096u) {
+                    size_t pn = chunk - off;
+                    uint32_t page = (uint32_t)((base + off) / 4096u);
+
+                    if (pn > 4096u) pn = 4096u;
+                    probe_fill(block + off, pn, page);
+                }
+            } else {
+                mix_fill(block, chunk, (uint32_t)(base / BLOCK));
+            }
             if (fwrite(block, 1u, chunk, f) != chunk) {
                 fprintf(stderr, "short write on %s\n", path);
                 fclose(f);

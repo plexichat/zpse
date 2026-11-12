@@ -240,25 +240,18 @@ The candidate list is itself a cost, and on a page it is now capped. The sweep
 prices a candidate by staging its transform over its probe window -- 2 KiB of
 a page, see `ZPSE_PROBE_SHORT_TILES` -- and pricing every plane of it, so nine
 candidates are nine stagings to choose one: on the dumps it was pricing 9.5
-per page. `ZPSE_PAGE_CAND_CAP` stops the sweep at seven and drops the
-candidates it left unpriced -- not the ones it could not price, which it still
-never drops -- and the count falls to 6.9. What the cap costs is the shape the
-eighth and ninth candidates would have won with, and where the level prices
-every plane that is a shape the trial was rejecting anyway: the dumps paid
-1.13% of packed bytes for a fifth of the rate back (40.92% to 41.38%, 112.0 to
-136.2 MB/s at five paired passes), the mixed workload 0.045% (96,731,301 to
-96,806,099 bytes)
-and Silesia 0.064% (119.6 to 134.0). With the whole-page price below in place
-it was free on the dumps and Silesia (the same 88,111,603 / 90,350,032 bytes
-with and without it, rates inside this host's band: 141.5 against 137.8 MB/s
-mean, 140.2 against 139.8), but on the generated corpus it is a small real
-trade: at level 6 the shipped cap writes 96,806,099 bytes against 96,731,301
-with the cap raised to nine -- 0.045 of a point -- for 184.0 against 160.5 MB/s
-of encode (two passes each). It stays as a ceiling rather than as a decision: at level 6 the sweep prices
-6.86, 6.90 and 5.62 candidates per page on the three dumps files, against a cap
-of seven, and raising the cap past the list length leaves the same counters
-(94,637 / 157,154 / 292,632 prices, 23,111 / 49,336 / 201,464 kept) and the same
-bytes -- the whole-page price convicts the field before the cap is reached.
+per page. `ZPSE_PAGE_CAND_CAP` is six and drops the candidates it left
+unpriced -- not the ones it could not price, which it still never drops. What
+the cap costs is the shape the seventh to ninth candidates would have won
+with, and at this build that is a real trade on all three corpora: at 4 KiB
+level 6 the dumps write 88,706,614 bytes with the cap at six and 86,168,376
+raised to nine -- 1.19 points -- for 159.0 against 128.8 MB/s, Silesia
+116,303,066 against 115,915,276 (0.18) for 158.7 against 135.0, and the
+generated mixed corpus 96,806,099 against 96,731,301 (0.045) for 193.3 against
+179.7 (two passes each, the bytes exact). Level 1 writes no LZ form and the
+cap is inert there. It stays armed where every plane is priced, levels 5 to 9,
+because 1.19 points over the dumps is just past the one-point line these page
+trades are held to and it buys about a fifth of the rung's rate.
 
 Which bytes a candidate is priced on is a separate trade, and it is not the
 same trade on every rung. A cheap rung acts on the price alone -- one or two
@@ -367,25 +360,48 @@ does not travel. Both samples stop at a page: the gate keeps its 2 KiB span and 
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
 
-The other four page knobs are byte-inert on this corpus: the noise probe (one
-sample, all sixteen tiles, or none, through `PAGE_FAST`), a third flat trial
-and the single-plane tile count all write the same 96,806,099 bytes at level 6
-and 154,192,607 with `PAGE_FAST` at level 1, with rates inside this host's
-band. Its pages do not hold the shapes those knobs price -- the dumps and
-Silesia figures above are the evidence that they matter elsewhere -- and the
-gate's window has no build switch of its own (`ZPSE_ASCII_PAGE_SAMPLE` is a
-constant), so it cannot be re-measured this way at all.
+The gate's own sample is buildable (`ZPSE_ASCII_PAGE_SAMPLE`), and the
+kilobyte is the corner of that trade on the generated corpus too: halving it
+writes 324,615 more bytes at level 1 and 233,992 more at level 6, and doubling
+it saves 118,324 and 88,616 for 12 and 16% of the rung's rate (level 1 reads
+338, 367 and 378 MB/s for 512 B, 1 KiB and 2 KiB; level 6 reads 184, 187 and
+155). A gate that samples more of a page also refuses more of them, which is
+why the doubled sample is the faster arm at the cheap rung and the slower one
+where the trials were going to repair the page anyway. It does not travel to
+the host corpora: at level 6 it writes 86 more bytes over the dumps and 7,648
+fewer over Silesia with every rate inside this host's band, and at level 1 it
+adds 1,219 bytes over the dumps while taking 55,947 off Silesia -- 0.0006 and
+0.026 of a point, in opposite directions -- for 5% of the dumps' rate. The
+halved sample is no better anywhere it was measured: 41 more bytes over the
+dumps and 45,411 more over Silesia at level 6, 130,451 more over Silesia at
+level 1. So the kilobyte stays.
+
+The other knobs were given the shapes they price: `corpus_write --probe` writes
+`probe.bin` (64 MiB, sha256 `2ee39ff2…`), one 4 KiB page per shape -- a noisy
+middle inside a compressible block, a flat 4-bit page, a stride-4 record,
+interleaved planes, text against noise, sparse holes, and a ramp with a noisy
+tile per kilobyte. Even there the noise probe writes the same bytes at zero,
+one and sixteen samples (44,116,378 with `PAGE_FAST` at level 1, 34,487,046 at
+level 6, the sixteen-sample arm 1 KB smaller), and the probe tile count writes
+the same bytes at two, four and eight (24,619,611 at level 6), so neither is
+even refuted, let alone paid for; the probe-free arm is 8% *slower* at level 1
+here, the opposite of the dumps. The third flat trial is the one arm that
+moves: 24,551,925 against 24,619,611 bytes, 0.10 of a point, with encode
+inside this host's band (221 against 224 MB/s), where Silesia's arm bought 210
+bytes for 6.6% of its rate, so the cap stays at two on the real corpus. The
+single-plane price's two tiles have no switch of their own -- `ZPSE_DECIDE_TILES`
+is the decide pass's count, not that sample -- so it cannot be re-measured this
+way at all.
 
 The candidate field a page prices is the other knob, and it is dearer per
 point of ratio than either sample: a page prices at most six candidates now,
-and the seventh it used to price is worth 1.276 points over the dumps and
-0.154 over Silesia for 5 to 10% of the page encoder's rate -- the arm the
-one-point line was moved for. Below six the field is nearly free to cut (the
+and raising that to nine is worth 1.19 points over the dumps and 0.18 over
+Silesia for 15 to 19% of the page encoder's rate -- the arm the one-point line
+was moved for. Below six the field is nearly free to cut (the
 sixth is worth 0.003 of a point) and then expensive again (the fifth, 0.18 for
-another 9%), so six is where the ratio the sweep still earns meets the rate. `ZPSE_PAGE_CAND_CAP` sets it -- a knob the header
-documents and, until this round, a plain `#define` that quietly ignored every
-`-D` aimed at it -- and seven is still buildable for a caller whose bytes
-matter more.
+another 9%), so six is where the ratio the sweep still earns meets the rate.
+`ZPSE_PAGE_CAND_CAP` sets it -- a knob the header documents -- and seven is
+still buildable for a caller whose bytes matter more.
 
 Two more page knobs were swept with that cap and both ship. The gate prices
 one 1 KiB window at each end instead of two 512-byte ones: 6.9% on both

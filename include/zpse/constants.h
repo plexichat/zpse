@@ -328,7 +328,13 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
  * no other knob on the price has offered without costing both corpora at once.
  * Seven is still buildable (-DZPSE_PAGE_CAND_CAP=7u) for a caller whose bytes
  * matter more than that, and the arms below six remain refused: they buy their
- * extra rate by dropping a shape the sweep has to be able to reach. */
+ * extra rate by dropping a shape the sweep has to be able to reach.
+ *
+ * Re-measured at 4 KiB level 6 on the current build: six writes 88,706,614
+ * bytes over the dumps against 86,168,376 raised to nine (1.19 points) for
+ * 159.0 against 128.8 MB/s, and Silesia 116,303,066 against 115,915,276 (0.18)
+ * for 158.7 against 135.0, so the cap is a real trade there and not a ceiling
+ * the price has already made free. */
 #ifndef ZPSE_PAGE_CAND_CAP
 #define ZPSE_PAGE_CAND_CAP 6u
 #endif
