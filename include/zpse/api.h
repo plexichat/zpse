@@ -2,7 +2,7 @@
 #define ZPSE_API_H
 
 /* High-level one-shot API. Contexts borrow caller-owned arenas
- * (320 KiB decode / 448 KiB encode, 64-B aligned). No allocation,
+ * (384 KiB decode / 448 KiB encode, 64-B aligned). No allocation,
  * no threads, no I/O inside. */
 
 #include <stddef.h>

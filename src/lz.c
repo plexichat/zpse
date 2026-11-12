@@ -372,20 +372,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
      * block of every file. */
     /* The table is 16 KiB and the pass around it reads it constantly, so the
      * clear is paid every block of every file. LZ_EMPTY is 0xFFFF and the
-     * table is uint16_t, so all-ones bytes are exactly the empty marker: one
-     * memset the C library widens to the machine's stores, instead of a loop
-     * of 8-byte stores a 4 KiB page pays twenty times over.
-     *
-     * Byte-identical, not merely equal-sized: the packed streams of the probe
-     * pages and all three dumps hash the same as the loop's, and the probe
-     * columns of every arm in the page table are unchanged to the byte. Rate
-     * measured with the two builds alternating on one pinned core at 4 KiB
-     * level 6, five rounds each: probe 212.3 -> 215.7, dumps 163.1 -> 170.2,
-     * Silesia 164.2 -> 171.1, mixed 190.2 -> 195.3 MB/s, so +1.6 to +4.4%,
-     * every corpus in the same direction. An earlier three-round pass read
-     * +6.4 to +22.4% while the host had other work on it, which is why the
-     * smaller numbers are the ones quoted. Decode cannot move and does not: the
-     * table belongs to the encoder. */
+     * table is uint16_t, so all-ones bytes are exactly the empty marker. */
     memset(tab, 0xFF, (size_t)entries * sizeof *tab);
     o.dst = dst;
     o.cap = cap;

@@ -16,10 +16,9 @@
 # not measure. The exit status is 0 only when every section ran.
 #
 # Env: CC (default cc), REPS (2), ZPSE_LEVELS ("1 5 6 9 F"),
-#      SILESIA_DIR, LZ4, ZSTD, KEEP=1 (keep the temp directory and print it),
-#      ZPSE_DUMPS (heap-dump files, space separated; adds the dumps columns to
-#      the page knob arms). Nothing else in the tree can regenerate a dump, so
-#      without it those columns are simply left out.
+#      SILESIA_DIR, LZ4, ZSTD, KEEP=1 (keep the temp directory and print it).
+#      The page tables come from the generated 4 KiB page corpus, so no host
+#      dump or other private input is needed or accepted.
 set -uo pipefail
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -67,6 +66,10 @@ cli="$work/zpse"
         "$repo/tests/corpus/corpus_write.c" -o "$work/corpus_write" ||
     { echo "refresh_tables: corpus_write build failed" >&2; exit 1; }
 
+"$CC" -std=c11 -O2 -I "$inc" "$repo/tests/benchmarks/bench_pages.c" \
+    "$unity" -ldl -o "$work/bench_pages" 2>/dev/null ||
+    { echo "refresh_tables: bench_pages build failed" >&2; exit 1; }
+
 zstd=""
 if [ -n "${ZSTD:-}" ] && [ -x "${ZSTD}" ]; then
     zstd="$ZSTD"
@@ -97,6 +100,10 @@ fi
 corpus="$work/corpus"
 mkdir -p "$corpus" || exit 1
 "$work/corpus_write" "$corpus" >/dev/null || exit 1
+
+pages="$work/pages"
+mkdir -p "$pages" || exit 1
+"$work/corpus_write" "$pages" 16777216 --pages >/dev/null || exit 1
 
 silesia="${SILESIA_DIR:-}"
 if [ -z "$silesia" ]; then
@@ -330,6 +337,40 @@ else
     missing "mixed corpus (corpus_write --mixed)"
 fi
 
+# ---- 4 KiB page corpus ------------------------------------------------
+#
+# The page corpus is generated, so every row is re-measurable from a checkout
+# and zero pages are kept out of the headline by construction. bench_pages
+# calls zstd and lz4 through their shared libraries once per 4 KiB page, which
+# is the comparison a zram device actually makes; a frame-level CLI run would
+# let one block shape span several pages.
+if [ -x "$work/bench_pages" ]; then
+    pin=""
+    command -v taskset >/dev/null 2>&1 && pin="taskset -c 0"
+    say "page corpus, non-zero pages"
+    $pin "$work/bench_pages" "$pages/pages-nonzero.bin"
+    say "page corpus, all pages including zero"
+    $pin "$work/bench_pages" "$pages/pages-all.bin"
+    say "page corpus, all pages excluding zero"
+    $pin "$work/bench_pages" --exclude-zero "$pages/pages-all.bin" |
+        sed -n '/^| codec/,$p'
+    say "page corpus, per class"
+    echo "| class | pages | zpse 6 | zstd 6 | lz4hc 12 |"
+    echo "| --- | ---: | ---: | ---: | ---: |"
+    for f in "$pages"/page-*.bin; do
+        name=$(basename "$f" .bin)
+        name=${name#page-}
+        out=$($pin "$work/bench_pages" "$f")
+        zp=$(printf '%s\n' "$out" | awk -F'|' '/\| zpse 6 \(default\)/ {gsub(/ /,"",$3); print $3}')
+        zs=$(printf '%s\n' "$out" | awk -F'|' '/\| zstd 6 / {gsub(/ /,"",$3); print $3}')
+        lz=$(printf '%s\n' "$out" | awk -F'|' '/\| lz4hc 12 / {gsub(/ /,"",$3); print $3}')
+        np=$(printf '%s\n' "$out" | awk '/^[0-9]+ pages/ {print $1}')
+        printf '| `%s` | %s | %s | %s | %s |\n' "$name" "$np" "$zp" "$zs" "$lz"
+    done
+else
+    missing "bench_pages build"
+fi
+
 # ---- Probe page tables ------------------------------------------------
 
 # probe.bin is the page shapes the price's knobs are supposed to separate
@@ -395,9 +436,9 @@ fi
 if [ -s "$pfile" ]; then
     km="$mixed/mixed.bin"
     [ -s "$km" ] || km=""
-    # The dumps are the author's, so that column needs ZPSE_DUMPS; Silesia is
-    # here whenever the fetch or SILESIA_DIR produced it.
-    kd="${ZPSE_DUMPS:-}"
+    # The page corpus replaces the old host-dump column: it is generated, has
+    # no zero pages in this file, and can be re-measured on any host.
+    kd="$pages/pages-nonzero.bin"
     ks=""
     if [ -n "$silesia" ] && ls "$silesia"/ >/dev/null 2>&1; then
         ks=$(ls "$silesia"/* 2>/dev/null | tr '\n' ' ')
@@ -406,7 +447,7 @@ if [ -s "$pfile" ]; then
     khdr="| arm |"
     ksep="| --- |"
     if [ -n "$kd" ]; then
-        khdr="$khdr dumps L6 | dumps \`PAGE_FAST\` L6 |"
+        khdr="$khdr pages L6 | pages \`PAGE_FAST\` L6 |"
         ksep="$ksep ---: | ---: |"
     fi
     if [ -n "$ks" ]; then

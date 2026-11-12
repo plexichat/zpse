@@ -166,7 +166,7 @@ fi
 
 tools=()
 for l in $ZPSE_LEVELS; do tools+=("zpse:$l"); done
-[ -n "$lz4" ] && tools+=("lz4:1" "lz4:3" "lz4:9")
+[ -n "$lz4" ] && tools+=("lz4:1" "lz4:3" "lz4:9" "lz4:12")
 [ -n "$zstd" ] && tools+=("zstd:1" "zstd:3" "zstd:19")
 [ "${#tools[@]}" -gt 0 ] || fail "no compressors found"
 [ -n "$lz4" ] || echo "bench_pareto: no lz4, its rows are missing" >&2
@@ -226,7 +226,7 @@ ratio() { # packed input
 # minutes of wall clock for the same answer.
 reps_for() {
     case "$1" in
-    zstd:19 | lz4:9) echo 1 ;;
+    zstd:19 | lz4:12) echo 1 ;;
     *) echo "$REPS" ;;
     esac
 }
