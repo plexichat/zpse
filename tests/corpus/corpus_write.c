@@ -267,15 +267,16 @@ static void mix_fill(uint8_t *o, size_t n, uint32_t chunk)
 
 /* A page workload aimed at the knobs the mixed corpus leaves inert: one
  * 4 KiB page per shape, the shape indexed by the page number, so a page run
- * meets every shape once per eight pages. The shapes are the ones the noise
+ * meets every shape once per twenty pages. The shapes are the ones the noise
  * probe, the flat trial cap and the single-plane tile count price -- a page
  * whose middle is noise inside an otherwise compressible block, a flat 4-bit
  * page, a record whose stride the identity cannot see, interleaved planes, a
  * text end against a noise end, sparse bytes with holes, a ramp with one
  * noisy tile per kilobyte, four quarters of different shapes, a tail-only
  * compressible page, stride-5 records, a 2-bit alphabet, alternating
- * compressible and noisy blocks, pointer words into zeros, and text with
- * ragged lines. Sixteen shapes, so a run meets each twice per 64 KiB. */
+ * compressible and noisy blocks, pointer words into zeros, text with ragged
+ * lines, and four pages whose quarters alternate two shapes. Twenty shapes,
+ * so a 64 MiB run meets each about eight hundred times. */
 static void probe_fill(uint8_t *o, size_t n, uint32_t page)
 {
     uint32_t s = 0x9E37u ^ page * 2654435761u;
@@ -288,7 +289,7 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
         "the page encoder prices every plane of a page before it trials one "
         "of them, which is the point of the price; ";
 
-    switch (page % 16u) {
+    switch (page % 20u) {
     case 0: /* compressible ends, a noisy middle third */
         memset(o, 0, n);
         for (i = n / 3u; i < (2u * n) / 3u; i++)
@@ -400,6 +401,33 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
         }
         break;
     }
+    case 16: /* quarters alternate zeros and noise: a two-tile sample sees
+              * only the zeros (tiles 0 and 8) */
+        for (i = 0; i < n; i++)
+            o[i] = ((i / (n / 4u)) & 1u) ? (uint8_t)(mix_rnd(&s) >> 24) : 0u;
+        break;
+    case 17: /* the same, noise first: a two-tile sample sees only the noise */
+        for (i = 0; i < n; i++)
+            o[i] = ((i / (n / 4u)) & 1u) ? 0u : (uint8_t)(mix_rnd(&s) >> 24);
+        break;
+    case 18: /* quarters alternate a 2-bit alphabet and 16-byte records */
+        for (i = 0; i < n; i++) {
+            if (((i / (n / 4u)) & 1u) == 0u)
+                o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x03u);
+            else
+                o[i] = (i % 16u == 0u) ? (uint8_t)(mix_rnd(&s) >> 24)
+                                       : (uint8_t)(i * 3u);
+        }
+        break;
+    case 19: /* the same, records first */
+        for (i = 0; i < n; i++) {
+            if (((i / (n / 4u)) & 1u) == 0u)
+                o[i] = (i % 16u == 0u) ? (uint8_t)(mix_rnd(&s) >> 24)
+                                       : (uint8_t)(i * 3u);
+            else
+                o[i] = (uint8_t)((mix_rnd(&s) >> 24) & 0x03u);
+        }
+        break;
     default: /* a ramp with one random hole in thirty-two */
         for (i = 0; i < n; i++)
             o[i] = ((mix_rnd(&s) & 31u) == 0u)

@@ -143,9 +143,11 @@ opaque data one 64 KiB chunk at a time:
 
 The zstd columns are one frame per file with 4 KiB blocks (`zstd -B4K -T1`),
 size and both rates from the same run. The corpus is generated here, so the
-table is re-measurable on any host. Figures earlier in this document that name
-the mixed workload without saying they were re-measured here come from that
-table's original host-file corpus, which this tree cannot regenerate.
+table is re-measurable on any host. Figures that name *the generated mixed
+corpus* were measured on it; figures that name `mixed` or *the mixed workload*
+without it -- the flat-cut rates, the cheap rungs' tile sample, the
+delta-coding points -- come from this table's original host-file corpus, which
+this tree cannot regenerate.
 
 Where the dumps' 9.68-point gap to zstd sits, split by the form the default
 level picked (zstd's column is its size over the same pages):
@@ -377,27 +379,31 @@ halved sample is no better anywhere it was measured: 41 more bytes over the
 dumps and 45,411 more over Silesia at level 6, 130,451 more over Silesia at
 level 1. So the kilobyte stays.
 
-`corpus_write --probe` writes `probe.bin` (64 MiB, sha256 `3754c151…`), one
-4 KiB page per shape, sixteen shapes cycling: a noisy middle inside a
+`corpus_write --probe` writes `probe.bin` (64 MiB, sha256 `621c4309…`), one
+4 KiB page per shape, twenty shapes cycling: a noisy middle inside a
 compressible block, a flat 4-bit page, a stride-4 record, interleaved planes,
 text against noise, sparse holes, a ramp with a noisy tile per kilobyte, four
 quarters of different shapes, a tail-only compressible page, stride-5 records,
 a 2-bit alphabet, alternating compressible and noisy blocks, pointer words into
-zeros, and ragged text. That is enough to exercise the knobs the mixed corpus
-leaves inert. Across a thousand pages of each shape at level 6 under
-`PAGE_FAST`, the midpoint sample writes 36,790,132 bytes and no probe at all
-38,670,125 -- 2.80 points, which is what the sample is for -- for 1,087 against
-1,207 MB/s, and all sixteen samples write 36,547,075, 0.36 of a point fewer for
-16% of that rate, so the shipped sample sits between the two ends and costs
-less than either. The probe tile count (`ZPSE_PROBE_TILES`) stays byte-inert
-even here (29,752,418 plain at level 6 for two, four and eight tiles), and the
-third flat trial is worth 34,342 bytes, 0.05 of a point, with encode inside
-this host's band, against 210 bytes for 6.6% of Silesia's rate, so the cap
-stays at two. The single-plane page price does have its own switch
-(`ZPSE_DECIDE_PAGE_TILES`): four tiles against the shipped two writes 4,884
-fewer bytes over the dumps (0.0023) and 8,739 over Silesia (0.0041) for 4 and
-6% of their rate, and 53 *more* on the probe corpus -- four thousandths of a
-point for four percent, refused.
+zeros, ragged text, and four pages whose quarters alternate two shapes -- zeros
+against noise and its mirror, a 2-bit alphabet against records and its mirror.
+Those last four separate the single-plane tile counts, because the sample takes
+one tile per quarter: two tiles see quarters one and three only.
+
+Across eight hundred pages of each shape at level 6 under `PAGE_FAST`, the
+midpoint sample writes 36,953,922 bytes, no probe at all 39,961,191 -- 4.48
+points, at 1,157 against 1,102 MB/s -- and all sixteen tiles 35,255,247, 2.53
+points fewer for 7 to 20% of the rate. That last arm is past the one-point
+line, and the thousand-byte default does not answer it: the host corpora are
+byte-identical across one, zero and sixteen samples, so these pages are the
+only witness, and re-pricing the default on them is open. The probe tile count
+(`ZPSE_PROBE_TILES`) stays byte-inert even here (29,036,416 plain at level 6
+for two, four and eight tiles), and the third flat trial is worth 27,056 bytes,
+0.04 of a point, at flat rate, so the cap stays at two. Four page tiles
+(`ZPSE_DECIDE_PAGE_TILES`) against the shipped two write 34,267 fewer bytes
+over these pages (0.051) for about 4% of the rate, and 4,884 and 8,739 fewer
+over the dumps and Silesia (0.0023 and 0.0041) for 4 and 6% -- thousandths of a
+point for percent of rate, refused with either sign.
 
 The candidate field a page prices is the other knob, and it is dearer per
 point of ratio than either sample: a page prices at most six candidates now,

@@ -384,6 +384,67 @@ else
     missing "probe corpus (corpus_write --probe)"
 fi
 
+# ---- Page knob arms ---------------------------------------------------
+
+# Every page knob the README prices, one build each and read on the same two
+# corpora: the probe pages separate them, the mixed corpus says what they cost
+# on real shapes. Ratios are byte counts; the rates carry this host.
+if [ -s "$pfile" ]; then
+    km="$mixed/mixed.bin"
+    [ -s "$km" ] || km=""
+    say "page knob arms"
+    if [ -n "$km" ]; then
+        echo "| arm | probe L6 | probe \`PAGE_FAST\` L6 | mixed L6 | mixed \`PAGE_FAST\` L6 |"
+        echo "| --- | ---: | ---: | ---: | ---: |"
+    else
+        echo "| arm | probe L6 | probe \`PAGE_FAST\` L6 |"
+        echo "| --- | ---: | ---: |"
+    fi
+    knob_cells() { # file -> "ratio at rate"
+        "$1" bench -q -b 4096 -l 6 -r "$REPS" "$2" |
+            awk '/TOTAL/ {printf "%.2f%% at %.0f MB/s", 100.0*$3/$2, $5}'
+    }
+    knob_fast() {
+        "$1" bench -q -b 4096 -l 6 -P -r "$REPS" "$2" |
+            awk '/TOTAL/ {printf "%.2f%% at %.0f MB/s", 100.0*$3/$2, $5}'
+    }
+    while IFS='|' read -r label def; do
+        case "$label" in "" | \#*) continue;; esac
+        bin="$work/arm-$label"
+        # The define column is meant to split into words (it is empty for the
+        # shipped arm), so it is unquoted here on purpose.
+        if ! "$CC" -std=c11 -O2 -I "$inc" $def \
+            "$repo/tests/tools/zpse_cli.c" "$unity" -o "$bin" 2>/dev/null; then
+            missing "page knob arm $label ($def)"
+            continue
+        fi
+        printf '| `%s` | %s | %s |' "$label" \
+            "$(knob_cells "$bin" "$pfile")" "$(knob_fast "$bin" "$pfile")"
+        if [ -n "$km" ]; then
+            printf ' %s | %s |\n' "$(knob_cells "$bin" "$km")" \
+                "$(knob_fast "$bin" "$km")"
+        else
+            printf '\n'
+        fi
+    done <<'ARMS'
+shipped|
+ZPSE_DECIDE_PAGE_TILES=3|-DZPSE_DECIDE_PAGE_TILES=3u
+ZPSE_DECIDE_PAGE_TILES=4|-DZPSE_DECIDE_PAGE_TILES=4u
+ZPSE_PROBE_TILES=2|-DZPSE_PROBE_TILES=2u
+ZPSE_PROBE_TILES=4|-DZPSE_PROBE_TILES=4u
+ZPSE_PROBE_PAGE_TILES=8|-DZPSE_PROBE_PAGE_TILES=8u
+ZPSE_PAGE_CAND_CAP=9|-DZPSE_PAGE_CAND_CAP=9u
+ZPSE_ASCII_PAGE_SAMPLE=512|-DZPSE_ASCII_PAGE_SAMPLE=512u
+ZPSE_ASCII_PAGE_SAMPLE=2048|-DZPSE_ASCII_PAGE_SAMPLE=2048u
+ZPSE_PAGE_NOISE_POINTS=0|-DZPSE_PAGE_NOISE_POINTS=0u
+ZPSE_PAGE_NOISE_POINTS=16|-DZPSE_PAGE_NOISE_POINTS=16u
+ZPSE_FLAT_TRIALS=3|-DZPSE_FLAT_TRIALS=3
+ZPSE_LZ_LAZY_LEN=2|-DZPSE_LZ_LAZY_LEN=2u
+ARMS
+else
+    missing "probe corpus (corpus_write --probe)"
+fi
+
 # ---- colcheck ---------------------------------------------------------
 
 if [ -f "$titanic" ] && [ -f "$uber" ]; then
