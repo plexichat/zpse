@@ -1,6 +1,7 @@
 #include "zpse/lz.h"
 
 #include "zpse/bits.h"
+#include "zpse/constants.h"
 #include "zpse/hot.h"
 #include "zpse/status.h"
 #include "zpse/vector.h"

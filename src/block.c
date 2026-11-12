@@ -6,6 +6,7 @@
 #include "zpse/crc32c.h"
 #include "zpse/dense.h"
 #include "zpse/lz.h"
+#include "zpse/lz2.h"
 #include "zpse/lzh.h"
 #include "zpse/predictor.h"
 #include "zpse/segment.h"
@@ -2830,6 +2831,40 @@ static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
 #define ZPSE_LZH_PAGE_LEVEL 7u
 #endif
 
+/* The block size from which the sweep's own finder pass uses the encoder's
+ * spare 64 KiB staging region as a 2^15-entry hash table instead of the 16
+ * KiB e->lz, and the reason it is not every size.
+ *
+ * A 64 KiB block has 65536 positions and a 13-bit table has 8192 slots, so the
+ * direct-mapped finder overwrites seven of every eight candidates before it
+ * can look at them; the 64 KiB region holds 32768 slots, one per two
+ * positions. Measured on the finder alone (same parse, same writers, one
+ * pinned core, best of three passes over the three dumps and twelve Silesia
+ * files), 13 bits against 15 at 64 KiB: dumps 76,665,796 -> 75,727,522 bytes,
+ * Silesia 100,690,345 -> 99,817,619, for 2.4 and 2.6% of the pass's rate. At
+ * 16 KiB the table also pays: dumps 82,251,876 -> 82,127,429 with the hex
+ * writer, 83,501,138 -> 83,300,437 with the fast one, and Silesia 106,838,855
+ * -> 106,447,280 / 107,001,086 -> 106,371,923, and there it is 6 to 10%
+ * FASTER as well as smaller, because 32 KiB of table fits L2 beside the block
+ * while the 16 KiB table does not stay resident in L1.
+ *
+ * A page is the exception, and it is why this is a floor rather than the
+ * default: at 4 KiB the 64 KiB region is sixteen times the block, and
+ * clearing it costs more than the collisions it removes (dumps 455.4 ->
+ * 388.3 MB/s at 15 bits, and 41.209 -> 41.178% of bytes -- the bigger table
+ * is SLOWER there). So the table grows where the block is big enough to pay
+ * for clearing it, and pages keep ZPSE_LZ_HASH_BITS.
+ *
+ * The region is free at every point this is used: it is the trials' transform
+ * staging, and the finder runs after the last trial. The one caller that
+ * writes a stream INTO tstage -- the lazy-window second pass, which only
+ * exists above a page and up to ZPSE_LZ_LAZY_MAX -- is passed the old table
+ * explicitly, and each pass clears its own table on entry, so the two never
+ * overlap. */
+#ifndef ZPSE_LZ_TABLE_BIG_MIN
+#define ZPSE_LZ_TABLE_BIG_MIN 16384u
+#endif
+
 /* The fast LZ form's block: same header, same 'is_last' and CRC handling as
  * zpse_block_try_lz, different payload codec. */
 static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -2891,6 +2926,13 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * reaches this: the sweep's candidates all write into e->cand.
              */
             tab = e->cand;
+            hb = 15u;
+        } else if (n >= (uint32_t)ZPSE_LZ_TABLE_BIG_MIN) {
+            /* The sweep's own candidate, big enough to pay for the table:
+             * the trials are over, so their 64 KiB staging region is free.
+             * See ZPSE_LZ_TABLE_BIG_MIN for what the bigger table is worth
+             * and why a page keeps the small one. */
+            tab = e->tstage;
             hb = 15u;
         }
         /* A page gets the hexadecimal encoding; anything larger keeps the fast
@@ -5133,11 +5175,23 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     lz_cap = best_total - win;
                 }
             }
-            rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                   lz_cap, e->lz,
-                                   (uint32_t)ZPSE_LZ_HASH_BITS,
-                                   (uint32_t)ZPSE_BLOCK_SHORT_MAX, &lz_total,
-                                   &lz_cmds);
+            /* The table is the small one at a page and the 64 KiB staging
+             * region from 16 KiB up: the trials have all finished, and the
+             * lazy pass below writes to tstage itself, so it keeps e->lz.
+             * See ZPSE_LZ_TABLE_BIG_MIN. */
+            {
+                void *ltab = e->lz;
+                uint32_t lhb = (uint32_t)ZPSE_LZ_HASH_BITS;
+
+                if (n >= (uint32_t)ZPSE_LZ_TABLE_BIG_MIN) {
+                    ltab = e->tstage;
+                    lhb = 15u;
+                }
+                rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
+                                       lz_cap, ltab, lhb,
+                                       (uint32_t)ZPSE_BLOCK_SHORT_MAX,
+                                       &lz_total, &lz_cmds);
+            }
             /* ---- The lazy window above a page -------------------------
              *
              * The length-measured lazy step is worth 0.5 points at a page and
@@ -5236,10 +5290,21 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
                        ZPSE_B_LZ2)) == 0u) {
             uint32_t blen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+            /* The table is the candidate staging, which this stage does not
+             * use: the winner is in e->best and the body is written to
+             * tstage. A body big enough to pay for the 64 KiB table gets it
+             * (ZPSE_LZ_TABLE_BIG_MIN); a page keeps the small one. */
+            void *btab = e->lz;
+            uint32_t bhb = (uint32_t)ZPSE_LZ_HASH_BITS;
+
+            if (blen >= (uint32_t)ZPSE_LZ_TABLE_BIG_MIN) {
+                btab = e->cand;
+                bhb = 15u;
+            }
             uint32_t pl = zpse_lz_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
                                          blen, e->tstage,
-                                         (uint32_t)ZPSE_E_SZ_TSTAGE, e->lz,
-                                         (uint32_t)ZPSE_LZ_HASH_BITS);
+                                         (uint32_t)ZPSE_E_SZ_TSTAGE, btab,
+                                         bhb);
             uint32_t tot = (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) + pl;
 
             if (pl != 0u &&

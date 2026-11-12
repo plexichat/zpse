@@ -1202,8 +1202,8 @@ caller's page faults:
 
 | mode | ratio | encode | decode | packed |
 | --- | ---: | ---: | ---: | ---: |
-| level 9 `ZPSE_ENC_SPEED_MAX` | 2.25:1 | 0.23 GB/s | 1.70 GB/s | 94,248,419 |
-| level 6 (default) | 2.08:1 | 0.36 GB/s | 1.72 GB/s | 101,858,449 |
+| level 9 `ZPSE_ENC_SPEED_MAX` | 2.25:1 | 0.23 GB/s | 1.70 GB/s | 94,204,004 |
+| level 6 (default) | 2.08:1 | 0.36 GB/s | 1.72 GB/s | 101,791,194 |
 | level 6 + `ZPSE_ENC_LZ_FAST` | 2.19:1 | 0.41 GB/s | 2.30 GB/s | 96,661,814 |
 
 A third command encoding, the **hexadecimal form** (`ZPSE_ENC_LZ_HEX`, bit 7 of
@@ -1248,7 +1248,7 @@ option writes names the form in its flags).
 What it used to be was a ratio-for-rate trade; on the mixed corpus it is now
 close to a free lunch, because the fast form is *smaller* than the default
 level as well as about half again as fast (96,661,814 against
-101,858,449). It is also the deepest rung's equal on ratio and three times
+101,791,194). It is also the deepest rung's equal on ratio and three times
 its encode (2.19:1 against 2.25:1, 414 against 233 MB/s), which is what the
 lazy probe bought: the form looks one position ahead and gives up a short
 match for a longer one that starts a byte later, and over the corpus that is
@@ -1284,6 +1284,18 @@ more. Below that, 2^15 is 6% slower and 0.4% larger; above it, 2^17 buys 0.2%
 for a 256 KiB table. Folding the candidate compare and the first length step
 into one eight-byte xor is 12-17% *slower* on prose, columnar XML and the
 binary members, because misses outnumber hits and a miss is the common case.
+
+The same lever applies inside the encoder, where the table was not the fast
+form's. The sweep's own finder passes -- the plain LZ candidate and the pass
+that compresses a tile body -- ran a 2^13-entry table (16 KiB) at every block
+size, which is 8192 slots for a 65536-position block: seven of every eight
+candidates are overwritten before they can be looked at. From 16 KiB up those
+passes now take the 64 KiB of trial staging they are finished with, at 2^15
+entries, and a page keeps the small table because clearing 64 KiB for a 4 KiB
+block costs more than the collisions it removes (dumps 455 to 388 MB/s at 15
+bits, and 0.03 more ratio points). Over Silesia at 64 KiB the default level
+writes 101,858,449 -> 101,791,194 bytes and level 9 94,248,419 -> 94,204,004,
+and 4 KiB pages are byte-identical.
 
 The frame layer costs a decode nothing measurable. Walking a frame's block
 headers without decoding — parse, header CRC, size checks — runs at thousands
@@ -1615,7 +1627,7 @@ text:
 
 `zpse_cli bench -r 2`, default level (6), 64 KiB blocks, one pinned core, best
 of two runs. The whole table is the v2 form's: `ZPSE_B_LZ_TILE` moved the
-corpus from 106,140,388 to the 101,858,449 bytes above, which cost ~6% of
+corpus from 106,140,388 to the 101,791,194 bytes above, which cost ~6% of
 encode and bought ~8% of decode (the tile bodies it compresses are shorter
 than the plain LZ streams they replace, so the command loop runs over fewer
 bytes).
@@ -1791,8 +1803,8 @@ OR-ing into it, and the ladder is what the level table documents:
 | 2 | 47,250,549 | 1.09 | 3.55 |
 | 3 FASTER | 47,250,549 | 1.09 | 3.21 |
 | 4 | 47,250,549 | 1.09 | 3.02 |
-| 5 BALANCED | 29,724,409 | 1.74 | 0.37 |
-| 6 (default) | 28,278,012 | 1.83 | 0.32 |
+| 5 BALANCED | 29,715,275 | 1.74 | 0.37 |
+| 6 (default) | 28,273,088 | 1.83 | 0.32 |
 | 7 | 26,179,799 | 1.97 | 0.30 |
 | 8 | 25,572,783 | 2.02 | 0.29 |
 | 9 MAX | 25,572,783 | 2.02 | 0.14 |
@@ -1804,7 +1816,7 @@ to every block.
 The default is level 6 rather than 5 because level 6 buys real size for a
 small rate: 106,140,388 packed bytes against 113,246,135 over all twelve
 files (2.00:1 against 1.87:1), encode 296 against 315 MB/s on the prose pair,
-and decode 4% lower. MAX goes further -- 94,248,419 bytes, 2.25:1 -- for
+and decode 4% lower. MAX goes further -- 94,204,004 bytes, 2.25:1 -- for
 about a third less encode rate, which is the rung to choose when size is the
 only thing that matters.
 
