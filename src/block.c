@@ -1352,6 +1352,20 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * on this price has offered. Three is a wash on both axes (1 296 bytes fewer on
  * the dumps, 36 661 on Silesia, rate inside the band) and is not taken.
  *
+ * All of those are mixture averages, and this knob is shape-local: on the probe
+ * corpus each shape is one page in twenty, so a page it re-ranks shows a
+ * twentieth of the effect. Measured with 64 MiB of a single shape (pages from
+ * `corpus_write --probe-shape=N`, level 6, three rounds), four tiles save
+ * 713 284 bytes on the page whose quarters alternate a 2-bit alphabet and
+ * 16-byte records -- 1.06 points of that workload -- for 9.6% of its rate, and
+ * leave the noisy-tile ramp byte-identical, add 0.003 of a point on the
+ * quarters mirror and take 898 bytes off the ramp with holes. So a caller whose
+ * pages are ALL one ambiguous shape can have a point from it, and a mix cannot:
+ * the probe corpus pays 0.051 of a point for 14% of the rate. That is why four
+ * tiles stay off the default and this knob stays an internal one rather than a
+ * public setting -- one synthetic page shape, deliberately built so the tile
+ * count re-ranks it, is not a corpus to recommend a build flag on.
+ *
  * 0 leaves a page on ZPSE_DECIDE_TILES. Above a page the value is untouched: */
 #ifndef ZPSE_DECIDE_PAGE_TILES
 #define ZPSE_DECIDE_PAGE_TILES 2u

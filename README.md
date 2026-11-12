@@ -439,8 +439,9 @@ time with `--probe-shape=N`, the mixture is the average of the twenty
 single-shape deltas to within 5% on all thirteen arms, so the aggregate hides
 shape-local responses by construction but never misreports one, and the arms
 refused above are refused on mixtures. A caller whose pages all look like one
-shape should read the arm against that shape: four page tiles are worth a point
-there, and cost 14% of its rate in the mixture.
+shape should read the arm against that shape -- four page tiles are worth a
+point on the 2-bit-against-records page for 10% of that workload's rate --
+while the mixture pays 0.051 of a point for 14%.
 
 Every page knob, one build each, two passes on one pinned core, 4 KiB pages at
 level 6 -- the ratio of one pass and the rate it read, so the bytes are exact
