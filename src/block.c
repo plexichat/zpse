@@ -5217,9 +5217,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
             /* ---- The lazy window above a page -------------------------
              *
-             * The length-measured lazy step is worth 0.5 points at a page on
-             * the host corpus it was measured on and 0.09 on the generated
-             * mixed corpus, whose matches are shorter. It is not offered at 8
+             * The length-measured lazy step is worth 0.31 of a point at a page
+             * on the dumps, 0.23 on Silesia and 0.09 on the generated mixed
+             * corpus, whose matches are shorter. It is not offered at 8
              * or 16 KiB because it is a heuristic, not a
              * proof: at those sizes it sometimes gives up a byte for a later
              * match that codes longer, and the level ladder (a deeper level

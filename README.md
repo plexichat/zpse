@@ -190,12 +190,13 @@ bytes, so a five-byte match here and a nine-byte match one byte on is a
 four-byte win the eight-byte test throws away. At page size the match is now
 measured first and the next position measured too, and the byte is given up
 only when the later match is strictly longer by more than it costs. That is
-1 118 460 bytes over the three dumps at the default level -- 41.13% to 40.61%,
-0.52 points -- for about 9% of the encode rate (129 to 118 MB/s), and
-1 025 625 bytes at level 9 (40.70% to 40.22%). On the generated mixed corpus
-it is 0.089 of a point at the default level (96,954,822 to 96,806,099 bytes)
-for 4% of the rate (200.1 to 191.6 MB/s) and 0.038 at level 9, because those
-pages' matches are shorter than the dumps'. The streams are unchanged in form,
+650 889 bytes over the three dumps at the default level -- 0.31 of a point --
+for about 4% of the encode rate (166.6 to 160.3 MB/s), 486 792 on Silesia
+(0.23) and 526 077 at level 9 on the dumps (0.25, for 11% of that rung's rate:
+145.9 to 130.0 MB/s). On the generated mixed corpus it is 0.089 of a point at
+the default level (96,954,822 to 96,806,099 bytes) for 4% of the rate (200.1
+to 191.6 MB/s) and 0.038 at level 9, because those pages' matches are shorter
+than the dumps'. The streams are unchanged in form,
 so decode is untouched.
 
 The decision itself is the last thing to pay for. At a page, levels 1 and 2
@@ -265,9 +266,9 @@ trials and no more -- so a page there is priced on its first 2 KiB, which is
 what `ZPSE_PROBE_SHORT_TILES` samples. Where every plane is priced the page is
 priced whole: the price is then exact for the page rather than for half of it,
 and the trials behind it repair what the extra 2 KiB costs. On 4 KiB pages that
-writes 0.16, 0.0003 and 0.12% fewer bytes on the dumps, the generated mixed
-corpus and Silesia (41.38% to 41.32% on the dumps) and reads the mixed corpus
-8% faster (193.3 against 179.0 MB/s at the default level), the other two
+writes 0.020, 0.0003 and 0.008% fewer bytes on the dumps, the generated mixed
+corpus and Silesia and reads the dumps and the mixed corpus faster at the
+default level (166.0 against 157.3 and 193.3 against 179.0 MB/s), Silesia
 inside this host's band; at levels 1 and 2 the same
 change costs 7.5 and 3.4% of encode on the dumps and grows the mixed workload
 by 0.18 and 0.21%, which is why the gate is the every-plane one. The sample
@@ -359,9 +360,21 @@ Level 1 writes no LZ form, so both knobs are inert there. The cap costs bytes
 at every rung it is armed on -- 74 798 at levels 5 and 6, 120 447 at level 9 --
 and buys rate back at each. The longer screen is free on bytes at levels 5 and
 6 and only pays on level 9, where it takes 180 233 bytes off for 15% of the
-rate. Both samples stop at a page: the gate keeps its 2 KiB span and the
+rate. The level-9 arm of the long screen is refused: on the host corpora it
+loses 453 715 bytes on the dumps (0.21 of a point) and 256 195 on Silesia
+(0.12) for 5 to 15% of that rung's rate, so its win on the generated corpus
+does not travel. Both samples stop at a page: the gate keeps its 2 KiB span and the
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
+
+The other four page knobs are byte-inert on this corpus: the noise probe (one
+sample, all sixteen tiles, or none, through `PAGE_FAST`), a third flat trial
+and the single-plane tile count all write the same 96,806,099 bytes at level 6
+and 154,192,607 with `PAGE_FAST` at level 1, with rates inside this host's
+band. Its pages do not hold the shapes those knobs price -- the dumps and
+Silesia figures above are the evidence that they matter elsewhere -- and the
+gate's window has no build switch of its own (`ZPSE_ASCII_PAGE_SAMPLE` is a
+constant), so it cannot be re-measured this way at all.
 
 The candidate field a page prices is the other knob, and it is dearer per
 point of ratio than either sample: a page prices at most six candidates now,
