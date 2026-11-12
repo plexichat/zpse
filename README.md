@@ -192,9 +192,11 @@ measured first and the next position measured too, and the byte is given up
 only when the later match is strictly longer by more than it costs. That is
 1 118 460 bytes over the three dumps at the default level -- 41.13% to 40.61%,
 0.52 points -- for about 9% of the encode rate (129 to 118 MB/s), and
-1 025 625 bytes at level 9 (40.70% to 40.22%). The mixed workload gains 0.50
-points at the default level (55.62% to 55.12%) and gives up 4% of its rate. The
-streams are unchanged in form, so decode is untouched.
+1 025 625 bytes at level 9 (40.70% to 40.22%). On the generated mixed corpus
+it is 0.089 of a point at the default level (96,954,822 to 96,806,099 bytes)
+for 4% of the rate (200.1 to 191.6 MB/s) and 0.038 at level 9, because those
+pages' matches are shorter than the dumps'. The streams are unchanged in form,
+so decode is untouched.
 
 The decision itself is the last thing to pay for. At a page, levels 1 and 2
 write no LZ form at all -- 0.0% of the dump corpus's bytes at either level --
@@ -263,9 +265,10 @@ trials and no more -- so a page there is priced on its first 2 KiB, which is
 what `ZPSE_PROBE_SHORT_TILES` samples. Where every plane is priced the page is
 priced whole: the price is then exact for the page rather than for half of it,
 and the trials behind it repair what the extra 2 KiB costs. On 4 KiB pages that
-writes 0.16, 0.09 and 0.12% fewer bytes on the dumps, the mixed workload and
-Silesia (41.38% to 41.32% on the dumps) and encodes the mixed workload 2.8%
-faster, the other two inside this host's band; at levels 1 and 2 the same
+writes 0.16, 0.0003 and 0.12% fewer bytes on the dumps, the generated mixed
+corpus and Silesia (41.38% to 41.32% on the dumps) and reads the mixed corpus
+8% faster (193.3 against 179.0 MB/s at the default level), the other two
+inside this host's band; at levels 1 and 2 the same
 change costs 7.5 and 3.4% of encode on the dumps and grows the mixed workload
 by 0.18 and 0.21%, which is why the gate is the every-plane one. The sample
 either side of eight was measured at the cheap rungs too, and eight is the local
@@ -341,7 +344,22 @@ point) for 4.4% of its rate, and a 768-byte screen gives Silesia back 171 723
 while growing the dumps by 48 286 and the generated mixed corpus by 2 096
 (0.001 of a point) and reading 9% slower there (195.0 to 177.4 MB/s, two
 passes each). The 1 KiB gate and the 512-byte screen are the
-corner of both trades. Both samples stop at a page: the gate keeps its 2 KiB span and the
+corner of both trades. Both trades by rung, on the generated mixed corpus at
+4 KiB pages, two passes each -- the bytes are exact, the rates are this host's
+shape:
+
+| level | cap: bytes, shipped / raised to nine | cap encode | screen: bytes, 512 B / 1 KiB | screen encode |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 139,082,213 / 139,082,213 | 380.1 / 386.7 MB/s | 139,082,213 / 139,082,213 | 380.1 / 397.6 MB/s |
+| 5 | 108,050,304 / 107,975,506 | 189.8 / 175.2 MB/s | 108,050,304 / 108,050,304 | 189.8 / 173.9 MB/s |
+| 6 | 96,806,099 / 96,731,301 | 193.3 / 179.7 MB/s | 96,806,099 / 96,807,482 | 193.3 / 177.8 MB/s |
+| 9 | 91,740,285 / 91,619,838 | 162.3 / 151.3 MB/s | 91,740,285 / 91,560,052 | 162.3 / 137.4 MB/s |
+
+Level 1 writes no LZ form, so both knobs are inert there. The cap costs bytes
+at every rung it is armed on -- 74 798 at levels 5 and 6, 120 447 at level 9 --
+and buys rate back at each. The longer screen is free on bytes at levels 5 and
+6 and only pays on level 9, where it takes 180 233 bytes off for 15% of the
+rate. Both samples stop at a page: the gate keeps its 2 KiB span and the
 screen its 1 KiB above `ZPSE_BLOCK_SHORT_MAX`, so every 16 KiB and 64 KiB block
 is byte-identical to what it was.
 

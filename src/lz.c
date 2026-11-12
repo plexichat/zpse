@@ -196,7 +196,8 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
  * for 3% of the encode rate, and 8,098 at level 9 for 4%. The one-byte
  * window is where the win is.
  *
- * 0 disables it. */
+ * 0 disables it; 2 restores the eight-byte question this replaced, for
+ * re-measuring the two against each other on a corpus. */
 #ifndef ZPSE_LZ_LAZY_LEN
 #define ZPSE_LZ_LAZY_LEN 1u
 #endif
@@ -559,19 +560,35 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
 
             if (cand1 != LZ_EMPTY && cand1 < pos + 1u && cand1 + 4u <= n &&
                 zpse_load_u32le(in + cand1) == v1) {
-                uint32_t l1 = ZPSE_LZ_MIN_MATCH;
-
-                while (pos + 1u + l1 < n && cand1 + l1 < n &&
-                       in[pos + 1u + l1] == in[cand1 + l1]) {
-                    l1++;
-                }
-                if (l1 > len + 1u) {
+#if (ZPSE_LZ_LAZY_LEN == 2)
+                /* The rule this one replaced: give the byte up as soon as the
+                 * next position starts an eight-byte match, measuring
+                 * neither match's length. */
+                if (pos + 9u <= n && cand1 + 8u <= n &&
+                    lz_load64(in + pos + 1u) == lz_load64(in + cand1)) {
                     pos++;
                     misses = 0u;
                     cur = v1;
                     h = h1;
                     continue;
                 }
+#else
+                {
+                    uint32_t l1 = ZPSE_LZ_MIN_MATCH;
+
+                    while (pos + 1u + l1 < n && cand1 + l1 < n &&
+                           in[pos + 1u + l1] == in[cand1 + l1]) {
+                        l1++;
+                    }
+                    if (l1 > len + 1u) {
+                        pos++;
+                        misses = 0u;
+                        cur = v1;
+                        h = h1;
+                        continue;
+                    }
+                }
+#endif
             }
         }
 #endif
