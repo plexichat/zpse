@@ -34,7 +34,7 @@ int zpse_compress_block(const uint8_t *in, uint32_t n,
 /* Same, with encoder options (ZPSE_ENC_*): ZPSE_ENC_CHECKSUM tags each
  * block with the CRC32-C of its decoded bytes, which every decoder here
  * then verifies. The effort level trades compressed size for encode time:
- * ZPSE_ENC_SPEED_BALANCED is the default sweep (level 5), levels 1-4 buy
+ * The default is level 6 (ZPSE_ENC_SPEED_L6), levels 1-4 buy
  * trials one at a time and never run the match finder, and levels 5-9 also
  * offer the intra-block LZ form as one more candidate -- each rung above 5
  * screens it more loosely, and the deepest also accepts a slower decode,

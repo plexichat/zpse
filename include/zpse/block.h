@@ -29,11 +29,11 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
 
 /* ---- Page dictionary ---------------------------------------------------- *
  *
- * A page store writes the same page more than once. 16.4% of the heap and
- * library dump pages this codec is measured on are byte-for-byte copies of a
- * page already written, and the copies are scattered, so only content
- * addressing finds them (docs/page-dictionary.md has the measurements and the
- * call sequence).
+ * A page store writes the same page more than once. On the generated repeat
+ * corpus in `corpus_write --pages`, one page in five is a byte copy of an
+ * earlier page, and a 65,536-entry content table serves about 18% of the
+ * stream (docs/page-dictionary.md has the measurements and the call
+ * sequence).
  *
  * None of it is part of the stream format: a hit is an ordinary block that a
  * decoder reads without knowing where it came from. The index is the caller's
@@ -47,11 +47,11 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
  * insertion maps it to 1/0.
  *
  * Set associativity is worth having where the table is small enough to
- * collide, and not where it is not: measured over the dump corpora at level 6,
- * four ways turn a 4,096-entry table's 12.89% of pages served into 16.77% for
- * 2.6% of the encode rate, half a point at 65,536 entries, and a point WORSE at
- * 1,024 because four ways mean a quarter of the distinct sets. See
- * docs/page-dictionary.md. */
+ * collide, and not where it is not: measured on the generated repeat corpus
+ * at level 6, four ways turn a 4,096-entry table's 15.70% of pages served
+ * into 17.70%, buy a quarter of a point at 65,536 entries, and a 1,024-entry
+ * table serves only 10.82% because a quarter of the sets per way is worse
+ * than the collisions it removes. See docs/page-dictionary.md. */
 typedef struct ZpsePageDict {
     uint64_t *tag_lo;   /* caller memory: entries * 8 */
     uint64_t *tag_hi;   /* caller memory: entries * 8 */

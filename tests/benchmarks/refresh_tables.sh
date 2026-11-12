@@ -69,6 +69,9 @@ cli="$work/zpse"
 "$CC" -std=c11 -O2 -I "$inc" "$repo/tests/benchmarks/bench_pages.c" \
     "$unity" -ldl -o "$work/bench_pages" 2>/dev/null ||
     { echo "refresh_tables: bench_pages build failed" >&2; exit 1; }
+"$CC" -std=c11 -O2 -I "$inc" "$repo/tests/benchmarks/bench_pagedict.c" \
+    "$unity" -o "$work/bench_pagedict" 2>/dev/null ||
+    { echo "refresh_tables: bench_pagedict build failed" >&2; exit 1; }
 
 zstd=""
 if [ -n "${ZSTD:-}" ] && [ -x "${ZSTD}" ]; then
@@ -367,6 +370,8 @@ if [ -x "$work/bench_pages" ]; then
         np=$(printf '%s\n' "$out" | awk '/^[0-9]+ pages/ {print $1}')
         printf '| `%s` | %s | %s | %s | %s |\n' "$name" "$np" "$zp" "$zs" "$lz"
     done
+    say "page dictionary, repeat stream"
+    $pin "$work/bench_pagedict" "$pages/pages-repeat.bin" 3
 else
     missing "bench_pages build"
 fi

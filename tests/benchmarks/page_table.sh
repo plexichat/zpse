@@ -39,13 +39,16 @@ trap cleanup EXIT
 
 mkdir -p "$work/pages" || exit 1
 
-echo "page_table: building corpus_write and bench_pages" >&2
+echo "page_table: building corpus_write, bench_pages and bench_pagedict" >&2
 "$CC" -std=c11 -O2 -I "$inc" -I "$repo/tests/corpus" \
     "$repo/tests/corpus/corpus_write.c" -o "$work/corpus_write" ||
     { echo "page_table: corpus_write build failed" >&2; exit 1; }
 "$CC" -std=c11 -O2 -I "$inc" "$repo/tests/benchmarks/bench_pages.c" \
     "$unity" -ldl -o "$work/bench_pages" ||
     { echo "page_table: bench_pages build failed" >&2; exit 1; }
+"$CC" -std=c11 -O2 -I "$inc" "$repo/tests/benchmarks/bench_pagedict.c" \
+    "$unity" -o "$work/bench_pagedict" ||
+    { echo "page_table: bench_pagedict build failed" >&2; exit 1; }
 
 "$work/corpus_write" "$work/pages" "$SIZE" --pages ||
     { echo "page_table: corpus generation failed" >&2; exit 1; }
@@ -96,3 +99,16 @@ echo "\`zero\` is listed so the share is visible; it is not part of the"
 echo "headline corpus. Classes: code, rodata, heap-pointers, heap-objects,"
 echo "slab-strings, btree, hash-table, json-arena, stack, float-series, blob,"
 echo "mixed-heap. See \`tests/corpus/corpus_write.c\` for the shape of each."
+echo
+
+echo "## table: page dictionary"
+echo
+echo "\`pages-repeat.bin\` is the same generator with one page in five a byte"
+echo "copy of an earlier page, scattered rather than adjacent. Each arm hashes"
+echo "the page first, serves a stored block on a hit and retags it, and"
+echo "compresses on a miss; packed bytes should be identical across arms."
+echo
+$pin "$work/bench_pagedict" "$work/pages/pages-repeat.bin" 3
+echo
+echo "A stream with no repeats pays the hash and serves nothing;"
+echo "\`bench_pagedict\` on \`pages-nonzero.bin\` measures that overhead."

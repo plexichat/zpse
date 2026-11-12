@@ -5,15 +5,16 @@
  *
  * --mixed writes only `mixed.bin`, the generated workload the README's mixed
  * tables are measured on (see mix_fill); at the default SIZE it is 4 MiB, and
- * the page tables use 160 MiB.
+ * the page tables use 16 MiB.
  *
  * --pages writes the 4 KiB page corpus (see page_fill): one file per page
  * class (`page-<name>.bin`), `pages-nonzero.bin` interleaving every class but
  * zero, `pages-all.bin` interleaving all of them with one zero page in eight,
- * and `pages.txt`, a manifest naming each class and its zero-page count. The
- * zero class is kept out of the headline file because a zram workload's
- * untouched anonymous pages compress to nothing and would flatter any average
- * that included them.
+ * `pages-repeat.bin` with one page in five a copy of an earlier page, and
+ * `pages.txt`, a manifest naming each class and its zero-page count. The zero
+ * class is kept out of the headline file because a zram workload's untouched
+ * anonymous pages compress to nothing and would flatter any average that
+ * included them; the repeat stream is what the page-dictionary harness reads.
  *
  * --probe writes only `probe.bin`, one 4 KiB page per shape (see probe_fill):
  * the page shapes the price's knobs are supposed to separate, which the mixed
@@ -986,6 +987,60 @@ static int write_page_stream(const char *dir, const char *name, size_t size,
     return fclose(f) != 0;
 }
 
+/* A page stream with a known duplicate share: one page in five is a byte
+ * copy of a page already written, chosen uniformly from the unique pages so
+ * far. The copies are scattered rather than adjacent, which is what makes a
+ * content-addressed dictionary worth anything; a run of repeats would be
+ * served by any small cache. `page-*.bin` stays unique, so this is the only
+ * stream the page-dictionary harness reads. */
+static int write_page_repeat(const char *dir, size_t size)
+{
+    char path[1024];
+    uint8_t *all = (uint8_t *)malloc(size);
+    uint32_t *uniq = (uint32_t *)malloc((size / PAGE) * sizeof *uniq);
+    uint32_t seed = 0x9E3779B9u;
+    size_t npages = size / PAGE;
+    size_t p, fresh = 0;
+
+    if (all == NULL || uniq == NULL) {
+        fprintf(stderr, "oom\n");
+        free(all);
+        free(uniq);
+        return 1;
+    }
+    for (p = 0; p < npages; p++) {
+        uint32_t r = mix_rnd(&seed);
+
+        if (fresh > 0u && (r % 5u) == 0u) {
+            size_t src = uniq[(r >> 8) % fresh];
+            memcpy(all + p * PAGE, all + src * PAGE, PAGE);
+        } else {
+            page_fill(all + p * PAGE, PAGE, (uint32_t)p,
+                      1 + (int)(p % (PKINDS - 1)));
+            uniq[fresh++] = (uint32_t)p;
+        }
+    }
+    free(uniq);
+
+    if (snprintf(path, sizeof path, "%s/pages-repeat.bin", dir) <= 0) {
+        free(all);
+        return 1;
+    }
+    {
+        FILE *f = fopen(path, "wb");
+        int rc;
+
+        if (f == NULL) {
+            fprintf(stderr, "cannot write %s\n", path);
+            free(all);
+            return 1;
+        }
+        rc = fwrite(all, 1u, size, f) != size;
+        free(all);
+        return fclose(f) != 0 || rc;
+    }
+}
+
 static int write_page_corpus(const char *dir, size_t size)
 {
     char path[1024];
@@ -1007,6 +1062,8 @@ static int write_page_corpus(const char *dir, size_t size)
         return 1;
     if (write_page_stream(dir, "pages-all.bin", size, -1, 1) != 0)
         return 1;
+    if (write_page_repeat(dir, size) != 0)
+        return 1;
 
     n = snprintf(path, sizeof path, "%s/pages.txt", dir);
     if (n <= 0 || (size_t)n >= sizeof path) {
@@ -1024,6 +1081,7 @@ static int write_page_corpus(const char *dir, size_t size)
                 size / PAGE, size, i == PZERO);
     fprintf(m, "pages-nonzero %zu %zu 0\n", size / PAGE, size);
     fprintf(m, "pages-all %zu %zu 1\n", size / PAGE, size);
+    fprintf(m, "pages-repeat %zu %zu 0\n", size / PAGE, size);
     return fclose(m) != 0;
 }
 
