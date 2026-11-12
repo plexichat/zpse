@@ -1,7 +1,12 @@
 #include "zpse/vector.h"
 #include "zpse/status.h"
 
+/* MSVC spells the cache access path out in vector.h without atomics (it
+ * needs /experimental:c11atomics to expose <stdatomic.h>), so the header is
+ * only needed where that path is compiled. */
+#if !defined(_MSC_VER)
 #include <stdatomic.h>
+#endif
 #include <string.h>
 
 /* Unity-build safe: no globals, no allocation, helpers are `static`.
@@ -81,14 +86,23 @@ uint32_t zpse_cpu_caps(void)
      * 17x slower than the scalar one for exactly this reason. The answer
      * cannot change while the process runs, so compute it once and cache
      * it; the computation is idempotent. Atomic cache makes concurrent
-     * first-call safe (all threads compute the same value). */
+     * first-call safe (all threads compute the same value).
+     *
+     * MSVC has no <stdatomic.h> unless /experimental:c11atomics is passed,
+     * and vector.h's fast path already calls this function on each site
+     * there, so the cache is never consulted: skip it rather than demand a
+     * non-default switch. */
+#if !defined(_MSC_VER)
     static _Atomic uint32_t cached = 0xFFFFFFFFu; /* sentinel: not yet computed */
+#endif
     uint32_t caps;
 
+#if !defined(_MSC_VER)
     caps = (uint32_t)atomic_load_explicit(&cached, memory_order_relaxed);
     if (caps != 0xFFFFFFFFu) {
         return caps;
     }
+#endif
     caps = 0;
 
 #if ZPSE_HAVE_NEON_BASELINE
@@ -170,7 +184,9 @@ uint32_t zpse_cpu_caps(void)
 #endif
 #endif
 
+#if !defined(_MSC_VER)
     atomic_store_explicit(&cached, caps, memory_order_relaxed);
+#endif
     return caps;
 #endif /* ZPSE_FORCE_SCALAR */
 }

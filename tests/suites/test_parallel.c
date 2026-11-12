@@ -44,9 +44,11 @@
 #define ZPSE_ALIGN64 __attribute__((aligned(64)))
 #endif
 
-static unsigned char ea[MAXTHREADS][ZPSE_ENC_ARENA_SIZE] ZPSE_ALIGN64;
-static unsigned char da[ZPSE_DEC_ARENA_SIZE] ZPSE_ALIGN64;
-static unsigned char dmt[MAXTHREADS][ZPSE_DEC_ARENA_SIZE] ZPSE_ALIGN64;
+/* The alignment spelling is a prefix on MSVC and may be a prefix or a
+ * suffix on gcc; putting it first is the form both accept. */
+ZPSE_ALIGN64 static unsigned char ea[MAXTHREADS][ZPSE_ENC_ARENA_SIZE];
+ZPSE_ALIGN64 static unsigned char da[ZPSE_DEC_ARENA_SIZE];
+ZPSE_ALIGN64 static unsigned char dmt[MAXTHREADS][ZPSE_DEC_ARENA_SIZE];
 
 static void *arenas[MAXTHREADS] = { ea[0], ea[1], ea[2], ea[3], ea[4], ea[5] };
 static void *decs[MAXTHREADS] = { dmt[0], dmt[1], dmt[2],
