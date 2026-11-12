@@ -5,6 +5,7 @@
 #include "zpse/constants.h"
 #include "zpse/crc32c.h"
 #include "zpse/dense.h"
+#include "zpse/huf.h"
 #include "zpse/lz.h"
 #include "zpse/lz2.h"
 #include "zpse/lzh.h"
@@ -252,7 +253,7 @@ static uint32_t zpse_block_shrink_page(uint8_t *out, uint32_t n,
         total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
         return total;
     }
-    if (zpse_block_header_parse(&h, out, ZPSE_BLOCK_HEADER_SIZE) != PSE_OK) {
+    if (zpse_block_header_parse(&h, out, ZPSE_BLOCK_HEADER_SIZE) != ZPSE_OK) {
         return total;
     }
     if (h.transform_meta_size > 255u) {
@@ -286,28 +287,28 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
     int rc;
 
     if (in == 0 || compressed_size_out == 0 || uncompressed_size_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     hdr = zpse_block_header_size(in, in_len);
     if (hdr == 0u || in_len < hdr) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_block_header_parse(&h, in, in_len);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (h.compressed_block_size < hdr) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (in_len < h.compressed_block_size) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     *compressed_size_out = h.compressed_block_size;
     *uncompressed_size_out = h.uncompressed_size;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
@@ -329,76 +330,76 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     int rc;
 
     if (d == 0 || in == 0 || output == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (d->recon == 0 || d->out_stage == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     hdr = zpse_block_header_size(in, in_len);
     if (hdr == 0u || in_len < hdr) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_block_header_parse(&h, in, in_len);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     /* Header CRC defence in depth (parse is expected to check it). */
     if (hdr == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
         if ((uint32_t)(zpse_crc32c(in, 14) & UINT32_C(0xFFFF)) !=
             h.header_crc32c) {
-            return PSE_BAD_HEADER_CRC;
+            return ZPSE_BAD_HEADER_CRC;
         }
     } else if (zpse_crc32c(in, 28) != h.header_crc32c) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
 
     n = h.uncompressed_size;
     c = h.compressed_block_size;
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (c < hdr) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (in_len < c) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
 
     if ((h.block_flags & ZPSE_B_RESERVED_MASK) != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if ((h.block_flags & ZPSE_B_RESET) == 0) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (h.reserved0 != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (h.predictor_profile != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (h.tile_size != (uint16_t)ZPSE_TILE_SIZE) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (h.transform_id >= 12) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     if (!zpse_block_scount_valid(h.segment_count)) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     meta_size = h.transform_meta_size;
     {
         int want_meta = (h.block_flags & ZPSE_B_HAS_META) != 0;
         int have_meta = meta_size > 0;
         if (want_meta != have_meta) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
 
     if (out_cap < n) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
 
     /* RAW fallback path: exactly N raw bytes at offset 32. */
@@ -406,10 +407,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         uint32_t calc;
         if (h.transform_id != 0 || h.segment_count != 1 || meta_size != 0 ||
             (h.block_flags & (ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if (c != hdr + n) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         if ((h.block_flags & ZPSE_B_CRC) != 0) {
             /* Fused copy + checksum. The fallback payload is a verbatim
@@ -418,7 +419,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
              * no second sweep over 64 KiB that has already left L1. */
             calc = zpse_crc32c_copy(output, in + hdr, n);
             if (calc != h.decoded_crc32c) {
-                return PSE_BAD_PAYLOAD_CRC;
+                return ZPSE_BAD_PAYLOAD_CRC;
             }
         } else {
             memcpy(output, in + hdr, n);
@@ -438,20 +439,20 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         (uint8_t)ZPSE_B_LZ_HEX) {
         if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
             (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if (c <= hdr) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         rc = zpse_lzh_decode(in + hdr, c - hdr, output, n);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if ((h.block_flags & ZPSE_B_CRC) != 0) {
             uint32_t calc = zpse_crc32c(output, n);
 
             if (calc != h.decoded_crc32c) {
-                return PSE_BAD_PAYLOAD_CRC;
+                return ZPSE_BAD_PAYLOAD_CRC;
             }
         }
         if (out_len_out != 0) {
@@ -465,23 +466,73 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
      * uses (transform 0, one segment, no metadata) so a reader can tell
      * the two apart by flag alone, and every reference it carries is a
      * distance inside this block. */
-    if ((h.block_flags & ZPSE_B_LZ) != 0) {
-        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
-            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
-            return PSE_BAD_HEADER;
+    /* The entropy-coded LZ form: one of the three LZ payloads, Huffman coded,
+     * with the form it unpacks to named inside the payload. It is dispatched
+     * here -- before the three LZ branches below -- because its flag pattern
+     * (110) contains the fast form's bit 7, so the fast form's branch would
+     * otherwise claim it and then refuse it for carrying the tile bit. And
+     * because the payload, not the flag byte, is what says which LZ decoder
+     * to run: the wrapped stream is an LZ payload either way, and the flag
+     * space has no bit left to name a fourth codec in. See
+     * include/zpse/huf.h. */
+    if ((h.block_flags & (uint8_t)ZPSE_B_HUF) == (uint8_t)ZPSE_B_HUF) {
+        uint32_t ilen = 0u;
+        uint8_t iform = 0u;
+
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u) {
+            return ZPSE_BAD_HEADER;
         }
         if (c <= hdr) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
-        rc = zpse_lz_decode(in + hdr, c - hdr, output, n);
-        if (rc != PSE_OK) {
+        if (d->lzbuf == 0) {
+            return ZPSE_BAD_ARG;
+        }
+        rc = zpse_huf_decode(in + hdr, c - hdr, d->lzbuf,
+                             (uint32_t)ZPSE_D_SZ_LZBUF, &ilen, &iform);
+        if (rc != ZPSE_OK) {
+            return rc;
+        }
+        if (iform == (uint8_t)ZPSE_B_LZ2) {
+            rc = zpse_lz2_decode(d->lzbuf, ilen, output, n);
+        } else if (iform == (uint8_t)ZPSE_B_LZ_HEX) {
+            rc = zpse_lzh_decode(d->lzbuf, ilen, output, n);
+        } else {
+            rc = zpse_lz_decode(d->lzbuf, ilen, output, n);
+        }
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if ((h.block_flags & ZPSE_B_CRC) != 0) {
             uint32_t calc = zpse_crc32c(output, n);
 
             if (calc != h.decoded_crc32c) {
-                return PSE_BAD_PAYLOAD_CRC;
+                return ZPSE_BAD_PAYLOAD_CRC;
+            }
+        }
+        if (out_len_out != 0) {
+            *out_len_out = n;
+        }
+        return (int)n;
+    }
+
+    if ((h.block_flags & ZPSE_B_LZ) != 0) {
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
+            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
+            return ZPSE_BAD_HEADER;
+        }
+        if (c <= hdr) {
+            return ZPSE_BAD_BLOCK_SIZE;
+        }
+        rc = zpse_lz_decode(in + hdr, c - hdr, output, n);
+        if (rc != ZPSE_OK) {
+            return rc;
+        }
+        if ((h.block_flags & ZPSE_B_CRC) != 0) {
+            uint32_t calc = zpse_crc32c(output, n);
+
+            if (calc != h.decoded_crc32c) {
+                return ZPSE_BAD_PAYLOAD_CRC;
             }
         }
         if (out_len_out != 0) {
@@ -497,20 +548,20 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if ((h.block_flags & ZPSE_B_LZ2) != 0) {
         if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
             (h.block_flags & (ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if (c <= hdr) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         rc = zpse_lz2_decode(in + hdr, c - hdr, output, n);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if ((h.block_flags & ZPSE_B_CRC) != 0) {
             uint32_t calc = zpse_crc32c(output, n);
 
             if (calc != h.decoded_crc32c) {
-                return PSE_BAD_PAYLOAD_CRC;
+                return ZPSE_BAD_PAYLOAD_CRC;
             }
         }
         if (out_len_out != 0) {
@@ -533,18 +584,18 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         uint32_t blen;
 
         if (d->lzbuf == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         if (c < hdr + 4u + (uint32_t)ZPSE_LZ_MIN_PAYLOAD) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         blen = zpse_load_u32le(in + hdr);
         if (blen < (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE ||
             blen > (uint32_t)ZPSE_D_SZ_LZBUF) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         rc = zpse_lz_decode(in + hdr + 4u, c - (hdr + 4u), d->lzbuf, blen);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         body = d->lzbuf;
@@ -555,12 +606,12 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     dir_end = (uint64_t)body_off + (uint64_t)meta_size +
               (uint64_t)scount * (uint64_t)ZPSE_SEG_DIR_ENTRY_SIZE;
     if (dir_end > (uint64_t)body_len) {
-        return PSE_BAD_SEGMENT_DIRECTORY;
+        return ZPSE_BAD_SEGMENT_DIRECTORY;
     }
     rc = zpse_transform_meta_parse(&meta, h.transform_id,
                                    body + body_off,
                                    (uint16_t)meta_size, h.segment_count);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     dir = body + body_off + meta_size;
@@ -573,18 +624,18 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             uint32_t off = zpse_load_u32le(dir + (size_t)s * 8);
             uint32_t sz = zpse_load_u32le(dir + (size_t)s * 8 + 4);
             if (off != expect) {
-                return PSE_BAD_SEGMENT_DIRECTORY;
+                return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             if ((uint64_t)off + (uint64_t)sz > area) {
-                return PSE_BAD_SEGMENT_DIRECTORY;
+                return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             if (sz < (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) {
-                return PSE_BAD_SEGMENT_DIRECTORY;
+                return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             expect = off + sz;
         }
         if ((uint64_t)expect != area) {
-            return PSE_BAD_SEGMENT_DIRECTORY;
+            return ZPSE_BAD_SEGMENT_DIRECTORY;
         }
     }
 
@@ -596,23 +647,23 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             uint32_t off = zpse_load_u32le(dir + (size_t)s * 8);
             uint32_t sz = zpse_load_u32le(dir + (size_t)s * 8 + 4);
             rc = zpse_segment_header_parse(&sh, payloads + off, sz);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 return rc;
             }
             if (sh.segment_decoded_size == 0) {
-                return PSE_BAD_SEGMENT_DIRECTORY;
+                return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             seg_lens[s] = sh.segment_decoded_size;
             sum += (uint64_t)sh.segment_decoded_size;
         }
         if (sum != (uint64_t)n) {
-            return PSE_BAD_SEGMENT_DIRECTORY;
+            return ZPSE_BAD_SEGMENT_DIRECTORY;
         }
     }
 
     rc = zpse_transform_validate_sizes(h.transform_id, h.segment_count, n,
                                        seg_lens);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
 
@@ -668,7 +719,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
          * its tiles turned out to use. */
         lanes.o2_ready = 0;
         if (lanes.order1 == 0 || lanes.o2 == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         cum = 0;
         for (s = 0; s < scount; s++) {
@@ -699,21 +750,21 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
              * have produced, and it can see everything it needs: lanes
              * below already points at the decoder's own tables. */
             if ((uint64_t)cum + (uint64_t)seg_lens[s] > ZPSE_MAX_BLOCK_SIZE) {
-                return PSE_BAD_SEGMENT_DIRECTORY;
+                return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             rc = zpse_segment_decode(d, &lanes, payloads + off, sz,
                                      plane, seg_lens[s], &got);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 return rc;
             }
             if (got != seg_lens[s]) {
-                return PSE_BAD_SEGMENT_DIRECTORY;
+                return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             csegs[s] = plane;
             cum += seg_lens[s];
         }
         if (cum != n) {
-            return PSE_BAD_SEGMENT_DIRECTORY;
+            return ZPSE_BAD_SEGMENT_DIRECTORY;
         }
     }
 
@@ -726,7 +777,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if (identity_shape == 0) {
         rc = zpse_transform_inverse(&meta, h.segment_count, csegs, seg_lens,
                                     output, n);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
@@ -751,7 +802,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             calc = zpse_crc32c(output, n);
         }
         if (calc != h.decoded_crc32c) {
-            return PSE_BAD_PAYLOAD_CRC;
+            return ZPSE_BAD_PAYLOAD_CRC;
         }
     }
 
@@ -761,7 +812,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     return (int)n;
 }
 
-/* Encode one transform trial into dst[0..cap). Returns PSE_OK with
+/* Encode one transform trial into dst[0..cap). Returns ZPSE_OK with
  * *total_out set, or a negative status / skip code. *budget_hit is set
  * when the trial was stopped by the RAW-envelope budget below rather
  * than by a real error, because the caller has to count that case
@@ -926,21 +977,21 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     e->flat_covered = 0u;
     e->flat_paid = 0u;
     rc = zpse_transform_width(tid, sc, &w);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_segment_lengths(n, w, lens);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     /* Clamping: N < W forbidden; empty segments forbidden. */
     for (s = 0; s < sc; s++) {
         if (lens[s] == 0) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
     }
     rc = zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     {
@@ -949,13 +1000,13 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         for (s = 0; s < sc; s++) {
             planes[s] = e->tstage + off;
             if ((uint64_t)off + (uint64_t)lens[s] > ZPSE_E_SZ_TSTAGE) {
-                return PSE_OUTPUT_OVERFLOW;
+                return ZPSE_OUTPUT_OVERFLOW;
             }
             off += lens[s];
             sum += (uint64_t)lens[s];
         }
         if (sum != (uint64_t)n) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
     }
     /* A width-1 split with neither DELTA8 nor XOR8 is the identity: the
@@ -968,7 +1019,7 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         planes[0] = (uint8_t *)(uintptr_t)in;
     } else {
         rc = zpse_transform_forward_planes(&tm, sc, in, n, planes, lens);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
@@ -976,7 +1027,7 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     base = (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)meta_len +
            (uint64_t)sc * (uint64_t)ZPSE_SEG_DIR_ENTRY_SIZE;
     if (base > (uint64_t)cap) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     lanes.order1 = e->order1;
     lanes.o2 = e->o2;
@@ -987,7 +1038,7 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * name ORDER2 has nothing to wipe. */
     lanes.o2_ready = 0;
     if (lanes.order1 == 0 || lanes.o2 == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     /* Sixteen prescreens against the tiles this trial is about to write,
      * asked for only while the flat abort could still fire: the abort is
@@ -1014,14 +1065,14 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         int budget_is_raw = 1;
         int wlen;
         if (at > (uint64_t)cap) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         /* Already at or past the running best before this segment writes
          * a byte: every remaining payload byte only adds to the total, so
          * this trial cannot be strictly smaller than the winner. A loss,
          * not a budget hit -- nothing here says anything about RAW. */
         if (have_best && (uint64_t)best_total <= at) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         room = (uint32_t)((uint64_t)cap - at);
         budget = (raw > at) ? (uint32_t)(raw - at) : 0u;
@@ -1050,20 +1101,20 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                        ? flat_abort_min
                                        : 0u);
         if (wlen < 0) {
-            if (wlen == PSE_OUTPUT_OVERFLOW && budget != 0u &&
+            if (wlen == ZPSE_OUTPUT_OVERFLOW && budget != 0u &&
                 budget_is_raw != 0 && budget_hit != 0) {
                 *budget_hit = 1;
             }
             return wlen;
         }
         if (wlen < (int)ZPSE_SEGMENT_HEADER_SIZE) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         seg_sizes[s] = (uint32_t)wlen;
         cum += (uint64_t)wlen;
     }
     if (base + cum > (uint64_t)cap) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     total = (uint32_t)(base + cum);
 
@@ -1100,7 +1151,7 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_header_serialize(dst, &h);
     zpse_block_fix_header_crc(dst);
     *total_out = total;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* Divisor of the trial-level noise probe's threshold: see flat_min in
@@ -1133,10 +1184,10 @@ static uint32_t zpse_block_floor(uint32_t n, uint8_t tid, uint8_t sc,
     uint8_t w = 0;
     uint8_t s;
 
-    if (zpse_transform_width(tid, sc, &w) != PSE_OK) {
+    if (zpse_transform_width(tid, sc, &w) != ZPSE_OK) {
         return UINT32_MAX;
     }
-    if (zpse_segment_lengths(n, w, lens) != PSE_OK) {
+    if (zpse_segment_lengths(n, w, lens) != ZPSE_OK) {
         return UINT32_MAX;
     }
     for (s = 0; s < sc; s++) {
@@ -1978,23 +2029,23 @@ static int zpse_block_planes(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint32_t off = 0;
     uint32_t s;
 
-    if (zpse_transform_width(tid, sc, &w) != PSE_OK)
-        return PSE_BAD_TRANSFORM;
-    if (zpse_segment_lengths(n, w, lens) != PSE_OK)
-        return PSE_BAD_TRANSFORM;
-    if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != PSE_OK)
-        return PSE_BAD_TRANSFORM;
+    if (zpse_transform_width(tid, sc, &w) != ZPSE_OK)
+        return ZPSE_BAD_TRANSFORM;
+    if (zpse_segment_lengths(n, w, lens) != ZPSE_OK)
+        return ZPSE_BAD_TRANSFORM;
+    if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != ZPSE_OK)
+        return ZPSE_BAD_TRANSFORM;
     for (s = 0; s < sc; s++) {
         if (lens[s] == 0u || (uint64_t)off + lens[s] > ZPSE_E_SZ_TSTAGE)
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         planes[s] = e->tstage + off;
         off += lens[s];
     }
     if (off != n)
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     if (tid == 0u && sc == 1u) {
         planes[0] = (uint8_t *)(uintptr_t)in;
-        return PSE_OK;
+        return ZPSE_OK;
     }
     /* The trusted form: the planes were just laid out above as
      * `tstage + running_total` with `running_total == n`, and `lens` came
@@ -2051,11 +2102,11 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
     if (e == 0 || in == 0 || sc < 2u || sc > 16u) {
         return ZPSE_PREFIX_NEED_FULL;
     }
-    if (zpse_transform_width(tid, sc, &wb) != PSE_OK || wb == 0u) {
+    if (zpse_transform_width(tid, sc, &wb) != ZPSE_OK || wb == 0u) {
         return ZPSE_PREFIX_NEED_FULL;
     }
     w = (uint32_t)wb;
-    if (zpse_segment_lengths(n, wb, lens) != PSE_OK)
+    if (zpse_segment_lengths(n, wb, lens) != ZPSE_OK)
         return ZPSE_PREFIX_NEED_FULL;
     /* Every plane has to hold one whole tile for the fold to be the one
      * exact_sum makes, and the prefix has to sit inside the window. */
@@ -2068,7 +2119,7 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
     if (pfront > n || (uint64_t)sc * 256u > (uint64_t)ZPSE_E_SZ_TSTAGE) {
         return ZPSE_PREFIX_NEED_FULL;
     }
-    if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != PSE_OK) {
+    if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != ZPSE_OK) {
         return ZPSE_PREFIX_NEED_FULL;
     }
     for (s = 0u; s < sc; s++) {
@@ -2081,7 +2132,7 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
             flens[s] = 256u;
         }
         if (zpse_transform_forward_planes(&tm, sc, in, pfront, planes,
-                                          flens) != PSE_OK) {
+                                          flens) != ZPSE_OK) {
             return ZPSE_PREFIX_NEED_FULL;
         }
     }
@@ -2189,7 +2240,7 @@ static uint32_t zpse_block_proxy_exact(ZpseEncoder *e, const uint8_t *in,
         *prefix_ok = 0;
     }
     if (zpse_block_planes(e, in, n, tid, sc, meta_bytes, meta_len, planes,
-                          lens) != PSE_OK) {
+                          lens) != ZPSE_OK) {
         return UINT32_MAX;
     }
     return zpse_block_exact_sum(e, planes, lens, sc, tiles, limit,
@@ -2263,7 +2314,7 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
 }
 
 /* Encode the block as the intra-block LZ form into dst[0..cap). Returns
- * PSE_OK with *total_out set, or a negative status when the payload does
+ * ZPSE_OK with *total_out set, or a negative status when the payload does
  * not fit (which the caller reads as "this candidate lost", not as an
  * error). The block header is written last-to-first: the payload at
  * dst + 32, then the envelope around it. */
@@ -2401,6 +2452,33 @@ typedef struct {
     uint8_t tie_field;
 } ZpseLevel;
 
+/* How many full-block trials a sweep that cuts tied fields may spend on a
+ * FULL-SIZE block, 0 = every survivor the price kept.
+ *
+ * The trial loop's floor bound and running-best budget already skip the
+ * candidates that provably cannot win, so what is left is the survivors the
+ * price could not separate -- and a window price is a weak ordering exactly
+ * where the trials cost the most. On the dumps at level 6, two full trials
+ * are 63% of a block's encode and their prices differ by under 1/16.
+ *
+ * What this does NOT do is replace the tied-field cut above: the cut keeps
+ * the identity survivor whatever the price says and stands down when the
+ * head window lied or a survivor was kept on content, and those guards are
+ * the reason it is safe. A raw trial cap has none of them, which is why it
+ * is applied after the cut and only where the cut's guards are satisfied by
+ * construction -- a full-size block, whose price window is a fifth of the
+ * block -- rather than to short blocks, where three cases of
+ * tests/suites/test_sizes.c grew 8 bytes each under exactly that change.
+ *
+ * Measured over Silesia at level 6 (203 MiB, RAM-resident, best of two, one
+ * core): 377.2 -> 392.7 MB/s for +7,662 bytes over the corpus (0.0075%, i.e.
+ * 2.080:1 either way). The gain is where the trials were: mr 242 -> 273
+ * MB/s, x-ray 397 -> 443, samba 395 -> 425, nci 564 -> 605. A cap of 1 is
+ * another 2.5% of rate for another 0.09% of size; that one is not worth it. */
+#ifndef ZPSE_TRIAL_CAP_FULL
+#define ZPSE_TRIAL_CAP_FULL 2
+#endif
+
 static const ZpseLevel zpse_level[10] = {
     /* 0: never used -- an empty level field normalises to BALANCED. */
     { 0u, 0u, 0u, 0u, 0u },
@@ -2468,6 +2546,19 @@ static uint32_t zpse_lz_min_bpc(uint32_t speed)
 #ifndef ZPSE_LZ_CHEAP_LEVELS
 #define ZPSE_LZ_CHEAP_LEVELS 0
 #endif
+
+/* Does this encoder Huffman code a winning LZ payload? Either the caller
+ * asked (ZPSE_ENC_HUF), or the level is deep enough that its own trade is
+ * size rather than rate (ZPSE_HUF_MIN_LEVEL, MAX by default). It is not a
+ * ladder column: the form only ever replaces a block with a smaller one, so
+ * it cannot break the ordering a deeper level promises, and it is offered at
+ * one rung because the encode pass it costs is the rung's to spend. */
+static int zpse_block_huf_level(uint32_t enc_flags)
+{
+    return (enc_flags & (uint32_t)ZPSE_ENC_HUF) != 0u ||
+           zpse_enc_speed(enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
+               (uint32_t)ZPSE_HUF_MIN_LEVEL;
+}
 
 /* Which levels run the match finder at all: BALANCED and deeper price
  * every block -- the pass is what those levels are for -- and, when
@@ -2936,10 +3027,10 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int hex_form;
 
     if (e->lz == 0 || dst == 0 || total_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ2_MIN_PAYLOAD) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     /* One decision, read by both the writer and the header. They have to agree
      * or the decoder dispatches to the other codec: the first version of the
@@ -3033,7 +3124,7 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
     if (payload == 0u) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if (cmds_out != 0) {
         *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
@@ -3051,7 +3142,7 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_header_serialize(dst, &h);
     zpse_block_fix_header_crc(dst);
     *total_out = total;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* ---- Which of the two LZ forms writes the block --------------------- *
@@ -3120,10 +3211,10 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint32_t total;
 
     if (e->lz == 0 || dst == 0 || total_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ_MIN_PAYLOAD) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     /* The gate's verdict chooses the form: a text block is written by the
      * fast one, everything else by this one. See the measurement above. */
@@ -3149,7 +3240,7 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                     : hb,
                                 lazy_max);
     if (payload == 0u) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     /* The payload header carries the count: the token stream is variable
      * length, so the payload length does not divide into commands. */
@@ -3167,7 +3258,7 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_header_serialize(dst, &h);
     zpse_block_fix_header_crc(dst);
     *total_out = total;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* The ASCII gate's sample: how many bytes of the block are priced against
@@ -3408,7 +3499,7 @@ static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
 {
     ZpseBlockHeader h;
 
-    if (zpse_block_header_parse(&h, blk, len) != PSE_OK ||
+    if (zpse_block_header_parse(&h, blk, len) != ZPSE_OK ||
         (h.block_flags &
          (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
                    ZPSE_B_LZ2)) != 0u) {
@@ -3469,7 +3560,7 @@ static int zpse_block_write_raw(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         flags |= ZPSE_B_LAST;
     }
     if (out_cap < total) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     zpse_block_fill_header(&h, flags, n, total, 0, 1, 0, seq, in_crc);
     zpse_block_header_serialize(out, &h);
@@ -3515,13 +3606,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     int rc;
 
     if (e == 0 || in == 0 || out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (e->tstage == 0 || e->cand == 0 || e->best == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
 
     /* ZPSE_ENC_LZ_FAST: the whole decision is the match finder. One pass
@@ -3545,13 +3636,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                      out_cap, &f_total, &f_cmds);
 
         (void)f_cmds;
-        if (lrc == PSE_OK &&
+        if (lrc == ZPSE_OK &&
             f_total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
             f_total = zpse_block_shrink_page(out, n, f_total);
             zpse_block_hist_set(e, out, f_total);
             return (int)f_total;
         }
-        if (lrc != PSE_OK && lrc != PSE_OUTPUT_OVERFLOW) {
+        if (lrc != ZPSE_OK && lrc != ZPSE_OUTPUT_OVERFLOW) {
             return lrc;
         }
         {
@@ -3564,7 +3655,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                            : 0u));
 
             if (out_cap < rtotal) {
-                return PSE_OUTPUT_OVERFLOW;
+                return ZPSE_OUTPUT_OVERFLOW;
             }
             if (is_last) {
                 flags |= ZPSE_B_LAST;
@@ -4746,7 +4837,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
 #endif
                 }
-                if (rc == PSE_OK &&
+                if (rc == ZPSE_OK &&
                     zpse_block_lz_wins(n, lz_cmds, lz_total, 1, atotal,
                                        lz_speed)) {
                     /* ---- The gate's total is arithmetic, so the trial is
@@ -4799,6 +4890,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     /* The slot (in trial order) that produced the current winner. */
     int win_pos = -1;
 #endif
+
+    /* The level row, for the full-size trial cap below (see
+     * ZPSE_TRIAL_CAP_FULL): only a sweep that already cuts tied fields takes
+     * the cap, so the deepest rungs keep every survivor their price
+     * separated and the ladder stays monotone. */
+    const ZpseLevel *cap_row = zpse_level_row(
+        zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK));
 
     /* One floor per candidate, computed once.
      *
@@ -4911,7 +5009,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * are cheap in absolute terms, so the guard does not cost the rate
          * this stage is for -- nci prices 5.3:1, dickens 1.6:1, both far
          * above it -- and it keeps the size suite's contract exact. */
-        if (lrc == PSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
+        if (lrc == ZPSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
             lz_total <= out_cap && lz_total >= n / 64u &&
             zpse_block_lz_wins(n, lz_cmds, lz_total, 0, 0u,
                                e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
@@ -4998,7 +5096,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         fprintf(stderr, "  trial oi=%d tid=%u rc=%d t=%u haven=%d bt=%u\n",
                 oi, (unsigned)tids[i], rc, t, have_best, best_total);
 #endif
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             /* A trial the budget stopped cannot win: its total only grows as
              * its remaining segments are written. That is a verdict on THIS
              * candidate and says nothing about the ones after it -- a shape
@@ -5076,6 +5174,32 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (!have_first_trial) {
             have_first_trial = 1;
             first_trial_total = t;
+        }
+#endif
+#if ZPSE_TRIAL_CAP_FULL > 0
+        /* ---- Full-size trial cap ------------------------------------ *
+         * A full block's price window is a fifth of the block, so the price
+         * has already had its say; the survivors it could not separate are
+         * the ones this stops paying for. A candidate EARLIER in the list
+         * than the winner can still tie it on list order, so one of those in
+         * the remaining field cancels the cap outright -- which is the same
+         * rule the floor skip and the history stop use, and the reason the
+         * stream cannot depend on attempt order. */
+        if (!direct_out && cap_row->tie_field != 0u &&
+            ntried >= ZPSE_TRIAL_CAP_FULL &&
+            n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+            int clear = 1;
+            int oj;
+
+            for (oj = oi + 1; oj < ncand; oj++) {
+                if ((uint32_t)idx[oj] < best_idx) {
+                    clear = 0;
+                    break;
+                }
+            }
+            if (clear) {
+                break;
+            }
         }
 #endif
 #if ZPSE_HIST_STOP_STREAK > 0u
@@ -5280,7 +5404,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * the lazy one is written beside it. Only a strictly smaller
              * stream replaces it, so enabling this window can cost encode
              * time and cannot cost a byte. */
-            if (rc == PSE_OK && e->ascii_gate == 0u &&
+            if (rc == ZPSE_OK && e->ascii_gate == 0u &&
                 n > (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
                 n <= (uint32_t)ZPSE_LZ_LAZY_MAX &&
                 lz_total <= (uint32_t)ZPSE_E_SZ_TSTAGE) {
@@ -5291,7 +5415,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                       e->tstage, lz_cap, e->lz,
                                       (uint32_t)ZPSE_LZ_HASH_BITS,
                                       (uint32_t)ZPSE_LZ_LAZY_MAX, &lz_lazy,
-                                      &lz_lazy_cmds) == PSE_OK &&
+                                      &lz_lazy_cmds) == ZPSE_OK &&
                     lz_lazy < lz_total) {
                     memcpy(e->cand, e->tstage, lz_lazy);
                     lz_total = lz_lazy;
@@ -5304,7 +5428,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * loop has to be inside this level's acceleration factor. Both
              * tests are in zpse_block_lz_wins, with the measurements they
              * came from. */
-            if (rc == PSE_OK &&
+            if (rc == ZPSE_OK &&
                 zpse_block_lz_wins(n, lz_cmds, lz_total, have_best,
                                    best_total, lz_speed)) {
                 if (direct_out) {
@@ -5359,7 +5483,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         ZpseBlockHeader wh;
 
         if (zpse_block_header_parse(&wh, e->best, ZPSE_BLOCK_HEADER_SIZE) ==
-                PSE_OK &&
+                ZPSE_OK &&
             (wh.block_flags &
              (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
                        ZPSE_B_LZ2)) == 0u) {
@@ -5524,7 +5648,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
         if (zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, e->cand,
                                (uint32_t)ZPSE_E_SZ_CAND, &t2, &cmds2) ==
-                PSE_OK &&
+                ZPSE_OK &&
             t2 < best_total && (!direct_out || t2 <= out_cap)) {
             if (direct_out) {
                 memcpy(out, e->cand, t2);
@@ -5537,6 +5661,79 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
 lz2_done:
+    /* ---- Huffman coding of the winning LZ payload -------------------- *
+     *
+     * The last thing the sweep does, and the only stage that runs after the
+     * decision rather than as part of it: it wraps the stream that already
+     * won. That placement is the whole of the design. Wrapping inside
+     * zpse_block_try_lz would be wrong twice -- that path delegates to the
+     * fast form on an ASCII-gated block, so the payload it returns is not
+     * always the token form's, and both LZ stages can still be overwritten by
+     * a later candidate, so a Huffman stream built there could be thrown
+     * away after its cost was paid.
+     *
+     * Nothing above can see it, so it cannot change what the sweep chooses.
+     * A block it takes is the same block with the same inner stream inside
+     * it, gated by ZPSE_HUF_DIV: the decode pays a Huffman pass before the LZ
+     * pass, and a few bytes is not worth a second pass over the payload.
+     *
+     * Only the three pure LZ forms are wrapped. The tile form's transform and
+     * segment count live in the block header, and this form's envelope is the
+     * LZ forms' own -- transform 0, one segment, no metadata -- so a tile body
+     * has nowhere to put them. The RAW form is not wrapped either: it is the
+     * fallback for bytes that did not compress, and coding it would make a
+     * block that had already lost try again with a pass that cannot win. */
+    if (!page_fast_page && have_best &&
+        zpse_block_huf_level(e->enc_flags) &&
+        best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + ZPSE_HUF_MIN_PAYLOAD)) {
+        uint8_t *win = direct_out ? out : e->best;
+        ZpseBlockHeader wh;
+
+        if (zpse_block_header_parse(&wh, win, ZPSE_BLOCK_HEADER_SIZE) ==
+            ZPSE_OK) {
+            uint8_t form = (uint8_t)(wh.block_flags &
+                                     (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE |
+                                               ZPSE_B_LZ2));
+
+            if (form == (uint8_t)ZPSE_B_LZ || form == (uint8_t)ZPSE_B_LZ2 ||
+                form == (uint8_t)ZPSE_B_LZ_HEX) {
+                uint32_t plen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+                uint32_t hl = zpse_huf_encode(win + ZPSE_BLOCK_HEADER_SIZE,
+                                              plen, e->tstage,
+                                              (uint32_t)ZPSE_E_SZ_TSTAGE,
+                                              form);
+
+                /* Strictly smaller is not enough for a form that costs a
+                 * decode pass: it has to be 1/ZPSE_HUF_DIV smaller, which at
+                 * 64 is the point where the pass pays for itself on every
+                 * corpus this was measured on. */
+                if (hl != 0u &&
+                    hl + plen / (uint32_t)ZPSE_HUF_DIV <= plen) {
+                    uint8_t nh[ZPSE_BLOCK_HEADER_SIZE];
+
+                    wh.block_flags =
+                        (uint8_t)((wh.block_flags &
+                                   ~(uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE |
+                                              ZPSE_B_LZ2)) |
+                                  (uint8_t)ZPSE_B_HUF);
+                    wh.compressed_block_size =
+                        (uint32_t)ZPSE_BLOCK_HEADER_SIZE + hl;
+                    zpse_block_header_serialize(nh, &wh);
+                    zpse_block_fix_header_crc(nh);
+                    if (direct_out) {
+                        memcpy(out, nh, sizeof nh);
+                        memcpy(out + ZPSE_BLOCK_HEADER_SIZE, e->tstage, hl);
+                    } else {
+                        memcpy(e->best + ZPSE_BLOCK_HEADER_SIZE, e->tstage,
+                               hl);
+                        memcpy(e->best, nh, sizeof nh);
+                    }
+                    best_total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + hl;
+                }
+            }
+        }
+    }
+
     /* RAW fallback when coded does not pay: coded >= 32 + N. */
     if (!have_best || (uint64_t)best_total >=
                       (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n) {
@@ -5545,7 +5742,7 @@ lz2_done:
     }
 
     if (out_cap < best_total) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if (!direct_out) {
         memcpy(out, e->best, best_total);
@@ -5821,23 +6018,23 @@ int zpse_block_retag(uint8_t *block, uint32_t block_len,
     int rc;
 
     if (block == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (block_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     hsz = zpse_block_header_size(block, block_len);
     if (hsz == 0u) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (block_len < hsz) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     /* The parser is the validator: magic/version/flags/size/transform checks
      * and the header CRC, so a block that has been corrupted, or that is not a
      * block at all, is refused before a byte of it is rewritten. */
     rc = zpse_block_header_parse(&h, block, block_len);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     /* `block_len` is the length the caller has, and the header says how long
@@ -5845,12 +6042,12 @@ int zpse_block_retag(uint8_t *block, uint32_t block_len,
      * block with trailing bytes, and either way the payload is not what the
      * header describes. */
     if (h.compressed_block_size != block_len) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     last = (is_last != 0) ? 1 : 0;
     if (h.block_sequence_number == seq &&
         (((h.block_flags & ZPSE_B_LAST) != 0u) ? 1 : 0) == last) {
-        return PSE_OK;
+        return ZPSE_OK;
     }
     h.block_sequence_number = seq;
     if (last != 0) {
@@ -5866,5 +6063,5 @@ int zpse_block_retag(uint8_t *block, uint32_t block_len,
     } else {
         zpse_block_header_serialize(block, &h);
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }

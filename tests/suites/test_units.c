@@ -34,7 +34,7 @@ int main(void) {
         CHECK(strcmp(zpse_version_string(), ZPSE_VERSION_STRING) == 0,
               "version: accessor %s, macro %s", zpse_version_string(),
               ZPSE_VERSION_STRING);
-        CHECK(strcmp(ZPSE_VERSION_STRING, "a.1.0-1") == 0,
+        CHECK(strcmp(ZPSE_VERSION_STRING, "1.0.0") == 0,
               "version: %s", ZPSE_VERSION_STRING);
         CHECK(zpse_crc32c(v, 9) == 0xE3069283u, "crc check value");
         CHECK(zpse_crc32c(v, 0) == 0u, "crc empty == 0");
@@ -82,7 +82,7 @@ int main(void) {
          * The default stream must not carry the flag at all. */
         rc = zpse_compress_block(in, sizeof in, comp, sizeof comp, &cl, 0, 1,
                                  ea);
-        CHECK(rc == PSE_OK, "const block encodes (rc=%d)", rc);
+        CHECK(rc == ZPSE_OK, "const block encodes (rc=%d)", rc);
         CHECK(zpse_block_header_parse(&h, comp, cl) == 0 &&
               (h.block_flags & ZPSE_B_CRC) == 0,
               "default block carries no payload CRC");
@@ -95,14 +95,14 @@ int main(void) {
                                     1, (uint32_t)(ZPSE_ENC_CHECKSUM |
                                                   ZPSE_ENC_SPEED_FASTEST),
                                     ea);
-        CHECK(rc == PSE_OK, "const block encodes with a CRC (rc=%d)", rc);
+        CHECK(rc == ZPSE_OK, "const block encodes with a CRC (rc=%d)", rc);
         CHECK(cl < sizeof comp && zpse_block_header_parse(&h, comp, cl) == 0,
               "const block header parses");
         CHECK((h.block_flags & ZPSE_B_CRC) != 0 &&
               (h.block_flags & ZPSE_B_RAW) == 0,
               "const block is coded with a payload CRC");
         rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, da);
-        CHECK(rc == PSE_OK && ol == sizeof in &&
+        CHECK(rc == ZPSE_OK && ol == sizeof in &&
               memcmp(out, in, sizeof in) == 0, "const block roundtrip");
 
         /* Corrupt the stored payload CRC (the serializer rewrites the
@@ -110,7 +110,7 @@ int main(void) {
         h.decoded_crc32c ^= 1u;
         zpse_block_header_serialize(comp, &h);
         CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &ol, da) ==
-              PSE_BAD_PAYLOAD_CRC, "const block corrupt CRC rejected");
+              ZPSE_BAD_PAYLOAD_CRC, "const block corrupt CRC rejected");
 
         /* Restore, then make one dense record reconstruct a different
          * value: the plane is no longer one value, so the arithmetic form
@@ -127,7 +127,7 @@ int main(void) {
             comp[rec0 + 4] = 0x11u; /* its constant byte */
         }
         CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &ol, da) ==
-              PSE_BAD_PAYLOAD_CRC,
+              ZPSE_BAD_PAYLOAD_CRC,
               "disagreeing dense records fall back to the byte CRC");
     }
 
@@ -159,13 +159,13 @@ int main(void) {
             int rc = zpse_compress_block_ex(in, sizeof in, comp, sizeof comp,
                                             &cl, 0, 1, levels[li], ea);
 
-            CHECK(rc == PSE_OK, "speed level %d encodes (rc=%d)", li, rc);
+            CHECK(rc == ZPSE_OK, "speed level %d encodes (rc=%d)", li, rc);
             CHECK(cl < sizeof comp &&
                   zpse_block_header_parse(&h, comp, cl) == 0,
                   "speed level %d header parses", li);
             memset(out, 0xA5, sizeof out);
             rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, da);
-            CHECK(rc == PSE_OK && ol == sizeof in &&
+            CHECK(rc == ZPSE_OK && ol == sizeof in &&
                   memcmp(out, in, sizeof in) == 0,
                   "speed level %d roundtrip", li);
             if (li == 0) {
@@ -186,7 +186,7 @@ int main(void) {
 
              CHECK(zpse_compress_block_ex(in, sizeof in, comp, sizeof comp,
                                           &cl_max, 0, 1,
-                                          (uint32_t)ZPSE_ENC_SPEED_MAX, ea) == PSE_OK,
+                                          (uint32_t)ZPSE_ENC_SPEED_MAX, ea) == ZPSE_OK,
                    "deepest level accepted");
             CHECK(cl_max > 0u && cl_max <= cl_bal,
                   "deepest level is no larger (%u vs %u)", cl_max, cl_bal);
@@ -195,7 +195,7 @@ int main(void) {
                                      0, 1,
                                      (uint32_t)ZPSE_ENC_SPEED_BALANCED |
                                          (UINT32_C(1) << 9), ea) ==
-              PSE_BAD_ARG, "unknown enc flag refused");
+              ZPSE_BAD_ARG, "unknown enc flag refused");
     }
 
     /* Arenas. */
@@ -203,10 +203,10 @@ int main(void) {
         ZpseDecoder d; ZpseEncoder e;
         static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
         static unsigned char ea[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
-        CHECK(zpse_decoder_init(NULL, da, sizeof da) == PSE_BAD_ARG, "dec null ctx");
-        CHECK(zpse_decoder_init(&d, NULL, sizeof da) == PSE_BAD_ARG, "dec null mem");
-        CHECK(zpse_decoder_init(&d, da, sizeof da - 1) == PSE_BAD_ARG, "dec short");
-        CHECK(zpse_decoder_init(&d, da + 1, sizeof da - 1) == PSE_BAD_ARG, "dec misaligned");
+        CHECK(zpse_decoder_init(NULL, da, sizeof da) == ZPSE_BAD_ARG, "dec null ctx");
+        CHECK(zpse_decoder_init(&d, NULL, sizeof da) == ZPSE_BAD_ARG, "dec null mem");
+        CHECK(zpse_decoder_init(&d, da, sizeof da - 1) == ZPSE_BAD_ARG, "dec short");
+        CHECK(zpse_decoder_init(&d, da + 1, sizeof da - 1) == ZPSE_BAD_ARG, "dec misaligned");
         CHECK(zpse_decoder_init(&d, da, sizeof da) == 0, "dec ok");
         CHECK(d.recon == da + 0x1000 && d.comb == da + 0x41800, "dec carve");
         CHECK(zpse_encoder_init(&e, ea, sizeof ea) == 0, "enc ok");
@@ -223,8 +223,8 @@ int main(void) {
         CHECK(zpse_frame_header_read(&fh2, buf) == 0, "frame hdr roundtrip");
         CHECK(fh2.nominal_block_size == 1024 && fh2.block_count == 5, "frame fields");
         buf[6] |= 0x10;
-        CHECK(zpse_frame_header_read(&fh2, buf) == PSE_BAD_HEADER_CRC ||
-              zpse_frame_header_read(&fh2, buf) == PSE_UNSUPPORTED_FEATURE,
+        CHECK(zpse_frame_header_read(&fh2, buf) == ZPSE_BAD_HEADER_CRC ||
+              zpse_frame_header_read(&fh2, buf) == ZPSE_UNSUPPORTED_FEATURE,
               "frame reserved bit rejected");
     }
 
@@ -378,7 +378,7 @@ int main(void) {
                     continue;
                 memset(w2, 0, sizeof w2);
                 if (zpse_mask_decode((uint8_t)mode, pay, (uint16_t)n, nt, k,
-                                     w2, comb) != PSE_OK ||
+                                     w2, comb) != ZPSE_OK ||
                     memcmp(w, w2, sizeof w) != 0) {
                     bad++;
                 }
@@ -466,7 +466,7 @@ int main(void) {
                 memset(back, 0xEE, sizeof back);
                 if (zpse_residual_decode((uint8_t)ZPSE_R_PALETTE_BITS, pay,
                                          (uint16_t)n, k, 0, back,
-                                         back) != PSE_OK ||
+                                         back) != ZPSE_OK ||
                     memcmp(exc, back, (size_t)k) != 0) {
                     bad++;
                 }

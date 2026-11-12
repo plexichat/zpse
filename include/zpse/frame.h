@@ -58,7 +58,7 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
  * checked against the index entry. Random access is the reason the format
  * keeps every block independent; this is the entry point that uses it.
  *
- * Returns PSE_OK with *out_len_out set, or a negative status. A frame
+ * Returns ZPSE_OK with *out_len_out set, or a negative status. A frame
  * without an index, a block index past the end, and an entry that does
  * not describe a block are all refusals, not scans. */
 int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
@@ -73,7 +73,7 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
  *
  * This is the shared tail of the serial and the multi-core encoder: both
  * have the blocks, and neither has the table until it is walked. `out`
- * needs ZPSE_INDEX_HEADER_SIZE + 8 per block free at `pos`. Returns PSE_OK
+ * needs ZPSE_INDEX_HEADER_SIZE + 8 per block free at `pos`. Returns ZPSE_OK
  * with *out_len_out = pos + table, or a negative status. */
 int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
                            uint32_t nominal_block_size, uint64_t content_size,

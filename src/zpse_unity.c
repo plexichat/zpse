@@ -15,6 +15,7 @@
 #include "lz.c"
 #include "lz2.c"
 #include "lzh.c"
+#include "huf.c"
 #include "tile.c"
 #include "segment.c"
 #include "block.c"

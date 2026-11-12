@@ -2085,7 +2085,7 @@ int zpse_transform_width(uint8_t transform_id, uint8_t segment_count,
     uint8_t w = 0;
 
     if (w_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     switch (transform_id) {
     case 0:
@@ -2111,18 +2111,18 @@ int zpse_transform_width(uint8_t transform_id, uint8_t segment_count,
         break;
     case 11:
         if (!zpse_valid_count(segment_count)) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         w = segment_count;
         break;
     default:
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     if (transform_id != 11 && segment_count != w) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     *w_out = w;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* (n + w - 1 - s) / w, for the segment widths the format allows.
@@ -2155,13 +2155,13 @@ int zpse_segment_lengths(uint32_t n, uint8_t w, uint32_t out_lens[16])
     uint32_t s;
 
     if (out_lens == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (!zpse_valid_count(w)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     for (s = 0; s < (uint32_t)w; s++) {
         out_lens[s] = zpse_seg_len(n, (uint32_t)w, s);
@@ -2169,7 +2169,7 @@ int zpse_segment_lengths(uint32_t n, uint8_t w, uint32_t out_lens[16])
     for (s = (uint32_t)w; s < 16u; s++) {
         out_lens[s] = 0;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
@@ -2180,26 +2180,26 @@ int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
     int rc;
 
     if (seg_lens == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     rc = zpse_transform_width(transform_id, segment_count, &w);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     for (s = 0; s < w; s++) {
         uint32_t expect = zpse_seg_len(n, (uint32_t)w, (uint32_t)s);
 
         if (seg_lens[s] != expect) {
-            return PSE_BAD_SEGMENT_DIRECTORY;
+            return ZPSE_BAD_SEGMENT_DIRECTORY;
         }
         if (seg_lens[s] < 1) {
-            return PSE_BAD_SEGMENT_DIRECTORY;
+            return ZPSE_BAD_SEGMENT_DIRECTORY;
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* The forward transform, with `trusted` choosing how much of the argument
@@ -2224,7 +2224,7 @@ int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
  * checks that are cheap stay in both forms, so a trusted caller that got the
  * shape wrong still cannot write outside the planes.
  *
- * Byte-identical either way: every skipped test can only return PSE_BAD_*.
+ * Byte-identical either way: every skipped test can only return ZPSE_BAD_*.
  */
 static ZPSE_HOT int zpse_transform_forward_impl(
     const ZpseTransformMeta *meta, uint8_t seg_count, const uint8_t *in,
@@ -2238,42 +2238,42 @@ static ZPSE_HOT int zpse_transform_forward_impl(
     int xorr;
 
     if (meta == 0 || in == 0 || segs == 0 || seg_lens == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (meta->transform_id > 11) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     rc = zpse_transform_width(meta->transform_id, seg_count, &w);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (meta->width_W != w || seg_count != w) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     if (!trusted) {
         rc = zpse_transform_validate_sizes(meta->transform_id, seg_count, n,
                                            seg_lens);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
     for (s = 0; s < w; s++) {
         if (segs[s] == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
     }
     delta = zpse_needs_delta(meta->transform_id, meta->stride_flags);
     xorr = zpse_needs_xor(meta->transform_id);
     if ((delta || xorr) && !meta->has_seeds) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (!trusted) {
         for (s = 0; s < w; s++) {
             if (zpse_ranges_overlap(in, n, segs[s], seg_lens[s])) {
-                return PSE_BAD_ARG;
+                return ZPSE_BAD_ARG;
             }
         }
         for (s = 0; s < w; s++) {
@@ -2281,7 +2281,7 @@ static ZPSE_HOT int zpse_transform_forward_impl(
             for (t = (uint8_t)(s + 1u); t < w; t++) {
                 if (zpse_ranges_overlap(segs[s], seg_lens[s],
                                         segs[t], seg_lens[t])) {
-                    return PSE_BAD_ARG;
+                    return ZPSE_BAD_ARG;
                 }
             }
         }
@@ -2294,12 +2294,12 @@ static ZPSE_HOT int zpse_transform_forward_impl(
             /* A plain width-1 split is the identity: 64 KiB of bytewise
              * `dst[j] = in[j]` becomes one memcpy. */
             memcpy(dst, in, (size_t)n);
-            return PSE_OK;
+            return ZPSE_OK;
         }
 #if ZPSE_T_HAVE_AVX2
         if (zpse_t_avx2()) {
             zpse_prefix_stream_avx2(dst, in, n, meta->seeds[0], delta);
-            return PSE_OK;
+            return ZPSE_OK;
         }
 #endif /* ZPSE_T_HAVE_AVX2 */
         /* Only dst[0] touches the seed. For j >= 1 the chain's
@@ -2323,7 +2323,7 @@ static ZPSE_HOT int zpse_transform_forward_impl(
             dst[j] = delta ? (uint8_t)(in[j] - in[j - 1u])
                            : (uint8_t)(in[j] ^ in[j - 1u]);
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     if (w == 16u) {
         uint32_t rows = seg_lens[0];
@@ -2398,7 +2398,7 @@ static ZPSE_HOT int zpse_transform_forward_impl(
                                          meta->seeds[s], delta);
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     /* The narrow widths (2, 4 and 8) are one byte permutation, and a
      * permutation does not care whether a chain follows it. The parity
@@ -2430,7 +2430,7 @@ static ZPSE_HOT int zpse_transform_forward_impl(
                                          delta);
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
 #endif /* ZPSE_T_HAVE_SSE2 */
 
@@ -2459,7 +2459,7 @@ static ZPSE_HOT int zpse_transform_forward_impl(
             }
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_count,
@@ -2492,39 +2492,39 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
     uint8_t prev[16];
 
     if (meta == 0 || segs == 0 || seg_lens == 0 || out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n < ZPSE_MIN_BLOCK_SIZE || n > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (meta->transform_id > 11) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     rc = zpse_transform_width(meta->transform_id, seg_count, &w);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (meta->width_W != w || seg_count != w) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     rc = zpse_transform_validate_sizes(meta->transform_id, seg_count, n,
                                        seg_lens);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     for (s = 0; s < w; s++) {
         if (segs[s] == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
     }
     delta = zpse_needs_delta(meta->transform_id, meta->stride_flags);
     xorr = zpse_needs_xor(meta->transform_id);
     if ((delta || xorr) && !meta->has_seeds) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     for (s = 0; s < w; s++) {
         if (zpse_ranges_overlap(out, n, segs[s], seg_lens[s])) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
     }
     for (s = 0; s < w; s++) {
@@ -2532,7 +2532,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
         for (t = (uint8_t)(s + 1u); t < w; t++) {
             if (zpse_ranges_overlap(segs[s], seg_lens[s],
                                     segs[t], seg_lens[t])) {
-                return PSE_BAD_ARG;
+                return ZPSE_BAD_ARG;
             }
         }
     }
@@ -2546,7 +2546,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
     if (!delta && !xorr) {
         if (w == 1u) {
             memcpy(out, segs[0], (size_t)n);
-            return PSE_OK;
+            return ZPSE_OK;
         }
 #if ZPSE_T_HAVE_SSE2
         if (w == 16u) {
@@ -2620,7 +2620,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
                     out[(uint32_t)s + jj * 16u] = src[jj];
                 }
             }
-            return PSE_OK;
+            return ZPSE_OK;
         }
         /* The narrow widths have no chain to restore here: the merge IS the
          * transform, so the same helper covers them. */
@@ -2643,7 +2643,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
                     out[(uint32_t)s + r2 * (uint32_t)w] = segs[s][r2];
                 }
             }
-            return PSE_OK;
+            return ZPSE_OK;
         }
 #endif /* ZPSE_T_HAVE_SSE2 */
         for (s = 0; s < w; s++) {
@@ -2654,7 +2654,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
                 out[(uint32_t)s + j * (uint32_t)w] = src[j];
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     for (s = 0; s < w; s++) {
         prev[s] = meta->seeds[s];
@@ -2672,7 +2672,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
 #if ZPSE_T_HAVE_AVX2
             if (zpse_t_avx2()) {
                 zpse_prefix_sum32(src, out, n, pv);
-                return PSE_OK;
+                return ZPSE_OK;
             }
 #endif
             zpse_prefix_sum16(src, out, n, pv);
@@ -2680,12 +2680,12 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
 #if ZPSE_T_HAVE_AVX2
             if (zpse_t_avx2()) {
                 zpse_prefix_xor32(src, out, n, pv);
-                return PSE_OK;
+                return ZPSE_OK;
             }
 #endif
             zpse_prefix_xor16(src, out, n, pv);
         }
-        return PSE_OK;
+        return ZPSE_OK;
 #else
         {
             uint32_t j;
@@ -2697,7 +2697,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
                 out[j] = d;
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
 #endif /* ZPSE_T_HAVE_SSE2 */
     }
 #if ZPSE_T_HAVE_SSE2
@@ -2733,7 +2733,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
                 out[(uint32_t)s + r2 * (uint32_t)w] = d;
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
 
     /* The 16-wide delta/xor inverse: the chain is what the byte-at-a-time
@@ -2812,7 +2812,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
                 out[(uint32_t)s + jj * 16u] = d;
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
 #endif /* ZPSE_T_HAVE_SSE2 */
     for (s = 0; s < w; s++) {
@@ -2827,7 +2827,7 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
             out[(uint32_t)s + j * (uint32_t)w] = d;
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 void zpse_delta8_encode(const uint8_t *in, uint8_t *enc, uint32_t n,

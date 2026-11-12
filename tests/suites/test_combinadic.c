@@ -81,11 +81,11 @@ int main(void) {
         uint8_t over[1] = {56};       /* C(8,3)=56, max valid 55 */
         uint8_t two[2] = {5, 0};      /* L(8,3)=1, overlong */
         CHECK(zpse_comb_unrank(8, 3, over, 1, w, comb_scratch) ==
-              PSE_BAD_ENUMERATIVE_RANK, "rank==C rejected");
+              ZPSE_BAD_ENUMERATIVE_RANK, "rank==C rejected");
         CHECK(zpse_comb_unrank(8, 3, two, 2, w, comb_scratch) ==
-              PSE_BAD_ENUMERATIVE_RANK, "overlong rank rejected");
+              ZPSE_BAD_ENUMERATIVE_RANK, "overlong rank rejected");
         CHECK(zpse_comb_unrank(8, 0, over, 1, w, comb_scratch) ==
-              PSE_BAD_ARG, "k=0 rejected");
+              ZPSE_BAD_ARG, "k=0 rejected");
     }
 
     /* Mode-5 mask integration: max rank C(N,K)-1 sets the top subset. */

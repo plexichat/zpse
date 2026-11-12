@@ -117,7 +117,7 @@ uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                          uint32_t cap, void *table, uint32_t hash_bits);
 
 /* Decode a payload of in_len bytes into exactly n bytes at out. Returns
- * PSE_OK, or a negative status for any stream that does not decode to exactly
+ * ZPSE_OK, or a negative status for any stream that does not decode to exactly
  * n bytes with every reference in range. */
 int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     uint32_t n);

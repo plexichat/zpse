@@ -885,18 +885,18 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     uint8_t *op;
 
     if (in == 0 || out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0u) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (in_len < ZPSE_LZ_MIN_PAYLOAD) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     lit_total = zpse_load_u32le(in);
     cmd_count = zpse_load_u32le(in + 4u);
     if (lit_total > in_len - LZ_HDR || cmd_count == 0u) {
-        return PSE_BAD_LZ;
+        return ZPSE_BAD_LZ;
     }
     lp = in + LZ_HDR;
     tend = in + in_len;
@@ -917,11 +917,11 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             uint8_t b;
 
             if (cmd_left == 0u) {
-                return PSE_BAD_LZ;
+                return ZPSE_BAD_LZ;
             }
             cmd_left--;
             if (lp >= tend) {
-                return PSE_BAD_LZ;
+                return ZPSE_BAD_LZ;
             }
             /* ---- The escape-free fast region --------------------------
              * A token whose two nibbles are both below fifteen names a
@@ -996,7 +996,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     lp = dp;
                     if (v == 0u) {
                         if (lit == 0u) {
-                            return PSE_BAD_LZ;
+                            return ZPSE_BAD_LZ;
                         }
                         continue;
                     }
@@ -1026,7 +1026,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     }
                     mlen = (uint32_t)(tok & 15u) + ZPSE_LZ_MIN_MATCH;
                     if (off > op_done) {
-                        return PSE_BAD_LZ;
+                        return ZPSE_BAD_LZ;
                     }
                     /* A short match at a distance at least as wide as the
                      * store: one store covers the match, and the bytes it
@@ -1069,7 +1069,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             if (lit == 15u) {
                 do {
                     if (lp >= tend) {
-                        return PSE_BAD_LZ;
+                        return ZPSE_BAD_LZ;
                     }
                     b = *lp++;
                     lit += b;
@@ -1077,7 +1077,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             }
             mlen = (tok & 15u) + ZPSE_LZ_MIN_MATCH;
             if (lit > op_rem || (uint32_t)(tend - lp) < lit) {
-                return PSE_BAD_LZ;
+                return ZPSE_BAD_LZ;
             }
             if (lit != 0u) {
                 /* `lit_safe16` is "there are sixteen readable bytes past
@@ -1145,7 +1145,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
 
                     do {
                         if (lp >= tend || shift > 21u) {
-                            return PSE_BAD_LZ;
+                            return ZPSE_BAD_LZ;
                         }
                         b = *lp++;
                         v |= (uint32_t)(b & 0x7Fu) << shift;
@@ -1156,14 +1156,14 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             if (v == 0u) {
                 /* A literal-only command has to make progress. */
                 if (lit == 0u) {
-                    return PSE_BAD_LZ;
+                    return ZPSE_BAD_LZ;
                 }
                 continue;
             }
             if ((tok & 15u) == 15u) {
                 do {
                     if (lp >= tend) {
-                        return PSE_BAD_LZ;
+                        return ZPSE_BAD_LZ;
                     }
                     b = *lp++;
                     mlen += b;
@@ -1196,7 +1196,7 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 rep0 = off;
             }
             if (off > op_done || mlen > op_rem) {
-                return PSE_BAD_LZ;
+                return ZPSE_BAD_LZ;
             }
             /* A short match at a long distance is one store: at distance d
              * the d bytes before the match are the bytes it repeats, and a
@@ -1215,8 +1215,8 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         /* Every literal and every command has to be accounted for, and the
          * stream has to end where the payload does. */
         if (cmd_left != 0u || lit_seen != lit_total || lp != tend) {
-            return PSE_BAD_LZ;
+            return ZPSE_BAD_LZ;
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }

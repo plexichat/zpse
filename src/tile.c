@@ -85,9 +85,9 @@ static int tile_parse_header(const uint8_t *record, uint32_t record_len,
                              struct ZpseTileHeader *th)
 {
     if (record_len < (uint32_t)ZPSE_TILE_HEADER_SIZE)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     zpse_tile_read_header(record, th);
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 static uint32_t tile_record_need(const struct ZpseTileHeader *th)
@@ -662,9 +662,9 @@ int zpse_tile_pack_ascii(const uint8_t *actual, uint16_t nt,
     uint32_t payload = need - (uint32_t)ZPSE_TILE_HEADER_SIZE;
 
     if (actual == 0 || record_out == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (record_cap < need)
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     record_out[0] = zpse_tile_flags_make((uint8_t)ZPSE_M_ASCII_PACK,
                                          (uint8_t)ZPSE_R_EXCLUSION_U8, 1);
     record_out[1] = (uint8_t)ZPSE_P_CONST_ZERO;
@@ -767,12 +767,12 @@ static int tile_unpack_deltas(const uint8_t *payload, uint16_t payload_len,
     uint16_t i;
 
     if (k > 0u && (payload == 0 || deltas == 0))
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (payload_len < 1u)
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     sub = payload[0];
     if (sub > 2u)
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     if (sub == 0u)
         expect = 1u + (((uint32_t)k + 1u) / 2u);
     else if (sub == 1u)
@@ -780,15 +780,15 @@ static int tile_unpack_deltas(const uint8_t *payload, uint16_t payload_len,
     else
         expect = 1u + (uint32_t)k;
     if ((uint32_t)payload_len != expect)
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     if (sub == 0u) {
         if (((k & 1u) != 0u) && ((payload[1u + (k >> 1u)] >> 4u) != 0u))
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         for (i = 0; i < k; i++) {
             uint8_t byte = payload[1u + (i >> 1u)];
             unsigned enc = ((i & 1u) == 0u) ? (byte & 0xFu) : (byte >> 4u);
             if (enc == 0u)
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             deltas[i] = (int8_t)((enc < 8u) ? (int)enc : (int)enc - 16);
         }
     } else if (sub == 1u) {
@@ -796,23 +796,23 @@ static int tile_unpack_deltas(const uint8_t *payload, uint16_t payload_len,
         uint32_t total_bits = 6u * (uint32_t)k;
         if (((total_bits & 7u) != 0u) && (expect > 1u) &&
             ((s[expect - 2u] >> (total_bits & 7u)) != 0u))
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         for (i = 0; i < k; i++) {
             unsigned enc = tile_get_bits(s, (uint32_t)i * 6u, 6u);
             if (enc == 0u)
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             deltas[i] = (int8_t)((enc < 32u) ? (int)enc : (int)enc - 64);
         }
     } else {
         for (i = 0; i < k; i++) {
             uint8_t enc = payload[1u + i];
             if (enc == 0u)
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             deltas[i] = (enc < 128u) ? (int8_t)enc :
                                        (int8_t)((int)enc - 256);
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
@@ -827,17 +827,17 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
     int rc;
 
     if (th == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     mask_mode = zpse_tile_mask_mode(th->tile_flags);
     res_mode = zpse_tile_res_mode(th->tile_flags);
     if (th->tile_flags & ZPSE_TILE_FLAG_RESERVED_BIT)
-        return PSE_UNSUPPORTED_FEATURE; /* bit 6 MUST be 0 */
+        return ZPSE_UNSUPPORTED_FEATURE; /* bit 6 MUST be 0 */
     if (mask_mode > (uint8_t)ZPSE_M_ASCII_PACK)
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     if (res_mode > (uint8_t)ZPSE_R_SIGNED_DELTA)
-        return PSE_BAD_RESIDUAL; /* modes 5..7 reserved */
+        return ZPSE_BAD_RESIDUAL; /* modes 5..7 reserved */
     if (th->predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     /* The ASCII form is one exact shape; every other combination with this
      * mask mode is malformed, and is rejected here rather than left to the
      * decoder, which never sees a mode-7 record it did not shape-check. */
@@ -848,21 +848,21 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
          th->residual_payload_size !=
              (uint16_t)((uint32_t)th->tile_length_minus_1 + 1u -
                         (((uint32_t)th->tile_length_minus_1 + 1u) >> 3))))
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     nt = (uint32_t)th->tile_length_minus_1 + (uint32_t)1;
     if (nt != (uint32_t)nt_expected)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     rc = zpse_mask_derive_k(mask_mode, th->exception_count, (uint16_t)nt, &k);
-    if (rc != PSE_OK)
+    if (rc != ZPSE_OK)
         return rc;
     need = tile_record_need(th);
     if (need > bytes_remaining)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     if (nt_out != 0)
         *nt_out = (uint16_t)nt;
     if (k_out != 0)
         *k_out = k;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* ------------------------------------------------------------------ *
@@ -2130,7 +2130,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         tile_classify_avx2(lanes, actual, nt, predictor_id, fam,
                            initial_literal, seg_base, seg_pos, cl, vl, vs,
                            want_at_pred);
-        return PSE_OK;
+        return ZPSE_OK;
     }
 #endif
 
@@ -2397,7 +2397,7 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         }
         cl->nu = nu;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* Shared body of the two classify entry points; want_at_pred selects
@@ -2409,13 +2409,13 @@ static int tile_classify_entry(ZpseLaneState *lanes, const uint8_t *actual,
                                ZpseTileClass *cl, int want_at_pred)
 {
     if (lanes == 0 || actual == 0 || cl == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     if (tile_family(predictor_id) == TILE_FAM_STRIDE && seg_base == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     return tile_classify(lanes, actual, nt, predictor_id, initial_literal,
                          tile_reset, seg_base, seg_pos, cl, want_at_pred);
 }
@@ -2520,7 +2520,7 @@ static ZPSE_TILE_AVX2 int tile_fill_at_pred_avx2(uint8_t predictor_id,
         }
         p += 32u;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 #endif /* ZPSE_TILE_HAVE_AVX2 */
 
@@ -2535,17 +2535,17 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
     uint16_t j = 0;
 
     if (actual == 0 || cl == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     fam = tile_family(predictor_id);
     if (fam == TILE_FAM_ORDER1 || fam == TILE_FAM_ORDER2)
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     if (fam == TILE_FAM_STRIDE) {
         if (seg_base == 0)
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         s = tile_stride_of(predictor_id);
     }
     if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
@@ -2597,7 +2597,7 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
             }
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* ------------------------------------------------------------------ *
@@ -2608,29 +2608,29 @@ static int tile_check_modes(uint8_t mask_mode, uint8_t res_mode, uint16_t nt,
                             uint16_t k)
 {
     if (mask_mode > (uint8_t)ZPSE_M_ASCII_PACK)
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     if (res_mode > (uint8_t)ZPSE_R_SIGNED_DELTA)
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     if (k > nt)
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     if (mask_mode == (uint8_t)ZPSE_M_ALL_HIT) {
         if (k != 0u)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
     } else if (mask_mode == (uint8_t)ZPSE_M_ASCII_PACK) {
         /* The form is written by zpse_tile_pack_ascii, never by the mode
          * search, so this only keeps the two sides' legality rules equal. */
         if (k != 0u)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
     } else if (mask_mode == (uint8_t)ZPSE_M_ALL_EXCEPTION) {
         if (k != nt)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
     } else {
         if (k < 1u || k >= nt)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         if (mask_mode == (uint8_t)ZPSE_M_ENUMERATIVE && nt < 2u)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* Base-M packing group for the mode-3 length estimate. Mirrors the
@@ -2859,18 +2859,18 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
     int rrc;
 
     if (cl == 0 || actual == 0 || record_out == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     if (record_cap < (uint32_t)ZPSE_TILE_HEADER_SIZE)
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
 
     words = cl->words;
     k = cl->k;
     rc = tile_check_modes(mask_mode, res_mode, nt, k);
-    if (rc != PSE_OK)
+    if (rc != ZPSE_OK)
         return rc;
 
     /* The two (mask, residual) pairs at the extremes of the exception
@@ -2886,9 +2886,9 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
                               ? 1u : 0u);
 
         if (total > record_cap)
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         if (zpse_mask_count_bits(words, nt) != 0)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         record_out[0] = zpse_tile_flags_make(mask_mode, res_mode,
                                              tile_reset ? 1 : 0);
         record_out[1] = predictor_id;
@@ -2909,14 +2909,14 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
         uint16_t i;
 
         if (total > record_cap)
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         if (zpse_mask_count_bits(words, nt) != (int)nt)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         for (i = 0; i < k; i++) {
             uint8_t v = cl->res_at_exc[i];
 
             if (v > 254u)
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             record_out[base + i] = v;
         }
         record_out[0] = zpse_tile_flags_make(mask_mode, res_mode,
@@ -2970,14 +2970,14 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
         (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? (uint32_t)1
                                                        : (uint32_t)0);
     if (off > record_cap)
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     mrc = zpse_mask_encode(mask_mode, words, nt, k, record_out + off,
                            tile_cap16(record_cap - off), comb_scratch);
     if (mrc < 0)
         return mrc;
     off += (uint32_t)mrc;
     if (off > record_cap)
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     /* The classification counted the distinct exclusion residuals (the
      * mode search needed `nu` to size the palette), so it can certify the
      * palette packer's value -> index map and save the packer a full scan
@@ -3014,13 +3014,13 @@ int zpse_tile_encode(ZpseLaneState *lanes, const uint8_t *actual, uint16_t nt,
     int rc;
 
     if (lanes == 0 || actual == 0 || record_out == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     /* zpse_tile_encode packs the modes it is handed, which can be any of
      * them (SIGNED_DELTA reads at_pred), so this entry point keeps the
      * full classification rather than the lean one. */
     rc = tile_classify(lanes, actual, nt, predictor_id, initial_literal,
                        tile_reset, seg_base, seg_pos, &cl, 1);
-    if (rc != PSE_OK)
+    if (rc != ZPSE_OK)
         return rc;
     return zpse_tile_pack(predictor_id, &cl, nt, actual, mask_mode, res_mode,
                           tile_reset, record_out, record_cap, comb_scratch);
@@ -4688,7 +4688,7 @@ static int tile_mask_raw_bitmap_256(const uint8_t *payload, uint16_t k,
     int counted = 0;
 
     if (k < 1u || k > 255u)
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     /* Load and count in one pass. zpse_mask_count_bits trims its input
      * with a 32-byte copy and a zeroing loop that a full tile cannot use
      * (there is no tail), so it is not the right tool here: eight whole
@@ -4701,8 +4701,8 @@ static int tile_mask_raw_bitmap_256(const uint8_t *payload, uint16_t k,
         words[2 * i + 1] = (uint32_t)(v >> 32);
     }
     if (counted != (int)k)
-        return PSE_BAD_MASK;
-    return PSE_OK;
+        return ZPSE_BAD_MASK;
+    return ZPSE_OK;
 }
 
 /* Resolve one predicted/residual stream in position order, family by
@@ -4732,19 +4732,19 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
     int fam;
 
     if (lanes == 0 || record == 0 || out == 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     rc = tile_parse_header(record, record_len, &th);
-    if (rc != PSE_OK)
+    if (rc != ZPSE_OK)
         return rc;
     nt = (uint16_t)((uint32_t)th.tile_length_minus_1 + (uint32_t)1);
     rc = zpse_tile_validate(&th, nt, record_len, &nt, &k);
-    if (rc != PSE_OK)
+    if (rc != ZPSE_OK)
         return rc;
     /* record_len IS tile_record_size here, so the size equation is exact. */
     if (tile_record_need(&th) != record_len)
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     if ((uint32_t)nt > out_cap)
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
 
     mask_mode = zpse_tile_mask_mode(th.tile_flags);
     res_mode = zpse_tile_res_mode(th.tile_flags);
@@ -4777,7 +4777,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         if (k != 0u || th.mask_payload_size != 0u ||
             ((uint32_t)nt - ((uint32_t)nt >> 3)) !=
                 (uint32_t)th.residual_payload_size)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         tile_capture_hist(lanes, ent_last, ent_second);
         zpse_tile_ascii_unpack(res_ptr, (uint32_t)th.residual_payload_size,
                                out, nt);
@@ -4793,7 +4793,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         rc = zpse_mask_decode(mask_mode, mask_ptr, th.mask_payload_size,
                               nt, k, words, comb_scratch);
     }
-    if (rc != PSE_OK)
+    if (rc != ZPSE_OK)
         return rc;
 
     /* Residual units are pred-independent except SIGNED_SMALL_DELTA, whose
@@ -4803,13 +4803,13 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
     if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
         rc = tile_unpack_deltas(res_ptr, th.residual_payload_size, k,
                                 deltas);
-        if (rc != PSE_OK)
+        if (rc != ZPSE_OK)
             return rc;
     } else if (k > 0 || th.residual_payload_size > 0) {
         rc = zpse_residual_decode(res_mode, res_ptr,
                                   th.residual_payload_size, k,
                                   0, resid, resid);
-        if (rc != PSE_OK)
+        if (rc != ZPSE_OK)
             return rc;
     }
 
@@ -4911,7 +4911,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         }
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
         if (j != k)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         return (int)nt;
     }
 
@@ -4952,7 +4952,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
                                   ent_second, 0u);
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
         if (j != k)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         return (int)nt;
     }
 #endif
@@ -5024,7 +5024,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         }
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
         if (j != k)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         return (int)nt;
     }
 
@@ -5092,7 +5092,7 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
             }
         }
         if (j != k)
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         return (int)nt;
     }
 
@@ -5163,6 +5163,6 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         }
     }
     if (j != k)
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     return (int)nt;
 }

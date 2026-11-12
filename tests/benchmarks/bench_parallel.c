@@ -104,7 +104,7 @@ static double enc_once(const uint8_t *in, size_t n, uint8_t *comp, size_t cap,
 
     if (zpse_compress_frame_parallel(in, n, comp, cap, len, BLK, 0, 1,
                                      threads, (void *const *)enc_arenas,
-                                     MAXT) != PSE_OK) {
+                                     MAXT) != ZPSE_OK) {
         return 0.0;
     }
     return now_ns() - t0;
@@ -119,7 +119,7 @@ static double dec_once(const uint8_t *comp, size_t len, uint8_t *out, size_t n,
 
     rc = zpse_decompress_frame_parallel(comp, len, out, n, &got, threads,
                                         (void *const *)dec_arenas, MAXT);
-    if (rc != PSE_OK || got != n) {
+    if (rc != ZPSE_OK || got != n) {
         return 0.0;
     }
     return now_ns() - t0;
@@ -176,7 +176,7 @@ static double strm_once(const uint8_t *in, size_t n, unsigned threads,
     if (zpse_compress_frame_stream(in, n, BLK, 0u, threads, 0u, 1,
                                    (void *const *)enc_arenas, MAXT,
                                    strm_slots, slot_cap, strm_ready,
-                                   strm_lens, strm_emit, &sink) != PSE_OK) {
+                                   strm_lens, strm_emit, &sink) != ZPSE_OK) {
         return 0.0;
     }
     *len = sink.bytes;

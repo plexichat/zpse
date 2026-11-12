@@ -197,7 +197,7 @@ static int decode(uint32_t payload_len, uint8_t *got, uint32_t *got_len)
     int rc;
 
     rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     lanes.order1 = d.order1;
@@ -256,7 +256,7 @@ static void run_case(uint32_t nt, int kind, uint8_t pred, uint8_t c,
     }
     cases++;
     rc = decode(len, out, &got_len);
-    if (rc != PSE_OK || got_len != nt || memcmp(out, plane, nt) != 0) {
+    if (rc != ZPSE_OK || got_len != nt || memcmp(out, plane, nt) != 0) {
         printf("FAIL %s nt=%u pred=%u mask=%u res=%u rc=%s got=%u\n", what,
                nt, pred, mask_mode, res_mode, zpse_status_name(rc), got_len);
         failures++;
@@ -287,7 +287,7 @@ static void hand_checked(void)
                 ZPSE_R_EXCLUSION_U8);
     cases++;
     rc = decode(len, out, &got_len);
-    CHECK(rc == PSE_OK && got_len == 12u && memcmp(out, plane, 12u) == 0,
+    CHECK(rc == ZPSE_OK && got_len == 12u && memcmp(out, plane, 12u) == 0,
           "hand plane, lane-delta, sparse mask");
 }
 
@@ -336,12 +336,12 @@ static void sequence_case(void)
         lanes.order1 = d.order1;
         lanes.o2 = d.o2;
         lanes.gen = 0u;
-        if (rc == PSE_OK) {
+        if (rc == ZPSE_OK) {
             rc = zpse_segment_decode(&d, &lanes, seg, ZPSE_SEGMENT_HEADER_SIZE + len_a + len_b,
                                      seqout, (uint32_t)sizeof seqout, &got_len);
         }
     }
-    CHECK(rc == PSE_OK && got_len == 4796u && memcmp(seqout, want, 4796u) == 0,
+    CHECK(rc == ZPSE_OK && got_len == 4796u && memcmp(seqout, want, 4796u) == 0,
           "two records decode as one plane");
 
     /* The same shape with exceptions in BOTH records and a different
@@ -385,12 +385,12 @@ static void sequence_case(void)
             lanes.order1 = d.order1;
             lanes.o2 = d.o2;
             lanes.gen = 0u;
-            if (rc == PSE_OK) {
+            if (rc == ZPSE_OK) {
                 rc = zpse_segment_decode(&d, &lanes, seg, ZPSE_SEGMENT_HEADER_SIZE + l1 + l2,
                                          seqout, (uint32_t)sizeof seqout,
                                          &got_len);
             }
-            CHECK(rc == PSE_OK && got_len == 4796u &&
+            CHECK(rc == ZPSE_OK && got_len == 4796u &&
                       memcmp(seqout, want2, 4796u) == 0,
                   "records with exceptions decode independently");
         }
@@ -407,11 +407,11 @@ static void sequence_case(void)
         lanes.order1 = d.order1;
         lanes.o2 = d.o2;
         lanes.gen = 0u;
-        if (rc == PSE_OK) {
+        if (rc == ZPSE_OK) {
             rc = zpse_segment_decode(&d, &lanes, seg, ZPSE_SEGMENT_HEADER_SIZE + len_a + len_b - 1u,
                                      seqout, (uint32_t)sizeof seqout, &gl);
         }
-        CHECK(rc != PSE_OK, "truncated record sequence rejected");
+        CHECK(rc != ZPSE_OK, "truncated record sequence rejected");
     }
 }
 
@@ -431,62 +431,62 @@ static void hostile(void)
     CHECK(len != 0u, "hostile base builds");
     cases++;
     rc = decode(len, out, &got_len);
-    CHECK(rc == PSE_OK && memcmp(out, plane, 64u) == 0, "hostile base decodes");
+    CHECK(rc == ZPSE_OK && memcmp(out, plane, 64u) == 0, "hostile base decodes");
 
     /* Reserved bit 7 of the flags byte. */
     save = seg[ZPSE_SEGMENT_HEADER_SIZE + 2];
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = (uint8_t)(save | 0x80u);
-    CHECK(decode(len, out, &got_len) != PSE_OK, "reserved flag bit rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "reserved flag bit rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = save;
 
     /* Reserved header byte. */
     seg[ZPSE_SEGMENT_HEADER_SIZE + 5] = 1u;
-    CHECK(decode(len, out, &got_len) != PSE_OK, "reserved header byte");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "reserved header byte");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 5] = 0u;
 
     /* ORDER1 prediction is reserved inside a dense record. */
     save = seg[ZPSE_SEGMENT_HEADER_SIZE + 3];
     seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = ZPSE_P_ORDER1;
-    CHECK(decode(len, out, &got_len) != PSE_OK, "ORDER1 rejected in dense");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "ORDER1 rejected in dense");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = save;
 
     /* Predictor out of range. */
     seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = 12u;
-    CHECK(decode(len, out, &got_len) != PSE_OK, "predictor >= 12 rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "predictor >= 12 rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = save;
 
     /* Signed-delta residual mode is reserved in v1. */
     save = seg[ZPSE_SEGMENT_HEADER_SIZE + 2];
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = (uint8_t)((save & 0xC7u) | (ZPSE_R_SIGNED_DELTA << 3));
-    CHECK(decode(len, out, &got_len) != PSE_OK, "residual mode 4 rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "residual mode 4 rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = save;
 
     /* Mask mode 3 is reserved inside a dense record. */
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = (uint8_t)((save & 0xF8u) | 3u);
-    CHECK(decode(len, out, &got_len) != PSE_OK, "mask mode 3 rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "mask mode 3 rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = save;
 
     /* Mask mode 7. */
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = (uint8_t)((save & 0xF8u) | 7u);
-    CHECK(decode(len, out, &got_len) != PSE_OK, "mask mode 7 rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "mask mode 7 rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = save;
 
     /* rec_len disagreeing with the span. */
     save = seg[ZPSE_SEGMENT_HEADER_SIZE];
     seg[ZPSE_SEGMENT_HEADER_SIZE] = (uint8_t)(save - 1u);
-    CHECK(decode(len, out, &got_len) != PSE_OK, "short rec_len rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "short rec_len rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE] = save;
 
     /* A trailing byte after the record. */
     seg[len] = 0u;
-    CHECK(decode(len + 1u, out, &got_len) != PSE_OK,
+    CHECK(decode(len + 1u, out, &got_len) != ZPSE_OK,
           "trailing byte rejected");
     seg[len] = 0u;
 
     /* K larger than the plane (all-exception mask with a short plane). */
     base = (uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 6] | ((uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 7] << 8);
     seg[ZPSE_SEGMENT_HEADER_SIZE + 6] = (uint8_t)(base + 1u);
-    CHECK(decode(len, out, &got_len) != PSE_OK, "K beyond mask rejected");
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "K beyond mask rejected");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 6] = (uint8_t)(base & 0xFFu);
 
     /* Bitmap with a set padding bit above nt.  Build one deliberately. */
@@ -498,7 +498,7 @@ static void hostile(void)
 
         CHECK(l2 != 0u && k0 == 1u, "3-byte bitmap base");
         seg[ZPSE_SEGMENT_HEADER_SIZE + 12] |= 0x08u; /* bit 3 >= nt == 3: pad bit */
-        CHECK(decode(l2, out, &got_len) != PSE_OK, "pad bit rejected");
+        CHECK(decode(l2, out, &got_len) != ZPSE_OK, "pad bit rejected");
     }
 
     /* Sparse positions not ascending. */
@@ -532,7 +532,7 @@ static void hostile(void)
 
             seg[ZPSE_SEGMENT_HEADER_SIZE + 12] = seg[ZPSE_SEGMENT_HEADER_SIZE + 13];
             seg[ZPSE_SEGMENT_HEADER_SIZE + 13] = t;
-            CHECK(decode(l4, out, &got_len) != PSE_OK,
+            CHECK(decode(l4, out, &got_len) != ZPSE_OK,
                   "non-ascending sparse rejected");
         }
     }
@@ -546,10 +546,10 @@ static void hostile(void)
         l5 = build(pl, 16u, 0u, ZPSE_P_LANE_PREVIOUS, 0u, ZPSE_M_RAW_BITMAP,
                    ZPSE_R_EXCLUSION_U8);
         seg[ZPSE_SEGMENT_HEADER_SIZE + 2] &= (uint8_t)~ZPSE_DENSE_MARKER;
-        CHECK(decode(l5, out, &got_len) != PSE_OK,
+        CHECK(decode(l5, out, &got_len) != ZPSE_OK,
               "unmarked record is no tile");
         seg[ZPSE_SEGMENT_HEADER_SIZE + 2] |= ZPSE_DENSE_MARKER;
-        CHECK(decode(l5, out, &got_len) == PSE_OK, "marked record decodes");
+        CHECK(decode(l5, out, &got_len) == ZPSE_OK, "marked record decodes");
     }
 }
 
@@ -588,7 +588,7 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
     memset(&e, 0, sizeof e);
     memset(&lanes, 0, sizeof lanes);
     rc = zpse_encoder_init(&e, EARENA, sizeof EARENA);
-    CHECK(rc == PSE_OK, "encoder arena init");
+    CHECK(rc == ZPSE_OK, "encoder arena init");
     lanes.order1 = e.order1;
     lanes.o2 = e.o2;
     lanes.gen = 0u;
@@ -621,11 +621,11 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
     dlanes.order1 = d.order1;
     dlanes.o2 = d.o2;
     dlanes.gen = 0u;
-    if (rc == PSE_OK) {
+    if (rc == ZPSE_OK) {
         rc = zpse_segment_decode(&d, &dlanes, seg, len, big,
                                  (uint32_t)sizeof big, &got_len);
     }
-    CHECK(rc == PSE_OK && got_len == n && memcmp(big, plane, n) == 0,
+    CHECK(rc == ZPSE_OK && got_len == n && memcmp(big, plane, n) == 0,
           "constant plane decodes");
 }
 
@@ -648,7 +648,7 @@ static void emitter_palette(void)
 
     memset(&e, 0, sizeof e);
     memset(&lanes, 0, sizeof lanes);
-    CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == PSE_OK,
+    CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == ZPSE_OK,
           "encoder arena init (palette)");
     lanes.order1 = e.order1;
     lanes.o2 = e.o2;
@@ -695,7 +695,7 @@ static void emitter_palette(void)
         CHECK(i == ZPSE_DENSE_MAX_LEN,
               "palette prediction is a value the plane lacks");
         rc = decode(len, out, &got_len);
-        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+        CHECK(rc == ZPSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
                   memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
               "sixteen-value plane decodes");
 
@@ -706,20 +706,20 @@ static void emitter_palette(void)
         memcpy(want, seg, len);
         seg[ZPSE_SEGMENT_HEADER_SIZE + 6] = 0u;
         seg[ZPSE_SEGMENT_HEADER_SIZE + 7] = 0u; /* K == 0 under an ALL_EXCEPTION mask */
-        CHECK(decode(len, out, &got_len) != PSE_OK,
+        CHECK(decode(len, out, &got_len) != ZPSE_OK,
               "palette record with K == 0 is rejected");
         memcpy(seg, want, len);
         seg[ZPSE_SEGMENT_HEADER_SIZE + 2] = (uint8_t)(ZPSE_DENSE_MARKER |
                                 (uint8_t)ZPSE_M_RAW_BITMAP |
                                 ((uint8_t)ZPSE_R_PALETTE_BITS << 3));
-        CHECK(decode(len, out, &got_len) != PSE_OK,
+        CHECK(decode(len, out, &got_len) != ZPSE_OK,
               "palette record claiming a bitmap with no mask is rejected");
         memcpy(seg, want, len);
         seg[ZPSE_SEGMENT_HEADER_SIZE + 11] = (uint8_t)(seg[ZPSE_SEGMENT_HEADER_SIZE + 11] + 2u); /* residual overruns */
-        CHECK(decode(len, out, &got_len) != PSE_OK,
+        CHECK(decode(len, out, &got_len) != ZPSE_OK,
               "palette record with a bad residual span is rejected");
         memcpy(seg, want, len);
-        CHECK(decode(len - 1u, out, &got_len) != PSE_OK,
+        CHECK(decode(len - 1u, out, &got_len) != ZPSE_OK,
               "truncated palette record is rejected");
         memcpy(seg, want, len);
     }
@@ -745,7 +745,7 @@ static void emitter_palette(void)
         CHECK(len == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u + 10u + 1u + 2u + 512u,
               "binary plane is one bit per byte");
         rc = decode(len, out, &got_len);
-        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+        CHECK(rc == ZPSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
                   memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
               "binary plane decodes");
     }
@@ -781,7 +781,7 @@ static void emitter_palette(void)
         CHECK(len == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u + 10u + 1u + 16u + 2048u,
               "palette plane with 255 is one palette stream");
         rc = decode(len, out, &got_len);
-        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+        CHECK(rc == ZPSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
                   memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
               "palette plane with 255 decodes");
     }
@@ -802,7 +802,7 @@ static void emitter_palette(void)
         CHECK((seg[ZPSE_SEGMENT_HEADER_SIZE + 2] & ZPSE_DENSE_MARKER) == 0,
               "seventeen-value plane stays tiles");
         rc = decode(len, out, &got_len);
-        CHECK(rc == PSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+        CHECK(rc == ZPSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
                   memcmp(out, want, ZPSE_DENSE_MAX_LEN) == 0,
               "seventeen-value plane decodes");
     }
@@ -823,7 +823,7 @@ static void emitter_not_constant(void)
     plane[2049] = 0xEEu; /* ... and one byte that breaks the run */
     memset(&e, 0, sizeof e);
     memset(&lanes, 0, sizeof lanes);
-    CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == PSE_OK,
+    CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == ZPSE_OK,
           "encoder arena init (per-tile)");
     lanes.order1 = e.order1;
     lanes.o2 = e.o2;
@@ -835,7 +835,7 @@ static void emitter_not_constant(void)
     if ((int)len > 0) {
         CHECK((seg[ZPSE_SEGMENT_HEADER_SIZE + 2] & ZPSE_DENSE_MARKER) == 0,
               "non-constant plane stays tiles");
-        CHECK(decode(len, out, &got_len) == PSE_OK && got_len == 4096u &&
+        CHECK(decode(len, out, &got_len) == ZPSE_OK && got_len == 4096u &&
                   memcmp(out, plane, 4096u) == 0,
               "per-tile plane decodes");
     }
@@ -857,8 +857,8 @@ static void emitter_block(uint32_t n, uint8_t v)
     rc = zpse_compress_block(in, n, comp, (uint32_t)sizeof comp, &clen, 0, 1,
                              EARENA);
     cases++;
-    CHECK(rc == PSE_OK, "constant block compresses");
-    if (rc != PSE_OK) {
+    CHECK(rc == ZPSE_OK, "constant block compresses");
+    if (rc != ZPSE_OK) {
         return;
     }
     /* A constant block used to be the dense form's showcase, and it still is
@@ -878,7 +878,7 @@ static void emitter_block(uint32_t n, uint8_t v)
 
         /* The flags byte is at offset 3 in the long header and at 2 in a
          * page's 16-byte one, so read it through the parse. */
-        CHECK(zpse_block_header_parse(&bh, comp, clen) == PSE_OK,
+        CHECK(zpse_block_header_parse(&bh, comp, clen) == ZPSE_OK,
               "constant block header parses");
         if ((bh.block_flags &
              (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) != 0) {
@@ -903,7 +903,7 @@ static void emitter_block(uint32_t n, uint8_t v)
     }
     rc = zpse_decompress_block(comp, clen, back, (uint32_t)sizeof back, &dlen,
                                DARENA);
-    CHECK(rc == PSE_OK && dlen == n && memcmp(back, in, n) == 0,
+    CHECK(rc == ZPSE_OK && dlen == n && memcmp(back, in, n) == 0,
           "constant block round-trips");
 }
 

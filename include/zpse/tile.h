@@ -151,7 +151,7 @@ int zpse_tile_classify_lean(ZpseLaneState *lanes, const uint8_t *actual,
  * tiles whose packed mode reads the predictions.
  *
  * Predictors 0, 1, 2, 5, 6, 7, 8, 9, 10 and 11 are supported -- the ten
- * the encoder classifies. ORDER1/ORDER2 return PSE_BAD_PREDICTOR: they
+ * the encoder classifies. ORDER1/ORDER2 return ZPSE_BAD_PREDICTOR: they
  * would have to rebuild their tables byte by byte, and the encoder never
  * asks for them. */
 int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
@@ -197,7 +197,7 @@ void zpse_tile_ascii_unpack(const uint8_t *in, uint32_t in_len,
                             uint8_t *out, uint16_t nt);
 
 /* Pack a tile into the ASCII form. Returns record bytes written, or
- * PSE_BAD_ARG / PSE_OUTPUT_OVERFLOW. Does not touch lane state and does not
+ * ZPSE_BAD_ARG / ZPSE_OUTPUT_OVERFLOW. Does not touch lane state and does not
  * verify that the tile is ASCII: the caller has zpse_tile_is_ascii for
  * that, and a byte with the high bit set would pack lossily. */
 int zpse_tile_pack_ascii(const uint8_t *actual, uint16_t nt,

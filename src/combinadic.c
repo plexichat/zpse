@@ -246,7 +246,7 @@ int zpse_comb_payload_len(uint16_t nt, uint16_t k, int *wide_out)
     if (wide_out)
         *wide_out = 0;
     if (nt < 1u || nt > 256u || k > nt)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     c = zpse_comb_choose_u256(nt, k);
     if (c.w[1] | c.w[2] | c.w[3]) {
         if (wide_out)
@@ -288,25 +288,25 @@ int zpse_comb_rank_to_bytes(const uint16_t *c, uint16_t k, uint16_t nt,
     uint16_t t;
 
     if (c == NULL && k != 0)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (nt < 1u || nt > 256u || k > nt)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     /* Encoder-side subset validation: strictly ascending positions < nt.
      * (The decoder side re-verifies via the R < C(nt,k) pre-check, so an
      * invalid subset can never decode successfully.) */
     for (t = 0; t < k; t++) {
         if (c[t] >= nt)
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         if (t > 0u && c[t] <= c[t - 1u])
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
     }
     L = zpse_comb_payload_len(nt, k, NULL);
     if (L < 0)
         return L;
     if (L > (int)payload_cap)
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     if (L > 0 && payload_out == NULL)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     rank = zpse_comb_rank(c, k);
     /* Minimal LE serialization of rank, zero-padded to exactly L bytes
      * (rank < C(nt,k) <= 256^L, so it always fits). */
@@ -328,11 +328,11 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
     uint16_t take;
 
     if (payload == NULL || words == NULL)
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (nt < 1u || nt > 256u || k < 1u || k > (uint16_t)(nt - 1u))
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     if (payload_len < 1u || payload_len > 32u)
-        return PSE_BAD_ENUMERATIVE_RANK;
+        return ZPSE_BAD_ENUMERATIVE_RANK;
 
     /* C(nt,k) is evaluated ONCE here and answers both of the questions
      * this function asks of it: the minimal payload length the format
@@ -351,7 +351,7 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
         L = (u256_bitlen(cm1) + 7) / 8;
     }
     if ((int)payload_len != L)
-        return PSE_BAD_ENUMERATIVE_RANK;
+        return ZPSE_BAD_ENUMERATIVE_RANK;
 
     /* Payload is LE rank R. */
     r = u256_zero();
@@ -363,7 +363,7 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
     /* Range pre-check BEFORE unranking: R < C(nt,k), from the value
      * computed at the top. */
     if (zpse_u256_gte(r, cnk))
-        return PSE_BAD_ENUMERATIVE_RANK;
+        return ZPSE_BAD_ENUMERATIVE_RANK;
 
     /* The function owns the output: fully written, no caller zeroing
      * required. */
@@ -430,8 +430,8 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
                 row[j] -= row[j - 1];
         }
         if (tt != 0u || r64 != 0u)
-            return PSE_BAD_ENUMERATIVE_RANK;
-        return PSE_OK;
+            return ZPSE_BAD_ENUMERATIVE_RANK;
+        return ZPSE_OK;
     }
 #endif /* __SIZEOF_INT128__ */
 
@@ -471,10 +471,10 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
                 row[j] = zpse_u256_sub(row[j], row[j - 1]);
         }
         if (t != 0u)
-            return PSE_BAD_ENUMERATIVE_RANK; /* ran out mid-loop */
+            return ZPSE_BAD_ENUMERATIVE_RANK; /* ran out mid-loop */
         if (!zpse_u256_is_zero(r))
-            return PSE_BAD_ENUMERATIVE_RANK; /* remainder must be zero */
-        return PSE_OK;
+            return ZPSE_BAD_ENUMERATIVE_RANK; /* remainder must be zero */
+        return ZPSE_OK;
     }
 
     /* Degraded path (scratch unavailable): same decisions via on-demand
@@ -495,8 +495,8 @@ int zpse_comb_unrank(uint16_t nt, uint16_t k, const uint8_t *payload,
         }
     }
     if (t != 0u)
-        return PSE_BAD_ENUMERATIVE_RANK; /* current_pos ran out mid-loop */
+        return ZPSE_BAD_ENUMERATIVE_RANK; /* current_pos ran out mid-loop */
     if (!zpse_u256_is_zero(r))
-        return PSE_BAD_ENUMERATIVE_RANK; /* final remainder must be zero */
-    return PSE_OK;
+        return ZPSE_BAD_ENUMERATIVE_RANK; /* final remainder must be zero */
+    return ZPSE_OK;
 }

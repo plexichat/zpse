@@ -358,7 +358,7 @@ static ZPSE_RES_SSSE3 __m128i residual_pal_index(uint64_t w, unsigned b)
  * returning how many values were written. It stops at the first block it
  * cannot handle - a width other than 1, 2 or 4, or an index that is not
  * below m - and the scalar loop in the caller then re-decides from there,
- * so a rejected payload still produces the scalar PSE_BAD_RESIDUAL at the
+ * so a rejected payload still produces the scalar ZPSE_BAD_RESIDUAL at the
  * scalar position and every accepted value is byte-identical to what that
  * loop would have written. Reads stop at the block's last needed byte, so
  * a partial final block never touches the byte after the packed region.
@@ -852,17 +852,17 @@ static int residual_decode_mode2(const uint8_t *payload,
     uint16_t i;
 
     if (payload_len < 1u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     m = payload[0];
     if (m < 2u || m > 16u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     b = zpse_ceil_log2_u32(m);
     packed = ((uint32_t)k * b + 7u) / 8u;
     expect = 1u + (uint32_t)m + packed;
     if ((uint32_t)payload_len != expect) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     /* `payload[1 + i] > 254` on a byte is `== 255`, which is the question
      * residual_has_ff already answers eight bytes at a time (the mode-0
@@ -872,14 +872,14 @@ static int residual_decode_mode2(const uint8_t *payload,
      * order are unchanged: the first such byte still rejects the payload,
      * and nothing has been written by the time the check runs. */
     if (residual_has_ff(payload + 1, (uint32_t)m)) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     if (packed > 0u) {
         total_bits = (uint32_t)k * b;
         if ((total_bits & 7u) != 0u) {
             /* Only the final byte can carry pad bits. */
             if ((payload[1u + m + packed - 1u] >> (total_bits & 7u)) != 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
         }
     }
@@ -899,11 +899,11 @@ static int residual_decode_mode2(const uint8_t *payload,
         unsigned idx = residual_get_bits(payload + 1u + m,
                                          (uint32_t)i * b, b);
         if (idx >= m) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         exc_out[i] = payload[1u + idx];
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* Base-M digit pairs, one per byte pair: m3_pair_lut[off + r] holds
@@ -1269,7 +1269,7 @@ m3_nib_expand4(uint8_t *dst, __m128i acc, uint32_t g)
             }                                                              \
             if (_mm256_testz_si256(w, w) == 0) {                           \
                 *consumed = 0u;                                            \
-                return PSE_BAD_RESIDUAL;                                   \
+                return ZPSE_BAD_RESIDUAL;                                   \
             }                                                              \
             m3_nib_expand8(dst + n * (uint32_t)(GG), acc, (GG));           \
             n += 8u;                                                       \
@@ -1297,13 +1297,13 @@ m3_nib_expand4(uint8_t *dst, __m128i acc, uint32_t g)
             }                                                              \
             if (_mm_testz_si128(w4, w4) == 0) {                            \
                 *consumed = 0u;                                            \
-                return PSE_BAD_RESIDUAL;                                   \
+                return ZPSE_BAD_RESIDUAL;                                   \
             }                                                              \
             m3_nib_expand4(dst + n * (uint32_t)(GG), acc4, (GG));          \
             n += 4u;                                                       \
         }                                                                  \
         *consumed = n;                                                     \
-        return PSE_OK;                                                     \
+        return ZPSE_OK;                                                     \
     }                                                                      \
     break;
 
@@ -1351,7 +1351,7 @@ static ZPSE_RES_AVX2 int residual_decode_mode3_nib(
     ZPSE_M3_NIB(14, 7)
     ZPSE_M3_NIB(15, 7)
     default:
-        return PSE_OK;
+        return ZPSE_OK;
     }
 }
 
@@ -1373,16 +1373,16 @@ static int residual_decode_mode3(const uint8_t *payload,
     uint32_t bad = 0u;
 
     if (payload_len < 1u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     m = payload[0];
     g = zpse_base_m_group(m);
     if (g == 0u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     ng = ((uint32_t)k + (uint32_t)g - 1u) / (uint32_t)g;
     if ((uint32_t)payload_len != 1u + ng * 4u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
 
     /* Only whole groups are decoded by the two loops below, so a group
@@ -1405,7 +1405,7 @@ static int residual_decode_mode3(const uint8_t *payload,
     if (g >= 7u && g <= 8u && nfull >= 9u &&
         (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         rc = residual_decode_mode3_nib(payload, nfull, k, m, exc_out, &j);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
@@ -1490,11 +1490,11 @@ static int residual_decode_mode3(const uint8_t *payload,
         ZPSE_M3_PAIRS6(15, 10, 7);
 #undef ZPSE_M3_PAIRS6
         default:
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         /* Full groups: word < M^G. Same check per group. */
         if ((w0 | w1 | w2 | w3 | w4 | w5) != 0u) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
     }
 
@@ -1544,11 +1544,11 @@ static int residual_decode_mode3(const uint8_t *payload,
         ZPSE_M3_PAIRS4(15, 10, 7);
 #undef ZPSE_M3_PAIRS4
         default:
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         /* Full groups: word < M^G. Same check per group. */
         if ((w0 | w1 | w2 | w3) != 0u) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
     }
 
@@ -1587,17 +1587,17 @@ static int residual_decode_mode3(const uint8_t *payload,
         ZPSE_M3_PAIRS(15, 10);
 #undef ZPSE_M3_PAIRS
         default:
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         /* Full groups: word < M^G; tail: high part zero. Same check. */
         if (word != 0u) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
     }
     if (bad != 0u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 static int residual_decode_mode4(const uint8_t *payload,
@@ -1610,11 +1610,11 @@ static int residual_decode_mode4(const uint8_t *payload,
     uint16_t i;
 
     if (payload_len < 1u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     sub = payload[0];
     if (sub > 2u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     if (sub == 0u) {
         expect = 1u + (((uint32_t)k + 1u) / 2u);
@@ -1624,15 +1624,15 @@ static int residual_decode_mode4(const uint8_t *payload,
         expect = 1u + (uint32_t)k;
     }
     if ((uint32_t)payload_len != expect) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     if (k > 0u && (pred_at_exc == 0 || exc_out == 0)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (sub == 0u) {
         if ((k & 1u) != 0u) {
             if ((payload[1u + (k >> 1u)] >> 4u) != 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
         }
         for (i = 0; i < k; i++) {
@@ -1642,7 +1642,7 @@ static int residual_decode_mode4(const uint8_t *payload,
             uint8_t x;
 
             if (enc == 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             d = (enc < 8u) ? (int)enc : (int)enc - 16;
             x = (uint8_t)(((int)pred_at_exc[i] + d) & 0xFF);
@@ -1654,7 +1654,7 @@ static int residual_decode_mode4(const uint8_t *payload,
 
         if ((total_bits & 7u) != 0u && expect > 1u) {
             if ((s[expect - 2u] >> (total_bits & 7u)) != 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
         }
         for (i = 0; i < k; i++) {
@@ -1663,7 +1663,7 @@ static int residual_decode_mode4(const uint8_t *payload,
             uint8_t x;
 
             if (enc == 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             d = (enc < 32u) ? (int)enc : (int)enc - 64;
             x = (uint8_t)(((int)pred_at_exc[i] + d) & 0xFF);
@@ -1676,14 +1676,14 @@ static int residual_decode_mode4(const uint8_t *payload,
             uint8_t x;
 
             if (enc == 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             d = (enc < 128u) ? (int)enc : (int)enc - 256;
             x = (uint8_t)(((int)pred_at_exc[i] + d) & 0xFF);
             exc_out[i] = zpse_exclusion_forward(x, pred_at_exc[i]);
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_residual_decode(uint8_t mode, const uint8_t *payload,
@@ -1693,33 +1693,33 @@ int zpse_residual_decode(uint8_t mode, const uint8_t *payload,
 {
     (void)pred_at_exc;
     if (mode > 4u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     if (payload_len > 0u && payload == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (mode == ZPSE_R_RAW_ACTUAL) {
         if ((uint32_t)payload_len != (uint32_t)k) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         if (k > 0u && (actual_out == 0 || payload == 0)) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         if (k > 0u) {
             residual_copy_bytes(actual_out, payload, (uint32_t)k);
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     if (k > 0u && exc_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     switch (mode) {
     case ZPSE_R_EXCLUSION_U8:
         if ((uint32_t)payload_len != (uint32_t)k) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         if (k > 0u && payload == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         /* Every unit must be <= 254 -- 255 is not a legal exclusion
          * residual -- and `payload[i] > 254` is exactly `payload[i] ==
@@ -1732,10 +1732,10 @@ int zpse_residual_decode(uint8_t mode, const uint8_t *payload,
          * tile's `resid[]` scratch) is never read afterwards. */
         if (k > 0u) {
             if (residual_copy_u8_checked(exc_out, payload, (uint32_t)k)) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_R_PALETTE_BITS:
         return residual_decode_mode2(payload, payload_len, k, exc_out);
     case ZPSE_R_PACKED_BASE_M:
@@ -1987,7 +1987,7 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
 
                 if (idx_of[v] == 0xFFu) {
                     if (v > 254u) {
-                        return PSE_BAD_RESIDUAL;
+                        return ZPSE_BAD_RESIDUAL;
                     }
                     idx_of[v] = (uint8_t)nu;
                     pal[nu] = (uint8_t)v;
@@ -2020,11 +2020,11 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
                 unsigned is_new;
 
                 if (v > 254u) {
-                    return PSE_BAD_RESIDUAL;
+                    return ZPSE_BAD_RESIDUAL;
                 }
                 is_new = (idx_of[v] == 0xFFu) ? 1u : 0u;
                 if (is_new != 0u && nu == 16u) {
-                    return PSE_BAD_RESIDUAL;
+                    return ZPSE_BAD_RESIDUAL;
                 }
                 idx_of[v] = (uint8_t)(is_new != 0u ? nu : (unsigned)idx_of[v]);
                 pal[nu] = (uint8_t)(is_new != 0u ? v : 0u);
@@ -2052,10 +2052,10 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
     packed = ((uint32_t)k * b + 7u) / 8u;
     total = 1u + (uint32_t)m + packed;
     if ((uint32_t)cap < total) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if (total > 0u && out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     out[0] = m;
     for (s = 0; s < m; s++) {
@@ -2171,17 +2171,17 @@ ZPSE_HOT static int residual_encode_mode3(const uint8_t *exc_in, uint16_t k,
         }
         m = residual_mode3_select_m(maxv);
         if (m == 0u) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
     }
     g = zpse_base_m_group(m);
     ng = ((uint32_t)k + (uint32_t)g - 1u) / (uint32_t)g;
     total = 1u + ng * 4u;
     if ((uint32_t)cap < total) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if (total > 0u && out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     out[0] = m;
     j = 0u;
@@ -2280,22 +2280,22 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
 
     if (k == 0u) {
         if (cap < 1u) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         if (out == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         out[0] = 0;
         return 1;
     }
     if (actual_in == 0 || pred_at_exc == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     for (i = 0; i < k; i++) {
         int d = residual_delta(actual_in[i], pred_at_exc[i]);
 
         if (d == 0) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         if (i == 0u) {
             dmin = d;
@@ -2320,10 +2320,10 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
         total = 1u + (uint32_t)k;
     }
     if ((uint32_t)cap < total) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if (out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     out[0] = sub;
     if (sub == 0u) {
@@ -2412,14 +2412,14 @@ ZPSE_HOT int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
                               uint16_t nu_hint, const uint32_t *seen_hint)
 {
     if (mode > 4u) {
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
     if (mode == ZPSE_R_RAW_ACTUAL) {
         if (k > 0u && (actual_in == 0 || payload_out == 0)) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         if ((uint32_t)payload_cap < (uint32_t)k) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         if (k > 0u)
             memcpy(payload_out, actual_in, (size_t)k);
@@ -2427,15 +2427,15 @@ ZPSE_HOT int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
     }
     if (mode == ZPSE_R_EXCLUSION_U8) {
         if (k > 0u && (exc_in == 0 || payload_out == 0)) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         if ((uint32_t)payload_cap < (uint32_t)k) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         if (k > 0u) {
             /* `> 254` on a byte is `== 255`; test eight at a time, then copy. */
             if (residual_has_ff(exc_in, (uint32_t)k)) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             memcpy(payload_out, exc_in, (size_t)k);
         }
@@ -2446,7 +2446,7 @@ ZPSE_HOT int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
                                      payload_cap);
     }
     if (k > 0u && exc_in == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (mode == ZPSE_R_PALETTE_BITS) {
         return residual_encode_mode2(exc_in, k, payload_out, payload_cap,
@@ -2468,13 +2468,13 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
                               const uint8_t *exc_in, uint16_t *len_out)
 {
     if (len_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     switch (mode) {
     case ZPSE_R_EXCLUSION_U8:
     case ZPSE_R_RAW_ACTUAL:
         *len_out = k;
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_R_PALETTE_BITS: {
         uint8_t seen[8];
         unsigned nu = 0;
@@ -2483,7 +2483,7 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
         uint16_t i;
 
         if (k > 0u && exc_in == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         /* Membership as a 256-bit bitmap rather than a linear probe of the
          * values seen so far: the probe is O(k*nu) with a data-dependent
@@ -2500,14 +2500,14 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
             uint8_t bit;
 
             if (v > 254u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             bit = (uint8_t)(1u << (v & 31u));
             if ((seen[v >> 5u] & bit) != 0u) {
                 continue;
             }
             if (nu == 16u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             seen[v >> 5u] |= bit;
             nu++;
@@ -2516,14 +2516,14 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
         b = zpse_ceil_log2_u32(m);
         *len_out = (uint16_t)(1u + (uint32_t)m +
                               (((uint32_t)k * b + 7u) / 8u));
-        return PSE_OK;
+        return ZPSE_OK;
     }
     case ZPSE_R_PACKED_BASE_M: {
         uint8_t m;
         uint8_t g;
 
         if (k > 0u && exc_in == 0) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         if (k == 0u) {
             m = 3;
@@ -2538,20 +2538,20 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
             }
             m = residual_mode3_select_m(maxv);
             if (m == 0u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
         }
         g = zpse_base_m_group(m);
         *len_out = (uint16_t)(1u + (((uint32_t)k + (uint32_t)g - 1u) /
                                     (uint32_t)g) * 4u);
-        return PSE_OK;
+        return ZPSE_OK;
     }
     case ZPSE_R_SIGNED_DELTA:
         /* Exact length needs actual+pred (submode selection); report the
          * 8-bit worst case for buffer sizing. */
         *len_out = (uint16_t)(1u + (uint32_t)k);
-        return PSE_OK;
+        return ZPSE_OK;
     default:
-        return PSE_BAD_RESIDUAL;
+        return ZPSE_BAD_RESIDUAL;
     }
 }

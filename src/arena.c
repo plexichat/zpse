@@ -15,13 +15,13 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
     uint8_t *base;
 
     if (d == 0 || arena_mem == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (arena_len < (size_t)ZPSE_DEC_ARENA_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (!zpse_arena_is_aligned(arena_mem)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     base = (uint8_t *)arena_mem;
     /* No arena-wide clear. A 256 KiB memset on every block call was
@@ -47,7 +47,7 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
     d->lzbuf = base + ZPSE_D_OFF_LZBUF;
     d->seg_const = 0u;
     d->seg_const_byte = 0u;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
@@ -55,13 +55,13 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     uint8_t *base;
 
     if (e == 0 || arena_mem == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (arena_len < (size_t)ZPSE_ENC_ARENA_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (!zpse_arena_is_aligned(arena_mem)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     base = (uint8_t *)arena_mem;
     /* See zpse_decoder_init: same reasoning, and each encoder region is
@@ -88,5 +88,5 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     e->hist_sc = 0u;
     e->hist_valid = 0u;
     e->hist_streak = 0u;
-    return PSE_OK;
+    return ZPSE_OK;
 }

@@ -90,11 +90,11 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
 
     fill_input(n, kind);
     CHECK(zpse_compress_frame_indexed(in, n, comp, sizeof comp, &clen,
-                                      blk_size, enc_flags, ea) == PSE_OK,
+                                      blk_size, enc_flags, ea) == ZPSE_OK,
           "indexed frame encode (n %u, block %u, flags %u)", n, blk_size,
           enc_flags);
     nblocks = n / blk_size + (n % blk_size != 0u ? 1u : 0u);
-    CHECK(zpse_frame_index_count(comp, clen, &count) == PSE_OK,
+    CHECK(zpse_frame_index_count(comp, clen, &count) == ZPSE_OK,
           "index count reads");
     CHECK(count == nblocks, "index count %u, expected %u", count, nblocks);
 
@@ -109,7 +109,7 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
          * the bytes it reports is a buffer overflow, not a detail. */
         memset(out, 0x5A, sizeof out);
         CHECK(zpse_decompress_frame(comp, clen, out, sizeof out, &got, da) ==
-                  PSE_OK,
+                  ZPSE_OK,
               "indexed frame sequential decode");
         CHECK(got == n && memcmp(out, in, n) == 0,
               "indexed frame sequential bytes");
@@ -146,7 +146,7 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
          * exactly the case where an over-copy has nowhere to go. */
         memset(blk, 0x5A, sizeof blk);
         CHECK(zpse_seek_frame(comp, clen, k, blk, sizeof blk, &got, da) ==
-                  PSE_OK,
+                  ZPSE_OK,
               "seek block %u of %u", k, nblocks);
         CHECK(got == want, "seek block %u produced %u of %u", k, got, want);
         CHECK(memcmp(blk, in + off, want) == 0, "seek block %u bytes", k);
@@ -174,7 +174,7 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
             if (tight != 0) {
                 memset(tight, 0x5A, want);
                 CHECK(zpse_seek_frame(comp, clen, k, tight, want, &got, da) ==
-                          PSE_OK,
+                          ZPSE_OK,
                       "exact-size seek block %u of %u", k, nblocks);
                 CHECK(got == want && memcmp(tight, in + off, want) == 0,
                       "exact-size seek block %u bytes", k);
@@ -187,10 +187,10 @@ static void seek_all(uint32_t n, uint32_t blk_size, uint32_t enc_flags,
     {
         uint32_t got = 0u;
         CHECK(zpse_seek_frame(comp, clen, nblocks, blk, sizeof blk, &got,
-                              da) == PSE_BAD_ARG,
+                              da) == ZPSE_BAD_ARG,
               "seek past the last block refused");
         CHECK(zpse_seek_frame(comp, clen, 0xFFFFFFFFu, blk, sizeof blk, &got,
-                              da) == PSE_BAD_ARG,
+                              da) == ZPSE_BAD_ARG,
               "seek far past the end refused");
     }
 }
@@ -204,15 +204,15 @@ static void corrupt_cases(void)
 
     fill_input(FRAME_N, 2);
     CHECK(zpse_compress_frame_indexed(in, FRAME_N, comp, sizeof comp, &clen,
-                                      BLK, 0u, ea) == PSE_OK,
+                                      BLK, 0u, ea) == ZPSE_OK,
           "corruption source frame");
-    if (zpse_frame_header_read(NULL, comp) != PSE_BAD_ARG) {
+    if (zpse_frame_header_read(NULL, comp) != ZPSE_BAD_ARG) {
         CHECK(0, "header read NULL ctx");
     }
     frame_index_off = zpse_load_u32le(comp + 24u);
     CHECK(frame_index_off > 32u && (size_t)frame_index_off < clen,
           "index offset in range (%u)", frame_index_off);
-    CHECK(zpse_frame_index_count(comp, clen, &count) == PSE_OK && count == 4u,
+    CHECK(zpse_frame_index_count(comp, clen, &count) == ZPSE_OK && count == 4u,
           "source index count %u", count);
 
     /* An entry whose size does not describe the block it points at. */
@@ -229,7 +229,7 @@ static void corrupt_cases(void)
                                          ZPSE_INDEX_HEADER_SIZE,
                                      (size_t)count * ZPSE_INDEX_ENTRY_SIZE));
         CHECK(zpse_seek_frame(comp, clen, 0u, blk, sizeof blk, &got, da) ==
-                  PSE_BAD_HEADER,
+                  ZPSE_BAD_HEADER,
               "entry/block size mismatch refused");
         zpse_store_u32le(comp + size_at, keep);
         zpse_store_u32le(comp + frame_index_off + 8u,
@@ -273,13 +273,13 @@ static void corrupt_cases(void)
         offs = (uint32_t *)malloc(sizeof *offs * (size_t)count);
         lens = (uint32_t *)malloc(sizeof *lens * (size_t)count);
         CHECK(offs != 0 && lens != 0, "walker arrays");
-        CHECK(zpse_frame_header_read(&fh, comp) == PSE_OK, "walker header");
+        CHECK(zpse_frame_header_read(&fh, comp) == ZPSE_OK, "walker header");
         for (m = 0; m < count; m++) {
             ZpseBlockHeader bh;
 
             CHECK(zpse_block_header_parse(&bh, comp + pos,
                                           (uint32_t)ZPSE_BLOCK_HEADER_SIZE) ==
-                      PSE_OK,
+                      ZPSE_OK,
                   "walker block %u header", m);
             offs[m] = pos;
             lens[m] = bh.compressed_block_size;
@@ -291,24 +291,24 @@ static void corrupt_cases(void)
         idx_len = (size_t)ZPSE_INDEX_HEADER_SIZE +
                   (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
         CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count, offs,
-                                        lens) == PSE_OK,
+                                        lens) == ZPSE_OK,
               "index validates against the walk");
         lens[count - 1u] += 1u;
         CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count, offs,
-                                        lens) == PSE_BAD_HEADER,
+                                        lens) == ZPSE_BAD_HEADER,
               "walked size mismatch refused");
         lens[count - 1u] -= 1u;
         offs[0] += 1u;
         CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count, offs,
-                                        lens) == PSE_BAD_HEADER,
+                                        lens) == ZPSE_BAD_HEADER,
               "walked offset mismatch refused");
         offs[0] -= 1u;
         CHECK(zpse_frame_index_validate(&fh, idx,
                                         (size_t)ZPSE_INDEX_HEADER_SIZE, count,
-                                        offs, lens) == PSE_TRUNCATED,
+                                        offs, lens) == ZPSE_TRUNCATED,
               "short table refused by the walker");
         CHECK(zpse_frame_index_validate(&fh, idx, idx_len, count - 1u, offs,
-                                        lens) == PSE_BAD_HEADER,
+                                        lens) == ZPSE_BAD_HEADER,
               "walker count that disagrees with the frame refused");
         free(offs);
         free(lens);
@@ -320,10 +320,10 @@ static void corrupt_cases(void)
 
         comp[frame_index_off + ZPSE_INDEX_HEADER_SIZE + 2u] ^= 0xFFu;
         CHECK(zpse_seek_frame(comp, clen, 0u, blk, sizeof blk, &got, da) ==
-                  PSE_BAD_HEADER_CRC,
+                  ZPSE_BAD_HEADER_CRC,
               "index checksum refuses a flipped entry");
         CHECK(zpse_frame_index_count(comp, clen, &count) ==
-                  PSE_BAD_HEADER_CRC,
+                  ZPSE_BAD_HEADER_CRC,
               "index count refuses a flipped entry");
         comp[frame_index_off + ZPSE_INDEX_HEADER_SIZE + 2u] = keep;
     }
@@ -334,10 +334,10 @@ static void corrupt_cases(void)
 
         zpse_store_u32le(comp + 24u, 0u);
         reseal_header(comp);
-        CHECK(zpse_frame_index_count(comp, clen, &count) == PSE_BAD_HEADER,
+        CHECK(zpse_frame_index_count(comp, clen, &count) == ZPSE_BAD_HEADER,
               "zero index offset refused");
         CHECK(zpse_seek_frame(comp, clen, 0u, blk, sizeof blk, &got, da) ==
-                  PSE_BAD_HEADER,
+                  ZPSE_BAD_HEADER,
               "seek with a zero index offset refused");
         zpse_store_u32le(comp + 24u, keep);
         reseal_header(comp);
@@ -345,7 +345,7 @@ static void corrupt_cases(void)
 
     /* Truncation: the table has to fit in what is there. */
     {
-        CHECK(zpse_frame_index_count(comp, clen - 4u, &count) == PSE_TRUNCATED,
+        CHECK(zpse_frame_index_count(comp, clen - 4u, &count) == ZPSE_TRUNCATED,
               "truncated index refused");
     }
 
@@ -354,13 +354,13 @@ static void corrupt_cases(void)
         size_t nlen = 0;
 
         CHECK(zpse_compress_frame(in, FRAME_N, comp, sizeof comp, &nlen, BLK,
-                                  ea) == PSE_OK,
+                                  ea) == ZPSE_OK,
               "plain frame encode");
-        CHECK(zpse_frame_index_count(comp, nlen, &count) == PSE_OK &&
+        CHECK(zpse_frame_index_count(comp, nlen, &count) == ZPSE_OK &&
                   count == 0u,
               "plain frame reports no index");
         CHECK(zpse_seek_frame(comp, nlen, 0u, blk, sizeof blk, &got, da) ==
-                  PSE_UNSUPPORTED_FEATURE,
+                  ZPSE_UNSUPPORTED_FEATURE,
               "seek on a plain frame refused");
     }
 }
@@ -392,9 +392,9 @@ int main(void)
 
                 CHECK(zpse_compress_frame_indexed(in, FRAME_N, comp,
                                                   sizeof comp, &clen,
-                                                  blocks[i], 0u, ea) == PSE_OK,
+                                                  blocks[i], 0u, ea) == ZPSE_OK,
                       "block size %u encode", blocks[i]);
-                CHECK(zpse_frame_index_count(comp, clen, &count) == PSE_OK,
+                CHECK(zpse_frame_index_count(comp, clen, &count) == ZPSE_OK,
                       "block size %u count", blocks[i]);
                 nblocks = (FRAME_N + blocks[i] - 1u) / blocks[i];
                 CHECK(count == nblocks, "block size %u: %u of %u entries",
@@ -408,7 +408,7 @@ int main(void)
                         want = blocks[i];
                     }
                     CHECK(zpse_seek_frame(comp, clen, k, blk, sizeof blk,
-                                          &got, da) == PSE_OK,
+                                          &got, da) == ZPSE_OK,
                           "block size %u: seek %u", blocks[i], k);
                     CHECK(got == want && memcmp(blk, in + off, want) == 0,
                           "block size %u: seek %u bytes", blocks[i], k);

@@ -130,6 +130,25 @@
  * a 15 nibble. It exists as a measured experiment (see the README's LZ section
  * for the numbers), not as a replacement for either form. */
 #define ZPSE_B_LZ_HEX           (UINT8_C(ZPSE_B_LZ) | UINT8_C(ZPSE_B_LZ2))
+/* The entropy-coded LZ form: an intra-block LZ stream, Huffman coded. Its
+ * payload is
+ *   [u8 table_id][u8 inner_form][u32 inner_len][u16 seg0][u16 seg1][u16 seg2]
+ *   [four Huffman streams]
+ * and `inner_form` names which of the three LZ forms above it decodes to
+ * (ZPSE_B_LZ, ZPSE_B_LZ2 or ZPSE_B_LZ_HEX). The tables are fixed in the
+ * format (src/huf_tables.inc), so a block costs 12 bytes of overhead and no
+ * table; see include/zpse/huf.h.
+ *
+ * It is spelled with the flag pattern both LZ bits set plus bit 6 -- 110 --
+ * which is free until now: the hex form is 011 and refuses the tile bit, and
+ * the two plain forms each refuse the other's bit, so a block whose flags
+ * are 110 cannot have been written by any earlier version. A reader that
+ * predates this form sees bit 6 in what was the reserved mask and refuses
+ * the block, which is exactly what a reserved bit is for. The envelope is
+ * the LZ forms' own -- transform 0, one segment, no metadata -- because the
+ * tile form's transform and segment count live in the header, and a Huffman
+ * payload only ever wraps a pure LZ stream. */
+#define ZPSE_B_HUF              (UINT8_C(ZPSE_B_LZ_TILE) | UINT8_C(ZPSE_B_LZ2))
 #define ZPSE_B_RESERVED_MASK    (UINT8_C(0x00))
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
@@ -173,6 +192,14 @@
  * taken. A decoder needs to know nothing about it: the form is named in the
  * block header. */
 #define ZPSE_ENC_LZ_HEX         (UINT32_C(1) << 7)
+
+/* Also Huffman code the winning LZ payload (include/zpse/huf.h). Off by
+ * default; the deepest level turns it on for itself, because it is the rung
+ * whose trade is size and nothing else. Set explicitly, it applies at any
+ * level that writes an LZ form at all (5-9). The streams it writes need no
+ * decoder option, so a caller who does not ask for it never sees one.
+ * Levels 1-4 write no LZ form, so the bit has nothing to act on there. */
+#define ZPSE_ENC_HUF            (UINT32_C(1) << 8)
 
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
@@ -238,7 +265,7 @@
  * acceleration factor (see ZPSE_LZ_ACCEL_*) decides how much slower than the
  * tile stream it is allowed to be.
  *
- * An unsupported level is rejected with PSE_BAD_ARG rather than rounded to
+ * An unsupported level is rejected with ZPSE_BAD_ARG rather than rounded to
  * one of these. */
 #define ZPSE_ENC_SPEED_SHIFT    1
 #define ZPSE_ENC_SPEED_MASK     (UINT32_C(0xF) << ZPSE_ENC_SPEED_SHIFT)

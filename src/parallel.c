@@ -77,13 +77,13 @@ static int zpse_mt_serial(const uint8_t *in, size_t n, uint8_t *out,
     int rc;
 
     rc = zpse_encoder_init(&enc, arenas[0], (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     enc.enc_flags = enc_flags;
     rc = zpse_frame_encode_ex(&enc, in, n, block, out, out_cap, out_len_out,
                               with_index);
-    return rc < 0 ? rc : PSE_OK;
+    return rc < 0 ? rc : ZPSE_OK;
 }
 
 #if defined(ZPSE_MT)
@@ -134,7 +134,7 @@ static size_t zpse_mt_claim(volatile long *next, size_t nblocks)
 static void zpse_mt_fail(ZpseMtJob *j, int rc)
 {
     if (j->failed == 0) {
-        j->failed = (rc < 0) ? rc : PSE_BAD_HEADER;
+        j->failed = (rc < 0) ? rc : ZPSE_BAD_HEADER;
     }
 }
 
@@ -144,7 +144,7 @@ static void zpse_mt_worker(ZpseMtJob *j, void *arena)
     int rc;
 
     rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         zpse_mt_fail(j, rc);
         return;
     }
@@ -164,7 +164,7 @@ static void zpse_mt_worker(ZpseMtJob *j, void *arena)
         }
         off = i * (size_t)j->block;
         if (off >= j->n) {
-            zpse_mt_fail(j, PSE_BAD_HEADER);
+            zpse_mt_fail(j, ZPSE_BAD_HEADER);
             return;
         }
         chunk = j->n - off;
@@ -217,14 +217,14 @@ static int zpse_mt_close(ZpseMtJob *j, int with_index, size_t *out_len_out)
         uint8_t *src = j->slots + i * j->stride;
 
         rc = zpse_block_header_parse(&bh, src, (uint32_t)j->stride);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if (bh.compressed_block_size <
                 (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
             (size_t)bh.compressed_block_size > j->stride ||
             bh.block_sequence_number != (uint32_t)i) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         /* Slots start at the header offset and pos starts there too, so
          * pos <= header + i * stride throughout and writing block i's
@@ -238,23 +238,23 @@ static int zpse_mt_close(ZpseMtJob *j, int with_index, size_t *out_len_out)
     }
     rc = zpse_frame_header_build(&fh, j->block, (uint64_t)j->n, 1,
                                  (uint32_t)j->nblocks, 1, with_index);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_frame_header_write(&fh, j->out);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (with_index) {
         rc = zpse_frame_write_index(j->out, pos, j->out_cap, j->block,
                                     (uint64_t)j->n, (uint32_t)j->nblocks,
                                     &pos);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
     *out_len_out = pos;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* ---- streamed encode -----------------------------------------------
@@ -336,7 +336,7 @@ static void zpse_mt_relax(void)
 static void zpse_mt_stream_fail(ZpseMtStream *j, int rc)
 {
     if (j->failed == 0) {
-        j->failed = (rc < 0) ? rc : PSE_BAD_HEADER;
+        j->failed = (rc < 0) ? rc : ZPSE_BAD_HEADER;
     }
 }
 
@@ -392,7 +392,7 @@ static int zpse_mt_stream_step(ZpseMtStream *j, ZpseEncoder *enc, unsigned w,
                             j->slots + slot * j->stride,
                             (uint32_t)j->stride);
     if (wrc <= 0 || (size_t)wrc > j->stride) {
-        return wrc < 0 ? wrc : PSE_BAD_HEADER;
+        return wrc < 0 ? wrc : ZPSE_BAD_HEADER;
     }
     j->lens[ctl] = (uint32_t)wrc;
     ZPSE_MT_FLAG_SET(&j->ready[ctl], ZPSE_MT_SLOT_READY);
@@ -406,7 +406,7 @@ static void zpse_mt_stream_worker(ZpseMtStream *j, void *arena, unsigned w)
     int rc;
 
     rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         zpse_mt_stream_fail(j, rc);
         return;
     }
@@ -449,7 +449,7 @@ static void *zpse_mt_stream_entry(void *p)
 }
 #endif
 
-/* Returns PSE_OK, a negative status, or 1 when no worker thread could be
+/* Returns ZPSE_OK, a negative status, or 1 when no worker thread could be
  * started (nothing encoded, the caller runs it serially). */
 static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
                               uint32_t block, uint32_t enc_flags,
@@ -469,7 +469,7 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
     unsigned started = 0u;
     unsigned w;
     size_t i = 0u;
-    int rc = PSE_OK;
+    int rc = ZPSE_OK;
 
     job.in = in;
     job.n = in_len;
@@ -543,7 +543,7 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
         int erc = zpse_encoder_init(&enc, arenas[0],
                                     (size_t)ZPSE_ENC_ARENA_SIZE);
 
-        if (erc != PSE_OK) {
+        if (erc != ZPSE_OK) {
             zpse_mt_stream_fail(&job, erc);
             rc = erc;
             goto join;
@@ -578,7 +578,7 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
                 break;
             }
             if (job.failed != 0) {
-                rc = job.failed < 0 ? job.failed : PSE_BAD_HEADER;
+                rc = job.failed < 0 ? job.failed : ZPSE_BAD_HEADER;
                 goto join;
             }
             /* Nothing to emit yet: encode the next block this thread owns,
@@ -601,7 +601,7 @@ static int zpse_mt_stream_run(const uint8_t *in, size_t in_len,
         }
     }
 join:
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         zpse_mt_stream_fail(&job, rc);
     }
     /* The spawned threads are 1..started: the calling thread is worker 0 and
@@ -614,7 +614,7 @@ join:
         pthread_join(handles[w], NULL);
 #endif
     }
-    if (rc == PSE_OK && job.failed != 0) {
+    if (rc == ZPSE_OK && job.failed != 0) {
         rc = job.failed;
     }
     return rc;
@@ -636,7 +636,7 @@ static int zpse_mt_stream_serial(const uint8_t *in, size_t in_len,
     int rc;
 
     rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     enc.enc_flags = enc_flags;
@@ -653,14 +653,14 @@ static int zpse_mt_stream_serial(const uint8_t *in, size_t in_len,
                                 (final_slab && (i + 1u) == nblocks) ? 1 : 0,
                                 slot, (uint32_t)stride);
         if (wrc <= 0 || (size_t)wrc > stride) {
-            return wrc < 0 ? wrc : PSE_BAD_HEADER;
+            return wrc < 0 ? wrc : ZPSE_BAD_HEADER;
         }
         rc = emit(emit_ctx, first_block + (uint32_t)i, slot, (size_t)wrc);
         if (rc != 0) {
             return rc;
         }
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
@@ -678,21 +678,21 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
 
     if (in == 0 || in_len == 0u || emit == 0 || enc_arenas == 0 ||
         slot_mem == 0 || ready == 0 || lens == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nominal_block_size < ZPSE_MIN_BLOCK_SIZE ||
         nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     nblocks = in_len / (size_t)nominal_block_size +
               ((in_len % (size_t)nominal_block_size) != 0u ? 1u : 0u);
     if (nblocks > (size_t)UINT32_MAX ||
         (uint64_t)first_block + (uint64_t)nblocks > (uint64_t)UINT32_MAX) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     stride = (size_t)nominal_block_size + ZPSE_MT_SLOT_OVERHEAD;
     if (slot_cap < stride) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     workers = threads;
     if (arena_count < workers) {
@@ -769,7 +769,7 @@ typedef struct ZpseMtDecArg {
 static void zpse_mt_dec_fail(ZpseMtDecJob *j, int rc)
 {
     if (j->failed == 0) {
-        j->failed = (rc < 0) ? rc : PSE_BAD_HEADER;
+        j->failed = (rc < 0) ? rc : ZPSE_BAD_HEADER;
     }
 }
 
@@ -779,7 +779,7 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena)
     int rc;
 
     rc = zpse_decoder_init(&d, arena, (size_t)ZPSE_DEC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         zpse_mt_dec_fail(j, rc);
         return;
     }
@@ -798,7 +798,7 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena)
         }
         off = i * j->nominal;
         if (off > j->out_cap) {
-            zpse_mt_dec_fail(j, PSE_OUTPUT_OVERFLOW);
+            zpse_mt_dec_fail(j, ZPSE_OUTPUT_OVERFLOW);
             return;
         }
         /* Decoded straight into its final place: the seek writes the block's
@@ -810,16 +810,16 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena)
         }
         rc = zpse_frame_seek(&d, j->in, j->in_len, (uint32_t)i, j->out + off,
                              (uint32_t)room, &got);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             zpse_mt_dec_fail(j, rc);
             return;
         }
         if (i + 1u < j->nblocks && (size_t)got != j->nominal) {
-            zpse_mt_dec_fail(j, PSE_BAD_HEADER);
+            zpse_mt_dec_fail(j, ZPSE_BAD_HEADER);
             return;
         }
         if ((size_t)got > j->out_cap - off) {
-            zpse_mt_dec_fail(j, PSE_OUTPUT_OVERFLOW);
+            zpse_mt_dec_fail(j, ZPSE_OUTPUT_OVERFLOW);
             return;
         }
     }
@@ -895,7 +895,7 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len, uint8_t *out,
     if (job.failed != 0) {
         return job.failed;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 static int zpse_mt_run(const uint8_t *in, size_t n, uint8_t *out,
@@ -969,11 +969,11 @@ static int zpse_mt_dec_serial(const uint8_t *in, size_t in_len,
     int rc;
 
     rc = zpse_decoder_init(&d, arena, (size_t)ZPSE_DEC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_frame_decode(&d, in, in_len, output, out_cap, out_len_out);
-    return rc < 0 ? rc : PSE_OK;
+    return rc < 0 ? rc : ZPSE_OK;
 }
 
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
@@ -989,24 +989,24 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arenas == 0 ||
         dec_arenas[0] == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (arena_count == 0u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     *out_len_out = 0;
     rc = zpse_frame_header_read(&fh, in);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     /* The index is the whole reason a block can be found: a header carries
      * its size, not its offset. No index (or a bad one) means the serial
      * decoder, which is not slower, only single-threaded. */
     rc = zpse_frame_index_count(in, in_len, &count);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     nominal = (size_t)fh.nominal_block_size;
@@ -1037,16 +1037,16 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
             size_t total;
 
             if (out_cap < last_off) {
-                return PSE_OUTPUT_OVERFLOW;
+                return ZPSE_OUTPUT_OVERFLOW;
             }
             if ((fh.frame_flags & ZPSE_F_CONTENT_SIZE) != 0u &&
                 fh.content_size != UINT64_MAX &&
                 fh.content_size > (uint64_t)out_cap) {
-                return PSE_OUTPUT_OVERFLOW;
+                return ZPSE_OUTPUT_OVERFLOW;
             }
             rc = zpse_mt_dec_run(in, in_len, output, out_cap, (size_t)count,
                                  nominal, 0u, t, dec_arenas);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 return rc;
             }
             if ((fh.frame_flags & ZPSE_F_CONTENT_SIZE) != 0u &&
@@ -1062,7 +1062,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
 
                 rc = zpse_decoder_init(&d, dec_arenas[0],
                                        (size_t)ZPSE_DEC_ARENA_SIZE);
-                if (rc != PSE_OK) {
+                if (rc != ZPSE_OK) {
                     return rc;
                 }
                 rc = zpse_frame_seek(&d, in, in_len, count - 1u,
@@ -1071,13 +1071,13 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                          ? UINT32_MAX
                                          : (uint32_t)room,
                                      &got);
-                if (rc != PSE_OK) {
+                if (rc != ZPSE_OK) {
                     return rc;
                 }
                 total = last_off + (size_t)got;
             }
             *out_len_out = total;
-            return PSE_OK;
+            return ZPSE_OK;
         }
     }
 #else
@@ -1102,23 +1102,23 @@ int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
 
     if (in == 0 || out == 0 || out_len_out == 0 || enc_arenas == 0 ||
         enc_arenas[0] == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nominal_block_size == 0 ||
         nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (arena_count == 0u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     *out_len_out = 0;
     nblocks = n / (size_t)nominal_block_size +
               ((n % (size_t)nominal_block_size) != 0u ? 1u : 0u);
     if (nblocks == 0u || nblocks > (size_t)UINT32_MAX) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
 #if defined(ZPSE_MT)
     if (threads > 1u && nblocks > 1u &&

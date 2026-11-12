@@ -111,7 +111,7 @@ static void roundtrip_cases(void)
             CHECK(pl <= sizeof payload, "shape %d size %u: payload %u", kind,
                   n, pl);
             memset(out, 0xA5, sizeof out);
-            CHECK(zpse_lz_decode(payload, pl, out, n) == PSE_OK,
+            CHECK(zpse_lz_decode(payload, pl, out, n) == ZPSE_OK,
                   "shape %d size %u: decode refused", kind, n);
             CHECK(memcmp(out, plain, n) == 0,
                   "shape %d size %u: bytes differ", kind, n);
@@ -182,48 +182,48 @@ static void hostile_cases(void)
     cmds[1] = cmd(4u, 0u, 8u);
     pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 2u);
     memset(out, 0, 16u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_OK, "hand-built stream");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_OK, "hand-built stream");
     CHECK(memcmp(out, "\1\2\3\4\1\2\3\4\1\2\3\4", 12u) == 0,
           "hand-built bytes");
 
     /* Offset past the bytes written so far. */
     cmds[0] = cmd(5u, 4u, 8u);
     pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_BAD_LZ, "offset past start");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "offset past start");
 
     /* A match that would write past the output. */
     cmds[0] = cmd(0u, 4u, 9u);
     pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_BAD_LZ, "match overruns");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "match overruns");
 
     /* Trailing literals the tokens never emit. */
     cmds[0] = cmd(0u, 4u, 4u);
     pl = build_payload(buf, sizeof buf, 8u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_BAD_LZ, "literals unused");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "literals unused");
 
     /* A command after the output is already full. */
     cmds[0] = cmd(0u, 4u, 8u);
     cmds[1] = cmd(0u, 0u, 0u);
     pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 2u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_BAD_LZ, "commands unused");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "commands unused");
 
     /* Zero progress: a literal-only command with no literals. */
     cmds[0] = cmd(0u, 0u, 0u);
     pl = build_payload(buf, sizeof buf, 0u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_BAD_LZ, "no progress");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "no progress");
 
     /* Literal count past the payload. */
     cmds[0] = cmd(0u, 4u, 0u);
     pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
     zpse_store_u32le(buf, 8u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == PSE_BAD_LZ, "literal count");
+    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "literal count");
 
     /* Not a whole number of command words, and nothing at all. */
     pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl - 1u, out, 12u) == PSE_BAD_LZ,
+    CHECK(zpse_lz_decode(buf, pl - 1u, out, 12u) == ZPSE_BAD_LZ,
           "partial command word");
-    CHECK(zpse_lz_decode(buf, 4u, out, 12u) == PSE_TRUNCATED, "no commands");
-    CHECK(zpse_lz_decode(buf, pl, out, 0u) == PSE_BAD_BLOCK_SIZE,
+    CHECK(zpse_lz_decode(buf, 4u, out, 12u) == ZPSE_TRUNCATED, "no commands");
+    CHECK(zpse_lz_decode(buf, pl, out, 0u) == ZPSE_BAD_BLOCK_SIZE,
           "no output");
 
     /* Every truncation of a real payload, and every byte corrupted, has to
@@ -236,7 +236,7 @@ static void hostile_cases(void)
     CHECK(pl > 0u, "fuzz payload");
     for (n = 0; n < pl; n = (n < 64u ? n + 1u : n + 37u)) {
         int rc = zpse_lz_decode(payload, n, out, 65536);
-        CHECK(rc == PSE_OK ? n == pl : 1, "truncated %u accepted", n);
+        CHECK(rc == ZPSE_OK ? n == pl : 1, "truncated %u accepted", n);
     }
     for (n = 0; n < 4000u; n++) {
         uint32_t at = rnd() % pl;
@@ -271,18 +271,18 @@ static void block_cases(void)
         }
         CHECK(zpse_compress_block_ex(plain, 65536u, comp, sizeof comp, &bal,
                                      0u, 1, (uint32_t)ZPSE_ENC_SPEED_BALANCED,
-                                     ea) == PSE_OK,
+                                     ea) == ZPSE_OK,
               "shape %d: balanced encode", shapes[k]);
         rc = zpse_compress_block_ex(plain, 65536u, comp, sizeof comp, &deep,
                                     0u, 1, (uint32_t)ZPSE_ENC_SPEED_MAX, ea);
-        CHECK(rc == PSE_OK, "shape %d: deepest encode", shapes[k]);
-        if (rc != PSE_OK) {
+        CHECK(rc == ZPSE_OK, "shape %d: deepest encode", shapes[k]);
+        if (rc != ZPSE_OK) {
             continue;
         }
         CHECK(deep <= bal, "shape %d: deepest %u larger than balanced %u",
               shapes[k], deep, bal);
         CHECK(zpse_decompress_block(comp, deep, out, sizeof out, &got, da) ==
-                  PSE_OK,
+                  ZPSE_OK,
               "shape %d: deepest decode", shapes[k]);
         CHECK(got == 65536u && memcmp(out, plain, 65536u) == 0,
               "shape %d: deepest round-trip", shapes[k]);
@@ -297,10 +297,10 @@ static void block_cases(void)
         make_shape(5, 65536u);
         CHECK(zpse_compress_block_ex(plain, 65536u, comp, sizeof comp, &deep,
                                      0u, 1, (uint32_t)ZPSE_ENC_SPEED_MAX, ea) ==
-                  PSE_OK,
+                  ZPSE_OK,
               "dual-form source block");
         CHECK(zpse_block_header_parse(&h, comp, ZPSE_BLOCK_HEADER_SIZE) ==
-                  PSE_OK,
+                  ZPSE_OK,
               "dual-form header parse");
         /* Whatever form won, the header is the part under test: setting
          * both form flags describes a payload no decoder may accept. */
@@ -340,7 +340,7 @@ static void table_size_cases(void)
             CHECK(pl <= sizeof payload, "shape %d bits %u: payload %u", kind,
                   bits[bi], pl);
             memset(out, 0xA5, sizeof out);
-            CHECK(zpse_lz_decode(payload, pl, out, n) == PSE_OK,
+            CHECK(zpse_lz_decode(payload, pl, out, n) == ZPSE_OK,
                   "shape %d bits %u: decode refused", kind, bits[bi]);
             CHECK(memcmp(out, plain, n) == 0,
                   "shape %d bits %u: bytes differ", kind, bits[bi]);
@@ -381,7 +381,7 @@ static void no_match_cases(void)
     CHECK(pl > 0u, "no-match block: no payload");
     if (pl > 0u) {
         memset(out, 0xA5, sizeof out);
-        CHECK(zpse_lz_decode(payload, pl, out, 65536u) == PSE_OK,
+        CHECK(zpse_lz_decode(payload, pl, out, 65536u) == ZPSE_OK,
               "no-match block: decode refused");
         CHECK(memcmp(out, plain, 65536u) == 0,
               "no-match block: bytes differ");
@@ -405,10 +405,10 @@ static void no_match_cases(void)
                                      0u, 1,
                                      (uint32_t)ZPSE_ENC_LZ_FAST |
                                          (uint32_t)ZPSE_ENC_SPEED_FASTER,
-                                     ea) == PSE_OK,
+                                     ea) == ZPSE_OK,
               "LZ_FAST: the block did not compress");
         CHECK(cl < 65568u, "LZ_FAST: fell back to a verbatim copy (%u B)", cl);
-        CHECK(zpse_block_header_parse(&h, comp, cl) == PSE_OK,
+        CHECK(zpse_block_header_parse(&h, comp, cl) == ZPSE_OK,
               "LZ_FAST: the header does not parse");
         CHECK((h.block_flags & ZPSE_B_LZ2) != 0 && h.segment_count == 1u &&
                   h.transform_id == 0u,
@@ -416,7 +416,7 @@ static void no_match_cases(void)
               (unsigned)h.block_flags);
         CHECK(h.compressed_block_size == cl, "LZ_FAST: size in header");
         CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
-                  PSE_OK &&
+                  ZPSE_OK &&
               got == 65536u && memcmp(out, plain, 65536u) == 0,
               "LZ_FAST: round-trip");
     }
@@ -440,11 +440,11 @@ static void page_fast_cases(void)
     CHECK(zpse_compress_block_ex(plain, 4096u, comp, sizeof comp, &cl, 0u, 1,
                                  (uint32_t)ZPSE_ENC_PAGE_FAST |
                                      (uint32_t)ZPSE_ENC_SPEED_FASTEST,
-                                 ea) == PSE_OK,
+                                 ea) == ZPSE_OK,
           "PAGE_FAST: the page did not compress");
     CHECK(cl < 4096u + 64u, "PAGE_FAST: fell back to a verbatim copy (%u B)",
           cl);
-    CHECK(zpse_block_header_parse(&h, comp, cl) == PSE_OK,
+    CHECK(zpse_block_header_parse(&h, comp, cl) == ZPSE_OK,
           "PAGE_FAST: the header does not parse");
     CHECK((h.block_flags &
            (ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) == 0u &&
@@ -455,7 +455,7 @@ static void page_fast_cases(void)
           (unsigned)h.transform_id);
     CHECK(h.compressed_block_size == cl, "PAGE_FAST: size in header");
     CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
-                  PSE_OK &&
+                  ZPSE_OK &&
               got == 4096u && memcmp(out, plain, 4096u) == 0,
           "PAGE_FAST: round-trip");
 
@@ -473,9 +473,9 @@ static void page_fast_cases(void)
                                      &cl6, 0u, 1,
                                      (uint32_t)ZPSE_ENC_PAGE_FAST |
                                          (uint32_t)ZPSE_ENC_SPEED_MAX,
-                                     ea) == PSE_OK,
+                                     ea) == ZPSE_OK,
               "PAGE_FAST level 9: the page did not compress");
-        CHECK(zpse_block_header_parse(&h, payload, cl6) == PSE_OK,
+        CHECK(zpse_block_header_parse(&h, payload, cl6) == ZPSE_OK,
               "PAGE_FAST level 9: the header does not parse");
         CHECK((h.block_flags &
                (ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) == 0u &&
@@ -483,7 +483,7 @@ static void page_fast_cases(void)
               "PAGE_FAST level 9: not one shape (flags 0x%02x, %u segments)",
               (unsigned)h.block_flags, (unsigned)h.segment_count);
         CHECK(zpse_decompress_block(payload, cl6, out, sizeof out, &got6,
-                                    da) == PSE_OK &&
+                                    da) == ZPSE_OK &&
                   got6 == 4096u && memcmp(out, plain, 4096u) == 0,
               "PAGE_FAST level 9: round-trip");
     }
@@ -499,13 +499,13 @@ static void page_fast_cases(void)
         }
         CHECK(zpse_compress_block_ex(plain, 8192u, comp, sizeof comp, &a, 0u,
                                      1, (uint32_t)ZPSE_ENC_SPEED_FASTEST,
-                                     ea) == PSE_OK,
+                                     ea) == ZPSE_OK,
               "PAGE_FAST: the 8 KiB reference block did not compress");
         CHECK(zpse_compress_block_ex(plain, 8192u, payload, sizeof payload,
                                      &b, 0u, 1,
                                      (uint32_t)(ZPSE_ENC_PAGE_FAST |
                                                 ZPSE_ENC_SPEED_FASTEST),
-                                     ea) == PSE_OK,
+                                     ea) == ZPSE_OK,
               "PAGE_FAST: the 8 KiB block did not compress");
         CHECK(a == b && memcmp(comp, payload, a) == 0,
               "PAGE_FAST changed a block above a page (%u vs %u bytes)", a, b);
@@ -543,7 +543,7 @@ static void lazy_window_cases(void)
                 continue;
             }
             memset(out, 0xA5, sizeof out);
-            CHECK(zpse_lz_decode(payload, pl, out, n) == PSE_OK,
+            CHECK(zpse_lz_decode(payload, pl, out, n) == ZPSE_OK,
                   "lazy shape %d size %u: decode refused", kind, n);
             CHECK(memcmp(out, plain, n) == 0,
                   "lazy shape %d size %u: bytes differ", kind, n);
@@ -603,7 +603,7 @@ static void lazy_window_cases(void)
                 continue;
             }
             memset(out, 0xA5, sizeof out);
-            CHECK(zpse_lz_decode(payload, pl, out, 16384u) == PSE_OK,
+            CHECK(zpse_lz_decode(payload, pl, out, 16384u) == ZPSE_OK,
                   "lazy soup seed %u: decode refused", seed);
             CHECK(memcmp(out, plain, 16384u) == 0,
                   "lazy soup seed %u: bytes differ", seed);
@@ -660,7 +660,7 @@ static void fixture_cases(void)
             return;
         }
         memset(out, 0xA5, sizeof out);
-        CHECK(zpse_lz_decode(payload, pl, out, 16384u) == PSE_OK,
+        CHECK(zpse_lz_decode(payload, pl, out, 16384u) == ZPSE_OK,
               "lazy fixture: decode refused");
         CHECK(memcmp(out, plain, 16384u) == 0, "lazy fixture: bytes differ");
     }
@@ -668,7 +668,7 @@ static void fixture_cases(void)
 
 int main(void)
 {
-    if (zpse_encoder_init(NULL, ea, sizeof ea) != PSE_BAD_ARG) {
+    if (zpse_encoder_init(NULL, ea, sizeof ea) != ZPSE_BAD_ARG) {
         printf("FAIL: encoder init accepted NULL\n");
         return 1;
     }

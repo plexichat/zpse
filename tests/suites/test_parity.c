@@ -558,7 +558,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
 
     rc = zpse_tile_classify(&L, tile_plane, 256u, pid, lit, 1, tile_plane,
                             0u, &clA);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         printf("FAIL chainclass a pid=%u rc=%d\n", (unsigned)pid, rc);
         fails++;
         return 1;
@@ -575,7 +575,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     /* The second tile, on the state the first left, WITHOUT a reset. */
     rc = zpse_tile_classify(&L, tile_plane + 256u, 256u, pid, lit, 0,
                             tile_plane, 256u, &clB);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         printf("FAIL chainclass b pid=%u rc=%d\n", (unsigned)pid, rc);
         fails++;
         return 1;

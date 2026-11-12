@@ -61,7 +61,7 @@ extern "C" {
  * encoder, which writes the same bytes in less room.
  *
  * `with_index` appends the FrameIndex, exactly as
- * zpse_compress_frame_indexed() does. Returns PSE_OK and sets
+ * zpse_compress_frame_indexed() does. Returns ZPSE_OK and sets
  * *out_len_out, or a negative status. */
 int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
                                  uint8_t *out, size_t out_cap,
@@ -124,7 +124,7 @@ typedef int (*ZpseBlockEmit)(void *ctx, uint32_t seq, const uint8_t *block,
  *
  * `threads` above is the ceiling: the worker count is the smallest of it, the
  * arena count and the number of slots in `slot_mem`, and a slab shorter than
- * four blocks per worker is encoded serially. Returns PSE_OK, or a negative
+ * four blocks per worker is encoded serially. Returns ZPSE_OK, or a negative
  * status. The stream is block for block the one zpse_compress_frame_parallel()
  * writes at the same thread count, and that call's stream at one worker is the
  * serial one, so a caller may switch between the three without changing a
@@ -160,7 +160,7 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
  * It now tests the room in front of every store, and this path decodes in
  * place instead of through a per-worker staging block.
  *
- * Returns PSE_OK with *out_len_out, or a negative status. */
+ * Returns ZPSE_OK with *out_len_out, or a negative status. */
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    uint8_t *output, size_t out_cap,
                                    size_t *out_len_out, unsigned threads,

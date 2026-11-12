@@ -411,7 +411,7 @@ static int decode_stream(const char *in_path, const char *out_path,
             fprintf(stderr, "zpse_cli: frame ends mid-header\n");
             goto fail;
         }
-        if (zpse_block_header_parse(&bh, blk, hdr_sz) != PSE_OK ||
+        if (zpse_block_header_parse(&bh, blk, hdr_sz) != ZPSE_OK ||
             bh.compressed_block_size < hdr_sz ||
             bh.compressed_block_size > (uint32_t)sizeof blk ||
             bh.uncompressed_size < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
@@ -432,7 +432,7 @@ static int decode_stream(const char *in_path, const char *out_path,
             goto fail;
         }
         if (zpse_decompress_block(blk, comp_sz, out, (uint32_t)sizeof out,
-                                  &blk_out, dec_arena) != PSE_OK ||
+                                  &blk_out, dec_arena) != ZPSE_OK ||
             blk_out != bh.uncompressed_size) {
             fprintf(stderr, "zpse_cli: block %zu does not decode\n", nblocks);
             goto fail;
@@ -491,7 +491,7 @@ static int decode_stream(const char *in_path, const char *out_path,
         vrc = zpse_frame_index_validate(fh, idx, need, (uint32_t)nblocks,
                                         blk_off, blk_len);
         free(idx);
-        if (vrc != PSE_OK) {
+        if (vrc != ZPSE_OK) {
             fprintf(stderr, "zpse_cli: index disagrees with the frame\n");
             goto fail;
         }
@@ -560,12 +560,12 @@ static int stream_emit(void *ctx, uint32_t seq, const uint8_t *blk, size_t len)
     StreamSink *s = (StreamSink *)ctx;
 
     if (s->failed) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (len > 0u && fwrite(blk, 1u, len, s->f) != len) {
         fprintf(stderr, "zpse_cli: short write on %s\n", s->path);
         s->failed = 1;
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (s->off != NULL) {
         s->off[seq] = (uint32_t)s->pos;
@@ -634,8 +634,8 @@ static int encode_stream(const char *in_path, const char *out_path,
     nblocks = n / (size_t)block + ((n % (size_t)block) != 0u ? 1u : 0u);
     if (nblocks > (size_t)UINT32_MAX ||
         zpse_frame_header_build(&fh, block, (uint64_t)n, 1,
-                                (uint32_t)nblocks, 1, indexed) != PSE_OK ||
-        zpse_frame_header_write(&fh, hdr) != PSE_OK) {
+                                (uint32_t)nblocks, 1, indexed) != ZPSE_OK ||
+        zpse_frame_header_write(&fh, hdr) != ZPSE_OK) {
         fprintf(stderr, "zpse_cli: cannot build the frame header\n");
         fclose(fi);
         return 1;
@@ -737,7 +737,7 @@ static int encode_stream(const char *in_path, const char *out_path,
                                            threads, (uint32_t)done_blocks,
                                            final, arenas, threads, slot_mem,
                                            slot_cap, ready, lens, stream_emit,
-                                           &sink) != PSE_OK ||
+                                           &sink) != ZPSE_OK ||
                 sink.failed != 0) {
                 fprintf(stderr, "zpse_cli: blocks at %zu do not encode\n",
                         done_blocks);
@@ -764,7 +764,7 @@ static int encode_stream(const char *in_path, const char *out_path,
                                             nblocks,
                                     block, (uint64_t)n, (uint32_t)nblocks,
                                     (uint32_t)out_pos, blk_off, blk_len,
-                                    &idx_len) != PSE_OK) {
+                                    &idx_len) != ZPSE_OK) {
             fprintf(stderr, "zpse_cli: cannot build the frame index\n");
             free(idx);
             goto done;
@@ -938,7 +938,7 @@ static int cmd_codec(int argc, char **argv)
 
         if (pf != NULL) {
             if (fread(head, 1u, sizeof head, pf) == sizeof head &&
-                zpse_frame_header_read(&ph, head) == PSE_OK &&
+                zpse_frame_header_read(&ph, head) == ZPSE_OK &&
                 (ph.frame_flags & (uint16_t)ZPSE_F_CONTENT_SIZE) != 0u &&
                 ph.content_size != UINT64_MAX &&
                 ((ph.frame_flags & (uint16_t)ZPSE_F_FRAME_INDEX) == 0u ||
@@ -2358,7 +2358,7 @@ static int cmd_dir(int argc, char **argv)
         return 1;
     }
     rc = zpse_frame_index_count(in, in_len, &count);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         fprintf(stderr, "zpse_cli: %s carries no usable index (rc=%d); "
                         "encode it with -x\n", argv[2], rc);
         free(in);
@@ -2380,7 +2380,7 @@ static int cmd_dir(int argc, char **argv)
 
         rc = zpse_seek_frame(in, in_len, k, blk, (uint32_t)ZPSE_MAX_BLOCK_SIZE,
                              &got, dec_arena);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             fprintf(stderr, "zpse_cli: block %u does not seek (rc=%d)\n",
                     (unsigned)k, rc);
             ZPSE_CLI_FREE(dec_arena);
@@ -2434,7 +2434,7 @@ static int cmd_seek(int argc, char **argv)
     }
     rc = zpse_seek_frame(in, in_len, (uint32_t)idx, out,
                          (uint32_t)ZPSE_MAX_BLOCK_SIZE, &got, dec_arena);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         fprintf(stderr, "zpse_cli: seek of block %lu failed (rc=%d)\n", idx,
                 rc);
         ZPSE_CLI_FREE(dec_arena);

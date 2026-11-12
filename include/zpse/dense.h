@@ -53,7 +53,7 @@
  * v1 limits: planes of at most ZPSE_DENSE_MAX_LEN bytes and residual
  * modes 0..3 (mode 4 needs the predictions up front, which a dense
  * record only knows while reconstructing). Both limits are reported as
- * PSE_UNSUPPORTED_FEATURE; they are reserved space, not decoder bugs. */
+ * ZPSE_UNSUPPORTED_FEATURE; they are reserved space, not decoder bugs. */
 
 #include <stdint.h>
 
@@ -67,9 +67,9 @@
  * segment header; `payload`/`payload_len` are the segment payload
  * (header included). scratch must hold at least h->segment_decoded_size
  * bytes (the caller passes the 8 KiB combinadic region).
- * Returns PSE_OK, or the same class of status a tile record would:
- * PSE_BAD_TILE_SIZE, PSE_BAD_MASK, PSE_BAD_RESIDUAL,
- * PSE_UNSUPPORTED_FEATURE, PSE_OUTPUT_OVERFLOW.
+ * Returns ZPSE_OK, or the same class of status a tile record would:
+ * ZPSE_BAD_TILE_SIZE, ZPSE_BAD_MASK, ZPSE_BAD_RESIDUAL,
+ * ZPSE_UNSUPPORTED_FEATURE, ZPSE_OUTPUT_OVERFLOW.
  *
  * On success *all_const is 1 iff every record reconstructed one byte value
  * end to end and all of them agreed on it, which is what the dense constant

@@ -28,7 +28,7 @@ int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n);
  *
  * byte_budget bounds the payload this call may commit: 0 means no bound,
  * otherwise the encoder stops as soon as the bytes it has already
- * committed would exceed it and returns PSE_OUTPUT_OVERFLOW. The bound is
+ * committed would exceed it and returns ZPSE_OUTPUT_OVERFLOW. The bound is
  * tested before a tile is started and `pos` only ever grows, so no tile
  * is ever truncated and the bytes written are a prefix of the unbounded
  * output. It exists so a caller that already knows a larger total cannot

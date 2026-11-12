@@ -104,7 +104,7 @@ static int run_arm(const Arm *a, const unsigned char *in, size_t npages,
                 blen = len[s];
                 if (blen > BLK_CAP) { rc = -1; break; }
                 memcpy(blk, slab + off[s], blen);
-                if (zpse_block_retag(blk, blen, seq, is_last) != PSE_OK) {
+                if (zpse_block_retag(blk, blen, seq, is_last) != ZPSE_OK) {
                     rc = -1;
                     break;
                 }

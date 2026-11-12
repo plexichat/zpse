@@ -20,7 +20,7 @@
  * digest.
  *
  * Also checks the documented refusals: ORDER1/ORDER2 return
- * PSE_BAD_PREDICTOR, and a STRIDE fill without seg_base is PSE_BAD_ARG.
+ * ZPSE_BAD_PREDICTOR, and a STRIDE fill without seg_base is ZPSE_BAD_ARG.
  *
  * Exit 0 with "FILLPRED: ALL OK (n checks)"; exits 1 on any mismatch.
  */
@@ -167,7 +167,7 @@ int main(void)
                         b = a;
                         rc = zpse_tile_classify(&a, plane + off, nt, pid, lit,
                                                 1, plane, off, &ref_cl);
-                        if (rc != PSE_OK) {
+                        if (rc != ZPSE_OK) {
                             printf("FAIL %s: full classify rc=%d\n", what, rc);
                             fails++;
                             continue;
@@ -175,7 +175,7 @@ int main(void)
                         rc = zpse_tile_classify_lean(&b, plane + off, nt, pid,
                                                      lit, 1, plane, off,
                                                      &lean_cl);
-                        if (rc != PSE_OK) {
+                        if (rc != ZPSE_OK) {
                             printf("FAIL %s: lean classify rc=%d\n", what, rc);
                             fails++;
                             continue;
@@ -193,7 +193,7 @@ int main(void)
                         rc = zpse_tile_fill_at_pred_reset(pid, plane + off, nt,
                                                           plane, off, lit,
                                                           &lean_cl);
-                        if (rc != PSE_OK) {
+                        if (rc != ZPSE_OK) {
                             printf("FAIL %s: fill rc=%d\n", what, rc);
                             fails++;
                             continue;
@@ -216,18 +216,18 @@ int main(void)
     memset(&lean_cl, 0, sizeof lean_cl);
     if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_ORDER1, plane, 256u,
                                      plane, 16u, 0u, &lean_cl) !=
-        PSE_BAD_PREDICTOR) {
+        ZPSE_BAD_PREDICTOR) {
         printf("FAIL ORDER1 fill was not refused\n");
         fails++;
     }
     if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_ORDER2, plane, 256u,
                                      plane, 16u, 0u, &lean_cl) !=
-        PSE_BAD_PREDICTOR) {
+        ZPSE_BAD_PREDICTOR) {
         printf("FAIL ORDER2 fill was not refused\n");
         fails++;
     }
     if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_STRIDE_1, plane, 256u, 0,
-                                     16u, 0u, &lean_cl) != PSE_BAD_ARG) {
+                                     16u, 0u, &lean_cl) != ZPSE_BAD_ARG) {
         printf("FAIL STRIDE fill without seg_base was not refused\n");
         fails++;
     }

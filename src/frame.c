@@ -36,11 +36,11 @@ int zpse_frame_header_build(ZpseFrameHeader *h, uint32_t nominal_block_size,
     uint8_t tmp[32];
 
     if (h == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nominal_block_size < ZPSE_MIN_BLOCK_SIZE ||
         nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     h->magic = ZPSE_MAGIC;
     h->version_major = ZPSE_FRAME_MAJOR;
@@ -56,7 +56,7 @@ int zpse_frame_header_build(ZpseFrameHeader *h, uint32_t nominal_block_size,
     h->frame_index_offset = 0u;
     zpse_frame_pack28(tmp, h);
     h->header_crc32c = zpse_crc32c(tmp, 28u);
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* Re-seal the header after a field moved: the CRC covers the 28 bytes
@@ -72,11 +72,11 @@ static void zpse_frame_reseal(ZpseFrameHeader *h)
 int zpse_frame_header_write(const ZpseFrameHeader *h, uint8_t out[32])
 {
     if (h == 0 || out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     zpse_frame_pack28(out, h);
     zpse_store_u32le(out + 28, h->header_crc32c);
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_header_read(ZpseFrameHeader *h, const uint8_t in[32])
@@ -85,7 +85,7 @@ int zpse_frame_header_read(ZpseFrameHeader *h, const uint8_t in[32])
     uint32_t want;
 
     if (h == 0 || in == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     tmp.magic = zpse_load_u32le(in + 0);
     tmp.version_major = in[4];
@@ -97,36 +97,36 @@ int zpse_frame_header_read(ZpseFrameHeader *h, const uint8_t in[32])
     tmp.frame_index_offset = zpse_load_u32le(in + 24);
     tmp.header_crc32c = zpse_load_u32le(in + 28);
     if (tmp.magic != ZPSE_MAGIC) {
-        return PSE_BAD_MAGIC;
+        return ZPSE_BAD_MAGIC;
     }
     if (tmp.version_major != ZPSE_FRAME_MAJOR ||
         tmp.version_minor != ZPSE_FRAME_MINOR) {
-        return PSE_BAD_VERSION;
+        return ZPSE_BAD_VERSION;
     }
     if ((tmp.frame_flags & ZPSE_F_RESERVED_MASK) != 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (tmp.nominal_block_size < ZPSE_MIN_BLOCK_SIZE ||
         tmp.nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if ((tmp.frame_flags & ZPSE_F_FRAME_INDEX) != 0u) {
         if (tmp.frame_index_offset == 0u) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     } else {
         if (tmp.frame_index_offset != 0u) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
     /* content_size / block_count sentinel-vs-validity mismatch is advisory
      * only: no rejection here. */
     want = zpse_crc32c(in, 28u);
     if (want != tmp.header_crc32c) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
     *h = tmp;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
@@ -142,13 +142,13 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     int rc;
 
     if (d == 0 || in == 0 || output == 0 || out_len_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_frame_header_read(&fh, in);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     has_count = (fh.frame_flags & ZPSE_F_BLOCK_COUNT) != 0;
@@ -171,14 +171,14 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         int is_last;
 
         rc = zpse_block_probe(in + pos, avail, &comp_sz, &uncomp_sz);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if (comp_sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if ((size_t)comp_sz > rem) {
-            return PSE_TRUNCATED;
+            return ZPSE_TRUNCATED;
         }
         /* The flags byte sits at offset 3 in the long header and at 2 in a
          * page's 16-byte one, so the LAST flag is read through the parse
@@ -187,18 +187,18 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
             ZpseBlockHeader bh;
 
             rc = zpse_block_header_parse(&bh, in + pos, comp_sz);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 return rc;
             }
             is_last = (bh.block_flags & ZPSE_B_LAST) != 0;
         }
         if (uncomp_sz < ZPSE_MIN_BLOCK_SIZE ||
             uncomp_sz > ZPSE_MAX_BLOCK_SIZE) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         /* Invariant: out_pos <= out_cap, so the subtraction cannot wrap. */
         if ((uint64_t)uncomp_sz > (uint64_t)(out_cap - out_pos)) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         o_rem = out_cap - out_pos;
         o_cap = o_rem > (size_t)UINT32_MAX ? UINT32_MAX : (uint32_t)o_rem;
@@ -208,7 +208,7 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
             return rc;
         }
         if (blk_out != uncomp_sz) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         /* Payload CRC MUST be verified when the block flag
          * OR the frame flag tags it. The block layer covers its own flag;
@@ -216,13 +216,13 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         if ((fh.frame_flags & ZPSE_F_BLOCK_CRC) != 0u) {
             ZpseBlockHeader bh;
             rc = zpse_block_header_parse(&bh, in + pos, comp_sz);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 return rc;
             }
             if ((bh.block_flags & ZPSE_B_CRC) == 0u) {
                 uint32_t calc = zpse_crc32c(output + out_pos, blk_out);
                 if (calc != bh.decoded_crc32c) {
-                    return PSE_BAD_PAYLOAD_CRC;
+                    return ZPSE_BAD_PAYLOAD_CRC;
                 }
             }
         }
@@ -235,7 +235,7 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         }
         if (has_count &&
             (uint64_t)nblocks > (uint64_t)fh.block_count) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
 
@@ -243,17 +243,17 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         /* Tolerated only when input ends exactly on a block boundary and
          * the declared block count matches. */
         if (pos != in_len) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if (!has_count || (uint64_t)nblocks != (uint64_t)fh.block_count) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
     if (has_count && (uint64_t)nblocks != (uint64_t)fh.block_count) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (has_content && (uint64_t)out_pos != (uint64_t)fh.content_size) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     /* A frame that claims an index has to carry one that describes
      * exactly the blocks just decoded: a table that disagrees with the
@@ -263,16 +263,16 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         uint32_t count = 0u;
 
         rc = zpse_frame_index_check(in, in_len, &fh, 0, &count);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if ((uint64_t)count != (uint64_t)nblocks) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
     *out_len_out = out_pos;
     if (out_pos > (size_t)INT_MAX) {
-        return PSE_OK;
+        return ZPSE_OK;
     }
     return (int)out_pos;
 }
@@ -290,35 +290,35 @@ static int zpse_frame_index_check(const uint8_t *in, size_t in_len,
     size_t need;
 
     if ((fh->frame_flags & ZPSE_F_FRAME_INDEX) == 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     off = fh->frame_index_offset;
     if ((size_t)off < (size_t)ZPSE_FRAME_HEADER_SIZE || (size_t)off > in_len) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (in_len - (size_t)off < (size_t)ZPSE_INDEX_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     if (zpse_load_u32le(in + off) != ZPSE_INDEX_MAGIC) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     count = zpse_load_u32le(in + off + 4u);
     need = (size_t)ZPSE_INDEX_HEADER_SIZE +
            (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
     if (need > in_len - (size_t)off) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     crc = zpse_load_u32le(in + off + 8u);
     if (zpse_crc32c(in + off + (size_t)ZPSE_INDEX_HEADER_SIZE,
                     (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE) != crc) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
     if (zpse_load_u32le(in + off + 12u) != 0u) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if ((fh->frame_flags & ZPSE_F_BLOCK_COUNT) != 0u &&
         (uint64_t)count != (uint64_t)fh->block_count) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (entries_out != 0) {
         *entries_out = in + off + (size_t)ZPSE_INDEX_HEADER_SIZE;
@@ -326,7 +326,7 @@ static int zpse_frame_index_check(const uint8_t *in, size_t in_len,
     if (count_out != 0) {
         *count_out = count;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_index_count(const uint8_t *in, size_t in_len,
@@ -336,18 +336,18 @@ int zpse_frame_index_count(const uint8_t *in, size_t in_len,
     int rc;
 
     if (in == 0 || count_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_frame_header_read(&fh, in);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if ((fh.frame_flags & ZPSE_F_FRAME_INDEX) == 0u) {
         *count_out = 0u;
-        return PSE_OK;
+        return ZPSE_OK;
     }
     return zpse_frame_index_check(in, in_len, &fh, 0, count_out);
 }
@@ -360,38 +360,38 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
     uint32_t k;
 
     if (fh == 0 || idx == 0 || offsets == 0 || sizes == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if ((fh->frame_flags & ZPSE_F_FRAME_INDEX) == 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (count == 0u || idx_len < (size_t)ZPSE_INDEX_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     if (zpse_load_u32le(idx) != ZPSE_INDEX_MAGIC) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     need = (size_t)ZPSE_INDEX_HEADER_SIZE +
            (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
     if (idx_len < need) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     /* The count in the table and the reserved word both have to be the ones
      * the format writes, and the entries have to be the ones the CRC covers. */
     if (zpse_load_u32le(idx + 4u) != count) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (zpse_crc32c(idx + (size_t)ZPSE_INDEX_HEADER_SIZE,
                     (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE) !=
         zpse_load_u32le(idx + 8u)) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
     if (zpse_load_u32le(idx + 12u) != 0u) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if ((fh->frame_flags & ZPSE_F_BLOCK_COUNT) != 0u &&
         (uint64_t)count != (uint64_t)fh->block_count) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     for (k = 0; k < count; k++) {
         const uint8_t *ent = idx + (size_t)ZPSE_INDEX_HEADER_SIZE +
@@ -399,7 +399,7 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
 
         if (zpse_load_u32le(ent) != offsets[k] ||
             zpse_load_u32le(ent + 4u) != sizes[k]) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
     /* A table that names the right blocks but sits in the wrong place is
@@ -407,9 +407,9 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
      * exactly where the table starts. */
     if ((uint64_t)offsets[count - 1u] + (uint64_t)sizes[count - 1u] !=
         (uint64_t)fh->frame_index_offset) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
@@ -425,21 +425,21 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     int rc;
 
     if (d == 0 || in == 0 || output == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_frame_header_read(&fh, in);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_frame_index_check(in, in_len, &fh, &entries, &count);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (block_index >= count) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     off = zpse_load_u32le(entries + (size_t)block_index *
                                        (size_t)ZPSE_INDEX_ENTRY_SIZE);
@@ -448,13 +448,13 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     if ((size_t)off < (size_t)ZPSE_FRAME_HEADER_SIZE ||
         size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
         (uint64_t)off + (uint64_t)size > (uint64_t)in_len) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     {
         ZpseBlockHeader bh;
 
         rc = zpse_block_header_parse(&bh, in + off, size);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         /* The entry has to describe the block that is actually there,
@@ -462,10 +462,10 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
          * entries point at the wrong blocks is worse than no table. */
         if (bh.compressed_block_size != size ||
             bh.block_sequence_number != block_index) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if (out_cap < bh.uncompressed_size) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
     }
     rc = zpse_block_decode(d, in + off, size, output, out_cap, &got);
@@ -475,7 +475,7 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     if (out_len_out != 0) {
         *out_len_out = got;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
@@ -492,13 +492,13 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
     int rc;
 
     if (out == 0 || out_len_out == 0 || block_count == 0u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (pos < (size_t)ZPSE_FRAME_HEADER_SIZE || pos > (size_t)UINT32_MAX) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if (out_cap < pos || need > out_cap - pos) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     at = (uint32_t)pos;
     off = (uint32_t)ZPSE_FRAME_HEADER_SIZE;
@@ -508,25 +508,25 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
                        (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
 
         if ((size_t)off + (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT > pos) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         rc = zpse_block_header_parse(&bh, out + off,
                                      (uint32_t)(pos - (size_t)off));
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if (bh.compressed_block_size <
                 (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
             (size_t)off + (size_t)bh.compressed_block_size > pos ||
             bh.block_sequence_number != k) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         zpse_store_u32le(ent, off);
         zpse_store_u32le(ent + 4u, bh.compressed_block_size);
         off += bh.compressed_block_size;
     }
     if ((size_t)off != pos) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     crc = zpse_crc32c(out + at + (size_t)ZPSE_INDEX_HEADER_SIZE,
                       (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count);
@@ -538,17 +538,17 @@ int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
      * the table it describes begins. */
     rc = zpse_frame_header_build(&fh, nominal_block_size, content_size, 1,
                                  block_count, 1, 1);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     fh.frame_index_offset = at;
     zpse_frame_reseal(&fh);
     rc = zpse_frame_header_write(&fh, out);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     *out_len_out = pos + need;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
@@ -566,20 +566,20 @@ int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
 
     if (hdr_out == 0 || idx_out == 0 || offsets == 0 || sizes == 0 ||
         idx_len_out == 0 || block_count == 0u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (need > idx_cap) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     if ((size_t)index_offset < (size_t)ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     /* The blocks have to start right after the header and follow each other
      * with no gap, and the table has to start right after the last of them:
      * that is what the sequential reader assumes when it walks the stream, and
      * a table that says otherwise describes a different frame. */
     if (offsets[0] != (uint32_t)ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     for (k = 0; k < block_count; k++) {
         uint32_t off = offsets[k];
@@ -588,20 +588,20 @@ int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
                        (size_t)k * (size_t)ZPSE_INDEX_ENTRY_SIZE;
 
         if (sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-            return PSE_BAD_BLOCK_SIZE;
+            return ZPSE_BAD_BLOCK_SIZE;
         }
         if ((uint64_t)off + (uint64_t)sz > (uint64_t)index_offset) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if (k + 1u < block_count && offsets[k + 1u] != off + sz) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         zpse_store_u32le(ent, off);
         zpse_store_u32le(ent + 4u, sz);
     }
     if ((uint32_t)(offsets[block_count - 1u] + sizes[block_count - 1u]) !=
         index_offset) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     crc = zpse_crc32c(idx_out + (size_t)ZPSE_INDEX_HEADER_SIZE,
                       (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count);
@@ -611,17 +611,17 @@ int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
     zpse_store_u32le(idx_out + 12u, 0u);
     rc = zpse_frame_header_build(&fh, nominal_block_size, content_size, 1,
                                  block_count, 1, 1);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     fh.frame_index_offset = index_offset;
     zpse_frame_reseal(&fh);
     rc = zpse_frame_header_write(&fh, hdr_out);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     *idx_len_out = need;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_encode(ZpseEncoder *e, const uint8_t *in, size_t n,
@@ -644,34 +644,34 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
     int rc;
 
     if (e == 0 || out == 0 || out_len_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nominal_block_size < ZPSE_MIN_BLOCK_SIZE ||
         nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     *out_len_out = 0;
     nblocks = n / (size_t)nominal_block_size +
         ((n % (size_t)nominal_block_size) != 0u ? 1u : 0u);
     if (nblocks == 0 || nblocks > (size_t)UINT32_MAX) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (out_cap < ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     rc = zpse_frame_header_build(&fh, nominal_block_size, (uint64_t)n, 1,
                                  (uint32_t)nblocks, 1, with_index);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_frame_header_write(&fh, out);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     pos = ZPSE_FRAME_HEADER_SIZE;
@@ -683,7 +683,7 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
         int wrc;
 
         if (off >= n) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         chunk = n - off;
         if (chunk > (size_t)nominal_block_size) {
@@ -692,7 +692,7 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
         /* Invariant: pos <= out_cap, so the subtraction cannot wrap. */
         rem = out_cap - pos;
         if (rem < (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         cap = rem > (size_t)UINT32_MAX ? UINT32_MAX : (uint32_t)rem;
         wrc = zpse_block_encode(e, in + off, (uint32_t)chunk, (uint32_t)i,
@@ -702,10 +702,10 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
             return wrc;
         }
         if (wrc == 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         if ((size_t)wrc > rem) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         pos += (size_t)wrc;
     }
@@ -719,13 +719,13 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
     if (with_index) {
         rc = zpse_frame_write_index(out, pos, out_cap, nominal_block_size,
                                     (uint64_t)n, (uint32_t)nblocks, &pos);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
     *out_len_out = pos;
     if (pos > (size_t)INT_MAX) {
-        return PSE_OK;
+        return ZPSE_OK;
     }
     return (int)pos;
 }

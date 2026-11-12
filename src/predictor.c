@@ -115,13 +115,13 @@ int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
     uint16_t p;
 
     if (s == NULL || pred_out == NULL) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nt == 0u || nt > 256u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3) {
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     }
 
     switch (predictor_id) {
@@ -147,7 +147,7 @@ int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
 
     case ZPSE_P_ORDER1: /* 3 */
         if (s->order1 == NULL) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         for (p = 0; p < nt; p++) {
             size_t lane = (size_t)p & 7u;
@@ -157,7 +157,7 @@ int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
 
     case ZPSE_P_ORDER2: /* 4 */
         if (s->o2 == NULL) {
-            return PSE_BAD_ARG;
+            return ZPSE_BAD_ARG;
         }
         /* Predicting O2 prepares the table (memset + generation bump) so
          * the lane state must be mutable. The caller passes a non-const
@@ -186,7 +186,7 @@ int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
         {
             uint32_t stride = zpse_stride_of(predictor_id);
             if (seg_pos + (uint32_t)nt > stride && seg_base == NULL) {
-                return PSE_BAD_ARG;
+                return ZPSE_BAD_ARG;
             }
             for (p = 0; p < nt; p++) {
                 /* Segment-absolute addressing: the stream
@@ -220,7 +220,7 @@ int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
         break;
     }
 
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 ZPSE_HOT void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,

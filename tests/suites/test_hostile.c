@@ -85,14 +85,14 @@ int main(void) {
     /* Truncations. */
     memcpy(work, comp, clen);
     rc = zpse_decompress_block(work, 31, out, sizeof out, &olen, dec_arena);
-    CHECK(rc == PSE_TRUNCATED, "truncated header -> TRUNCATED");
+    CHECK(rc == ZPSE_TRUNCATED, "truncated header -> TRUNCATED");
     rc = zpse_decompress_block(work, clen - 1, out, sizeof out, &olen, dec_arena);
     CHECK(rc != 0, "truncated tail rejected");
 
     /* Header CRC corruption. */
     memcpy(work, comp, clen); work[10] ^= 0xFF;
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
-    CHECK(rc == PSE_BAD_HEADER_CRC, "bad header CRC rejected");
+    CHECK(rc == ZPSE_BAD_HEADER_CRC, "bad header CRC rejected");
 
     /* Payload corruption with intact header -> BAD_PAYLOAD_CRC, when the
      * stream asks for the checksum. Use incompressible input so the block
@@ -120,7 +120,7 @@ int main(void) {
         rc = zpse_decompress_block(big_comp, big_len, big_out,
                                    (uint32_t)sizeof big_out, &olen,
                                    dec_arena);
-        CHECK(rc == PSE_BAD_PAYLOAD_CRC, "bad payload CRC rejected");
+        CHECK(rc == ZPSE_BAD_PAYLOAD_CRC, "bad payload CRC rejected");
         /* The default stream carries no checksum, so the same flip is a
          * value change the format never promised to detect -- that is the
          * trade the default makes, and it is asserted here so a future
@@ -129,7 +129,7 @@ int main(void) {
         memcpy(work, comp, clen);
         work[100] ^= 0xFF;
         rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
-        CHECK(rc == PSE_OK && memcmp(out, input, sizeof input) != 0,
+        CHECK(rc == ZPSE_OK && memcmp(out, input, sizeof input) != 0,
               "default stream has no payload CRC (flip undetected)");
         for (i = 0; i < (int)sizeof input; i++) input[i] = (uint8_t)(i & 0xFF);
         refresh();
@@ -146,7 +146,7 @@ int main(void) {
               "and carries no CRC flag");
         rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen,
                                    dec_arena);
-        CHECK(rc == PSE_OK && olen == sizeof input &&
+        CHECK(rc == ZPSE_OK && olen == sizeof input &&
                   memcmp(out, input, sizeof input) == 0,
               "and the page still round-trips");
     }
@@ -170,16 +170,27 @@ int main(void) {
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc < 0, "LZ flag on a tile payload rejected");
 
+    /* The entropy-coded form (flag pattern 110) on a stream that is not one.
+     * Its envelope is the LZ forms' own, so a tile payload carrying the flag
+     * is refused by the transform check before the entropy decoder sees a
+     * byte of it -- and the decoder's own header is what has to agree with
+     * the payload length, not the other way round. */
+    memcpy(work, comp, clen);
+    work[hostile_short(work, clen) ? 2u : 3u] |= 0xC0;
+    hostile_fix_crc(work, clen);
+    rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
+    CHECK(rc < 0, "Huffman flag on a tile payload rejected");
+
     /* Bad transform_id with repaired CRC -> BAD_TRANSFORM. */
     memcpy(work, comp, clen);
     work[hostile_short(work, clen) ? 3u : 12u] = 12;
     hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
-    CHECK(rc == PSE_BAD_TRANSFORM, "transform 12 rejected");
+    CHECK(rc == ZPSE_BAD_TRANSFORM, "transform 12 rejected");
 
     /* Output too small -> OUTPUT_OVERFLOW. */
     rc = zpse_decompress_block(comp, clen, out, sizeof input - 1, &olen, dec_arena);
-    CHECK(rc == PSE_OUTPUT_OVERFLOW, "small output -> OVERFLOW");
+    CHECK(rc == ZPSE_OUTPUT_OVERFLOW, "small output -> OVERFLOW");
 
     /* Frame-level corruptions. */
     {
@@ -190,13 +201,13 @@ int main(void) {
         CHECK(rc == 0, "frame compress baseline");
         memcpy(work, fcomp, flen); work[0] ^= 0xFF;
         rc = zpse_decompress_frame(work, flen, fout, sizeof fout, &folen, dec_arena);
-        CHECK(rc == PSE_BAD_MAGIC, "frame bad magic");
+        CHECK(rc == ZPSE_BAD_MAGIC, "frame bad magic");
         memcpy(work, fcomp, flen); work[4] ^= 0xFF;
         rc = zpse_decompress_frame(work, flen, fout, sizeof fout, &folen, dec_arena);
-        CHECK(rc == PSE_BAD_VERSION, "frame bad version");
+        CHECK(rc == ZPSE_BAD_VERSION, "frame bad version");
         memcpy(work, fcomp, flen); work[30] ^= 0xFF;
         rc = zpse_decompress_frame(work, flen, fout, sizeof fout, &folen, dec_arena);
-        CHECK(rc == PSE_BAD_HEADER_CRC, "frame bad CRC");
+        CHECK(rc == ZPSE_BAD_HEADER_CRC, "frame bad CRC");
     }
 
     /* Unit-level residual hostility. */
@@ -204,18 +215,18 @@ int main(void) {
         uint8_t exc[4]; uint8_t bad1[1] = {255};
         uint8_t dummy_pred[1] = {0};
         rc = zpse_residual_decode(0, bad1, 1, 1, dummy_pred, exc, exc);
-        CHECK(rc == PSE_BAD_RESIDUAL, "residual 255 rejected (mode 0)");
+        CHECK(rc == ZPSE_BAD_RESIDUAL, "residual 255 rejected (mode 0)");
         /* Base-M tail: M=3 -> G=20; K=1 valid word=1, invalid word=4. */
         uint8_t good[5] = {3, 1, 0, 0, 0};
         uint8_t badw[5] = {3, 4, 0, 0, 0};
         rc = zpse_residual_decode(3, good, 5, 1, dummy_pred, exc, exc);
         CHECK(rc == 0 && exc[0] == 1, "base-M valid tail accepted");
         rc = zpse_residual_decode(3, badw, 5, 1, dummy_pred, exc, exc);
-        CHECK(rc == PSE_BAD_RESIDUAL, "base-M nonzero tail rejected");
+        CHECK(rc == ZPSE_BAD_RESIDUAL, "base-M nonzero tail rejected");
         /* Signed delta zero unit. */
         uint8_t z4[2] = {0, 0x00};
         rc = zpse_residual_decode(4, z4, 2, 1, dummy_pred, exc, exc);
-        CHECK(rc == PSE_BAD_RESIDUAL, "delta d=0 rejected");
+        CHECK(rc == ZPSE_BAD_RESIDUAL, "delta d=0 rejected");
         /* Palette index out of range: M=3 needs 2-bit indices, so the
          * value 3 is illegal. K=4 packs 4 indices into 1 byte; 0xFF makes
          * every index 3 -> rejected. (Power-of-two M cannot trigger OOR
@@ -223,7 +234,7 @@ int main(void) {
         uint8_t pal[5] = {3, 10, 20, 30, 0xFF};
         uint8_t pexc[8];
         rc = zpse_residual_decode(2, pal, 5, 4, dummy_pred, pexc, pexc);
-        CHECK(rc == PSE_BAD_RESIDUAL, "palette OOR index rejected");
+        CHECK(rc == ZPSE_BAD_RESIDUAL, "palette OOR index rejected");
     }
 
     /* Unit-level mask hostility: nonzero pad bits (Nt=9 -> 2 bytes). */
@@ -231,7 +242,7 @@ int main(void) {
         uint32_t w[8] = {0,0,0,0,0,0,0,0};
         uint8_t badmap[2] = {0x01, 0xFE}; /* bit0 set (K=1) + pad garbage */
         rc = zpse_mask_decode(1, badmap, 2, 9, 1, w, NULL);
-        CHECK(rc == PSE_BAD_MASK, "bitmap pad bits rejected");
+        CHECK(rc == ZPSE_BAD_MASK, "bitmap pad bits rejected");
     }
 
     /* Random garbage must error, never crash. */

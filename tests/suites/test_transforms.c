@@ -76,7 +76,7 @@ int main(void)
             int xorr = is_xor(id);
 
             for (c = 1; c <= 16u; c <<= 1) {
-                if (zpse_transform_width((uint8_t)id, (uint8_t)c, &w) == PSE_OK) {
+                if (zpse_transform_width((uint8_t)id, (uint8_t)c, &w) == ZPSE_OK) {
                     sc = (uint8_t)c;
                     break;
                 }
@@ -114,7 +114,7 @@ int main(void)
             {
                 uint32_t other[16];
 
-                if (zpse_segment_lengths(n, w, other) != PSE_OK) {
+                if (zpse_segment_lengths(n, w, other) != ZPSE_OK) {
                     printf("FAIL id=%u n=%u: segment_lengths\n", id, n);
                     fails++;
                     continue;
@@ -142,7 +142,7 @@ int main(void)
                 }
             }
 
-            if (zpse_transform_forward(&m, w, in, n, segs, lens) != PSE_OK) {
+            if (zpse_transform_forward(&m, w, in, n, segs, lens) != ZPSE_OK) {
                 printf("FAIL id=%u n=%u: forward rc\n", id, n);
                 fails++;
                 continue;
@@ -160,7 +160,7 @@ int main(void)
             for (s = 0; s < (unsigned)w; s++) {
                 csegs[s] = planes[s];
             }
-            if (zpse_transform_inverse(&m, w, csegs, lens, out, n) != PSE_OK) {
+            if (zpse_transform_inverse(&m, w, csegs, lens, out, n) != ZPSE_OK) {
                 printf("FAIL id=%u n=%u: inverse rc\n", id, n);
                 fails++;
                 continue;

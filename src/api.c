@@ -29,7 +29,7 @@ static int enc_flags_ok(uint32_t enc_flags)
     if ((enc_flags &
          ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK |
                      ZPSE_ENC_LZ_FAST | ZPSE_ENC_PAGE_FAST |
-                     ZPSE_ENC_LZ_HEX)) != 0u) {
+                     ZPSE_ENC_LZ_HEX | ZPSE_ENC_HUF)) != 0u) {
         return 0;
     }
     lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
@@ -58,16 +58,16 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
     int rc;
 
     if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0 || n > 65536u) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (!enc_flags_ok(enc_flags)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     enc.enc_flags = enc_flags;
@@ -76,7 +76,7 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
         return rc;
     }
     *out_len_out = (uint32_t)rc;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
@@ -88,22 +88,22 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
     int rc;
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     /* A page's block is 16 bytes of header, so this floor is the short one:
      * the header itself is what says which form it is. */
     if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_block_decode(&dec, in, in_len, output, out_cap, out_len_out);
     if (rc < 0) {
         return rc;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_compress_frame(const uint8_t *in, size_t n,
@@ -127,19 +127,19 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     int rc;
 
     if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nominal_block_size == 0 || nominal_block_size > 65536u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (!enc_flags_ok(enc_flags)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     enc.enc_flags = enc_flags;
@@ -148,7 +148,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     if (rc < 0) {
         return rc;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
@@ -162,19 +162,19 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
     int rc;
 
     if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nominal_block_size == 0 || nominal_block_size > 65536u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (!enc_flags_ok(enc_flags)) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     enc.enc_flags = enc_flags;
@@ -183,7 +183,7 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
     if (rc < 0) {
         return rc;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
@@ -194,13 +194,13 @@ int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
     int rc;
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < 32u) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     return zpse_frame_seek(&dec, in, in_len, block_index, output, out_cap,
@@ -216,21 +216,21 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
     int rc;
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (in_len < 32u) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     rc = zpse_frame_decode(&dec, in, in_len, output, out_cap, out_len_out);
     if (rc < 0) {
         return rc;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }

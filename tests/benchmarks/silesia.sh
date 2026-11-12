@@ -105,6 +105,18 @@ command -v taskset >/dev/null 2>&1 && pin="taskset -c 0"
 lvl_flag=""
 [ -n "$level" ] && lvl_flag="-l $level"
 
+# Read the corpus into RAM before anything is timed. The 202 MiB lives on
+# disk, and on a SATA SSD a cold read is several tenths of a second -- the
+# size of a whole encode pass -- so a run that started cold would be timing
+# the drive. Every file is read twice: the first pass faults it in, the
+# second proves it is resident. `zpse_cli bench` reads each file once and
+# then re-runs the codec on its own copy, so this is the only disk in the
+# run.
+for f in $files; do
+    cat "$f" > /dev/null
+    cat "$f" > /dev/null
+done
+
 echo "silesia: $nfiles files, $bytes bytes, level ${level:-default}, ${reps} rep(s)" >&2
 out=$($pin "$bin" bench $lvl_flag -r "$reps" $files 2>&1)
 rc=$?

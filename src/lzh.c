@@ -526,7 +526,7 @@ static int lzh_bad(int line)
 #else
     (void)line;
 #endif
-    return PSE_BAD_LZ;
+    return ZPSE_BAD_LZ;
 }
 
 /* One chained escape: every 0xFF adds 255 and the first byte below it ends
@@ -556,13 +556,13 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     uint32_t tok = 0u;
 
     if (in == 0 || out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0u) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (in_len < ZPSE_LZH_MIN_PAYLOAD) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     lit_total = zpse_load_u32le(in);
     cmd_count = zpse_load_u32le(in + 4u);
@@ -772,5 +772,5 @@ int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     if (i != cmd_count || op != n || lit_seen != lit_total || pos != in_len) {
         return lzh_bad(__LINE__);
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }

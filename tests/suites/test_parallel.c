@@ -137,9 +137,9 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
         rc = zpse_compress_frame_ex(in, n, ref, sizeof ref, &rlen, block,
                                     enc_flags, arenas[0]);
     }
-    CHECK(rc == PSE_OK, "serial encode (n %u, block %u, flags %u): %s",
+    CHECK(rc == ZPSE_OK, "serial encode (n %u, block %u, flags %u): %s",
           n, block, enc_flags, zpse_status_name(rc));
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return;
     }
 
@@ -148,7 +148,7 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     rc = zpse_compress_frame_parallel(in, n, plain, sizeof plain, &qlen, block,
                                       enc_flags, indexed, 1u,
                                       (void *const *)arenas, 1u);
-    CHECK(rc == PSE_OK, "one-worker encode (n %u, block %u)", n, block);
+    CHECK(rc == ZPSE_OK, "one-worker encode (n %u, block %u)", n, block);
     CHECK(qlen == rlen && memcmp(plain, ref, rlen) == 0,
           "one worker wrote a different frame (n %u, block %u, flags %u, "
           "index %d): %lu vs %lu bytes",
@@ -158,9 +158,9 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     rc = zpse_compress_frame_parallel(in, n, par, sizeof par, &plen, block,
                                       enc_flags, indexed, threads,
                                       (void *const *)arenas, MAXTHREADS);
-    CHECK(rc == PSE_OK, "%u workers encode (n %u, block %u): %s", threads,
+    CHECK(rc == ZPSE_OK, "%u workers encode (n %u, block %u): %s", threads,
           n, block, zpse_status_name(rc));
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return;
     }
     CHECK(plen == rlen, "%u workers wrote %lu bytes, serial %lu (n %u, "
@@ -173,8 +173,8 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
 
     /* What the frame is for: it has to decode to the input, in one pass. */
     rc = zpse_decompress_frame(par, plen, out, sizeof out, &got, da);
-    CHECK(rc == PSE_OK, "%u workers: decode (n %u)", threads, n);
-    CHECK(rc == PSE_OK && got == n && memcmp(out, in, n) == 0,
+    CHECK(rc == ZPSE_OK, "%u workers: decode (n %u)", threads, n);
+    CHECK(rc == ZPSE_OK && got == n && memcmp(out, in, n) == 0,
           "%u workers: decoded bytes (n %u, block %u, flags %u)", threads, n,
           block, enc_flags);
 
@@ -186,9 +186,9 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     rc = zpse_decompress_frame_parallel(par, plen, out, sizeof out, &pgot,
                                         threads, (void *const *)decs,
                                         MAXTHREADS);
-    CHECK(rc == PSE_OK, "%u workers: parallel decode (n %u, index %d): %s",
+    CHECK(rc == ZPSE_OK, "%u workers: parallel decode (n %u, index %d): %s",
           threads, n, indexed, zpse_status_name(rc));
-    CHECK(rc == PSE_OK && pgot == n && memcmp(out, in, n) == 0,
+    CHECK(rc == ZPSE_OK && pgot == n && memcmp(out, in, n) == 0,
           "%u workers: parallel decoded bytes (n %u, block %u, index %d)",
           threads, n, block, indexed);
 
@@ -199,12 +199,12 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
         uint32_t sgot = 0u;
         uint32_t off;
 
-        CHECK(zpse_frame_index_count(par, plen, &count) == PSE_OK,
+        CHECK(zpse_frame_index_count(par, plen, &count) == ZPSE_OK,
               "%u workers: index reads", threads);
         CHECK(count == nblocks, "%u workers: %u entries of %u blocks",
               threads, count, nblocks);
         CHECK(zpse_seek_frame(par, plen, 0u, blk, sizeof blk, &want, da) ==
-                  PSE_OK && want == block && memcmp(blk, in, block) == 0,
+                  ZPSE_OK && want == block && memcmp(blk, in, block) == 0,
               "%u workers: seek of block 0 (n %u, block %u)", threads, n,
               block);
         off = last * block;
@@ -213,7 +213,7 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
             want = block;
         }
         CHECK(zpse_seek_frame(par, plen, last, blk, sizeof blk, &sgot, da) ==
-                  PSE_OK && sgot == want && memcmp(blk, in + off, want) == 0,
+                  ZPSE_OK && sgot == want && memcmp(blk, in + off, want) == 0,
               "%u workers: seek of block %u (n %u, block %u)", threads, last,
               n, block);
     }
@@ -253,7 +253,7 @@ static int stream_emit(void *ctx, uint32_t seq, const uint8_t *bytes,
 
     if (seq != s->next || s->len + len > sizeof strm) {
         s->bad = 1;
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     memcpy(strm + s->len, bytes, len);
     s->len += len;
@@ -280,8 +280,8 @@ static void run_stream_case(uint32_t n, uint32_t block, unsigned max_threads,
         rc = zpse_compress_frame_ex(in, n, ref, sizeof ref, &rlen, block,
                                     enc_flags, arenas[0]);
     }
-    CHECK(rc == PSE_OK, "stream: serial reference (n %u, block %u)", n, block);
-    if (rc != PSE_OK) {
+    CHECK(rc == ZPSE_OK, "stream: serial reference (n %u, block %u)", n, block);
+    if (rc != ZPSE_OK) {
         return;
     }
     /* The stream carries blocks and nothing else: no frame header and, when
@@ -301,7 +301,7 @@ static void run_stream_case(uint32_t n, uint32_t block, unsigned max_threads,
                                         (void *const *)arenas, MAXTHREADS,
                                         slotmem, slot_cap, ready, lens,
                                         stream_emit, &sink);
-        CHECK(rc == PSE_OK,
+        CHECK(rc == ZPSE_OK,
               "stream encode (%u workers, depth %u, n %u): %s", t, depth,
               n, zpse_status_name(rc));
         CHECK(sink.bad == 0,
@@ -362,7 +362,7 @@ int main(void)
         rc = zpse_compress_frame_parallel(in, 4096u * 3u, par, sizeof par,
                                           &plen, 4096u, 0u, 0, MAXTHREADS,
                                           (void *const *)arenas, 2u);
-        CHECK(rc == PSE_OK, "fewer arenas than threads is accepted");
+        CHECK(rc == ZPSE_OK, "fewer arenas than threads is accepted");
         digest_bytes(par, plen);
     }
 

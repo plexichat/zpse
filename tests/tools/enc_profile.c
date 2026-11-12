@@ -154,8 +154,8 @@ static double time_forward(uint8_t tid, uint8_t sc, int reps)
     double best = 1e18;
     int r;
 
-    if (zpse_transform_width(tid, sc, &w) != PSE_OK) return 0.0;
-    if (zpse_segment_lengths(65536, w, lens) != PSE_OK) return 0.0;
+    if (zpse_transform_width(tid, sc, &w) != ZPSE_OK) return 0.0;
+    if (zpse_segment_lengths(65536, w, lens) != ZPSE_OK) return 0.0;
     meta.transform_id = tid;
     meta.width_W = w;
     meta.stride_flags = 0;
@@ -164,7 +164,7 @@ static double time_forward(uint8_t tid, uint8_t sc, int reps)
     for (r = 0; r < (int)w; r++) segs[r] = plane + (size_t)r * lens[0];
     for (r = 0; r < reps; r++) {
         double t0 = now_ns(), t1;
-        if (zpse_transform_forward(&meta, w, in, 65536, segs, lens) != PSE_OK)
+        if (zpse_transform_forward(&meta, w, in, 65536, segs, lens) != ZPSE_OK)
             return 0.0;
         t1 = now_ns();
         if (t1 - t0 < best) best = t1 - t0;

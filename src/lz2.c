@@ -23,6 +23,22 @@
  * to the exact sum only at the cap boundary. */
 #define LZ2_CMD_ROOM 260u
 
+/* Output room the decode loop's fast region needs before it takes a command.
+ *
+ * The region's stores are wider than the run and the match they produce, so
+ * the reserve has to cover the widest reach of any of them, counted from the
+ * command's own start: the literal store touches the first 16 bytes, and the
+ * match store then begins at op + lit (up to 14 bytes on) and touches 24
+ * (two eight-byte steps, plus a third when the match is 17 or 18). So 14 + 24
+ * = 38. Reserving 24 -- the match reach alone, measured from the token rather
+ * than from where the copy starts -- let a command with a literal run and a
+ * long match write up to 14 bytes PAST the block: two bytes of the next
+ * block, in a frame whose workers decode into adjacent slots. It went unseen
+ * because an in-order decode writes those bytes again afterwards, so only a
+ * frame decoded out of order showed it (block 84, 98 and 127 of a 16 MiB
+ * columnar frame wrote two bytes past their 64 KiB). */
+#define ZPSE_LZ2_FAST_ROOM 38u
+
 /* How fast the finder gallops once a run of positions has found nothing: the
  * step is 1 + (misses >> LZ2_SKIP_BITS). A parameter so the trade can be
  * measured -- a smaller shift finds more matches (better ratio) and costs
@@ -44,9 +60,19 @@
  * is a long match at the next -- so the ceiling keeps the cost on the short
  * matches where the decision actually differs, which are also the ones the
  * probe can settle with a single xor. A parameter so the trade can be
- * measured; see the README for the sweep that chose the value. */
+ * measured; see the README for the sweep that chose the value.
+ *
+ * 12 rather than the 24 this shipped with first: the probe is a dependent
+ * chain of two loads and on prose most matches are shorter than either
+ * ceiling, so the cost is nearly flat in the ceiling while the ratio gain
+ * is not. Measured on whole 64 KiB blocks, best of four alternating runs:
+ * dickens 259.7 -> 267.7 MB/s (payload unchanged, 40474 bytes), webster
+ * 307.9 -> 319.3 for +0.2%, mozilla 396.0 -> 408.1 for +0.15%, xml 666.2 ->
+ * 695.4 for +0.4%. Below 12 the rate stops moving and the size starts to:
+ * at 8 webster gains another 1.5% of rate for 0.4% of size, which is the
+ * wrong way round. */
 #ifndef ZPSE_LZ2_LAZY_MAX
-#define ZPSE_LZ2_LAZY_MAX 24u
+#define ZPSE_LZ2_LAZY_MAX 12u
 #endif
 
 static uint32_t lz2_hash(uint32_t v, uint32_t hash_bits)
@@ -218,13 +244,34 @@ static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
     return len;
 }
 
+/* Whether the lazy probe's two dependent loads are issued before the
+ * backward walk and the forward extension rather than after them.
+ *
+ * The probe is a chain -- hash the four bytes at pos + 1, load the table
+ * entry that hash names, then load the four bytes at that entry -- and both
+ * loads are L2 hits whose latency the match extension below does not need.
+ * Issued here, the chain overlaps the backward walk and the eight-byte
+ * extension; issued where the probe used to load them, it stalls the loop
+ * for its whole latency once per match, which is what a third of the
+ * finder's rate on prose was.
+ *
+ * It reads the same two values the probe read before, from the same places
+ * and in the same order relative to the table write at the top of the loop,
+ * so the decisions -- and the streams -- are identical. The only cost is
+ * that the work is wasted when the backward walk moves the match start (the
+ * probe only applies when it did not) or when the match turns out longer
+ * than ZPSE_LZ2_LAZY_MAX. */
+#ifndef ZPSE_LZ2_PROBE_EARLY
+#define ZPSE_LZ2_PROBE_EARLY 1
+#endif
+
 /* Tagged with the rest of the hot set: this finder is the whole of the F
  * form's encode, and it was the one kernel in the tree left at the build's
  * own level. */
 ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                          uint32_t cap, void *table, uint32_t hash_bits)
 {
-    uint16_t *tab = (uint16_t *)table;
+    uint16_t *restrict tab = (uint16_t *)table;
     uint32_t entries = 1u << hash_bits;
     uint32_t pos, anchor, misses;
     uint32_t lit_total = 0u, cmds = 0u, out = LZ2_HDR;
@@ -274,6 +321,21 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             h = lz2_hash(cur, hash_bits);
             continue;
         }
+#if ZPSE_LZ2_PROBE_EARLY
+        /* The lazy probe's two loads, issued now so their latency overlaps
+         * the backward walk and the extension below (see
+         * ZPSE_LZ2_PROBE_EARLY). Read after the table write above, so a
+         * self-hit reads exactly as it did before. */
+        uint32_t p_cur = 0u, p_h = 0u, p_c1 = LZ2_EMPTY;
+        int p_ok = 0;
+
+        if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
+            p_cur = zpse_load_u32le(in + pos + 1u);
+            p_h = lz2_hash(p_cur, hash_bits);
+            p_c1 = tab[p_h];
+            p_ok = 1;
+        }
+#endif
         /* Extend backward into the pending literals: an earlier start is a
          * longer match for the same four bytes, and the run in front of it is
          * that many bytes shorter. That walk is where the token form earns
@@ -367,6 +429,19 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * this had no guard). A walked-back match is already the better
          * match, so there is nothing to look ahead for: the probe only runs
          * when the match starts where the cursor is. */
+#if ZPSE_LZ2_PROBE_EARLY
+        if (p_ok && mpos == pos && len <= (uint32_t)ZPSE_LZ2_LAZY_MAX) {
+            if (p_c1 != LZ2_EMPTY && p_c1 <= mpos &&
+                zpse_load_u32le(in + p_c1) == p_cur &&
+                lz2_extend(in, n, mpos + 1u, p_c1, ZPSE_LZ2_MIN_MATCH) > len) {
+                pos = mpos + 1u;
+                misses = 0u;
+                cur = p_cur;
+                h = p_h;
+                continue;
+            }
+        }
+#else
         if (mpos == pos && len <= (uint32_t)ZPSE_LZ2_LAZY_MAX &&
             mpos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             uint32_t cur1 = zpse_load_u32le(in + mpos + 1u);
@@ -383,6 +458,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 continue;
             }
         }
+#endif
         {
             uint32_t run = mpos - anchor;
             const uint8_t *ls = in + anchor;
@@ -610,18 +686,18 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     const uint8_t *lp, *tend;
 
     if (in == 0 || out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (n == 0u) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (in_len < ZPSE_LZ2_MIN_PAYLOAD) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     lit_total = zpse_load_u32le(in);
     cmd_count = zpse_load_u32le(in + 4u);
     if (lit_total > in_len - LZ2_HDR || cmd_count == 0u) {
-        return PSE_BAD_LZ;
+        return ZPSE_BAD_LZ;
     }
     lp = in + LZ2_HDR;
     tend = in + in_len;
@@ -632,25 +708,27 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         uint8_t b;
 
         if (cmd_left == 0u) {
-            return PSE_BAD_LZ;
+            return ZPSE_BAD_LZ;
         }
         cmd_left--;
         /* Fast region: enough payload left for the largest command this path
          * can take (a token, fourteen literals and the two offset bytes) and
-         * enough output for the widest store the copy below makes (twenty-four
-         * bytes, against a match of at most eighteen), so a command whose
-         * two nibbles are both literal needs no room test of its own -- and
-         * that is four commands in five on prose. Everything else falls
-         * through to the careful path, which is what a truncated or hostile
-         * stream needs anyway. */
-        if ((size_t)(tend - lp) >= 18u && (n - op) >= 24u) {
+         * enough output for the widest reach of the stores below, which is
+         * the literal store's sixteen bytes and then the match store's
+         * twenty-four, counted from op + lit -- see ZPSE_LZ2_FAST_ROOM. A
+         * command whose two nibbles are both literal therefore needs no room
+         * test of its own, and that is four commands in five on prose.
+         * Everything else falls through to the careful path, which is what a
+         * truncated or hostile stream needs anyway. */
+        if ((size_t)(tend - lp) >= 18u && (n - op) >= ZPSE_LZ2_FAST_ROOM) {
             tok = *lp;
             if (((tok >> 4) != 15u) && ((tok & 15u) != 15u)) {
                 lit = tok >> 4;
                 lp++;
                 /* Two eight-byte stores rather than one sixteen: the run is
                  * at most fourteen bytes, both stores land inside the output
-                 * (the room test above reserves twenty-four bytes), and the
+                 * (the room test above reserves ZPSE_LZ2_FAST_ROOM, which
+                 * covers this run and the match store after it), and the
                  * bytes past the run are output a later command overwrites. */
                 memcpy(out + op, lp, 8u);
                 memcpy(out + op + 8u, lp + 8u, 8u);
@@ -707,12 +785,12 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                 mlen = (uint32_t)(tok & 15u) + ZPSE_LZ2_MIN_MATCH;
                 if (off == 0u) {
                     if (lit == 0u) {
-                        return PSE_BAD_LZ;
+                        return ZPSE_BAD_LZ;
                     }
                     continue;
                 }
                 if (off > op) {
-                    return PSE_BAD_LZ;
+                    return ZPSE_BAD_LZ;
                 }
                 /* Eight-byte steps, lz4's wildcopy shape. At a distance of
                  * eight or more each step reads only bytes already written,
@@ -721,7 +799,8 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                  * name (its nibbles are under fifteen, so the match is at
                  * most eighteen). The steps may run past the match; the bytes
                  * they write are output a later command overwrites, and the
-                 * room test above reserves the twenty-four they reach.
+                 * room test above reserves the twenty-four this store reaches
+                 * on top of the fourteen-byte literal run in front of it.
                  *
                  * This is the shape that closed the prose gap. The same two
                  * files decoded with one 32-byte match store and one 16-byte
@@ -750,14 +829,14 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             }
         }
         if (lp >= tend) {
-            return PSE_BAD_LZ;
+            return ZPSE_BAD_LZ;
         }
         tok = *lp++;
         lit = tok >> 4;
         if (lit == 15u) {
             do {
                 if (lp >= tend) {
-                    return PSE_BAD_LZ;
+                    return ZPSE_BAD_LZ;
                 }
                 b = *lp++;
                 lit += b;
@@ -765,7 +844,7 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         }
         mlen = (tok & 15u) + ZPSE_LZ2_MIN_MATCH;
         if (lit > n - op || (uint32_t)(tend - lp) < lit) {
-            return PSE_BAD_LZ;
+            return ZPSE_BAD_LZ;
         }
         if (lit != 0u) {
             if (lit < 15u && n - op >= 16u && (uint32_t)(tend - lp) >= 16u) {
@@ -785,14 +864,14 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             lit_seen += lit;
         }
         if (lp >= tend) {
-            return PSE_BAD_LZ;
+            return ZPSE_BAD_LZ;
         }
         if (lp[0] >= LZ2_REP_BASE) {
             off = lz2_dist_take(rep, (uint32_t)(lp[0] & 3u) + 1u);
             lp++;
         } else {
             if ((uint32_t)(tend - lp) < 2u) {
-                return PSE_BAD_LZ;
+                return ZPSE_BAD_LZ;
             }
             off = (uint32_t)lp[0] | ((uint32_t)lp[1] << 8u);
             lp += 2;
@@ -803,27 +882,27 @@ int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         if (off == 0u) {
             /* A literal-only command has to make progress. */
             if (lit == 0u) {
-                return PSE_BAD_LZ;
+                return ZPSE_BAD_LZ;
             }
             continue;
         }
         if ((tok & 15u) == 15u) {
             do {
                 if (lp >= tend) {
-                    return PSE_BAD_LZ;
+                    return ZPSE_BAD_LZ;
                 }
                 b = *lp++;
                 mlen += b;
             } while (b == 255u);
         }
         if (off > op || mlen > n - op) {
-            return PSE_BAD_LZ;
+            return ZPSE_BAD_LZ;
         }
         lz2_copy_match(out, op, n, off, mlen);
         op += mlen;
     }
     if (cmd_left != 0u || lit_seen != lit_total || lp != tend) {
-        return PSE_BAD_LZ;
+        return ZPSE_BAD_LZ;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }

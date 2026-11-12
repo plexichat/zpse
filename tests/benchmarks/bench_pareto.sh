@@ -124,6 +124,16 @@ elif [ -n "$work" ]; then
 fi
 [ "${#inputs[@]}" -gt 0 ] || fail "no input files"
 
+# The corpus is read into RAM first. Every tool here is timed as a process
+# that reads its input, and on a SATA SSD a cold 202 MiB read is several
+# tenths of a second -- comparable to a whole encode pass -- so a cold run
+# would put the drive in the ratio column. Two reads per file: the first
+# faults it in, the second proves it stayed.
+for f in "${inputs[@]}"; do
+    cat "$f" > /dev/null
+    cat "$f" > /dev/null
+done
+
 # One stream, so a ratio is the ratio of the corpus and every tool sees the
 # same bytes in the same order. Scratch (the joined input, the packed stream
 # and the round-trip output) goes in its own directory: writing a 202 MiB

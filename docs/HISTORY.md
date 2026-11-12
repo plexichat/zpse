@@ -203,6 +203,238 @@ nothing until the copy changes. The remaining gap to lz4 on prose is about a
 quarter, and it sits on the escape-heavy side, where the careful path still
 uses the rle-table copy helper.
 
+## Coding the token stream
+
+The LZ forms left a residue that was easy to see and hard to take: the command
+stream is bytes, and on a page of heap pointers the distribution of those bytes
+is nothing like flat. Huffman coding the payload is the oldest answer to that.
+It went in as a block form of its own -- flag pattern 110 -- rather than as
+another LZ encoder, so it wraps a stream the match finder already won and never
+has to re-decide a match.
+
+Three of its choices were settled by measurement, and two of them by being
+wrong first.
+
+* Two symbols per lookup is the wrong table for this data. A 2 048-entry table
+  only packs two codes into one entry when their lengths fit inside eleven
+  bits, and an LZ command stream averages 7.41 bits per symbol, so a pair
+  needs fourteen. Measured over the page and mixed corpora, only 10.4% of
+  eleven-bit windows hold two complete codes: The first tables were
+  built that way and produced a 101% payload: 32 KiB of lookup to decode one
+  symbol per lookup. One symbol in two bytes of entry is what the payload
+  wants, and it halves the tables to 16 KiB.
+  Measured over 29.8 MB of real payloads at 7.41 bits per symbol, 10.4% of
+  windows hold two complete codes, so a pair table would remove one chain
+  step in ten, not one in two.
+
+* The decoder had to stop keeping its state in memory. A first version held
+  seven values per stream -- accumulator, bits left, bit position, cursor,
+  cursor end, stream start, stream end -- which does not fit in sixteen
+  registers, and the compiler's answer to that is to spill all of them: 122
+  stack moves in the decoding function and 470 MB/s. Three values per stream,
+  five lookups between refills on a fixed cadence instead of a test, and no
+  bounds check inside the loop is 1 450 MB/s, or 2.40 cycles per byte. That is the same shape huff0
+  (Zstd's entropy coder) uses, and the shape is the reason, not a coincidence.
+  It is also 2.40 cycles per byte, which is where the shape lands: one chain
+  step is a masked window, a five-cycle L1 load and a shift, and four streams
+  at three live values each is what the register file allows.
+
+* Interleaving the four encode streams is also wrong here. It needs twenty live
+  values -- four cursors, four sources, four ends, four accumulators, four bit
+  offsets -- and spills. Coding them one after another needs six, and the
+  overrun that each stream's eight-byte flush leaves in the next stream's
+  region is repaired by that stream being written afterwards. Positions within
+  a five-code step come from a prefix sum rather than a running total, so the
+  five shifts issue in parallel instead of queueing behind each other's table
+  loads. The result is 2.2 GB/s of encode on real Silesia payloads, 1.66 to
+  1.70 cycles per byte, against 500 MB/s for the version that accumulated a
+  position per symbol.
+
+Two more passes went after the first version shipped, and both by asking what
+each one was really for.
+
+The four per-stream histograms went first. They were doing two jobs -- picking
+the table, and making each stream's exact length arithmetic instead of a
+scan -- and the measurement said the two jobs want different things. A scatter
+histogram is a chain of read-modify-writes to a counter, and an LZ payload
+hits the same bin often enough that the chain is what the pass waits on: 2.52
+cycles per byte with the four streams counted one after another, 2.00 with
+them interleaved, 1.95 with sixteen copies of the counters instead of four.
+That is close to a hard floor, and it was the largest single item left in the
+encoder. Ranking four fixed code books does not need every byte, so the table
+is now chosen from one byte in eight -- 0.25 cycles per byte -- and the
+ranking is the only thing that was ever allowed to be approximate. It is still
+deterministic: every build, every SIMD level and every worker samples the same
+bytes of the same block, so a block is still a function of its own bytes.
+
+The exact lengths then came free from the coding loop. That loop already forms
+the bit total of every five symbols it stores, so a stream's encoded length is
+what the write itself produced. When the caller's capacity can absorb eleven
+bits per symbol and the store slop, the four streams are written first and the
+twelve-byte header last, and no bit count runs at all. When it cannot -- a
+payload near the 64 KiB staging buffer, where eleven bits a symbol could not
+be stored -- the lengths are counted first and nothing is written until the
+size is known. Both paths were checked to produce identical bytes.
+
+What it is worth, measured over 16 MiB of 4 KiB pages at level 9 -- HUF on
+against a build with it switched off, the two binaries alternating: the frame
+goes from ratio 0.3887 to 0.3649, so 6.1% smaller. 63.4% of blocks take the
+form, and it cuts the payloads it wraps by 11.3%.
+
+Choosing the table from one byte in eight rather than every byte was the one
+approximation in the design, so it was measured the same way, against a build
+with the stride at one: 9 534 bytes out of 24.5 MB, which is four hundredths
+of a percent of the output. That is what makes the sampled ranking the right
+trade -- the exact version of it costs a cycle per byte and buys nothing a
+reader can see.
+
+It costs 18 KiB of read-only tables and a pass on each side: under two percent
+of encode time at level 9 end to end, because the match finder still dominates
+the block, and about 1 430 MB/s of decode end to end on Silesia. Level 6 does
+not offer it: the rung below MAX is where encode time is worth more than seven
+percent of bytes. `ZPSE_ENC_HUF` asks for it at any level.
+
+Four shapes of the writer were built and timed against each other on real LZ
+payloads (`build/hufvar`), and the shipped one won every time. One 32-bit table
+holding code and length together -- one load per symbol instead of two -- is
+2.25 to 2.50 cycles per byte against the shipped 1.66 to 1.70: the loop is not
+waiting on load ports, it is waiting on the shifts and the prefix adds, so
+trading a load for a shift and a mask costs more than it saves. A tree of ORs
+instead of a chain is 1.71 and 1.82; ten symbols per iteration is 1.74 and
+1.87. Interleaving two streams needs two output cursors whose starts depend on
+each other's final lengths, which is the same reason four at once does not
+work.
+
+The form is kept only when it saves at least a sixty-fourth of the payload it
+wraps. Without that gate, a payload that is already close to uniform still
+finds a better code sometimes, and a block would pay for a second header and a
+second pass to gain four bytes.
+
+## Why a Silesia encode is not five hundred megabytes a second
+
+The entropy pass is not the gate. It writes at 2.2 GB/s and reads at 1.5, and
+it only ever wraps a payload the block encoder has already produced, so a
+Silesia block cannot be waiting on it. The gate is the match finder, and the
+library's own cycle counters say so (`ZPSE_BLOCK_STATS`, read by
+`build/blkstat`): at level 6 the finder is 33% to 92% of a block's encode on
+every file where it runs at all, and the two files where it does not run
+(`mr`, `x-ray`) spend 62% and 64% in the shape trials instead.
+
+The arithmetic a reader can check in one line: the finder runs at 278 MB/s on
+`dickens`, 315 on `webster`, 409 on `mozilla`, and a 64 KiB block cannot leave
+that pass faster than the pass runs. The rest of the pipeline -- the candidate
+probe, the trials, the header -- is the other half of the budget and cannot buy
+back what the finder spends. The ladder makes the same trade visible from the
+other end: level 1, which writes no LZ form at all, encodes Silesia at 983 MB/s
+for 1.24:1, and every rung that offers the finder pays roughly two and a half
+times the time for two thirds of the bytes.
+
+Three changes came out of that profile. Together they are about 4.2% of
+geometric mean over six Silesia files for 0.3% of packed size.
+
+The first is `restrict` on the table pointer: the store of the cursor into the
+hash table cannot alias the candidate load, so the compiler is free to keep
+that load from queueing behind the store. Three interleaved rounds over eight
+files, best of each, byte-identical payloads throughout: `nci` +6.1%, `sao`
++5.1%, `dickens` +2.8%, `webster` +2.2%, `osdb` +1.5%, `mozilla` -0.4%, `mr`
+-0.6%, `ooffice` -2.5% -- about 1.9% geometric mean, and the same stream.
+
+The second is the lazy probe's ceiling, 24 bytes down to 12. The probe is a
+dependent chain -- hash the four bytes at the next position, load the table
+entry that hash names, load the four bytes there -- so its cost is nearly flat
+in the ceiling while the size it buys is not. Best of four alternating runs per
+configuration, whole 64 KiB blocks: `dickens` 260 -> 274 MB/s with its payload
+byte-identical, `webster` 308 -> 315 for +0.2% of size, `mozilla` 396 -> 408,
+`xml` 666 -> 695 for +0.4%. Below 12 the rate stops moving and the size does
+not: at 8, `webster` gains another 1.5% of rate for 0.4% of size, which is the
+wrong way round.
+
+The third is where the probe's two loads are issued. They used to be loaded
+where the decision is made, after the backward walk and the eight-byte
+forward extension, which stalls the loop for the whole latency of the chain
+once per match. Issued before that work, they overlap it. The values read are
+the same, from the same places, in the same order relative to the table write
+at the top of the loop, so the decisions and the streams are identical: the
+same payload bytes in every one of the six files, and `xml` +4%, `dickens`
++2%, `mozilla` +1%, `nci` +0.5%, `webster` and `osdb` to the noise.
+
+A fourth experiment was rejected. Sweeping `hash_bits` 11..16 over whole
+blocks showed 16 bits both faster and smaller than the 13 the benchmark binary
+uses (`dickens` 292 against 274 MB/s, 39 477 against 40 474 bytes), which looks
+like a free win until you check the encoder: the block path already passes 15
+(`e->tstage` is the 64 KiB region that holds 2^15 entries, and
+`ZPSE_LZ_TABLE_BIG_MIN` is where it starts being used), so the only thing the
+sweep was measuring is the benchmark's own default. Sixteen bits would need a
+128 KiB staging region for a few percent that 15 already has most of.
+
+The trial loop was the other half of the profile, and it is harder to cut than
+it looks, because a window price cannot separate the survivors it keeps -- that
+is what keeping them means. The one thing it can answer is "how many trials is
+a full-size block worth": its price window is a fifth of the block, and on the
+dumps two full trials are 63% of a block's encode. So a full-size block runs at
+most two. Measured over Silesia at level 6, best of three alternating rounds:
+`mr` 257 -> 272 MB/s, `samba` 409 -> 424, `ooffice` 225 -> 232, `mozilla` 316
+-> 323, and the corpus total 382 -> 385 MB/s -- inside this host's run-to-run
+noise -- for no measurable size.
+
+The first attempt at this was wrong and the suite said so. Setting the level
+row's trial count to 2 replaces the tied-field cut rather than supplementing
+it, and that cut is what keeps the identity survivor whatever the price says
+and what stands down when the head window lied or a survivor was kept on
+content. Three cases of `tests/suites/test_sizes.c` grew by 8 bytes each. The
+shipped rule leaves the cut alone, applies the cap after it, and fires only
+where the cut's guards already hold by construction: a full-size block. A cap
+of one trial is another 2.5% of rate for another 0.09% of size, and it is not
+taken.
+
+What would move the ceiling rather than the noise is a finder that makes fewer
+or better-placed probes per byte, and every version of that changes which
+matches are found, so it changes the stream, the ratio and every pinned size in
+the suite. That is a different change from this one and it is not taken here.
+
+## The fast LZ decoder wrote past its block
+
+A frame's workers decode straight into the caller's buffer, each block at its
+own offset, so a block decode must write exactly its own bytes. That invariant
+was false for one class of block, and it took a shuffled decode to see it.
+
+The fast LZ decoder's fast region reserved 24 bytes of output before it took a
+command, counting the match store. But the match store does not start at the
+token: it starts at the token plus the literal run, which the same region has
+already advanced `op` over. The literal store itself touches 16 bytes, so the
+true reach was 14 + 24 = 38. A command carrying a literal run and a 17- or
+18-byte match could therefore write up to 14 bytes past the end of its block --
+straight into the next block's slot.
+
+In order, nothing showed. The next block is decoded immediately afterwards and
+writes those bytes again, so every sequential decode and every whole-frame
+decode of the 202 MiB Silesia corpus was correct. The frame benchmark found
+it because it decodes blocks out of order and compares each one against the
+input: two bytes at the front of block 99 and block 128 of a 16 MiB columnar
+frame, and only sometimes, because whether a poisoned block was decoded before
+or after its neighbour depended on which worker claimed it.
+
+Finding it took a harness that names the failing side rather than guessing at
+it. A canary decode -- each block into a slot with eight guard bytes after it
+-- reported the overrunning blocks directly: three of a 16 MiB frame, all of
+them fast-LZ blocks. That killed the first hypothesis (decoder arena state
+carried between blocks: re-initialising the decoder before every block changed
+nothing) and the second (a bad predecessor: no single predecessor reproduced
+it). The two differing bytes were the block's first two, which is what a
+neighbour's overrun leaves.
+
+The reserve is `ZPSE_LZ2_FAST_ROOM`, 38, with the arithmetic written down
+beside it. After the fix: zero overruns across every block of a 16 MiB frame,
+zero bad blocks in forward, shuffled and fresh-decoder order, and identical
+frames and decode output at 2, 3, 4, 5 and 6 workers. The two other decoders
+were checked for the same shape and are not affected: the token form reserves
+`LZ_CMD_ROOM + lit + 16`, which includes the run, and the hex form's 32 bytes
+cover its 14 + 16.
+
+This is why the README's parallel section quotes 16 MiB again, and why the
+invariant the README opens with -- a block's output is a function of its own
+bytes -- is now tested by an out-of-order decode and not only an in-order one.
+
 ## What measurement changed
 
 The project converged on a small set of rules:

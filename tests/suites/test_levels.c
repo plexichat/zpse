@@ -135,17 +135,17 @@ int main(void)
                     rc = zpse_compress_block_ex(in, n, comp, sizeof comp,
                                                 &cl, 0, 1, levels[li], E);
                     t1 = now_ns();
-                    if (rc != PSE_OK) {
+                    if (rc != ZPSE_OK) {
                         break;
                     }
                     if (t1 - t0 < best) {
                         best = t1 - t0;
                     }
                 }
-                CHECK(rc == PSE_OK,
+                CHECK(rc == ZPSE_OK,
                       "%s: the %s level did not compress %u bytes",
                       zpse_col_names[kind], names[li], n);
-                if (rc != PSE_OK) {
+                if (rc != ZPSE_OK) {
                     sizes[li] = 0xFFFFFFFFu;
                     times[li] = 0.0;
                     continue;
@@ -156,7 +156,7 @@ int main(void)
                 /* Every level's block must decode to the bytes it came
                  * from. */
                 rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, D);
-                CHECK(rc == PSE_OK && ol == n && memcmp(out, in, n) == 0,
+                CHECK(rc == ZPSE_OK && ol == n && memcmp(out, in, n) == 0,
                       "%s: the %s level did not round-trip %u bytes",
                       zpse_col_names[kind], names[li], n);
             }
@@ -191,7 +191,7 @@ int main(void)
 
     /* The level field is four bits, so 10-15 are representable and must be
      * refused rather than treated as the deepest level: a caller asking for
-     * a setting that does not exist should hear PSE_BAD_ARG, not get the
+     * a setting that does not exist should hear ZPSE_BAD_ARG, not get the
      * slowest encoder in the library. The empty field, which is how every
      * caller gets the default, has to stay legal. */
     {
@@ -203,7 +203,7 @@ int main(void)
                                             (uint32_t)sizeof comp, &cl, 0, 1,
                                             lvl << ZPSE_ENC_SPEED_SHIFT, E);
 
-            CHECK(rc == PSE_BAD_ARG, "level %u was not refused (rc=%d)",
+            CHECK(rc == ZPSE_BAD_ARG, "level %u was not refused (rc=%d)",
                   lvl, rc);
         }
         {
@@ -212,7 +212,7 @@ int main(void)
                                             (uint32_t)sizeof comp, &cl, 0, 1,
                                             0u, E);
 
-            CHECK(rc == PSE_OK, "the default level (empty field) was refused");
+            CHECK(rc == ZPSE_OK, "the default level (empty field) was refused");
         }
     }
 

@@ -10,7 +10,7 @@
 
 /* Decode one block. in_len must be >= compressed_block_size taken from
  * the header; output must hold uncompressed_size bytes. Returns bytes
- * written (== uncompressed_size) or negative PseStatus. */
+ * written (== uncompressed_size) or negative ZpseStatus. */
 int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                       uint8_t *output, uint32_t out_cap,
                       uint32_t *out_len_out);
@@ -101,12 +101,12 @@ void zpse_pagedict_insert(ZpsePageDict *d, uint64_t lo, uint64_t hi,
  * payload checksum a block is written with still holds.
  *
  * The block must be a complete block written by this library -- block_len is
- * what its header says its size is. Returns PSE_OK, PSE_BAD_ARG for a NULL
- * block, PSE_TRUNCATED for a block_len below a page header, PSE_BAD_HEADER
+ * what its header says its size is. Returns ZPSE_OK, ZPSE_BAD_ARG for a NULL
+ * block, ZPSE_TRUNCATED for a block_len below a page header, ZPSE_BAD_HEADER
  * for a length that disagrees with the header or a header that is not one,
- * and PSE_BAD_HEADER_CRC when the header CRC does not match. Retagging a
+ * and ZPSE_BAD_HEADER_CRC when the header CRC does not match. Retagging a
  * block whose header already says (seq, is_last) is a no-op that still
- * returns PSE_OK. */
+ * returns ZPSE_OK. */
 int zpse_block_retag(uint8_t *block, uint32_t block_len,
                      uint32_t seq, int is_last);
 

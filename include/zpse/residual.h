@@ -42,7 +42,7 @@ uint8_t zpse_residual_mode3_pick_m(uint8_t maxv);
 /* Generic decode: payload -> exc_out[K] (exclusion domain, [0,254]).
  * Mode 1 instead writes raw actual bytes to actual_out[K] ([0,255]).
  * pred_at_exc[K]: predictions at exception positions (needed by modes
- * that store deltas). Returns 0 or PSE_BAD_RESIDUAL. */
+ * that store deltas). Returns 0 or ZPSE_BAD_RESIDUAL. */
 int zpse_residual_decode(uint8_t mode, const uint8_t *payload,
                          uint16_t payload_len, uint16_t k,
                          const uint8_t *pred_at_exc,

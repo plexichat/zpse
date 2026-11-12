@@ -26,7 +26,7 @@
  * decision probe, which prices ten candidates exactly on the block's head,
  * and two full trials: the identity, which is written at 33 288 bytes, and
  * a transpose behind it, whose stream has already outgrown the block when
- * it overflows the candidate buffer (PSE_OUTPUT_OVERFLOW, not a budget
+ * it overflows the candidate buffer (ZPSE_OUTPUT_OVERFLOW, not a budget
  * stop). See tests/tools/enc_profile and the ZPSE_BLOCK_STATS counters in
  * src/block.c for the split.
  */

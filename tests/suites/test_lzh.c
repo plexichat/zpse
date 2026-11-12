@@ -115,7 +115,7 @@ static void roundtrip_all(void)
                   n, pl);
             memset(out, 0, n);
             rc = zpse_lzh_decode(payload, pl, out, n);
-            CHECK(rc == PSE_OK, "shape %u size %u: decode %d", k, n, rc);
+            CHECK(rc == ZPSE_OK, "shape %u size %u: decode %d", k, n, rc);
             CHECK(memcmp(out, plain, n) == 0,
                   "shape %u size %u: bytes differ", k, n);
             /* Determinism: the same input twice is the same payload. */
@@ -151,7 +151,7 @@ static void truncations(void)
     for (len = 0; len < pl; len++) {
         int rc = zpse_lzh_decode(payload, len, out, n);
 
-        if (rc == PSE_OK) {
+        if (rc == ZPSE_OK) {
             bad++;
         }
     }
@@ -181,7 +181,7 @@ static void corruptions(void)
 
         payload[i] = (uint8_t)(keep ^ 0xFFu);
         rc = zpse_lzh_decode(payload, pl, out, n);
-        if (rc == PSE_OK) {
+        if (rc == ZPSE_OK) {
             /* A complete decode is a legal answer: this form carries no
              * payload checksum, so a flipped literal decodes to those bytes.
              * What is not legal is a crash, a partial write, or a status that
@@ -220,8 +220,8 @@ static void block_form(void)
                                         (uint32_t)(ZPSE_ENC_LZ_HEX |
                                                    ZPSE_ENC_SPEED_L6),
                                         ea);
-            CHECK(rc == PSE_OK, "block size %u shape %u: encode %d", n, k, rc);
-            if (rc != PSE_OK) {
+            CHECK(rc == ZPSE_OK, "block size %u shape %u: encode %d", n, k, rc);
+            if (rc != ZPSE_OK) {
                 continue;
             }
             /* When the hex form was the winner it carries both LZ bits and no
@@ -230,7 +230,7 @@ static void block_form(void)
              * rather than read at a fixed offset, because a page's block is
              * the 16-byte header and the two forms put the flags in different
              * places. */
-            CHECK(zpse_block_header_parse(&bh, comp, clen) == PSE_OK,
+            CHECK(zpse_block_header_parse(&bh, comp, clen) == ZPSE_OK,
                   "block size %u shape %u: header parse failed", n, k);
             if ((bh.block_flags & (uint8_t)ZPSE_B_LZ_HEX) ==
                 (uint8_t)ZPSE_B_LZ_HEX) {
@@ -241,7 +241,7 @@ static void block_form(void)
                       n, k, bh.block_flags);
             }
             rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen, da);
-            CHECK(rc == PSE_OK, "block size %u shape %u: decode %d", n, k, rc);
+            CHECK(rc == ZPSE_OK, "block size %u shape %u: decode %d", n, k, rc);
             CHECK(olen == n && memcmp(out, plain, n) == 0,
                   "block size %u shape %u: bytes differ", n, k);
         }
@@ -268,18 +268,18 @@ static void block_form(void)
             rc = zpse_compress_block_ex(
                 plain, 4096u, comp, sizeof comp, &clen, 0u, 1,
                 (uint32_t)(ZPSE_ENC_LZ_FAST | ZPSE_ENC_LZ_HEX), ea);
-            CHECK(rc == PSE_OK, "fast+hex shape %u: encode %d", k, rc);
-            if (rc != PSE_OK) {
+            CHECK(rc == ZPSE_OK, "fast+hex shape %u: encode %d", k, rc);
+            if (rc != ZPSE_OK) {
                 continue;
             }
-            CHECK(zpse_block_header_parse(&bh, comp, clen) == PSE_OK,
+            CHECK(zpse_block_header_parse(&bh, comp, clen) == ZPSE_OK,
                   "fast+hex shape %u: header parse", k);
             if ((bh.block_flags & (uint8_t)ZPSE_B_LZ_HEX) ==
                 (uint8_t)ZPSE_B_LZ_HEX) {
                 fhex++;
             }
             rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen, da);
-            CHECK(rc == PSE_OK && olen == 4096u &&
+            CHECK(rc == ZPSE_OK && olen == 4096u &&
                       memcmp(out, plain, 4096u) == 0,
                   "fast+hex shape %u: decode %d", k, rc);
         }
@@ -293,7 +293,7 @@ static void block_form(void)
         make_shape(3, 4096u);
         CHECK(zpse_compress_block_ex(plain, 4096u, comp, sizeof comp, &clen,
                                      0u, 1, (uint32_t)ZPSE_ENC_LZ_HEX,
-                                     ea) == PSE_OK,
+                                     ea) == ZPSE_OK,
               "hex option without a level was refused");
     }
 }

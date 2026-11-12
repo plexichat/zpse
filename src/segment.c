@@ -211,7 +211,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     }
     zpse_tile_read_header(rec, &th);
     rc = zpse_tile_validate(&th, (uint16_t)ZPSE_MAX_TILE_LEN, rsz, &nt, &k);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return 0;
     }
     /* record_need == record_len, the identity zpse_tile_decode insists on
@@ -267,7 +267,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
             uint16_t prev = 0;
 
             if (mlen != k) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
             for (jj = 0; jj < k; jj++) {
                 uint16_t v = mpl[jj];
@@ -276,7 +276,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
                  * the ascending test is the whole of what the generic
                  * decoder checks here. */
                 if (jj > 0u && v <= prev) {
-                    return PSE_BAD_MASK;
+                    return ZPSE_BAD_MASK;
                 }
                 prev = v;
                 pos[jj] = (uint8_t)v;
@@ -286,14 +286,14 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
             uint32_t gp = 0;
 
             if (mlen < 1u) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
             flag = mpl[0];
             if (flag > 1u) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
             if (mlen != (uint16_t)(flag != 0u ? 1u + 2u * k : 1u + k)) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
             for (jj = 0; jj < k; jj++) {
                 uint32_t gap =
@@ -304,7 +304,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
 
                 gp = (jj == 0u) ? gap : gp + 1u + gap;
                 if (gp >= 256u) {
-                    return PSE_BAD_MASK;
+                    return ZPSE_BAD_MASK;
                 }
                 pos[jj] = (uint8_t)gp;
             }
@@ -313,13 +313,13 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
          * one additionally forbids 255, which is the only value that is
          * not a legal exclusion residual. */
         if ((uint32_t)th.residual_payload_size != (uint32_t)k) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         rpl = mpl + mlen;
         if (res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8) {
             for (jj = 0; jj < k; jj++) {
                 if (rpl[jj] == 255u) {
-                    return PSE_BAD_RESIDUAL;
+                    return ZPSE_BAD_RESIDUAL;
                 }
             }
         }
@@ -343,14 +343,14 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     zpse_mask_clear(words);
     rc = zpse_mask_decode(mask_mode, mp, th.mask_payload_size, nt, k, words,
                           comb);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (k > 0u || th.residual_payload_size > 0u) {
         rc = zpse_residual_decode(res_mode, mp + th.mask_payload_size,
                                   th.residual_payload_size, k, 0, resid,
                                   resid);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
     }
@@ -381,7 +381,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     memcpy(lanes->last, out + 248u, sizeof lanes->last);
     memcpy(lanes->second_last, out + 240u, sizeof lanes->second_last);
     if (j != k) {
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     }
     return 1;
 }
@@ -412,7 +412,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
 
     if (d == 0 || lanes == 0 || payload == 0 || decoded_out == 0 ||
         decoded_len_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     /* Cleared here, set only by the dense constant form below: block
      * decode reads it after the loop to decide whether the payload CRC
@@ -420,19 +420,19 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     d->seg_const = 0u;
     d->seg_const_byte = 0u;
     rc = zpse_segment_header_parse(&h, payload, payload_len);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
     if (h.segment_decoded_size < 1u ||
         h.segment_decoded_size > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_SEGMENT_DIRECTORY;
+        return ZPSE_BAD_SEGMENT_DIRECTORY;
     }
     expect_tc = (h.segment_decoded_size + 255u) / 256u;
     if (h.tile_count == 0u) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (h.segment_decoded_size > decoded_cap) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
 
     /* ---- Dense record (Sec. 6.3) -------------------------------- *
@@ -448,7 +448,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     if (payload_len > (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u &&
         (payload[ZPSE_SEGMENT_HEADER_SIZE + 2u] & ZPSE_DENSE_MARKER) != 0u) {
         if ((uint32_t)h.tile_count != 1u) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         {
             int all_const = 0;
@@ -457,7 +457,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
             rc = zpse_dense_decode(&h, payload, payload_len, decoded_out,
                                    decoded_cap, decoded_len_out, d->comb,
                                    &all_const, &const_byte);
-            if (rc == PSE_OK && all_const != 0) {
+            if (rc == ZPSE_OK && all_const != 0) {
                 d->seg_const = 1u;
                 d->seg_const_byte = const_byte;
             }
@@ -465,7 +465,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         }
     }
     if ((uint32_t)h.tile_count != expect_tc) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
 
     /* First tile of the segment always re-seeds lane state,
@@ -507,20 +507,20 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
             nt_exp = (uint16_t)(seg_size - produced);
         }
         if (pos + 2u > payload_len) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         rsz = zpse_load_u16le(payload + pos);
         if (rsz == 0u) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         if ((uint32_t)rsz > payload_len - pos - 2u) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         if ((uint32_t)nt_exp > seg_size - produced) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         if (produced + (uint32_t)nt_exp > decoded_cap) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
         rec = payload + pos + 2u;
 
@@ -920,7 +920,7 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
             return got;
         }
         if ((uint32_t)got != (uint32_t)nt_exp) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         produced += (uint32_t)got;
         pos += 2u + (uint32_t)rsz;
@@ -932,13 +932,13 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
         prev_ok = (tile_reset != 0) ? 1 : 0;
     }
     if (produced != h.segment_decoded_size) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (pos != payload_len) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     *decoded_len_out = produced;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 /* ---- Encoder tile search (PSE SELECT) -------------------------------
@@ -2978,7 +2978,7 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
 
             if (zpse_tile_classify_lean(lanes, actual, nt, pred,
                                         initial_literal, 1, plane, seg_pos,
-                                        &cl) != PSE_OK) {
+                                        &cl) != ZPSE_OK) {
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
@@ -3140,7 +3140,7 @@ uint32_t zpse_segment_probe_cost(ZpseEncoder *e, ZpseLaneState *lanes,
  * fit where the tile records no longer do, so it is offered before the
  * overflow is reported. Nothing is known about the plane here, so the
  * constant test runs (it is a word-wise scan with an early exit). Returns a
- * payload length or PSE_OUTPUT_OVERFLOW. */
+ * payload length or ZPSE_OUTPUT_OVERFLOW. */
 static int seg_no_room(ZpseSegmentHeader *h, uint8_t *payload_out,
                        const uint8_t *plane, uint32_t plane_len,
                        uint8_t initial_literal, uint32_t pos,
@@ -3149,7 +3149,7 @@ static int seg_no_room(ZpseSegmentHeader *h, uint8_t *payload_out,
     int dn = seg_dense_emit(h, payload_out, plane, plane_len, initial_literal,
                             pos, byte_budget, payload_cap, 0);
 
-    return dn != 0 ? dn : PSE_OUTPUT_OVERFLOW;
+    return dn != 0 ? dn : ZPSE_OUTPUT_OVERFLOW;
 }
 
 /* Repeat cache geometry: 128 direct-mapped slots, indexed by the top bits
@@ -3244,16 +3244,16 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     uint64_t rep_key[ZPSE_REP_SLOTS];
 
     if (e == 0 || lanes == 0 || plane == 0 || payload_out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (plane_len < 1u || plane_len > 65536u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (e->hist == 0 || e->comb == 0 || e->input == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (payload_cap < ZPSE_SEGMENT_HEADER_SIZE) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
     /* Assigned after the argument checks, not with the declarations: both
      * read through `e`. */
@@ -3516,7 +3516,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                  * tile, which is what the general path records here. */
                 dense_ok = 0;
                 if (seg_flat_abort(e, nt, rlen, flat_abort_min)) {
-                    return PSE_OUTPUT_OVERFLOW;
+                    return ZPSE_OUTPUT_OVERFLOW;
                 }
                 continue;
             }
@@ -3564,7 +3564,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             pos += 2u + alen;
             dense_ok = 0;
             if (seg_flat_abort(e, nt, 2u + alen, flat_abort_min)) {
-                return PSE_OUTPUT_OVERFLOW;
+                return ZPSE_OUTPUT_OVERFLOW;
             }
             continue;
         }
@@ -3679,7 +3679,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * and nothing after this loop reads `lanes`.
          *
          * The run stops (rather than overflowing) on the same capacity
-         * condition the general path returns PSE_OUTPUT_OVERFLOW for. */
+         * condition the general path returns ZPSE_OUTPUT_OVERFLOW for. */
         if (best_k == 0u) {
             uint8_t pred = best_p;
 
@@ -3814,7 +3814,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             int rc = zpse_tile_classify_lean(lanes, actual, nt, pred,
                                              initial_literal, 1, plane,
                                              seg_pos, &cl);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
@@ -3867,7 +3867,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         /* seg_pred_wins[best_p]++; -- disabled for debugging */
 
         if (best_len < 0) {
-            return PSE_BAD_RESIDUAL;
+            return ZPSE_BAD_RESIDUAL;
         }
         if (pos + 2u > payload_cap ||
             (uint32_t)best_len > payload_cap - pos - 2u) {
@@ -4072,7 +4072,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             }
         }
         if (seg_flat_abort(e, nt, 2u + (uint32_t)best_len, flat_abort_min)) {
-            return PSE_OUTPUT_OVERFLOW;
+            return ZPSE_OUTPUT_OVERFLOW;
         }
     }
 

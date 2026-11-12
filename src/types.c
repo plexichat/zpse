@@ -49,29 +49,29 @@ static int zpse_block_header_parse_short(ZpseBlockHeader *out,
     calc = (uint16_t)(zpse_crc32c(buf, 14) & UINT32_C(0xFFFF));
 
     if (calc != stored) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
     if ((flags & ZPSE_B_CRC) != 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if ((flags & ZPSE_B_RESET) == 0u) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (((flags & ZPSE_B_HAS_META) != 0u) != (meta8 > 0u)) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if ((flags & ZPSE_B_RESERVED_MASK) != 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (uncomp < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
         uncomp > (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (comp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (tid > 11u || !zpse_is_valid_segment_count(scount)) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
 
     out->sync = ZPSE_BLOCK_SYNC_SHORT;
@@ -89,7 +89,7 @@ static int zpse_block_header_parse_short(ZpseBlockHeader *out,
     out->decoded_crc32c = 0u;
     out->header_crc32c = stored;
     out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t len)
@@ -104,10 +104,10 @@ int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t l
     uint32_t stored_crc, calc_crc;
 
     if (out == 0 || buf == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (len < ZPSE_FRAME_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     magic = zpse_load_u32le(buf + 0);
     major = buf[4];
@@ -120,28 +120,28 @@ int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t l
     stored_crc = zpse_load_u32le(buf + 28);
 
     if (magic != ZPSE_MAGIC) {
-        return PSE_BAD_MAGIC;
+        return ZPSE_BAD_MAGIC;
     }
     if (major != ZPSE_FRAME_MAJOR || minor != ZPSE_FRAME_MINOR) {
-        return PSE_BAD_VERSION;
+        return ZPSE_BAD_VERSION;
     }
     calc_crc = zpse_crc32c(buf, 28);
     if (calc_crc != stored_crc) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
     if ((flags & ZPSE_F_RESERVED_MASK) != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (nominal < ZPSE_MIN_BLOCK_SIZE || nominal > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if ((flags & ZPSE_F_FRAME_INDEX) != 0) {
         if (index_off == 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     } else {
         if (index_off != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
     }
 
@@ -154,7 +154,7 @@ int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t l
     out->block_count = block_count;
     out->frame_index_offset = index_off;
     out->header_crc32c = stored_crc;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 void zpse_frame_header_serialize(uint8_t out[32], const ZpseFrameHeader *h)
@@ -192,17 +192,17 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     int has_meta;
 
     if (out == 0 || buf == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (len < 2u) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     hsz = zpse_block_header_size(buf, len);
     if (hsz == 0u) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (len < hsz) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     if (hsz == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
         return zpse_block_header_parse_short(out, buf);
@@ -223,45 +223,45 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     stored_crc = zpse_load_u32le(buf + 28);
 
     if (sync != ZPSE_BLOCK_SYNC) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if (ver != ZPSE_BLOCK_VERSION) {
-        return PSE_BAD_VERSION;
+        return ZPSE_BAD_VERSION;
     }
     calc_crc = zpse_crc32c(buf, 28);
     if (calc_crc != stored_crc) {
-        return PSE_BAD_HEADER_CRC;
+        return ZPSE_BAD_HEADER_CRC;
     }
     if (uncomp < ZPSE_MIN_BLOCK_SIZE || uncomp > ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (comp < ZPSE_BLOCK_HEADER_SIZE) {
-        return PSE_BAD_BLOCK_SIZE;
+        return ZPSE_BAD_BLOCK_SIZE;
     }
     if (tid > 11) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     if (!zpse_is_valid_segment_count(scount)) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     if (tile_size != ZPSE_TILE_SIZE) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (profile != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (r0 != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     has_meta = (meta_size > 0) ? 1 : 0;
     if (((flags & ZPSE_B_HAS_META) != 0) != has_meta) {
-        return PSE_BAD_HEADER;
+        return ZPSE_BAD_HEADER;
     }
     if ((flags & ZPSE_B_RESET) == 0) {
-        return PSE_BAD_HEADER; /* required-1 bit, cf. HAS_META agreement */
+        return ZPSE_BAD_HEADER; /* required-1 bit, cf. HAS_META agreement */
     }
     if ((flags & ZPSE_B_RESERVED_MASK) != 0) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
 
     out->sync = sync;
@@ -279,7 +279,7 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     out->decoded_crc32c = dec_crc;
     out->header_crc32c = stored_crc;
     out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 void zpse_block_header_serialize_short(uint8_t out[16], const ZpseBlockHeader *h)
@@ -332,10 +332,10 @@ int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32
     uint8_t init_lit, sflags;
 
     if (out == 0 || buf == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (len < ZPSE_SEGMENT_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     dec_size = zpse_load_u32le(buf + 0);
     tile_count = zpse_load_u16le(buf + 4);
@@ -343,13 +343,13 @@ int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32
     sflags = buf[7];
 
     if (tile_count == 0) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (dec_size == 0) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (sflags != ZPSE_S_LEN_PREFIX) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
 
     /* The directory size and the reserved word are no longer carried: both
@@ -362,7 +362,7 @@ int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32
     out->segment_flags = sflags;
     out->tile_directory_size = 0u;
     out->reserved = 0u;
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 void zpse_segment_header_serialize(uint8_t out[8], const ZpseSegmentHeader *h)
@@ -381,10 +381,10 @@ int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len
     uint8_t flags, mask_mode, res_mode, pid;
 
     if (out == 0 || buf == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (len < ZPSE_TILE_HEADER_SIZE) {
-        return PSE_TRUNCATED;
+        return ZPSE_TRUNCATED;
     }
     flags = buf[0];
     pid = buf[1];
@@ -392,18 +392,18 @@ int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len
      * equation and K-derivation need cross-field context and stay with
      * zpse_tile_validate, but unknown modes and reserved bits fail here. */
     if ((flags & (uint8_t)0x40) != 0) {
-        return PSE_UNSUPPORTED_FEATURE; /* bit 6 reserved-0 */
+        return ZPSE_UNSUPPORTED_FEATURE; /* bit 6 reserved-0 */
     }
     mask_mode = (uint8_t)(flags & (uint8_t)0x07);
     res_mode = (uint8_t)((flags & (uint8_t)0x38) >> 3u);
     if (mask_mode > 6u) {
-        return PSE_BAD_MASK; /* mode 7 reserved */
+        return ZPSE_BAD_MASK; /* mode 7 reserved */
     }
     if (res_mode > 4u) {
-        return PSE_BAD_RESIDUAL; /* modes 5..7 reserved */
+        return ZPSE_BAD_RESIDUAL; /* modes 5..7 reserved */
     }
     if (pid > (uint8_t)ZPSE_P_STRIDE_3) {
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     }
     out->tile_flags = flags;
     out->predictor_id = pid;
@@ -411,7 +411,7 @@ int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len
     out->exception_count = buf[3];
     out->mask_payload_size = zpse_load_u16le(buf + 4);
     out->residual_payload_size = zpse_load_u16le(buf + 6);
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
@@ -421,16 +421,16 @@ int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
     uint8_t i;
 
     if (out == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (len > 0 && buf == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (transform_id > 11) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
     if (!zpse_is_valid_segment_count(segment_count)) {
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
 
     out->transform_id = transform_id;
@@ -444,142 +444,142 @@ int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
     switch (transform_id) {
     case ZPSE_T_RAW_BYTES:
         if (segment_count != 1) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 1;
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_DELTA8:
     case ZPSE_T_XOR8:
         if (segment_count != 1) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 1) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 1;
         out->has_seeds = 1;
         out->seeds[0] = buf[0];
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_TRANSPOSE_2:
         if (segment_count != 2) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 2;
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_TRANSPOSE_4:
         if (segment_count != 4) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 4;
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_TRANSPOSE_8:
         if (segment_count != 8) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 8;
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_TRANSPOSE_16:
         if (segment_count != 16) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 0) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 16;
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_DELTA_TRANSPOSE_2:
         if (segment_count != 2) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 2) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 2;
         out->has_seeds = 1;
         out->seeds[0] = buf[0];
         out->seeds[1] = buf[1];
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_DELTA_TRANSPOSE_4:
         if (segment_count != 4) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 4) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 4;
         out->has_seeds = 1;
         for (i = 0; i < 4; i++) {
             out->seeds[i] = buf[i];
         }
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_DELTA_TRANSPOSE_8:
         if (segment_count != 8) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 8) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 8;
         out->has_seeds = 1;
         for (i = 0; i < 8; i++) {
             out->seeds[i] = buf[i];
         }
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_DELTA_TRANSPOSE_16:
         if (segment_count != 16) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (len != 16) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = 16;
         out->has_seeds = 1;
         for (i = 0; i < 16; i++) {
             out->seeds[i] = buf[i];
         }
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_T_STRIDE_TRANSPOSE: {
         uint8_t w, sflags;
 
         /* segment_count already validated to be in {1,2,4,8,16} */
         if (len != 2 && len != (uint16_t)(2u + (uint16_t)segment_count)) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         w = buf[0];
         sflags = buf[1];
         if (!zpse_is_valid_segment_count(w)) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if (w != segment_count) {
-            return PSE_BAD_TRANSFORM;
+            return ZPSE_BAD_TRANSFORM;
         }
         if ((sflags & (uint8_t)0xFE) != 0) {
-            return PSE_UNSUPPORTED_FEATURE;
+            return ZPSE_UNSUPPORTED_FEATURE;
         }
         if ((sflags & 0x01u) == 0) {
             if (len != 2) {
-                return PSE_BAD_HEADER;
+                return ZPSE_BAD_HEADER;
             }
             out->width_W = w;
             out->stride_flags = sflags;
             out->has_seeds = 0;
-            return PSE_OK;
+            return ZPSE_OK;
         }
         /* DELTA flag set: expect 2+W bytes */
         if (len != (uint16_t)(2u + (uint16_t)w)) {
-            return PSE_BAD_HEADER;
+            return ZPSE_BAD_HEADER;
         }
         out->width_W = w;
         out->stride_flags = sflags;
@@ -587,9 +587,9 @@ int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
         for (i = 0; i < w; i++) {
             out->seeds[i] = buf[2 + i];
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     default:
-        return PSE_BAD_TRANSFORM;
+        return ZPSE_BAD_TRANSFORM;
     }
 }

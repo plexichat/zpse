@@ -370,13 +370,13 @@ int zpse_reconstruct_bitmap_excl_u8(uint8_t *dst, const uint8_t *pred,
     unsigned consumed = 0;
     unsigned p;
     if (dst == 0 || pred == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     if (nt < 1u || nt > 256u) {
-        return PSE_BAD_TILE_SIZE; /* Nt normative range 1..256 (Sec. 6.2) */
+        return ZPSE_BAD_TILE_SIZE; /* Nt normative range 1..256 (Sec. 6.2) */
     }
     if (nt > 0u && bitmap == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     for (p = 0; p < (unsigned)nt; p++) {
         unsigned bit = (unsigned)((bitmap[p >> 3] >> (p & 7u)) & 1u);
@@ -384,17 +384,17 @@ int zpse_reconstruct_bitmap_excl_u8(uint8_t *dst, const uint8_t *pred,
             unsigned r;
             unsigned ph;
             if (residuals == 0) {
-                return PSE_BAD_ARG;
+                return ZPSE_BAD_ARG;
             }
             if (consumed >= (unsigned)res_len) {
-                return PSE_TRUNCATED;
+                return ZPSE_TRUNCATED;
             }
             r = (unsigned)residuals[consumed];
             consumed++;
             /* EXCLUSION_U8 residuals are in [0,254]; 255 is forbidden
              * outside RAW_ACTUAL_BYTES. */
             if (r > 254u) {
-                return PSE_BAD_RESIDUAL;
+                return ZPSE_BAD_RESIDUAL;
             }
             ph = (unsigned)pred[p];
             dst[p] = (uint8_t)((r < ph) ? r : (r + 1u));
@@ -448,7 +448,7 @@ int zpse_compact8(uint8_t *dst, const uint8_t data[8], uint8_t mask8,
                   const uint8_t *lut_2k)
 {
     if (dst == 0 || data == 0) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
 #if ZPSE_HAVE_X86
     if (lut_2k != 0 && (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_SSSE3)) {

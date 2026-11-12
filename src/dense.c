@@ -295,30 +295,30 @@ static int dense_check_mask(uint8_t mask_mode, const uint8_t *mask,
     switch (mask_mode) {
     case ZPSE_M_ALL_HIT:
         if (k != 0u || mask_len != 0u) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_M_ALL_EXCEPTION:
         if (k != nt || mask_len != 0u) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
-        return PSE_OK;
+        return ZPSE_OK;
     case ZPSE_M_RAW_BITMAP: {
         uint32_t need = (nt + 7u) >> 3;
 
         if (k < 1u || k >= nt) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
         if (mask_len != need) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
         if ((nt & 7u) != 0u && (mask[need - 1u] >> (nt & 7u)) != 0u) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
         if (dense_popcount(mask, need) != k) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     case ZPSE_M_SPARSE_U8: {
         uint32_t j;
@@ -326,27 +326,27 @@ static int dense_check_mask(uint8_t mask_mode, const uint8_t *mask,
         /* Positions are one byte each, so this form only exists for
          * records whose positions all fit in a byte. */
         if (nt > 256u) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
         if (k < 1u || k >= nt) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
         if (mask_len != k) {
-            return PSE_BAD_MASK;
+            return ZPSE_BAD_MASK;
         }
         for (j = 0u; j < k; j++) {
             if ((uint32_t)mask[j] >= nt) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
             if (j > 0u && mask[j] <= mask[j - 1u]) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
     default:
         /* Mask modes 3, 4, 5 and 7 are reserved inside a dense record. */
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
 }
 
@@ -379,10 +379,10 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
 
     *is_const = 0;
     if (nt == 0u || nt > ZPSE_DENSE_MAX_LEN) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (payload_len < base || payload_len - base < ZPSE_DENSE_HEADER_SIZE) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
 
     rec_len = (uint32_t)zpse_load_u16le(payload + base);
@@ -396,39 +396,39 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
     res_mode = (uint8_t)((flags >> 3) & UINT8_C(0x07));
 
     if ((flags & ZPSE_DENSE_MARKER) == 0u) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if ((flags & UINT8_C(0x80)) != 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (payload[base + 5u] != 0u) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (rec_len < 10u ||
         (uint64_t)base + 2u + (uint64_t)rec_len > (uint64_t)payload_len) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     if (mask_len + res_len != rec_len - 10u) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     /* Mode 4 (signed delta) is prediction-dependent, and a record only
      * knows a position's prediction while reconstructing it, so it is
      * reserved here and reported as an unsupported feature rather than
      * decoded wrongly. */
     if (res_mode > (uint8_t)ZPSE_R_PACKED_BASE_M) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (pred > (uint8_t)ZPSE_P_STRIDE_3) {
-        return PSE_BAD_PREDICTOR;
+        return ZPSE_BAD_PREDICTOR;
     }
     if (pred == (uint8_t)ZPSE_P_ORDER1 || pred == (uint8_t)ZPSE_P_ORDER2) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
 
     mask = payload + base + ZPSE_DENSE_HEADER_SIZE;
     res = mask + mask_len;
     rc = dense_check_mask(mask_mode, mask, nt, k, mask_len);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
 
@@ -452,7 +452,7 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
 
         rc = zpse_residual_decode(res_mode, res, (uint16_t)res_len,
                                   (uint16_t)k, 0, out, out);
-        if (rc != PSE_OK) {
+        if (rc != ZPSE_OK) {
             return rc;
         }
         if (res_mode != (uint8_t)ZPSE_R_RAW_ACTUAL) {
@@ -470,12 +470,12 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
                 dense_exclusion_map(out, nt, fill);
             }
         }
-        return PSE_OK;
+        return ZPSE_OK;
     }
 
     rc = zpse_residual_decode(res_mode, res, (uint16_t)res_len, (uint16_t)k,
                               0, scratch, scratch);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         return rc;
     }
 
@@ -498,7 +498,7 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
          * instead of a CRC pass (crc32c.h: zpse_crc32c_repeat). */
         *is_const = 1;
         *fill_out = fill;
-        return PSE_OK;
+        return ZPSE_OK;
     }
 
     for (l = 0; l < 8u; l++) {
@@ -523,13 +523,13 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
          * at k and the residual stream is read identically. The mask has
          * k < nt here (ALL_EXCEPTION took the no-prediction path above and
          * k == 0 the fill above that), but a position at or past nt is
-         * refused rather than written: that is the same PSE_BAD_MASK the
+         * refused rather than written: that is the same ZPSE_BAD_MASK the
          * position loop's j != k check answered with. */
         for (j = 0; j < (uint32_t)k; j++) {
             uint32_t pos = dense_next(mask_mode, mask, nt, j, at);
 
             if (pos >= (uint32_t)nt) {
-                return PSE_BAD_MASK;
+                return ZPSE_BAD_MASK;
             }
             if (pos > at) {
                 dense_fill(out + at, pos - at, fill);
@@ -645,9 +645,9 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
     }
 
     if (j != k) {
-        return PSE_BAD_MASK;
+        return ZPSE_BAD_MASK;
     }
-    return PSE_OK;
+    return ZPSE_OK;
 }
 
 int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
@@ -663,16 +663,16 @@ int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
 
     if (h == 0 || payload == 0 || out == 0 || out_len == 0 || scratch == 0 ||
         all_const == 0 || const_byte == 0 || h->tile_count != 1u) {
-        return PSE_BAD_ARG;
+        return ZPSE_BAD_ARG;
     }
     *all_const = 0;
     *const_byte = 0u;
     total = h->segment_decoded_size;
     if (total == 0u || total > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
-        return PSE_UNSUPPORTED_FEATURE;
+        return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (total > out_cap) {
-        return PSE_OUTPUT_OVERFLOW;
+        return ZPSE_OUTPUT_OVERFLOW;
     }
 
     produced = 0u;
@@ -686,7 +686,7 @@ int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
             ns = ZPSE_DENSE_MAX_LEN;
         }
         if (pos + 2u > payload_len) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         rec_len = (uint32_t)zpse_load_u16le(payload + pos);
         {
@@ -696,7 +696,7 @@ int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
             rc = dense_record(ns, payload, payload_len, pos, out + produced,
                               scratch, h->initial_literal, &rec_const,
                               &rec_fill);
-            if (rc != PSE_OK) {
+            if (rc != ZPSE_OK) {
                 return rc;
             }
             if (rec_const == 0 || (one_value != 0 && produced != 0u &&
@@ -708,15 +708,15 @@ int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
         }
         pos += 2u + rec_len;
         if (pos > payload_len) {
-            return PSE_BAD_TILE_SIZE;
+            return ZPSE_BAD_TILE_SIZE;
         }
         produced += ns;
     }
     if (pos != payload_len) {
-        return PSE_BAD_TILE_SIZE;
+        return ZPSE_BAD_TILE_SIZE;
     }
     *out_len = total;
     *all_const = one_value;
     *const_byte = fill;
-    return PSE_OK;
+    return ZPSE_OK;
 }

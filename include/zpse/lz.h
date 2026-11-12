@@ -11,11 +11,18 @@
  *
  * Payload layout (the block header is not part of it):
  *
- *   u32 literal_bytes        count of literal bytes that follow
- *   u32 command_count        number of tokens that follow
- *   u8  literals[]           literal_bytes bytes, padded to a 4-byte
- *                            boundary with bytes the decoder never reads
- *   token stream             to the end of the payload
+ *   u32 literal_bytes        total literal bytes in the stream
+ *   u32 command_count        number of tokens
+ *   command stream           to the end of the payload
+ *
+ * The command stream is ONE forward-growing buffer, not two regions: each
+ * command writes its token, then its literals, then its distance, in the
+ * order the decoder reads them. The two header words are totals for the
+ * whole payload rather than pointers -- nothing is skipped, padded or
+ * compacted at the end, so a command is written once, where it stays.
+ * (This comment used to describe a separate literal region padded to a
+ * 4-byte boundary, which is not what src/lz.c has written since the
+ * token-length rework; the layout above is the one it writes.)
  *
  * Each command is a token byte and an offset:
  *
@@ -119,9 +126,9 @@ uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n, uint8_t *dst,
                            uint32_t lazy_max);
 
 /* Decode a payload of in_len bytes into exactly n bytes at out. Returns
- * PSE_OK, or a negative status for any stream that does not decode to
+ * ZPSE_OK, or a negative status for any stream that does not decode to
  * exactly n bytes with every reference in range. out is only valid on
- * PSE_OK; a refused stream may have had part of it written. */
+ * ZPSE_OK; a refused stream may have had part of it written. */
 int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                    uint32_t n);
 

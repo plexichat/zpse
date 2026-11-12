@@ -89,9 +89,9 @@ one -- and re-emits the header checksum, which is a CRC32-C over 28 bytes in the
 long form and a 16-bit truncation over 14 in the short one. The payload is not
 touched: it decodes to the page's bytes, which did not change, so a payload
 checksum written with the block still holds. It refuses a NULL block
-(`PSE_BAD_ARG`), a length below a page header (`PSE_TRUNCATED`), a length the
-header disagrees with or a block with no sync (`PSE_BAD_HEADER`) and a bad
-header CRC (`PSE_BAD_HEADER_CRC`), so a store cannot turn a corrupt entry into a
+(`ZPSE_BAD_ARG`), a length below a page header (`ZPSE_TRUNCATED`), a length the
+header disagrees with or a block with no sync (`ZPSE_BAD_HEADER`) and a bad
+header CRC (`ZPSE_BAD_HEADER_CRC`), so a store cannot turn a corrupt entry into a
 stream that only fails at read time.
 
 ## The call sequence
@@ -103,7 +103,7 @@ uint32_t slot, blen;
 zpse_page_hash(page, 4096, &lo, &hi);
 if (zpse_pagedict_find(&d, lo, hi, &slot) &&
     store_read(slot, blk, &blen) &&                  /* the stored block     */
-    zpse_block_retag(blk, blen, seq, is_last) == PSE_OK) {
+    zpse_block_retag(blk, blen, seq, is_last) == ZPSE_OK) {
     emit(blk, blen);                                 /* no arena touched     */
 } else {
     zpse_compress_block(page, 4096, blk, cap, &blen, seq, is_last, arena);

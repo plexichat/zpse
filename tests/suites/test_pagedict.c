@@ -318,12 +318,12 @@ static void test_store(void)
             len = plen[slot];
             memcpy(blk[q], pool + poff[slot], len);
             rc = zpse_block_retag(blk[q], len, q, last);
-            CHECK(rc == PSE_OK, "retag failed: %s", zpse_status_name(rc));
+            CHECK(rc == ZPSE_OK, "retag failed: %s", zpse_status_name(rc));
             hits++;
         } else {
             rc = zpse_compress_block(src[q], PAGE, blk[q], CAP, &len, q, last,
                                      ea);
-            CHECK(rc == PSE_OK, "encode failed: %s", zpse_status_name(rc));
+            CHECK(rc == ZPSE_OK, "encode failed: %s", zpse_status_name(rc));
             misses++;
             /* Only what compressed is worth an entry: a RAW page's "block" is
              * longer than the page, so storing it would cost more than the
@@ -342,7 +342,7 @@ static void test_store(void)
         /* The dictionary's whole contract: the bytes written for a hit are the
          * bytes a fresh encode of this page at this position writes. */
         rc = zpse_compress_block(src[q], PAGE, ref, CAP, &rlen, q, last, ea);
-        CHECK(rc == PSE_OK, "reference encode failed: %s",
+        CHECK(rc == ZPSE_OK, "reference encode failed: %s",
               zpse_status_name(rc));
         CHECK(rlen == len && memcmp(ref, blk[q], len) == 0,
               "page %u: served block differs from a fresh encode", q);
@@ -352,13 +352,13 @@ static void test_store(void)
             uint32_t got = 0u;
 
             rc = zpse_decompress_block(blk[q], len, dec, PAGE, &got, da);
-            CHECK(rc == PSE_OK && got == PAGE &&
+            CHECK(rc == ZPSE_OK && got == PAGE &&
                       memcmp(dec, src[q], PAGE) == 0,
                   "page %u: block decoded wrong", q);
-            if (rc == PSE_OK && got == PAGE) {
+            if (rc == ZPSE_OK && got == PAGE) {
                 ZpseBlockHeader h;
 
-                if (zpse_block_header_parse(&h, blk[q], len) == PSE_OK) {
+                if (zpse_block_header_parse(&h, blk[q], len) == ZPSE_OK) {
                     if ((h.block_flags & ZPSE_B_LAST) != 0u ? !last : last) {
                         last_ok = 0;
                     }
@@ -394,22 +394,22 @@ static void test_retag_edges(void)
     fill_pattern(big, 3u, (uint32_t)sizeof big);
     rc = zpse_compress_block(big, (uint32_t)sizeof big, cbig,
                              (uint32_t)sizeof cbig, &clen, 3u, 0, ea);
-    CHECK(rc == PSE_OK && clen < sizeof big,
+    CHECK(rc == ZPSE_OK && clen < sizeof big,
           "16 KiB pattern should compress (rc %s)", zpse_status_name(rc));
 
-    CHECK(zpse_block_retag(cbig, clen, 1234u, 1) == PSE_OK,
+    CHECK(zpse_block_retag(cbig, clen, 1234u, 1) == ZPSE_OK,
           "retag of a long-header block failed");
-    CHECK(zpse_block_header_parse(&h, cbig, clen) == PSE_OK &&
+    CHECK(zpse_block_header_parse(&h, cbig, clen) == ZPSE_OK &&
               h.header_size == (uint8_t)ZPSE_BLOCK_HEADER_SIZE &&
               h.block_sequence_number == 1234u &&
               (h.block_flags & ZPSE_B_LAST) != 0u,
           "the long header did not take the new position");
-    CHECK(zpse_block_probe(cbig, clen, &cs, &us) == PSE_OK && cs == clen &&
+    CHECK(zpse_block_probe(cbig, clen, &cs, &us) == ZPSE_OK && cs == clen &&
               us == (uint32_t)sizeof big,
           "a retagged block must still probe as itself");
     rc = zpse_decompress_block(cbig, clen, out, (uint32_t)sizeof out, &olen,
                                da);
-    CHECK(rc == PSE_OK && olen == (uint32_t)sizeof big &&
+    CHECK(rc == ZPSE_OK && olen == (uint32_t)sizeof big &&
               memcmp(out, big, sizeof big) == 0,
           "a retagged long-header block decoded wrong");
 
@@ -417,12 +417,12 @@ static void test_retag_edges(void)
      * payload must not move: the header CRC is the only other byte that can
      * change. */
     memcpy(copy, cbig, clen);
-    CHECK(zpse_block_retag(cbig, clen, 3u, 0) == PSE_OK,
+    CHECK(zpse_block_retag(cbig, clen, 3u, 0) == ZPSE_OK,
           "retag back to the original position failed");
     CHECK(memcmp(copy + ZPSE_BLOCK_HEADER_SIZE, cbig + ZPSE_BLOCK_HEADER_SIZE,
                  clen - ZPSE_BLOCK_HEADER_SIZE) == 0,
           "retag moved the payload");
-    CHECK(zpse_block_header_parse(&h, cbig, clen) == PSE_OK &&
+    CHECK(zpse_block_header_parse(&h, cbig, clen) == ZPSE_OK &&
               h.block_sequence_number == 3u &&
               (h.block_flags & ZPSE_B_LAST) == 0u,
           "the long header did not take the cleared position");
@@ -433,13 +433,13 @@ static void test_retag_edges(void)
     clen = 0u;
     rc = zpse_compress_block(page, PAGE, cbig, (uint32_t)sizeof cbig, &clen,
                              5u, 0, ea);
-    CHECK(rc == PSE_OK && clen < PAGE, "the page should compress");
-    CHECK(zpse_block_header_parse(&h, cbig, clen) == PSE_OK &&
+    CHECK(rc == ZPSE_OK && clen < PAGE, "the page should compress");
+    CHECK(zpse_block_header_parse(&h, cbig, clen) == ZPSE_OK &&
               h.header_size == (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
           "a page's block should carry the 16-byte header");
-    CHECK(zpse_block_retag(cbig, clen, 99u, 1) == PSE_OK,
+    CHECK(zpse_block_retag(cbig, clen, 99u, 1) == ZPSE_OK,
           "retag of a page's block failed");
-    CHECK(zpse_block_header_parse(&h, cbig, clen) == PSE_OK &&
+    CHECK(zpse_block_header_parse(&h, cbig, clen) == ZPSE_OK &&
               h.header_size == (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT &&
               h.block_sequence_number == 99u &&
               (h.block_flags & ZPSE_B_LAST) != 0u &&
@@ -447,27 +447,27 @@ static void test_retag_edges(void)
           "the 16-byte header did not take the new position");
     rc = zpse_decompress_block(cbig, clen, out, (uint32_t)sizeof out, &olen,
                                da);
-    CHECK(rc == PSE_OK && olen == PAGE && memcmp(out, page, PAGE) == 0,
+    CHECK(rc == ZPSE_OK && olen == PAGE && memcmp(out, page, PAGE) == 0,
           "a retagged page block decoded wrong");
 
     /* Refusals. Each one has to leave the block readable: a caller that
      * retags a corrupt or truncated block must not write a stream that only
      * fails later. */
-    CHECK(zpse_block_retag(0, clen, 1u, 0) == PSE_BAD_ARG,
+    CHECK(zpse_block_retag(0, clen, 1u, 0) == ZPSE_BAD_ARG,
           "a NULL block must be refused");
-    CHECK(zpse_block_retag(cbig, 8u, 1u, 0) == PSE_TRUNCATED,
+    CHECK(zpse_block_retag(cbig, 8u, 1u, 0) == ZPSE_TRUNCATED,
           "a block shorter than a page header must be truncated");
-    CHECK(zpse_block_retag(cbig, clen - 1u, 1u, 0) == PSE_BAD_HEADER,
+    CHECK(zpse_block_retag(cbig, clen - 1u, 1u, 0) == ZPSE_BAD_HEADER,
           "a length the header disagrees with must be refused");
-    CHECK(zpse_block_retag(cbig, clen + 1u, 1u, 0) == PSE_BAD_HEADER,
+    CHECK(zpse_block_retag(cbig, clen + 1u, 1u, 0) == ZPSE_BAD_HEADER,
           "a length with trailing bytes must be refused");
     memcpy(copy, cbig, clen);
     copy[3] ^= 0x01u; /* transform id: inside the header CRC */
-    CHECK(zpse_block_retag(copy, clen, 1u, 0) == PSE_BAD_HEADER_CRC,
+    CHECK(zpse_block_retag(copy, clen, 1u, 0) == ZPSE_BAD_HEADER_CRC,
           "a bad header CRC must be refused");
     memcpy(copy, cbig, clen);
     copy[0] ^= 0xFFu; /* sync */
-    CHECK(zpse_block_retag(copy, clen, 1u, 0) == PSE_BAD_HEADER,
+    CHECK(zpse_block_retag(copy, clen, 1u, 0) == ZPSE_BAD_HEADER,
           "a block with no sync must be refused");
 
     /* A RAW block is a block too: its header takes a position, and its
@@ -479,12 +479,12 @@ static void test_retag_edges(void)
         fill_noise(noise, PAGE);
         rc = zpse_compress_block(noise, PAGE, cbig, (uint32_t)sizeof cbig,
                                  &rlen, 1u, 0, ea);
-        CHECK(rc == PSE_OK && rlen >= PAGE, "noise should be written raw");
-        CHECK(zpse_block_retag(cbig, rlen, 2u, 1) == PSE_OK,
+        CHECK(rc == ZPSE_OK && rlen >= PAGE, "noise should be written raw");
+        CHECK(zpse_block_retag(cbig, rlen, 2u, 1) == ZPSE_OK,
               "retag of a RAW block failed");
         rc = zpse_decompress_block(cbig, rlen, out, (uint32_t)sizeof out,
                                    &olen, da);
-        CHECK(rc == PSE_OK && olen == PAGE && memcmp(out, noise, PAGE) == 0,
+        CHECK(rc == ZPSE_OK && olen == PAGE && memcmp(out, noise, PAGE) == 0,
               "a retagged RAW block decoded wrong");
     }
 }

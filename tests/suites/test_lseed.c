@@ -234,7 +234,7 @@ static int run_case(const char *name, int ntiles, const uint8_t *pids,
     dl.gen = 0u;
     rc = zpse_segment_decode(&D, &dl, payload, pos, out,
                              (uint32_t)ntiles * 256u, &got);
-    if (rc != PSE_OK) {
+    if (rc != ZPSE_OK) {
         printf("FAIL %s: decode rc=%d\n", name, rc);
         fails++;
         return 1;
