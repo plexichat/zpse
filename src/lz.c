@@ -165,6 +165,26 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
  * below skip working out the exact size first. */
 #define LZ_CMD_ROOM 8u
 
+/* Whether the page lazy probe measures the match at pos + 1 eight bytes at a
+ * time rather than a byte at a time.
+ *
+ * The probe weighs the match one byte ahead against the one it already has,
+ * and weighing it means walking its whole length from four bytes on. On prose
+ * that walk is one or two bytes, but on a structured page -- a tile of records,
+ * a heap of pointers -- the probe is asked about matches of fifty bytes and
+ * more, and the byte loop paid a dependent load, compare and branch per byte
+ * of every one of them. The wide form compares eight at a time and takes the
+ * low set bit of the mismatch as its length, which is exactly where the byte
+ * loop would have stopped, so `l1` -- and with it the decision, the stream and
+ * the size -- is unchanged. The four-byte head the loop starts on is still
+ * measured bytewise, because the byte loop has to run from wherever the wide
+ * loop stops anyway.
+ *
+ * 0 restores the byte loop, for re-measuring the two on a page corpus. */
+#ifndef ZPSE_LZ_LAZY_WIDE
+#define ZPSE_LZ_LAZY_WIDE 1
+#endif
+
 /* Lazy matching by LENGTH, for pages only.
  *
  * The probe above asks one question -- "is there an eight-byte match one
@@ -635,6 +655,24 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                 {
                     uint32_t l1 = ZPSE_LZ_MIN_MATCH;
 
+#if ZPSE_LZ_LAZY_WIDE
+                    /* Only the larger cursor needs the bound: cand1 is
+                     * below pos + 1, so eight readable bytes at pos + 1 + l1
+                     * are eight readable bytes at cand1 + l1 as well. */
+                    while (pos + 1u + l1 + 8u <= n) {
+                        uint64_t x = lz_load64(in + pos + 1u + l1) ^
+                                     lz_load64(in + cand1 + l1);
+
+                        if (x != 0u) {
+                            l1 += (uint32_t)(zpse_ctz64(x) >> 3);
+                            break;
+                        }
+                        l1 += 8u;
+                    }
+#endif
+                    /* The tail, and with the wide loop off the whole of it:
+                     * it exits at once after a mismatch the wide loop found,
+                     * because that is the byte it stopped on. */
                     while (pos + 1u + l1 < n && cand1 + l1 < n &&
                            in[pos + 1u + l1] == in[cand1 + l1]) {
                         l1++;

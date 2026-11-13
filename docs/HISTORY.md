@@ -629,3 +629,40 @@ its own detection and test surface.
 
 `ab_silesia.sh` grew the `BLOCK` variable for the first measurement; without
 it the default-block numbers are the only ones the script can produce.
+
+## The page lazy probe measured its match a byte at a time
+
+The lazy pass on a page-sized block weighs the match one byte ahead against the
+one it already has, and weighing it means walking its whole length from four
+bytes on -- the only place in either LZ finder that still measured a match a
+byte at a time (`src/lz2.c` and `src/lzh.c` ask `lz2_extend` / `lzh_extend`,
+which have stepped eight bytes at a time since they were written). On prose
+that walk is one or two bytes; on a structured page it is fifty and more, and
+every byte of it was a dependent load, compare and branch.
+
+The wide form compares eight bytes and takes the low set bit of the mismatching
+word as the length, which is where the byte loop would have stopped, so `l1`,
+the decision and the stream are unchanged. `ZPSE_LZ_LAZY_WIDE 0` puts the byte
+loop back for re-measuring the two.
+
+`ZPSE_LZ2_BLOCK=4096 bench_lz2 FILE...` now measures the page path (the lz1
+column passes the block size as the lazy ceiling, which is the rule the block
+encoder applies; the default is still the fast form's 64 KiB). Two runs per arm
+-- each run best-of-three passes over the file, arms alternated in both orders
+-- LZ encode MB/s, 4 KiB blocks then 16 KiB: `dickens` 256.6 -> 274.4 and 217.4
+-> 246.3, `mozilla` 383.3 -> 433.1 and 336.2 -> 373.7, `nci` 514.7 -> 666.4 and
+532.0 -> 725.8, `xml` 423.7 -> 523.2 and 462.1 -> 573.8, `reymont` 256.0 ->
+301.4 and 255.6 -> 319.7, `ooffice` 311.2 -> 338.2 and 244.7 -> 266.6,
+`samba` 405.5 -> 486.8 and 387.4 -> 470.3. Every file, both block sizes, both
+orders.
+
+The whole encoder sees a smaller share of it, because the LZ pass is one of the
+things a page block does: the CLI at `-b 4096` over the same 16 MiB stream,
+two rounds, packed bytes identical at every level, level 6 361.1 -> 414.8 and
+363.0 -> 410.9 MB/s (+14%), level 9 288.4 -> 324.7 and 288.5 -> 327.8 (+13%),
+level 1 535.2 -> 542.3 and 546.0 -> 553.1 (inside the host's spread, which is
+what a page block that writes no LZ form should do).
+
+Sizes did not move, which is the whole claim: the 768-case size gate reports the
+same `delta=-435636 bytes`, `LZ: ALL OK (1191 checks)` pins the payloads this
+pass writes, and the parallel digest is unchanged.

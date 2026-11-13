@@ -11,6 +11,12 @@
  *   Files:    every complete 64 KiB block of each file, which is the unit the
  *             block encoder actually hands the finder.
  *
+ *   ZPSE_LZ2_BLOCK        block size to measure (default 65536 = ZPSE_LZ2's own
+ *                         maximum). Set it to 4096 or 16384 to measure what a
+ *                         page-sized block costs, which is where the plain LZ
+ *                         codec runs its lazy pass; the lz1 column passes the
+ *                         size as the lazy ceiling, which is the rule the block
+ *                         encoder itself applies.
  *   ZPSE_LZ_MIN_MBPS      exit non-zero when any row's encode rate is below
  *                         this, for a job that wants a floor (0 = report
  *                         only). A floor has to be loose -- CI hosts differ by
@@ -50,6 +56,11 @@
  * decode is timed on its own. */
 #define PAYCAP 70000u
 
+/* The block size under measurement. BLOCK is the capacity every buffer is
+ * declared with -- the ceiling ZPSE_LZ2's own encoder accepts -- and this is
+ * what a run actually hands the codecs. */
+static uint32_t bsize = BLOCK;
+
 static uint8_t in[BLOCK];
 static uint8_t payload[200000];
 static uint8_t outbuf[BLOCK];
@@ -84,18 +95,20 @@ static double rate(int which, const uint8_t *data, uint32_t blocks,
     uint32_t last = 0u;
     int rep;
 
+    const uint32_t lazy = (bsize <= (uint32_t)ZPSE_LZ_LAZY_MAX) ? bsize : 0u;
+
     for (rep = 0; rep < 3; rep++) {
         double t0, t1;
         uint32_t b;
 
         t0 = now_ns();
         for (b = 0; b < blocks; b++) {
-            memcpy(in, data + (size_t)b * BLOCK, BLOCK);
+            memcpy(in, data + (size_t)b * bsize, bsize);
             memset(tab, 0xFF, sizeof tab);
             last = (which == 0)
-                       ? zpse_lz_encode(in, BLOCK, payload, sizeof payload,
-                                        tab, ZPSE_LZ_HASH_BITS)
-                       : zpse_lz2_encode(in, BLOCK, payload, sizeof payload,
+                       ? zpse_lz_encode_ex(in, bsize, payload, sizeof payload,
+                                           tab, ZPSE_LZ_HASH_BITS, lazy)
+                       : zpse_lz2_encode(in, bsize, payload, sizeof payload,
                                          tab, ZPSE_LZ_HASH_BITS);
             if (last == 0u) {
                 return -1.0;
@@ -106,7 +119,7 @@ static double rate(int which, const uint8_t *data, uint32_t blocks,
             double ns = t1 - t0;
 
             if (ns > 0.0) {
-                double mb = (double)blocks * (double)BLOCK / (ns / 1e9) / 1e6;
+                double mb = (double)blocks * (double)bsize / (ns / 1e9) / 1e6;
 
                 if (mb > best) {
                     best = mb;
@@ -126,7 +139,12 @@ static double rate(int which, const uint8_t *data, uint32_t blocks,
 static double dec_rate(const uint8_t *data, uint32_t blocks,
                        uint32_t *packed_out)
 {
-    uint8_t *packed = (uint8_t *)malloc((size_t)blocks * PAYCAP);
+    /* A payload never exceeds the block by more than the command overhead,
+     * so the hold is charged per block rather than at the 64 KiB ceiling: a
+     * 4 KiB run over a large file would otherwise allocate hundreds of
+     * megabytes of slack. */
+    const uint32_t pcap = bsize + bsize / 2u + 64u;
+    uint8_t *packed = (uint8_t *)malloc((size_t)blocks * (size_t)pcap);
     uint32_t *lens = (uint32_t *)malloc((size_t)blocks * sizeof(uint32_t));
     double best = 0.0;
     uint32_t total = 0u;
@@ -141,8 +159,8 @@ static double dec_rate(const uint8_t *data, uint32_t blocks,
     }
     for (b = 0; b < blocks; b++) {
         memset(tab, 0xFF, sizeof tab);
-        lens[b] = zpse_lz2_encode(data + (size_t)b * BLOCK, BLOCK,
-                                  packed + (size_t)b * PAYCAP, PAYCAP, tab,
+        lens[b] = zpse_lz2_encode(data + (size_t)b * bsize, bsize,
+                                  packed + (size_t)b * pcap, pcap, tab,
                                   ZPSE_LZ_HASH_BITS);
         if (lens[b] == 0u) {
             free(packed);
@@ -156,8 +174,8 @@ static double dec_rate(const uint8_t *data, uint32_t blocks,
         double ns;
 
         for (b = 0; b < blocks; b++) {
-            if (zpse_lz2_decode(packed + (size_t)b * PAYCAP, lens[b], outbuf,
-                                BLOCK) != 0) {
+            if (zpse_lz2_decode(packed + (size_t)b * pcap, lens[b], outbuf,
+                                bsize) != 0) {
                 free(packed);
                 free(lens);
                 return -1.0;
@@ -165,7 +183,7 @@ static double dec_rate(const uint8_t *data, uint32_t blocks,
         }
         ns = now_ns() - t0;
         if (ns > 0.0) {
-            double mb = (double)blocks * (double)BLOCK / (ns / 1e9) / 1e6;
+            double mb = (double)blocks * (double)bsize / (ns / 1e9) / 1e6;
 
             if (mb > best) {
                 best = mb;
@@ -184,11 +202,19 @@ int main(int argc, char **argv)
     const char *dec_env = getenv("ZPSE_LZ_MIN_DEC_MBPS");
     double floor_mb = floor_env != 0 ? atof(floor_env) : 0.0;
     double dec_floor = dec_env != 0 ? atof(dec_env) : 0.0;
+    const char *block_env = getenv("ZPSE_LZ2_BLOCK");
     int bad = 0;
     int arg;
 
+    if (block_env != 0) {
+        long v = atol(block_env);
+
+        if (v >= 64 && v <= (long)BLOCK) {
+            bsize = (uint32_t)v;
+        }
+    }
     printf("block=%u B, best of 3 passes, one thread, table %u entries\n",
-           (unsigned)BLOCK, (unsigned)ZPSE_LZ_TABLE_ENTRIES);
+           (unsigned)bsize, (unsigned)ZPSE_LZ_TABLE_ENTRIES);
     printf("%-14s %7s %10s %10s %8s %10s\n", "input", "blocks", "lz1 MB/s",
            "lz2 MB/s", "lz2 B", "dec MB/s");
 
@@ -209,7 +235,7 @@ int main(int argc, char **argv)
             fseek(f, 0, SEEK_END);
             sz = ftell(f);
             fseek(f, 0, SEEK_SET);
-            if (sz < (long)BLOCK) {
+            if (sz < (long)bsize) {
                 fclose(f);
                 continue;
             }
@@ -221,7 +247,7 @@ int main(int argc, char **argv)
             }
             got = fread(filebuf, 1, (size_t)sz, f);
             fclose(f);
-            blocks = (uint32_t)(got / BLOCK);
+            blocks = (uint32_t)(got / bsize);
             r1 = rate(0, filebuf, blocks, &b1);
             r2 = rate(1, filebuf, blocks, &b2);
             d2 = dec_rate(filebuf, blocks, &dp);
@@ -259,6 +285,10 @@ int main(int argc, char **argv)
                                              "random" };
         uint32_t r = 0x1234u;
         int k;
+
+        /* The patterns are one full block each, so the env override only
+         * applies to files. */
+        bsize = BLOCK;
 
         for (k = 0; k < 3; k++) {
             uint32_t i, b1 = 0u, b2 = 0u, dp = 0u;

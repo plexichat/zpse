@@ -489,6 +489,7 @@ benchmarks are all under `tests/benchmarks/`:
 | `bench.c` | 64 KiB byte patterns and machine ceilings |
 | `bench_levels.c` | nine levels over the 25-case columnar matrix |
 | `bench_columnar.c` | per-case transforms and cross-codec comparison |
+| `bench_lz2.c` | both intra-block LZ codecs: encode and decode rate, `ZPSE_LZ2_BLOCK` for a page-sized block |
 | `bench_pareto.sh` | ratio/encode/decode frontier against lz4 and zstd |
 | `silesia.sh` | Silesia per-file table (downloads the corpus) |
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
