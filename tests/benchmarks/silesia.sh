@@ -124,9 +124,12 @@ lvl_flag=""
 floor=$(stage_floor "$work/webster")
 
 echo "silesia: $nfiles files, $bytes bytes, level ${level:-default}, ${reps} rep(s), read floor $floor MB/s" >&2
-# Staged paths are not what a reader of the table wants to see, so the staging
-# root is stripped from the names the CLI prints.
-out=$($pin "$bin" bench $lvl_flag -r "$reps" $files 2>&1 | sed "s|$STAGE_DIR/||g")
+# Staged paths are not what a reader of the table wants to see, so a leading
+# directory is stripped from each row's name. It is matched at the start of a
+# line rather than against $STAGE_DIR because the CLI is a native binary: it
+# is handed /tmp/... and prints the C:/Users/... form it resolves to.
+out=$($pin "$bin" bench $lvl_flag -r "$reps" $files 2>&1 |
+    sed -E 's|^([A-Za-z]:)?/[^ ]*/||')
 rc=$?
 printf '%s\n' "$out"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
