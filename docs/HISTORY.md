@@ -511,6 +511,32 @@ read against it rather than against an assumption about the drive. The lz4
 rows in the cross-codec tables are the real `lz4` CLI built from 1.10.0
 source, driven the way a user drives it.
 
+## The fast form's finder, the same lookahead
+
+The token form's finder (`src/lz.c`) got its next-key lookahead first. This is
+the same lever in the fast form (`src/lz2.c`), which is the one text blocks
+actually run, and it paid twice over because the lazy probe asks about the
+same position the lookahead reads.
+
+The loop files `pos` and then tests the candidate at `pos`. On a miss the
+cursor steps a single byte -- four iterations in five on prose, where the
+average match is 5.4 bytes -- and the old code loaded the word at the new
+cursor, hashed it and read its slot only after that test had resolved. The
+lookahead issues those three reads right after the store, so the miss path
+starts with its key, hash and entry in registers, and the entry is carried
+across iterations instead of being re-read at the top of the loop. On a hit
+the probe was about to read the same three values for `pos + 1` anyway, so it
+now takes them from the lookahead instead of issuing the chain a second time.
+
+The reads are taken after the table store, so a slot the store has just
+overwritten reads back exactly what the next iteration would read, and every
+other read is unchanged. Two binaries alternating over six Silesia files
+(176,670 bytes of payload either way), eight rounds on one core: ahead in all
+eight, median 367.5 against 356.1 MB/s. Through the whole block encoder at
+level 6 over the twelve-file corpus, ahead in three rounds of four (median 392
+against 376 MB/s) with the payload identical to the byte, 169,502,562 bytes
+both ways.
+
 ## What measurement changed
 
 The project converged on a small set of rules:

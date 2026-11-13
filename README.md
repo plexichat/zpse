@@ -68,7 +68,7 @@ and the lz4 *CLI* are not the same encoder.
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 276 | 1374 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 296 | 1369 |
 | | zpse 1 `FASTEST` | 1.24:1 | 816 | 2998 |
 | | zpse 9 `MAX` | 2.31:1 | 183 | 1087 |
 | 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.25:1 | 719 | 8562 |
@@ -102,19 +102,19 @@ pinned core, output written normally.
 
 | file | bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| `dickens` | 10,192,446 | 1.19:1 | 618 | 3264 |
-| `mozilla` | 51,220,480 | 2.01:1 | 251 | 1043 |
-| `mr` | 9,970,564 | 2.50:1 | 150 | 990 |
-| `nci` | 33,553,445 | 5.43:1 | 379 | 1092 |
-| `ooffice` | 6,152,192 | 1.49:1 | 170 | 948 |
-| `osdb` | 10,085,684 | 1.15:1 | 415 | 3880 |
-| `reymont` | 6,627,202 | 1.99:1 | 244 | 1666 |
-| `samba` | 21,606,400 | 2.61:1 | 316 | 1349 |
-| `sao` | 7,251,944 | 1.01:1 | 540 | 4663 |
-| `webster` | 41,458,703 | 2.10:1 | 228 | 1810 |
-| `x-ray` | 8,474,240 | 1.72:1 | 312 | 2196 |
-| `xml` | 5,345,280 | 4.22:1 | 429 | 1383 |
-| **total** | **211,938,580** | **2.08:1** | **276** | **1374** |
+| `dickens` | 10,192,446 | 1.19:1 | 510 | 3005 |
+| `mozilla` | 51,220,480 | 2.01:1 | 259 | 1007 |
+| `mr` | 9,970,564 | 2.50:1 | 173 | 1011 |
+| `nci` | 33,553,445 | 5.43:1 | 423 | 1362 |
+| `ooffice` | 6,152,192 | 1.49:1 | 178 | 867 |
+| `osdb` | 10,085,684 | 1.15:1 | 467 | 3058 |
+| `reymont` | 6,627,202 | 1.99:1 | 197 | 1493 |
+| `samba` | 21,606,400 | 2.61:1 | 312 | 1461 |
+| `sao` | 7,251,944 | 1.01:1 | 776 | 4381 |
+| `webster` | 41,458,703 | 2.10:1 | 269 | 1495 |
+| `x-ray` | 8,474,240 | 1.72:1 | 295 | 1950 |
+| `xml` | 5,345,280 | 4.22:1 | 461 | 1982 |
+| **total** | **211,938,580** | **2.08:1** | **296** | **1369** |
 
 Half of Silesia is English prose, the shape the tile model is weakest on.
 `sao` and `osdb` are close to the raw path doing a copy; `nci`, `samba` and
@@ -169,26 +169,26 @@ codec's, not the filesystem's; the read floor is printed by the script.
 
 | tool | packed bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| zpse 1 `FASTEST` | 170,031,147 | 1.25:1 | 529 | 1172 |
-| zpse 5 `BALANCED` | 105,756,601 | 2.00:1 | 256 | 910 |
-| zpse 6 (default) | 102,043,806 | 2.08:1 | 268 | 878 |
-| zpse 9 `MAX` | 91,665,498 | 2.31:1 | 169 | 765 |
-| lz4 CLI -1 | 100,910,487 | 2.10:1 | 391 | 1143 |
-| lz4 CLI -3 | 81,374,580 | 2.60:1 | 88 | 1228 |
-| lz4 CLI -9 (HC) | 77,916,351 | 2.72:1 | 31 | 1255 |
-| lz4 CLI -12 (HC) | 77,293,783 | 2.74:1 | 9 | 1209 |
-| zstd CLI -1 | 73,307,280 | 2.89:1 | 809 | 834 |
-| zstd CLI -3 | 66,209,100 | 3.20:1 | 427 | 730 |
-| zstd CLI -19 | 52,855,117 | 4.01:1 | 4 | 582 |
+| zpse 1 `FASTEST` | 170,031,147 | 1.25:1 | 577 | 1190 |
+| zpse 5 `BALANCED` | 105,756,601 | 2.00:1 | 286 | 936 |
+| zpse 6 (default) | 102,043,806 | 2.08:1 | 269 | 870 |
+| zpse 9 `MAX` | 91,665,498 | 2.31:1 | 184 | 709 |
+| lz4 CLI -1 | 100,910,487 | 2.10:1 | 433 | 1258 |
+| lz4 CLI -3 | 81,374,580 | 2.60:1 | 89 | 1311 |
+| lz4 CLI -9 (HC) | 77,916,351 | 2.72:1 | 31 | 1342 |
+| lz4 CLI -12 (HC) | 77,293,783 | 2.74:1 | 9 | 1364 |
+| zstd CLI -1 | 73,307,280 | 2.89:1 | 809 | 879 |
+| zstd CLI -3 | 66,209,100 | 3.20:1 | 464 | 791 |
+| zstd CLI -19 | 52,855,117 | 4.01:1 | 4 | 572 |
 
 Every row was round-tripped and compared whole with the input before it was
 timed, with the input staged in memory and the output sent to `/dev/null`. The
-read floor that staging measures here is 1723 MB/s, so a whole-process row
+read floor that staging measures here is 2179 MB/s, so a whole-process row
 still pays a share of its read; it is the same share for every row. All three
 tools are the real binaries: `lz4` 1.10.0 and `zstd` from their CLIs.
 
 On this corpus the default level is not the frontier: lz4 writes a slightly
-smaller stream at the same ratio and encodes 1.5x faster. zpse 1 is the encode
+smaller stream at the same ratio and encodes 1.6x faster. zpse 1 is the encode
 row and `MAX` is the only row under 2.4:1. That is the honest summary of
 Silesia -- zpse is a decode-and-determinism choice, not a text-ratio choice.
 
@@ -537,7 +537,7 @@ pages), `-t N` workers, `-x` writes an index, `-F` requests `LZ_FAST`, and
   Ratio loses to zstd on redundant text and on memory pages.
 * **Encode is slower than lz4's** because every block is decided, not merely
   encoded, and because the match finder runs once per block at 220-790 MB/s on
-  real data. On Silesia the default level is about 69% of the lz4 CLI's encode
+  real data. On Silesia the default level is about 62% of the lz4 CLI's encode
   rate at the same ratio; on typed columns the two run at the same rate and
   zpse's stream is 42% smaller.
 * **The default level trades decode speed for ratio.** A block the LZ form wins

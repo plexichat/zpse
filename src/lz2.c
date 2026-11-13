@@ -282,6 +282,29 @@ static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
 #define ZPSE_LZ2_PROBE_SELF 1
 #endif
 
+/* Whether the finder reads the key at pos + 1, its hash and that hash's entry
+ * immediately after filing pos, before the candidate at pos is tested, and
+ * carries the tested entry across iterations instead of re-reading it at the
+ * top of the loop.
+ *
+ * The loop is one dependent chain -- load the four bytes at the cursor, hash
+ * them, load the entry the hash names, load the four bytes at that entry --
+ * and on prose the miss path, where the cursor steps a single byte, is four
+ * iterations in five (the average match is 5.4 bytes). Issuing the next
+ * position's chain before the candidate test puts it behind the one load the
+ * iteration actually waits on instead of in front of the next one, and the
+ * lazy probe then reads the same three values instead of issuing them a
+ * second time (see ZPSE_LZ2_PROBE_EARLY).
+ *
+ * The reads are taken after the store above them, so a slot the store has
+ * just overwritten reads back exactly what the next iteration would have
+ * read, and the stream is unchanged -- the same argument, and the same
+ * guarantee, as src/lz.c's ZPSE_LZ_PIPE_NEXT. Set to 0 to build the finder
+ * without it, which is what the measurement compares against. */
+#ifndef ZPSE_LZ2_PIPE_NEXT
+#define ZPSE_LZ2_PIPE_NEXT 1
+#endif
+
 /* Tagged with the rest of the hot set: this finder is the whole of the F
  * form's encode, and it was the one kernel in the tree left at the build's
  * own level. */
@@ -315,18 +338,62 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     limit = n - ZPSE_LZ2_MIN_MATCH;
     cur = zpse_load_u32le(in + pos);
     h = lz2_hash(cur, hash_bits);
+#if ZPSE_LZ2_PIPE_NEXT
+    /* The entry the top of the loop tests, carried across iterations: the
+     * miss path reads it while the candidate is being compared (see
+     * ZPSE_LZ2_PIPE_NEXT), so re-reading it at the top would spend the
+     * latency the lookahead just saved. */
+    uint32_t cand = tab[h];
+#endif
 
     while (pos <= limit) {
+#if ZPSE_LZ2_PIPE_NEXT
+        uint32_t len = ZPSE_LZ2_MIN_MATCH;
+        uint32_t mpos = pos;
+        uint32_t mcand = cand;
+        uint32_t nx_cur = 0u, nx_h = 0u, nx_c = LZ2_EMPTY;
+        int nx_ok = 0;
+#else
         uint32_t cand = tab[h];
         uint32_t len = ZPSE_LZ2_MIN_MATCH;
         /* The match's own start: the walk below moves these instead of the
          * scanning cursor (see there). */
         uint32_t mpos = pos;
         uint32_t mcand = cand;
+#endif
 
         tab[h] = (uint16_t)pos;
+#if ZPSE_LZ2_PIPE_NEXT
+        /* The next position's chain, read BEFORE the candidate at the cursor
+         * is tested: the word at pos + 1 is the byte the cursor is about to
+         * step over on a miss, and the slot read is an L1 hit, while what
+         * this iteration waits on is the word AT the candidate (see
+         * ZPSE_LZ2_PIPE_NEXT). Read after the store above, so a self-hit
+         * yields the `pos` just filed, exactly as the next iteration would
+         * find it. */
+        if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
+            nx_cur = zpse_load_u32le(in + pos + 1u);
+            nx_h = lz2_hash(nx_cur, hash_bits);
+            nx_c = tab[nx_h];
+            nx_ok = 1;
+        }
+#endif
         if (ZPSE_LIKELY(cand == LZ2_EMPTY ||
                         zpse_load_u32le(in + cand) != cur)) {
+#if ZPSE_LZ2_PIPE_NEXT
+            /* The ordinary step: one byte on, which is every miss until
+             * ZPSE_LZ2_SKIP_BITS of them in a row accelerate it, and this
+             * iteration has already read that position's key, slot and the
+             * slot's entry. */
+            if (nx_ok != 0 && (misses >> ZPSE_LZ2_SKIP_BITS) == 0u) {
+                pos += 1u;
+                misses++;
+                cur = nx_cur;
+                h = nx_h;
+                cand = nx_c;
+                continue;
+            }
+#endif
             /* Two misses are a coincidence; a run of them means the data has
              * no match here, so the cursor accelerates. */
             pos += 1u + (misses >> ZPSE_LZ2_SKIP_BITS);
@@ -336,6 +403,9 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             }
             cur = zpse_load_u32le(in + pos);
             h = lz2_hash(cur, hash_bits);
+#if ZPSE_LZ2_PIPE_NEXT
+            cand = tab[h];
+#endif
             continue;
         }
 #if ZPSE_LZ2_PROBE_EARLY
@@ -346,12 +416,21 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t p_cur = 0u, p_h = 0u, p_c1 = LZ2_EMPTY;
         int p_ok = 0;
 
+#if ZPSE_LZ2_PIPE_NEXT
+        /* The probe asks about pos + 1, and so does the lookahead above: on
+         * a hit the three reads are already in hand. */
+        p_cur = nx_cur;
+        p_h = nx_h;
+        p_c1 = nx_c;
+        p_ok = nx_ok;
+#else
         if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             p_cur = zpse_load_u32le(in + pos + 1u);
             p_h = lz2_hash(p_cur, hash_bits);
             p_c1 = tab[p_h];
             p_ok = 1;
         }
+#endif
 #endif
         /* Extend backward into the pending literals: an earlier start is a
          * longer match for the same four bytes, and the run in front of it is
@@ -456,6 +535,9 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 misses = 0u;
                 cur = p_cur;
                 h = p_h;
+#if ZPSE_LZ2_PIPE_NEXT
+                cand = tab[h];
+#endif
                 continue;
             }
         }
@@ -473,6 +555,9 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 misses = 0u;
                 cur = cur1;
                 h = h1;
+#if ZPSE_LZ2_PIPE_NEXT
+                cand = tab[h];
+#endif
                 continue;
             }
         }
@@ -496,6 +581,9 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 }
                 cur = zpse_load_u32le(in + pos);
                 h = lz2_hash(cur, hash_bits);
+#if ZPSE_LZ2_PIPE_NEXT
+                cand = tab[h];
+#endif
                 continue;
             }
 
@@ -585,6 +673,9 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         }
         cur = zpse_load_u32le(in + pos);
         h = lz2_hash(cur, hash_bits);
+#if ZPSE_LZ2_PIPE_NEXT
+        cand = tab[h];
+#endif
     }
     if (anchor < n) {
         uint32_t run = n - anchor;
