@@ -511,6 +511,14 @@ read against it rather than against an assumption about the drive. The lz4
 rows in the cross-codec tables are the real `lz4` CLI built from 1.10.0
 source, driven the way a user drives it.
 
+The other use of staging is measurement itself. The same tree builds here
+twice -- clang 22.1 (LLVM-MinGW) for the tables, gcc 15 under WSL2 -- and
+the two produce identical streams (the parity digest and every packed size
+in the suite match), which is the repository's byte-identity invariant seen
+from a second compiler on a second OS, not a claim about it. An A/B that is
+close to the host's noise band is run on both, and the quieter one decides;
+the fast-form lookahead below is one of those, and it agreed on both.
+
 ## The fast form's finder, the same lookahead
 
 The token form's finder (`src/lz.c`) got its next-key lookahead first. This is
