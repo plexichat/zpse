@@ -343,6 +343,25 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                              (uint32_t)ZPSE_BLOCK_SHORT_MAX);
 }
 
+/* Whether the finder's inner loop reads the key and hash slot for pos + 1
+ * before it tests the candidate at pos, so the miss path -- the cursor
+ * stepping one byte -- starts with its key already in a register instead of
+ * computing it after the test resolves.
+ *
+ * Both reads are off the critical path: the word at pos + 1 is the byte the
+ * cursor is about to step over and the slot read is an L1 hit, while what
+ * the loop waits on is the word AT the candidate. Doing the work early is
+ * what the lazy probe in the fast form (ZPSE_LZ2_PROBE_EARLY) already does
+ * for its own two loads, and for the same reason. The values are the ones
+ * the next iteration would read, in the same order relative to the table
+ * store above them, so the decisions and the streams are identical.
+ *
+ * Set to 0 to build the finder without the lookahead, which is what the
+ * measurement compares against. */
+#ifndef ZPSE_LZ_PIPE_NEXT
+#define ZPSE_LZ_PIPE_NEXT 1
+#endif
+
 ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                                     uint8_t *dst, uint32_t cap, void *table,
                                     uint32_t hash_bits, uint32_t lazy_max)
@@ -350,7 +369,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
     uint16_t *tab = (uint16_t *)table;
     LzOut o;
     uint32_t pos, anchor, misses;
-    uint32_t cur, h;
+    uint32_t cur, h, cand;
     uint32_t entries = 1u << hash_bits;
 
     if (in == 0 || dst == 0 || tab == 0) {
@@ -409,12 +428,43 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
      * `sparse_mix` 1.09x, where a walk is most of the pass. */
     cur = zpse_load_u32le(in + pos);
     h = lz_hash(cur, hash_bits);
+    /* The candidate at the cursor, carried across iterations: the entry the
+     * top of the loop reads is the one the previous iteration or the miss
+     * path already loaded (see ZPSE_LZ_PIPE_NEXT). */
+    cand = tab[h];
 
     while (pos + ZPSE_LZ_MIN_MATCH <= n) {
-        uint32_t cand = tab[h];
         uint32_t len;
+#if ZPSE_LZ_PIPE_NEXT
+        uint32_t nxt_ok = 0u, nxt_cur = 0u, nxt_h = 0u;
+        uint16_t nxt_cand = LZ_EMPTY;
+#endif
 
         tab[h] = (uint16_t)pos;
+#if ZPSE_LZ_PIPE_NEXT
+        /* The key and the slot for pos + 1, read BEFORE the candidate at the
+         * cursor is tested.
+         *
+         * Both are cheap and independent of `cand`: the word at pos + 1 is
+         * the byte the cursor is about to step over on a miss, and the slot
+         * read is an L1 hit. What they buy is the miss path's stall. There
+         * the cursor moves to pos + 1, and recomputing its key there waits
+         * on a chain the iteration already had the time to run -- the hash
+         * multiply and the table read are off the critical path here, and
+         * the candidate word they name is one L1 access further on.
+         *
+         * The read is taken after the store above, which is what makes it
+         * exact: when the two positions hash to the same slot, the entry
+         * read here is the `pos` the store just wrote -- the same value the
+         * next iteration would find -- and the miss test rejects it either
+         * way. Everything else the next iteration reads is unchanged. */
+        if (pos + 1u + ZPSE_LZ_MIN_MATCH <= n) {
+            nxt_cur = zpse_load_u32le(in + pos + 1u);
+            nxt_h = lz_hash(nxt_cur, hash_bits);
+            nxt_cand = tab[nxt_h];
+            nxt_ok = 1u;
+        }
+#endif
         /* No distance test: every entry the table can hold was written by
          * this call at a position strictly below the cursor, and the
          * cursor never passes n - 4 <= 65532, so no candidate is more than
@@ -444,6 +494,19 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
  * at the candidate. */
         if (cand == LZ_EMPTY || (uint32_t)cand >= pos ||
             zpse_load_u32le(in + cand) != cur) {
+#if ZPSE_LZ_PIPE_NEXT
+            /* The ordinary case: the cursor advances by one, which is every
+             * miss until thirty-two in a row make it accelerate, and the
+             * iteration has already read that position's key and slot. */
+            if (nxt_ok != 0u && (misses >> 5) == 0u) {
+                pos += 1u;
+                misses++;
+                cur = nxt_cur;
+                h = nxt_h;
+                cand = nxt_cand;
+                continue;
+            }
+#endif
             /* Two misses are a coincidence; a run of them means the data
              * has no match here, so the cursor accelerates. */
             pos += 1u + (misses >> 5);
@@ -453,6 +516,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
             }
             cur = zpse_load_u32le(in + pos);
             h = lz_hash(cur, hash_bits);
+            cand = tab[h];
             continue;
         }
         /* Lazy matching: if pos+1 has an 8-byte match, skip this position */
@@ -484,6 +548,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                 misses = 0;
                 cur = v1;
                 h = lz_hash(cur, hash_bits);
+                cand = tab[h];
                 continue;
             }
         }
@@ -563,6 +628,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                     misses = 0u;
                     cur = v1;
                     h = h1;
+                    cand = tab[h];
                     continue;
                 }
 #else
@@ -578,6 +644,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                         misses = 0u;
                         cur = v1;
                         h = h1;
+                        cand = tab[h];
                         continue;
                     }
                 }
@@ -597,6 +664,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
         }
         cur = zpse_load_u32le(in + pos);
         h = lz_hash(cur, hash_bits);
+        cand = tab[h];
     }
     /* Trailing literals: no match left to code, so offset 0. What a run
      * of `run` literals does to both regions is known before a byte of it

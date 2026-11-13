@@ -55,10 +55,15 @@ rc=0
 cleanup() {
     [ -n "$cli" ] && rm -f "$cli"
     [ -n "$scratch" ] && rm -rf "$scratch"
+    stage_done
     if [ -n "$tmp" ] && [ "${KEEP:-0}" != "1" ]; then
         rm -rf "$tmp"
     fi
 }
+
+# Corpus staging: a memory-backed copy, read back before anything is timed.
+# shellcheck source=tests/benchmarks/lib_stage.sh
+. "$(dirname "$0")/lib_stage.sh"
 trap cleanup EXIT
 
 fail() {
@@ -124,14 +129,14 @@ elif [ -n "$work" ]; then
 fi
 [ "${#inputs[@]}" -gt 0 ] || fail "no input files"
 
-# The corpus is read into RAM first. Every tool here is timed as a process
-# that reads its input, and on a SATA SSD a cold 202 MiB read is several
-# tenths of a second -- comparable to a whole encode pass -- so a cold run
-# would put the drive in the ratio column. Two reads per file: the first
-# faults it in, the second proves it stayed.
+# The corpus is staged into memory before anything is timed (see
+# lib_stage.sh). Every tool here is timed as a process that reads its input,
+# so a cold read of the disk would land in the ratio column; the staged copy
+# is read back once here, and the floor it reads at is printed under the
+# table because that is what even a hot run still pays.
+stage_init || fail "cannot create a staging directory"
 for f in "${inputs[@]}"; do
-    cat "$f" > /dev/null
-    cat "$f" > /dev/null
+    stage_file "$f" >/dev/null || fail "cannot stage $f"
 done
 
 # One stream, so a ratio is the ratio of the corpus and every tool sees the
@@ -142,12 +147,8 @@ done
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/zpse-pareto-run.XXXXXX")" ||
     fail "cannot create a scratch directory"
 in="$scratch/in.bin"
-if [ "${#inputs[@]}" -eq 1 ] && [ -f "${inputs[0]}" ] &&
-    [ "$(wc -c <"${inputs[0]}")" -gt 1048576 ]; then
-    in="${inputs[0]}"
-else
-    cat "${inputs[@]}" >"$in" || fail "cannot concatenate the inputs"
-fi
+cat "${inputs[@]}" >"$in" || fail "cannot concatenate the inputs"
+in=$(stage_file "$in") || fail "cannot stage the joined input"
 insize=$(wc -c <"$in")
 [ "$insize" -gt 0 ] || fail "empty input"
 
@@ -270,9 +271,7 @@ rm -f "$packed" "$rt"
 
 [ "$(wc -l <"$rows")" -gt 0 ] || fail "no tool produced a row"
 
-cats=$(now_ns)
-cat "$in" >/dev/null
-cats=$((($(now_ns) - cats)))
+read_floor=$(stage_floor "$in")
 
 # ---- Report -----------------------------------------------------------
 {
@@ -296,10 +295,10 @@ cats=$((($(now_ns) - cats)))
         }' "$rows"
     echo
     echo "MB/s counts uncompressed bytes. Best of $REPS run(s) per tool"
-    echo "(zstd -19 and lz4 -9 once). Output to /dev/null, so the rate is the"
-    echo "codec's; reading the input still costs $(mbs "$insize" "$cats") MB/s of"
-    echo "it, which is the read floor on this host. Every row round-tripped"
-    echo "and compared whole with the input before it was timed."
+    echo "(zstd -19 and lz4 -9 once). The input is staged in memory and read"
+    echo "back before the clock starts; output goes to /dev/null, so the rate is"
+    echo "the codec's, against a read floor of $read_floor MB/s. Every row"
+    echo "round-tripped and compared whole with the input before it was timed."
     echo "Frontier: no other row is at least as good on all three columns."
 } | tee "$scratch/report.md"
 

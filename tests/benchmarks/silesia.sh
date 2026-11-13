@@ -32,10 +32,15 @@ bin=""
 
 cleanup() {
     [ -n "$bin" ] && rm -f "$bin"
+    stage_done
     if [ -n "$tmp" ] && [ "${KEEP:-0}" != "1" ]; then
         rm -rf "$tmp"
     fi
 }
+
+# Corpus staging: a memory-backed copy, read back before anything is timed.
+# shellcheck source=tests/benchmarks/lib_stage.sh
+. "$(dirname "$0")/lib_stage.sh"
 trap cleanup EXIT
 
 if [ -z "$work" ]; then
@@ -77,9 +82,12 @@ fi
 # lying around is worse than no benchmark. This exact list is also what the
 # README's table covers.
 names="dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml"
+stage_init || { echo "silesia: cannot create a staging directory" >&2; exit 1; }
 files=""
 for n in $names; do
-    [ -f "$work/$n" ] && files="$files $work/$n"
+    [ -f "$work/$n" ] || continue
+    s=$(stage_file "$work/$n") || { echo "silesia: cannot stage $n" >&2; exit 1; }
+    files="$files $s"
 done
 # shellcheck disable=SC2086
 set -- $files
@@ -88,7 +96,10 @@ if [ "$#" -eq 0 ]; then
     exit 1
 fi
 nfiles="$#"
-bytes=$(printf '%s\n' "$files" | xargs -d '\n' du -cb 2>/dev/null | tail -1 | cut -f1)
+bytes=0
+for f in $files; do
+    bytes=$((bytes + $(wc -c <"$f")))
+done
 
 bin="$(mktemp "${TMPDIR:-/tmp}/zpse-cli.XXXXXX")" ||
     { echo "silesia: cannot create a binary path" >&2; exit 1; }
@@ -105,20 +116,17 @@ command -v taskset >/dev/null 2>&1 && pin="taskset -c 0"
 lvl_flag=""
 [ -n "$level" ] && lvl_flag="-l $level"
 
-# Read the corpus into RAM before anything is timed. The 202 MiB lives on
-# disk, and on a SATA SSD a cold read is several tenths of a second -- the
-# size of a whole encode pass -- so a run that started cold would be timing
-# the drive. Every file is read twice: the first pass faults it in, the
-# second proves it is resident. `zpse_cli bench` reads each file once and
-# then re-runs the codec on its own copy, so this is the only disk in the
-# run.
-for f in $files; do
-    cat "$f" > /dev/null
-    cat "$f" > /dev/null
-done
+# The corpus is staged into memory before anything is timed (see
+# lib_stage.sh): the 202 MiB lives on disk, and a cold read of it is the
+# size of a whole encode pass, so a run that started cold would be timing
+# the drive. `zpse_cli bench` then reads each staged file once and re-runs
+# the codec on its own copy, so the disk is out of the run entirely.
+floor=$(stage_floor "$work/webster")
 
-echo "silesia: $nfiles files, $bytes bytes, level ${level:-default}, ${reps} rep(s)" >&2
-out=$($pin "$bin" bench $lvl_flag -r "$reps" $files 2>&1)
+echo "silesia: $nfiles files, $bytes bytes, level ${level:-default}, ${reps} rep(s), read floor $floor MB/s" >&2
+# Staged paths are not what a reader of the table wants to see, so the staging
+# root is stripped from the names the CLI prints.
+out=$($pin "$bin" bench $lvl_flag -r "$reps" $files 2>&1 | sed "s|$STAGE_DIR/||g")
 rc=$?
 printf '%s\n' "$out"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

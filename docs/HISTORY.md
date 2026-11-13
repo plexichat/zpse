@@ -460,6 +460,57 @@ This is why the README's parallel section quotes 16 MiB again, and why the
 invariant the README opens with -- a block's output is a function of its own
 bytes -- is now tested by an out-of-order decode and not only an in-order one.
 
+## The finder's next key, read before the candidate
+
+The match finder spends its time on one dependent chain: hash the four bytes
+at the cursor, load the table entry that hash names, then load the four bytes
+at that entry and compare. The third step cannot start until the second
+returns, and the second is an L2 hit, so on prose -- where a match turns up
+every five or six bytes and the miss path advances the cursor one byte at a
+time -- the loop is waiting on that chain more than it is doing arithmetic.
+
+The lever is not a shorter chain but work already in flight. `ZPSE_LZ_PIPE_NEXT`
+reads the key at pos + 1, hashes it and reads its slot immediately after the
+store for pos, before the candidate at pos is tested. That is the position the
+cursor steps to on a miss, and a miss is the common case, so the read sits
+behind the compare instead of in front of it. It is taken after the table
+store, which is what makes the change byte-identical: a position whose slot the
+store has just overwritten reads back exactly the value the next iteration
+would have read, and every other read is unchanged.
+
+Measured with `tests/benchmarks/bench_lz2.c` over six Silesia files, two
+binaries alternating over the same blocks, six rounds: ahead in five of the
+six, median 312 against 305 MB/s, payload 176,670 bytes either way, and the
+suite's stream digest unchanged. Identical bytes for a measured rate is the
+shape of change this project takes.
+
+Two knobs beside it were measured and left where they are. Dropping the fast
+form's lazy ceiling to 4 or 8 is 2-3% slower, not faster: the probe is what
+keeps the number of positions the loop walks down, so removing it costs more
+than the probe does. Moving the miss acceleration from `misses >> 5` to 4 or 6
+moves the weighted rate by 1.5% in one direction and the payload by 0.19% in
+the other, which is the host's spread rather than a result.
+
+## The drive, kept out of the tables
+
+Every cross-tool harness here times a process that reads its own input, and
+the corpus lives on a disk: a cold 202 MiB read is the size of a whole Silesia
+encode pass. Reading each file twice to warm the page cache was the first
+answer to that, and it is not sufficient on a host whose reads go through a
+compatibility layer at 0.6-1.7 GB/s -- on a 68 MiB corpus that is the same
+order as the codec's own rate, so the read could still be the column.
+
+`tests/benchmarks/lib_stage.sh` now stages every corpus file in a
+memory-backed directory when the host has one, reads the staged copy back
+before the clock starts, and reports the rate that read ran at under the
+table. The in-process harnesses (`bench.c`, `bench_levels.c`,
+`bench_parallel.c`, the CLI's own `bench`) never needed it: they read once and
+then clock the codec on their own copy, so their numbers carry no read at all.
+The scripts that run a tool as a process print the floor, and the tables are
+read against it rather than against an assumption about the drive. The lz4
+rows in the cross-codec tables are the real `lz4` CLI built from 1.10.0
+source, driven the way a user drives it.
+
 ## What measurement changed
 
 The project converged on a small set of rules:

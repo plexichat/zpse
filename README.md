@@ -42,34 +42,40 @@ ever disagree.
 All ratios are **uncompressed:compressed** (`x:1`); all rates are decimal MB/s
 of uncompressed bytes. Unless a table says otherwise: **one core**, 64 KiB
 blocks, default level 6, clang 22.1 (LLVM-MinGW) on a Ryzen 5 5600X under
-Windows 11. Every number here is single-core. Every corpus is generated or
-fetched by a script under `tests/benchmarks/`, and the benchmark scripts read
-the corpus into RAM before the clock starts: this host's corpus lives on a SATA
-SSD, and a cold 202 MiB read is the size of a whole Silesia encode pass, so a
-cold run would put the drive in the rate column. Rates are best-of-N and move
-by roughly 10% between runs; ratios are exact byte counts.
+Windows 11. Every number here is single-core, on an otherwise idle host.
 
-Two things to know before comparing these numbers with older ones. First,
-the compiler matters enormously here: gcc on Windows cannot align a 32-byte
+Every corpus is generated or fetched by a script under `tests/benchmarks/`,
+and the harnesses stage it in memory and read the staged copy back before the
+clock starts (`tests/benchmarks/lib_stage.sh`), so a timed row never waits on
+the drive. The floor that staging reads at is printed with each table -- 1.7
+GB/s for the 202 MiB Silesia stream, 0.73 GB/s for the 68 MiB columnar corpus
+on this host -- and a whole-process row (a CLI invocation) still pays one read
+of its input against that floor. The in-process harnesses (`bench.c`,
+`bench_levels.c`, `bench_parallel.c`, the CLI's own `bench`) read once and then
+clock the codec on their own copy, so no read is in their numbers at all.
+Rates are best-of-N and move by roughly 10% between runs; ratios are exact
+byte counts.
+
+The compiler matters enormously here: gcc on Windows cannot align a 32-byte
 stack slot for a by-value `__m256i`, so `hot.h` answers `ZPSE_AVX2_ABI_OK 0`
 there and the tile kernels fall back to scalar. A gcc build of this tree is
 two to four times slower on the tile path than the clang build every table
-below uses; the same source, the same block, the same bytes out. Second, the
-cross-codec tables name the binary each row came from, because an lz4 *library*
-call and the lz4 *CLI* are not the same encoder.
+below uses; the same source, the same block, the same bytes out. Every
+cross-codec row names the binary it came from, because an lz4 *library* call
+and the lz4 *CLI* are not the same encoder.
 
 ### At a glance
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 378 | 1778 |
-| | zpse 1 `FASTEST` | 1.24:1 | 983 | 3297 |
-| | zpse 9 `MAX` | 2.31:1 | 247 | 1432 |
-| 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.25:1 | 988 | 10498 |
-| | zpse 1 `FASTEST` | 4.01:1 | 2172 | 15336 |
-| | zpse 9 `MAX` | 5.28:1 | 929 | 10272 |
-| 64 KiB block, all zeros | zpse 6 (default) | 978:1 | 11010 | 67204 |
-| 64 KiB block, random | zpse 6 (default) | 1.00:1 | 2087 | 67652 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 276 | 1374 |
+| | zpse 1 `FASTEST` | 1.24:1 | 816 | 2998 |
+| | zpse 9 `MAX` | 2.31:1 | 183 | 1087 |
+| 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.25:1 | 719 | 8562 |
+| | zpse 1 `FASTEST` | 4.01:1 | 1716 | 14528 |
+| | zpse 9 `MAX` | 5.28:1 | 677 | 9128 |
+| 64 KiB block, all zeros | zpse 6 (default) | 978:1 | 10030 | 64680 |
+| 64 KiB block, random | zpse 6 (default) | 1.00:1 | 1600 | 64700 |
 
 The cross-codec rows are in each corpus's own section, labelled with the
 binary they came from; a single table mixing them would mix hosts.
@@ -96,19 +102,19 @@ pinned core, output written normally.
 
 | file | bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| `dickens` | 10,192,446 | 1.19:1 | 793 | 3298 |
-| `mozilla` | 51,220,480 | 2.01:1 | 319 | 1342 |
-| `mr` | 9,970,564 | 2.50:1 | 250 | 1376 |
-| `nci` | 33,553,445 | 5.43:1 | 579 | 1754 |
-| `ooffice` | 6,152,192 | 1.49:1 | 216 | 1187 |
-| `osdb` | 10,085,684 | 1.15:1 | 665 | 3873 |
-| `reymont` | 6,627,202 | 1.99:1 | 314 | 2006 |
-| `samba` | 21,606,400 | 2.61:1 | 411 | 1908 |
-| `sao` | 7,251,944 | 1.01:1 | 985 | 9268 |
-| `webster` | 41,458,703 | 2.10:1 | 316 | 1934 |
-| `x-ray` | 8,474,240 | 1.72:1 | 383 | 2443 |
-| `xml` | 5,345,280 | 4.22:1 | 461 | 1552 |
-| **total** | **211,938,580** | **2.08:1** | **378** | **1778** |
+| `dickens` | 10,192,446 | 1.19:1 | 618 | 3264 |
+| `mozilla` | 51,220,480 | 2.01:1 | 251 | 1043 |
+| `mr` | 9,970,564 | 2.50:1 | 150 | 990 |
+| `nci` | 33,553,445 | 5.43:1 | 379 | 1092 |
+| `ooffice` | 6,152,192 | 1.49:1 | 170 | 948 |
+| `osdb` | 10,085,684 | 1.15:1 | 415 | 3880 |
+| `reymont` | 6,627,202 | 1.99:1 | 244 | 1666 |
+| `samba` | 21,606,400 | 2.61:1 | 316 | 1349 |
+| `sao` | 7,251,944 | 1.01:1 | 540 | 4663 |
+| `webster` | 41,458,703 | 2.10:1 | 228 | 1810 |
+| `x-ray` | 8,474,240 | 1.72:1 | 312 | 2196 |
+| `xml` | 5,345,280 | 4.22:1 | 429 | 1383 |
+| **total** | **211,938,580** | **2.08:1** | **276** | **1374** |
 
 Half of Silesia is English prose, the shape the tile model is weakest on.
 `sao` and `osdb` are close to the raw path doing a copy; `nci`, `samba` and
@@ -123,30 +129,30 @@ Level 6, 64 KiB blocks, same run as the table above:
 
 | file | finder | probe | trials | gate + order | rest | block MB/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `webster` | 91.7% | 0.0% | 0.1% | 5.6% | 2.6% | 320 |
-| `reymont` | 90.6% | 0.3% | 0.0% | 5.8% | 3.3% | 323 |
-| `ooffice` | 81.5% | 7.2% | 5.0% | 0.4% | 5.9% | 207 |
-| `xml` | 80.8% | 1.6% | 1.4% | 10.0% | 6.1% | 545 |
-| `samba` | 70.7% | 6.5% | 7.3% | 5.0% | 10.4% | 409 |
-| `mozilla` | 67.7% | 10.1% | 8.1% | 0.2% | 13.3% | 311 |
-| `nci` | 63.5% | 21.6% | 2.7% | 5.1% | 7.2% | 564 |
-| `dickens` | 59.7% | 0.9% | 9.8% | 11.9% | 17.5% | 758 |
-| `osdb` | 43.7% | 21.5% | 19.8% | 1.2% | 13.7% | 612 |
-| `sao` | 33.1% | 33.2% | 9.6% | 0.1% | 22.2% | 1032 |
-| `mr` | 0.4% | 9.8% | 64.0% | 0.3% | 25.1% | 254 |
-| `x-ray` | 0.0% | 15.9% | 62.3% | 0.8% | 21.0% | 429 |
+| `webster` | 91.6% | 0.0% | 0.1% | 5.7% | 2.6% | 322 |
+| `reymont` | 90.4% | 0.2% | 0.0% | 6.0% | 3.3% | 245 |
+| `xml` | 81.2% | 1.5% | 1.5% | 9.7% | 6.1% | 573 |
+| `ooffice` | 78.9% | 8.9% | 5.5% | 0.5% | 6.2% | 176 |
+| `mozilla` | 68.2% | 9.9% | 8.1% | 0.7% | 13.1% | 319 |
+| `samba` | 67.8% | 6.3% | 8.6% | 5.5% | 11.7% | 328 |
+| `nci` | 63.4% | 22.1% | 2.5% | 5.2% | 6.9% | 570 |
+| `dickens` | 58.4% | 1.0% | 9.6% | 12.7% | 18.3% | 786 |
+| `osdb` | 43.6% | 21.5% | 20.3% | 1.2% | 13.4% | 603 |
+| `sao` | 28.3% | 36.3% | 12.3% | 1.6% | 21.4% | 594 |
+| `mr` | 0.4% | 9.7% | 63.5% | 0.7% | 25.8% | 251 |
+| `x-ray` | 0.0% | 16.2% | 61.9% | 0.8% | 21.1% | 439 |
 
 That is the answer to "why is the whole path not 500 MB/s": on the text and
 executable files the block is one match-finder pass, and the finder runs at
-278-881 MB/s on them (measured standalone over whole 64 KiB blocks, best of
-four interleaved runs: `dickens` 278, `webster` 315, `osdb` 389, `mozilla` 409,
-`xml` 707, `nci` 881 MB/s). A pass at that rate cannot produce a block faster
+220-790 MB/s on them (measured standalone over whole 64 KiB blocks, best of
+three passes: `dickens` 219, `webster` 271, `mozilla` 309, `osdb` 326,
+`xml` 552, `nci` 787 MB/s). A pass at that rate cannot produce a block faster
 than that rate, and the rest of the pipeline cannot win back what the pass
 spends. The two files that are not finder-bound are bound by the trial loop
 instead -- `x-ray` (medical image) and `mr` spend 62% and 64% of a block in two
 full shape trials. Raising the ceiling means either a faster finder or fewer
 finder passes, and fewer passes costs ratio: level 1 writes no LZ form at all
-and runs at 983 MB/s for 1.24:1, and `LZ_FAST` is one pass at 2.19:1.
+and runs at 816 MB/s for 1.24:1, and `LZ_FAST` is one pass at 2.19:1.
 
 The finder is one hash probe per position over a 2^15-entry table, with a
 one-byte lazy lookahead limited to short matches: the lookahead is a dependent
@@ -163,29 +169,26 @@ codec's, not the filesystem's; the read floor is printed by the script.
 
 | tool | packed bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| zpse 1 `FASTEST` | 170,031,147 | 1.25:1 | 722 | 1543 |
-| zpse 5 `BALANCED` | 105,756,601 | 2.00:1 | 330 | 1131 |
-| zpse 6 (default) | 102,043,806 | 2.08:1 | 327 | 1106 |
-| zpse 9 `MAX` | 91,665,498 | 2.31:1 | 228 | 947 |
-| lz4 frame API -1 | 100,910,487 | 2.10:1 | 525 | 1394 |
-| lz4 frame API -3 | 81,374,580 | 2.60:1 | 111 | 1632 |
-| lz4 frame API -9 (HC) | 77,916,351 | 2.72:1 | 39 | 1582 |
-| lz4 frame API -12 (HC) | 77,293,783 | 2.74:1 | 13 | 1454 |
-| zstd CLI -1 | 73,307,280 | 2.89:1 | 872 | 1027 |
-| zstd CLI -3 | 66,209,100 | 3.20:1 | 588 | 964 |
-| zstd CLI -19 | 52,855,117 | 4.01:1 | 6 | 883 |
+| zpse 1 `FASTEST` | 170,031,147 | 1.25:1 | 529 | 1172 |
+| zpse 5 `BALANCED` | 105,756,601 | 2.00:1 | 256 | 910 |
+| zpse 6 (default) | 102,043,806 | 2.08:1 | 268 | 878 |
+| zpse 9 `MAX` | 91,665,498 | 2.31:1 | 169 | 765 |
+| lz4 CLI -1 | 100,910,487 | 2.10:1 | 391 | 1143 |
+| lz4 CLI -3 | 81,374,580 | 2.60:1 | 88 | 1228 |
+| lz4 CLI -9 (HC) | 77,916,351 | 2.72:1 | 31 | 1255 |
+| lz4 CLI -12 (HC) | 77,293,783 | 2.74:1 | 9 | 1209 |
+| zstd CLI -1 | 73,307,280 | 2.89:1 | 809 | 834 |
+| zstd CLI -3 | 66,209,100 | 3.20:1 | 427 | 730 |
+| zstd CLI -19 | 52,855,117 | 4.01:1 | 4 | 582 |
 
 Every row was round-tripped and compared whole with the input before it was
-timed, with the output sent to `/dev/null`; the read floor on this host is
-2581 MB/s, so a whole-process row still pays part of the read. Two labels are
-load-bearing. The lz4 rows are the **reference frame API** driven directly, not
-the `lz4` CLI, because this host has no lz4 package: they are a floor on what
-lz4 does rather than its documented rate, and its -1 row compares with zpse's
-default at the same ratio, four times the encode. The zstd rows are the real
-`zstd` binary.
+timed, with the input staged in memory and the output sent to `/dev/null`. The
+read floor that staging measures here is 1723 MB/s, so a whole-process row
+still pays a share of its read; it is the same share for every row. All three
+tools are the real binaries: `lz4` 1.10.0 and `zstd` from their CLIs.
 
 On this corpus the default level is not the frontier: lz4 writes a slightly
-smaller stream at the same ratio and encodes 1.6x faster. zpse 1 is the encode
+smaller stream at the same ratio and encodes 1.5x faster. zpse 1 is the encode
 row and `MAX` is the only row under 2.4:1. That is the honest summary of
 Silesia -- zpse is a decode-and-determinism choice, not a text-ratio choice.
 
@@ -197,35 +200,39 @@ comparison over the concatenation:
 
 | tool | packed bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| zpse 1 `FASTEST` | 16,355,993 | 4.36:1 | 703 | 1123 |
-| zpse 5 `BALANCED` | 12,528,872 | 5.69:1 | 616 | 1146 |
-| zpse 6 (default) | 12,514,663 | 5.70:1 | 592 | 1131 |
-| zpse 9 `MAX` | 12,505,679 | 5.70:1 | 539 | 1006 |
-| lz4 frame API -1 | 21,744,005 | 3.28:1 | 734 | 966 |
-| lz4 frame API -3 | 20,141,108 | 3.54:1 | 158 | 1039 |
-| lz4 frame API -9 (HC) | 19,786,464 | 3.60:1 | 69 | 1039 |
-| lz4 frame API -12 (HC) | 19,728,335 | 3.61:1 | 8 | 1036 |
-| zstd CLI -1 | 14,930,140 | 4.78:1 | 908 | 838 |
-| zstd CLI -3 | 14,531,238 | 4.91:1 | 613 | 837 |
-| zstd CLI -19 | 12,482,868 | 5.71:1 | 11 | 778 |
+| zpse 1 `FASTEST` | 16,355,993 | 4.36:1 | 548 | 931 |
+| zpse 5 `BALANCED` | 12,529,172 | 5.69:1 | 455 | 939 |
+| zpse 6 (default) | 12,514,963 | 5.70:1 | 476 | 877 |
+| zpse 9 `MAX` | 12,505,979 | 5.70:1 | 455 | 992 |
+| zpse 6 `LZ_FAST` | 20,431,878 | 3.49:1 | 523 | 834 |
+| lz4 CLI -1 | 21,744,005 | 3.28:1 | 474 | 750 |
+| lz4 CLI -3 | 20,141,108 | 3.54:1 | 117 | 732 |
+| lz4 CLI -9 (HC) | 19,786,464 | 3.60:1 | 54 | 771 |
+| lz4 CLI -12 (HC) | 19,728,335 | 3.61:1 | 5 | 667 |
+| zstd CLI -1 | 14,930,140 | 4.78:1 | 634 | 666 |
+| zstd CLI -3 | 14,531,238 | 4.91:1 | 425 | 708 |
+| zstd CLI -19 | 12,482,868 | 5.71:1 | 7 | 604 |
 
 The default stream is 42% smaller than lz4 -1's and decodes 1.17x as fast, for
-19% less encode. zstd -19 matches the ratio at 1/54th of the encode rate and 69%
-of the decode rate. This is the corpus where the design pays off: the win is
-not "a better match finder", it is predicting a monotone or fixed-width column
-instead of trying to match it.
+the same encode rate. zstd -19 matches the ratio at 1/68th of the encode rate
+and 69% of the decode rate. The read floor on this corpus is 731 MB/s, so the
+whole-process rows here pay a larger share of their time to the read than the
+Silesia rows above do; the ratio and packed-byte columns are unaffected. This
+is the corpus where the design pays off: the win is not "a better match
+finder", it is predicting a monotone or fixed-width column instead of trying
+to match it.
 
 The 25-case effort matrix in `tests/benchmarks/bench_levels.c` shows the same
 thing per case. Selected default-level rows:
 
 | case | ratio | encode MB/s | decode MB/s | what it is |
 | --- | ---: | ---: | ---: | --- |
-| `i32_seq` | 9.63:1 | 1250 | 9880 | monotone i32 |
-| `i64_mixed` | 7.93:1 | 1310 | 12830 | mixed-width i64 |
-| `geo_point` | 18.59:1 | 2280 | 6780 | lat/lon plus cell id |
-| `struct_offsets` | 4.45:1 | 710 | 11270 | increasing byte offsets |
-| `text_en` | 1.88:1 | 364 | 1930 | English prose |
-| `uuid_mix` | 1.33:1 | 291 | 3170 | high-cardinality hex |
+| `i32_seq` | 9.63:1 | 1010 | 5780 | monotone i32 |
+| `i64_mixed` | 7.93:1 | 821 | 9690 | mixed-width i64 |
+| `geo_point` | 18.59:1 | 1390 | 5200 | lat/lon plus cell id |
+| `struct_offsets` | 4.45:1 | 729 | 10490 | increasing byte offsets |
+| `text_en` | 1.88:1 | 292 | 1920 | English prose |
+| `uuid_mix` | 1.33:1 | 252 | 2660 | high-cardinality hex |
 
 A CSV export of typed data is prose with punctuation, not a typed column; the
 `zpse_cli col` path types it first and rebuilds it byte for byte, but the gain
@@ -246,7 +253,7 @@ series, an incompressible blob and a mixed heap.
 codec. zstd and lz4/lz4hc are called once per 4 KiB page through their shared
 libraries, so no frame spans two pages; packed bytes include each codec's
 framing. That harness needs `dlopen`, which this host does not have, so the
-cross-codec page comparison is not republished here; the rows below are zpse's
+cross-codec page comparison cannot be built here; the rows below are zpse's
 own, measured with the CLI at `-b 4096` over the 16 MiB non-zero corpus.
 
 | codec | ratio | encode MB/s | decode MB/s |
@@ -270,7 +277,7 @@ dropping the zero pages from that same file leaves 2.40:1. The headline table
 uses the non-zero file, so the ratio describes content, not untouched memory.
 
 The per-class split needs the same `dlopen` harness (`bench_pages`), so it is
-not republished here either. What the corpus is for still holds: on a 4 KiB
+not in this table. What the corpus is for still holds: on a 4 KiB
 page the encoder has a sixteenth of the input to decide on, so the page path is
 where `PAGE_FAST` and `LZ_FAST` exist at all, and the ones placed above are the
 rates a page store has to choose between.
@@ -283,18 +290,18 @@ tile model and the decode ceilings.
 
 | pattern | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| `zeros` | 978:1 | 11010 | 67200 |
-| `const5A` | 964:1 | 10850 | 66820 |
-| `random` | 1.00:1 | 2087 | 67652 |
-| `lowentropy` (4-bit alphabet) | 1.97:1 | 758 | 54570 |
-| `incr` (0..255 ramp) | 624:1 | 3500 | 12670 |
-| `strided` | 580:1 | 1160 | 12700 |
-| `alt00FF` | 830:1 | 7720 | 31950 |
-| `sparse2` | 61:1 | 6120 | 17710 |
-| `sparse` (1 byte per 97) | 24:1 | 3120 | 10510 |
-| `sawtooth` | 565:1 | 1170 | 11860 |
+| `zeros` | 978:1 | 10030 | 64680 |
+| `const5A` | 964:1 | 10440 | 60260 |
+| `random` | 1.00:1 | 1600 | 64700 |
+| `lowentropy` (4-bit alphabet) | 1.97:1 | 540 | 53160 |
+| `incr` (0..255 ramp) | 624:1 | 3390 | 10460 |
+| `strided` | 580:1 | 830 | 11050 |
+| `alt00FF` | 830:1 | 5950 | 30610 |
+| `sparse2` | 61:1 | 4550 | 15380 |
+| `sparse` (1 byte per 97) | 24:1 | 2370 | 8140 |
+| `sawtooth` | 565:1 | 860 | 9570 |
 
-On the same machine `memcpy` measures 69,310 MB/s and `memset` 126,380 MB/s.
+On the same machine `memcpy` measures 49,220 MB/s and `memset` 86,620 MB/s.
 The one-value rows decode within a couple of percent of `memcpy`; the raw row is
 a copy plus a header check. The rest are transform-bound, not memory-bound.
 
@@ -311,15 +318,15 @@ best of three):
 
 | level | mean ratio | mean encode MB/s | mean decode MB/s | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `FASTEST` | 4.01:1 | 2172 | 15336 | one trial, cheap prescreen, no match finder |
-| 2 | 4.09:1 | 1779 | 14364 | full prescreen, two trials |
-| 3 `FASTER` | 4.09:1 | 1711 | 16089 | three trials |
-| 4 | 4.09:1 | 1710 | 16198 | four trials, still no match finder |
-| 5 `BALANCED` | 5.20:1 | 930 | 9718 | price every plane, guarded field cut, LZ at 1.25x |
-| 6 (default) | 5.25:1 | 988 | 10498 | margin 1.1875x, decode bill 6 bytes/command |
-| 7 | 5.25:1 | 988 | 10626 | margin 1.125x |
-| 8 | 5.25:1 | 944 | 10324 | margin 1.0625x, accel 20, tied-tail cut |
-| 9 `MAX` | 5.28:1 | 929 | 10272 | margin 1.0625x, one sample, accel 24, fast LZ candidate, Huffman over the LZ payload |
+| 1 `FASTEST` | 4.01:1 | 1716 | 14528 | one trial, cheap prescreen, no match finder |
+| 2 | 4.09:1 | 1472 | 13424 | full prescreen, two trials |
+| 3 `FASTER` | 4.09:1 | 1345 | 13619 | three trials |
+| 4 | 4.09:1 | 1304 | 12877 | four trials, still no match finder |
+| 5 `BALANCED` | 5.20:1 | 708 | 8427 | price every plane, guarded field cut, LZ at 1.25x |
+| 6 (default) | 5.25:1 | 719 | 8562 | margin 1.1875x, decode bill 6 bytes/command |
+| 7 | 5.25:1 | 739 | 7533 | margin 1.125x |
+| 8 | 5.25:1 | 716 | 8182 | margin 1.0625x, accel 20, tied-tail cut |
+| 9 `MAX` | 5.28:1 | 677 | 9128 | margin 1.0625x, one sample, accel 24, fast LZ candidate, Huffman over the LZ payload |
 
 The jump from 4 to 5 is the match finder and the LZ form; the jump from 1 to 2
 is the full predictor prescreen. Levels 3-4 and 6-9 buy little on this corpus,
@@ -346,28 +353,29 @@ uncompressed bytes; this host has six physical cores and no SMT to disable.
 
 | frame | workers | encode | speedup | decode | speedup | identical frames |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| 4 MiB | 1 | 1.12 GB/s | 1.00x | 4.12 GB/s | 1.00x | yes |
-| 4 MiB | 2 | 1.90 GB/s | 1.69x | 8.49 GB/s | 2.06x | yes |
-| 4 MiB | 3 | 2.54 GB/s | 2.26x | 7.79 GB/s | 1.89x | yes |
-| 4 MiB | 4 | 3.10 GB/s | 2.75x | 8.45 GB/s | 2.05x | yes |
-| 4 MiB | 5 | 3.84 GB/s | 3.42x | 8.15 GB/s | 1.98x | yes |
-| 4 MiB | 6 | 3.78 GB/s | 3.36x | 8.46 GB/s | 2.05x | yes |
-| 16 MiB | 1 | 0.65 GB/s | 1.00x | 2.53 GB/s | 1.00x | yes |
-| 16 MiB | 2 | 1.17 GB/s | 1.81x | 6.14 GB/s | 2.43x | yes |
-| 16 MiB | 3 | 1.88 GB/s | 2.90x | 8.76 GB/s | 3.47x | yes |
-| 16 MiB | 4 | 2.58 GB/s | 3.98x | 11.65 GB/s | 4.61x | yes |
-| 16 MiB | 5 | 3.10 GB/s | 4.79x | 10.21 GB/s | 4.04x | yes |
-| 16 MiB | 6 | 3.39 GB/s | 5.23x | 11.76 GB/s | 4.65x | yes |
-| 64 MiB | 1 | 0.90 GB/s | 1.00x | 3.65 GB/s | 1.00x | yes |
-| 64 MiB | 2 | 1.59 GB/s | 1.78x | 6.82 GB/s | 1.87x | yes |
-| 64 MiB | 3 | 2.32 GB/s | 2.59x | 9.77 GB/s | 2.68x | yes |
-| 64 MiB | 4 | 3.04 GB/s | 3.40x | 10.25 GB/s | 2.81x | yes |
-| 64 MiB | 5 | 3.36 GB/s | 3.76x | 13.05 GB/s | 3.57x | yes |
-| 64 MiB | 6 | 3.84 GB/s | 4.29x | 12.42 GB/s | 3.40x | yes |
+| 4 MiB | 1 | 0.79 GB/s | 1.00x | 4.36 GB/s | 1.00x | yes |
+| 4 MiB | 2 | 1.33 GB/s | 1.68x | 5.60 GB/s | 1.28x | yes |
+| 4 MiB | 3 | 1.93 GB/s | 2.44x | 4.65 GB/s | 1.07x | yes |
+| 4 MiB | 4 | 1.83 GB/s | 2.31x | 5.23 GB/s | 1.20x | yes |
+| 4 MiB | 5 | 3.08 GB/s | 3.90x | 4.03 GB/s | 0.92x | yes |
+| 4 MiB | 6 | 1.83 GB/s | 2.32x | 5.26 GB/s | 1.21x | yes |
+| 16 MiB | 1 | 0.50 GB/s | 1.00x | 2.38 GB/s | 1.00x | yes |
+| 16 MiB | 2 | 0.87 GB/s | 1.75x | 2.79 GB/s | 1.17x | yes |
+| 16 MiB | 3 | 1.31 GB/s | 2.65x | 7.36 GB/s | 3.10x | yes |
+| 16 MiB | 4 | 1.77 GB/s | 3.58x | 7.37 GB/s | 3.10x | yes |
+| 16 MiB | 5 | 2.00 GB/s | 4.04x | 10.47 GB/s | 4.40x | yes |
+| 16 MiB | 6 | 1.98 GB/s | 4.00x | 10.96 GB/s | 4.61x | yes |
+| 64 MiB | 1 | 0.56 GB/s | 1.00x | 2.72 GB/s | 1.00x | yes |
+| 64 MiB | 2 | 1.24 GB/s | 2.21x | 5.33 GB/s | 1.96x | yes |
+| 64 MiB | 3 | 1.81 GB/s | 3.23x | 6.86 GB/s | 2.53x | yes |
+| 64 MiB | 4 | 2.19 GB/s | 3.91x | 8.97 GB/s | 3.30x | yes |
+| 64 MiB | 5 | 2.68 GB/s | 4.78x | 9.95 GB/s | 3.67x | yes |
+| 64 MiB | 6 | 2.62 GB/s | 4.67x | 9.07 GB/s | 3.34x | yes |
 
 Encode scales better than decode because it has more work to divide; decode
-already reconstructs a block in a few microseconds. Every frame in the table
-was checked byte-for-byte against the one-worker frame and every decode was
+already reconstructs a block in a few microseconds, and at 4 MiB a whole frame
+decodes inside this host's run-to-run spread. Every frame in the table was
+checked byte-for-byte against the one-worker frame and every decode was
 compared whole with the input.
 
 A worker decodes straight into the caller's buffer at its block's offset, so a
@@ -489,6 +497,7 @@ benchmarks are all under `tests/benchmarks/`:
 | `huf_train.c` | refits the four Huffman tables into `src/huf_tables.inc` |
 | `binary_size.sh` | compiled library size |
 | `refresh_tables.sh` | regenerates the reproducible tables in one pass |
+| `lib_stage.sh` | memory staging and the read floor, sourced by the scripts above |
 
 None of them writes into the repository; corpora and tools that are not already
 on the host are fetched into a temporary directory.
@@ -527,9 +536,10 @@ pages), `-t N` workers, `-x` writes an index, `-F` requests `LZ_FAST`, and
   level 9 or on request; it is not a general entropy coder for the tile forms.
   Ratio loses to zstd on redundant text and on memory pages.
 * **Encode is slower than lz4's** because every block is decided, not merely
-  encoded, and because the match finder runs once per block at 278-881 MB/s on
-  real data. On Silesia the default level is about 62% of the reference lz4
-  frame API's encode rate at the same ratio; on typed columns it is 80%.
+  encoded, and because the match finder runs once per block at 220-790 MB/s on
+  real data. On Silesia the default level is about 69% of the lz4 CLI's encode
+  rate at the same ratio; on typed columns the two run at the same rate and
+  zpse's stream is 42% smaller.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
   is the only metric, level 4 or `PAGE_FAST` is the lever.
