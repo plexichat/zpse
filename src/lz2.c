@@ -75,6 +75,56 @@
 #define ZPSE_LZ2_LAZY_MAX 12u
 #endif
 
+/* Whether the finder's key is five bytes rather than four.
+ *
+ * A four-byte key collides whenever two positions agree on four bytes and
+ * differ on the fifth -- on prose that is a whole word family (" the", " ther",
+ * " them"), so the slot keeps being overwritten by near-misses and the loop
+ * pays a candidate load to find out. lz4 hashes five bytes on 64-bit builds for
+ * this reason (`LZ4_hash5`). Here the extra byte is read from the block (the
+ * four-byte key is already in a register), folded into a 64-bit multiply, and
+ * the low `hash_bits` of the high half are the slot.
+ *
+ * Positions with fewer than five bytes left keep the four-byte key: the last
+ * four of a block are never worth a guard on every iteration. A position
+ * stored under one key and looked up under the other is simply a miss, so the
+ * streams stay decodable -- what changes is which positions the finder offers,
+ * and that is what the measurement is for. */
+#ifndef ZPSE_LZ2_HASH5
+/* Measured and refused: 0 ships.
+ *
+ * The idea is lz4's (`LZ4_hash5`): a five-byte key separates words that share
+ * their first four bytes, so the slot stops being overwritten by near-misses
+ * and the loop skips a candidate load. On whole 64 KiB Silesia blocks it is
+ * not a win, and it is not consistent either -- 12 files, one pass each, the
+ * payload moves `mr` 31 146 -> 26 418 and `nci` 12 816 -> 12 583 and `xml`
+ * 25 449 -> 24 753, and moves `sao` 60 026 -> 63 491, `x-ray` 59 735 ->
+ * 63 173 and `mozilla` 28 783 -> 29 488, for 383 015 bytes against 369 970.
+ * The four-byte key is what the size corpus was built around and the near-miss
+ * collisions it keeps are cheaper than the matches it finds. */
+#define ZPSE_LZ2_HASH5 0
+#endif
+
+static uint32_t lz2_hash(uint32_t v, uint32_t hash_bits);
+
+static inline uint32_t lz2_hash_at(const uint8_t *in, uint32_t pos, uint32_t n,
+                                  uint32_t cur, uint32_t hash_bits)
+{
+#if ZPSE_LZ2_HASH5
+    if (pos + 5u <= n) {
+        uint64_t v = (uint64_t)cur | ((uint64_t)in[pos + 4u] << 32);
+
+        return (uint32_t)((v * UINT64_C(0x9E3779B97F4A7C15)) >>
+                          (64u - hash_bits));
+    }
+#else
+    (void)in;
+    (void)pos;
+    (void)n;
+#endif
+    return lz2_hash(cur, hash_bits);
+}
+
 static uint32_t lz2_hash(uint32_t v, uint32_t hash_bits)
 {
     /* One multiply at the cursor, top bits kept: the four-byte compare at the
@@ -337,7 +387,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     misses = 0u;
     limit = n - ZPSE_LZ2_MIN_MATCH;
     cur = zpse_load_u32le(in + pos);
-    h = lz2_hash(cur, hash_bits);
+    h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
     /* The entry the top of the loop tests, carried across iterations: the
      * miss path reads it while the candidate is being compared (see
@@ -373,7 +423,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * find it. */
         if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             nx_cur = zpse_load_u32le(in + pos + 1u);
-            nx_h = lz2_hash(nx_cur, hash_bits);
+            nx_h = lz2_hash_at(in, pos + 1u, n, nx_cur, hash_bits);
             nx_c = tab[nx_h];
             nx_ok = 1;
         }
@@ -402,7 +452,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 break;
             }
             cur = zpse_load_u32le(in + pos);
-            h = lz2_hash(cur, hash_bits);
+            h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
             cand = tab[h];
 #endif
@@ -426,7 +476,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 #else
         if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             p_cur = zpse_load_u32le(in + pos + 1u);
-            p_h = lz2_hash(p_cur, hash_bits);
+            p_h = lz2_hash_at(in, pos + 1u, n, p_cur, hash_bits);
             p_c1 = tab[p_h];
             p_ok = 1;
         }
@@ -545,7 +595,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         if (mpos == pos && len <= (uint32_t)ZPSE_LZ2_LAZY_MAX &&
             mpos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             uint32_t cur1 = zpse_load_u32le(in + mpos + 1u);
-            uint32_t h1 = lz2_hash(cur1, hash_bits);
+            uint32_t h1 = lz2_hash_at(in, mpos + 1u, n, cur1, hash_bits);
             uint32_t c1 = tab[h1];
 
             if (c1 != LZ2_EMPTY && c1 <= mpos &&
@@ -580,7 +630,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                     break;
                 }
                 cur = zpse_load_u32le(in + pos);
-                h = lz2_hash(cur, hash_bits);
+                h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
                 cand = tab[h];
 #endif
@@ -672,7 +722,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             break;
         }
         cur = zpse_load_u32le(in + pos);
-        h = lz2_hash(cur, hash_bits);
+        h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
         cand = tab[h];
 #endif
