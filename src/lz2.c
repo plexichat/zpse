@@ -774,6 +774,26 @@ static void lz2_copy_match(uint8_t *out, uint32_t op, uint32_t n,
         memcpy(d + 16u, d - off + 16u, 16u);
         left = 0u;
     } else if (off >= 8u) {
+        /* Step as wide as the distance allows, not as wide as the machine
+         * could: a step wider than the distance reads bytes this copy has not
+         * written yet. Past 32 bytes back, a 32-byte step is safe and a long
+         * match stops paying eight bytes a store; the binary members are
+         * where that shows, because their matches are the medium-length
+         * ones at medium distances. */
+        if (off >= 32u) {
+            while (left >= 32u) {
+                memcpy(d, d - off, 32u);
+                d += 32u;
+                left -= 32u;
+            }
+        }
+        if (off >= 16u) {
+            while (left >= 16u) {
+                memcpy(d, d - off, 16u);
+                d += 16u;
+                left -= 16u;
+            }
+        }
         while (left >= 8u) {
             memcpy(d, d - off, 8u);
             d += 8u;

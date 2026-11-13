@@ -504,6 +504,27 @@ static void lzh_copy_match(uint8_t *out, uint32_t op, uint32_t n, uint32_t off,
         memcpy(d + 16u, d - off + 16u, 16u);
         left = 0u;
     } else if (off >= 8u) {
+        /* Step as wide as the distance allows: a step wider than the distance
+         * would read bytes this same copy has not written yet, so the guard is
+         * the distance, not the size left. Above 32 bytes back the widest
+         * step is safe, and a long match is then eight bytes a store only for
+         * its tail -- which is what the other corpora pay for: on the binary
+         * members the medium-length match is the common one, and this loop
+         * was copying it eight bytes at a time. */
+        if (off >= 32u) {
+            while (left >= 32u) {
+                memcpy(d, d - off, 32u);
+                d += 32u;
+                left -= 32u;
+            }
+        }
+        if (off >= 16u) {
+            while (left >= 16u) {
+                memcpy(d, d - off, 16u);
+                d += 16u;
+                left -= 16u;
+            }
+        }
         while (left >= 8u) {
             memcpy(d, d - off, 8u);
             d += 8u;

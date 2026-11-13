@@ -545,6 +545,23 @@ level 6 over the twelve-file corpus, ahead in three rounds of four (median 392
 against 376 MB/s) with the payload identical to the byte, 169,502,562 bytes
 both ways.
 
+## Wider steps in the match copy
+
+Both LZ decoders copy a long match eight bytes at a store once the distance is
+past sixteen, because a step wider than the distance would read bytes the same
+copy has not written yet. That is the right reason, but the wrong guard: the
+condition is the distance, not the size left. Past 32 bytes back a 32-byte step
+is safe and past 16 a 16-byte one, so the long match stops paying eight bytes a
+store and only its tail does. A match that ends mid-step is copied by the same
+steps and byte loop as before, and the bytes are identical by construction --
+this changes how the copy runs, not what it copies.
+
+Prose does not move: its matches average 5.4 bytes and never reach that loop.
+The columnar corpus does, and decode-only over its 17 files (two binaries
+alternating, four rounds) the mean is 11.1 against 10.3 GB/s, ahead in four of
+four rounds -- though the per-file spread on that host is wider than the
+difference on the files whose matches are short.
+
 ## What measurement changed
 
 The project converged on a small set of rules:
