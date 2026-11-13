@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 #define ZPSE_DEC_ARENA_SIZE (384u * 1024u) /* 0x60000 */
-#define ZPSE_ENC_ARENA_SIZE (448u * 1024u) /* 0x70000 */
+#define ZPSE_ENC_ARENA_SIZE (464u * 1024u) /* 0x74000 */
 #define ZPSE_ARENA_ALIGN    64u
 
 /* Decoder offsets. */
@@ -59,7 +59,7 @@
 #define ZPSE_E_OFF_HIST     0x63800u
 #define ZPSE_E_OFF_SHUF     0x64800u
 #define ZPSE_E_OFF_LZ       0x65800u
-#define ZPSE_E_OFF_GUARD    0x69800u
+#define ZPSE_E_OFF_GUARD    0x6D800u
 
 #define ZPSE_E_SZ_CTRL      0x01000u
 #define ZPSE_E_SZ_INPUT     0x10000u
@@ -71,11 +71,14 @@
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
 #define ZPSE_E_SZ_SHUF      0x01000u
-/* The intra-block LZ match finder's direct-mapped table: 8192 16-bit
- * block positions, ZPSE_LZ_TABLE_ENTRIES entries. Only the deepest
- * effort level touches it, so it is the encoder arena that pays for it
- * and the decoder never carries it. */
-#define ZPSE_E_SZ_LZ        0x04000u
+/* The intra-block LZ match finder's direct-mapped table, sized for the
+ * widest pass that uses this region: 16,384 16-bit block positions, i.e.
+ * a 2^14 table (ZPSE_LZ_HASH_BITS_WIDE). The screens and the page passes
+ * still use the first 2^13 entries; only the 4-16 KiB lazy pass indexes
+ * the whole region. Only the effort levels that write an LZ form touch
+ * it, so it is the encoder arena that pays for it and the decoder never
+ * carries it. */
+#define ZPSE_E_SZ_LZ        0x08000u
 #define ZPSE_E_SZ_GUARD     0x06800u
 
 typedef struct ZpseDecoder {
@@ -98,7 +101,7 @@ typedef struct ZpseDecoder {
 } ZpseDecoder;
 
 typedef struct ZpseEncoder {
-    uint8_t *arena;       /* base, 64-B aligned, 448 KiB */
+    uint8_t *arena;       /* base, 64-B aligned, 464 KiB */
     uint8_t *input;       /* 64 KiB */
     uint8_t *tstage;      /* 64 KiB */
     uint8_t *cand;        /* 64 KiB candidate staging */
@@ -108,7 +111,7 @@ typedef struct ZpseEncoder {
     uint8_t *comb;        /* 8 KiB */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
-    uint8_t *lz;          /* 16 KiB LZ match-finder table */
+    uint8_t *lz;          /* 32 KiB LZ match-finder table (2^14 max) */
     /* Which optional fields this encoder emits (ZPSE_ENC_* in
      * constants.h). The one-shot API leaves it 0, i.e. no payload
      * checksum; zpse_compress_block_ex / zpse_compress_frame_ex set it

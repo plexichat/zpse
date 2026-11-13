@@ -38,7 +38,7 @@ model, not a promise: measure the store's own pages before sizing the table.
 
 ## Why it does not live in the codec
 
-The encoder's state is a 448 KiB caller-owned arena, sized once and never
+The encoder's state is a 464 KiB caller-owned arena, sized once and never
 allocated from (include/zpse/arena.h). An entry has to hold a whole encoded
 page -- 700 bytes for a text page, several kilobytes for a literal-heavy one --
 so 65,536 entries is hundreds of megabytes of buffers. That is the page store's
@@ -165,7 +165,10 @@ which is what the two inits are for.
 * **Not a decoder feature.** No new block type, no new header field, no format
   version: hits and misses are the same bytes a non-dictionary writer produces.
 * **Not in the arena.** Growing `ZPSE_ENC_ARENA_SIZE` would make every caller
-  pay for a heap corpus's repeats, including the ones compressing prose.
+  pay for a heap corpus's repeats, including the ones compressing prose. (The
+  arena did grow once, by 16 KiB, but for the intra-block finder's lazy table
+  at 4-16 KiB blocks -- encoder state, not corpus storage; see
+  docs/HISTORY.md.)
 
 ## Open questions
 

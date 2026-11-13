@@ -579,3 +579,53 @@ The project converged on a small set of rules:
 The result is a codec with a narrow promise: deterministic bytes, no
 allocation, predictable decode, and a documented place on the ratio/rate
 frontier rather than a claim to beat general-purpose compressors everywhere.
+
+## Fourteen bits for the lazy pass, level 4's fourth trial, and the CRC's place
+
+Three follow-ups were measured in one pass. Two changed the tree; one did not.
+
+**The 4-16 KiB lazy pass gets all fourteen bits.** The arena's LZ region was
+16 KiB -- a 2^13 table -- and the lazy second pass on blocks between 4 and
+16 KiB inserts up to 16,384 positions into it, a load factor of two. The region
+is now 32 KiB (`ZPSE_E_SZ_LZ 0x08000`, `ZPSE_LZ_HASH_BITS_WIDE 14`) and the
+arena is 464 KiB. Every other caller of the finder keeps 13 bits, so the
+screens and the page passes are byte-for-byte untouched -- only the lazy pass
+indexes all fourteen bits. Measured per file over two rounds with
+`BLOCK=16384 bash tests/benchmarks/ab_silesia.sh 69ca55a 2 6`, the rounds
+agreeing on every byte: the twelve files go 106,180,882 -> 106,079,560 bytes,
+-101,322 (-0.095%). mozilla -58,844, nci -13,251, ooffice -12,510, osdb -9,901,
+samba -6,371, sao -217, xml -124, dickens -92, mr and x-ray unchanged, and
+reymont +25 -- the one case the wider table loses, in both rounds. At the
+default 64 KiB block the same build is identical on eleven files and 4 bytes
+smaller on reymont, and the 768-case size gate reports no growth. The price is
+16 KiB of every caller's encode arena and the win is confined to blocks of
+4-16 KiB.
+
+**Level 4's rung is one trial, and it is worth its rate.** Level 4 exists only
+to spend a fourth full-block trial over level 3, so the rung is now
+`ZPSE_L4_TRIALS` and the fold is a build. Over Silesia at level 4, two rounds,
+identical sizes in both: level 3's three trials write 163,955,885 against
+163,631,549 (+324,336, +0.198%), and seven of the twelve files do not move at
+all -- the rung is mozilla's (+293,583), with samba +14,008, nci +12,535,
+ooffice +2,881 and x-ray +1,329. Encode is faster folded on every file in both
+rounds (mozilla 352/426 against 298/349 MB/s, dickens 1764/2193 against
+1321/1463), so the trial buys 0.198% for its rate and level 4 keeps it.
+
+**Fusing the CRC into the inverse buys nothing it can reach.** The decoder's
+checksum pass was priced with `ZPSE_SKIP_CRC_VERIFY=1`, which drops PHASE5
+entirely: at level 1 on the fastest blocks the pass is a large share of decode
+(xml 7.2 -> 12.7 GB/s, reymont 5.4 -> 10.2, ooffice 5.1 -> 6.9), while every
+other cell on this host sits inside a 2-3x per-file spread. The share is
+already the `crc32` instruction's throughput limit -- three chains at 8 B per
+cycle is 24 GB/s, and a fused loop still executes one `crc32` per eight bytes,
+so it can only save the second L1 read, a fraction of what that arm removes.
+The tree had already measured the two forms against each other
+(`zpse_crc32c_copy_hw`: ~11 GB/s fused against ~3x for memcpy plus the
+three-chain hasher, which is why the fused form only serves blocks under
+8 KiB), so no fusion was landed. The headroom is real but it is not in the
+fusion: a folding CRC (PCLMULQDQ, and 4-8x again with AVX-512 VPCLMULQDQ)
+would have to replace the instruction chain, which is a different change with
+its own detection and test surface.
+
+`ab_silesia.sh` grew the `BLOCK` variable for the first measurement; without
+it the default-block numbers are the only ones the script can produce.

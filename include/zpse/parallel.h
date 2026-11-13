@@ -50,7 +50,7 @@ extern "C" {
 
 /* Encode `in` as one frame using up to `threads` workers.
  *
- * `enc_arenas` holds `arena_count` caller-owned 448 KiB encode arenas
+ * `enc_arenas` holds `arena_count` caller-owned 464 KiB encode arenas
  * (ZPSE_ENC_ARENA_SIZE, 64-B aligned); the number of workers is
  * min(threads, arena_count, blocks) and `threads` 0 or 1 means one worker.
  * With threads > 1 the caller's buffer must hold the reserved layout --

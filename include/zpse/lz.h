@@ -69,7 +69,7 @@
 #define ZPSE_LZ_MAX_LITERALS    255u
 /* The match finder's direct-mapped table: 2^hash_bits 16-bit block
  * positions. The table is the encoder's hottest random access, and a
- * 16 KiB table does not stay in L1 beside a 64 KiB block streaming past
+ * 32 KiB table does not stay in L1 beside a 64 KiB block streaming past
  * it, so every position costs an L2 access. The size is a parameter of
  * the encode so an effort level can pick it: the deepest level wants the
  * matches and the big table, a level that trades size for speed wants
@@ -80,6 +80,16 @@
 #define ZPSE_LZ_HASH_BITS_FAST 11u
 #define ZPSE_LZ_TABLE_ENTRIES   (1u << ZPSE_LZ_HASH_BITS) /* 8192 */
 #define ZPSE_LZ_TABLE_BYTES     (ZPSE_LZ_TABLE_ENTRIES * 2u) /* 16 KiB */
+
+/* The widest table the encoder arena's LZ region holds (ZPSE_E_SZ_LZ is
+ * 32 KiB, so 2^14 16-bit entries). The 4-16 KiB lazy pass inserts up to
+ * 16,384 positions, which the 2^13 table above can only hold at a load
+ * factor of two; it is the one caller that indexes all fourteen bits.
+ * Nothing else widens: the screens see a 512-1024 byte sample, where 2^13
+ * already has eight to sixteen slots per byte, and a wider screen only
+ * changes which blocks it convicts (see ZPSE_LZ_SCREEN_HASH_BITS in
+ * src/block.c). Callers of the wide table must supply 2^14 entries. */
+#define ZPSE_LZ_HASH_BITS_WIDE  14u
 
 
 

@@ -26,7 +26,7 @@ rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen, dec_arena);
 ```
 
 Both arenas are 64-byte aligned and owned by the caller; nothing inside the
-library allocates. They are 448 KiB (encode) and 384 KiB (decode), named
+library allocates. They are 464 KiB (encode) and 384 KiB (decode), named
 `ZPSE_ENC_ARENA_SIZE` and `ZPSE_DEC_ARENA_SIZE`. `rc` is negative on failure;
 every status in `include/zpse/status.h` is reachable from a corrupt stream and
 is tested that way.

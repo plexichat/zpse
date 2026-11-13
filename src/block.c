@@ -782,8 +782,19 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         }
     }
 
-    /* PHASE5: payload CRC iff the block flag tags it. */
+    /* PHASE5: payload CRC iff the block flag tags it.
+     *
+     * ZPSE_SKIP_CRC_VERIFY is a measurement arm, never a shipped
+     * configuration: it drops the pass and the compare, so a bench can
+     * price the checksum's share of decode. That share is the ceiling on
+     * any fusion of the CRC into the inverse -- a fused loop still pays
+     * one `crc32` step per eight bytes, so it can only save the second
+     * read, which is a fraction of what this arm removes. */
+#ifndef ZPSE_SKIP_CRC_VERIFY
+#define ZPSE_SKIP_CRC_VERIFY 0
+#endif
     if ((h.block_flags & ZPSE_B_CRC) != 0) {
+#if !ZPSE_SKIP_CRC_VERIFY
         uint32_t calc;
 
         /* A one-value plane is the dense constant form (Sec. 6.3), and
@@ -804,6 +815,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (calc != h.decoded_crc32c) {
             return ZPSE_BAD_PAYLOAD_CRC;
         }
+#endif /* !ZPSE_SKIP_CRC_VERIFY */
     }
 
     if (out_len_out != 0) {
@@ -2452,6 +2464,13 @@ typedef struct {
     uint8_t tie_field;
 } ZpseLevel;
 
+/* Level 4's rung: one more full-block trial than level 3, and nothing
+ * else -- the last rung before the LZ columns open at BALANCED. Built at 3
+ * it is level 3 exactly, which is the fold its measurement compares. */
+#ifndef ZPSE_L4_TRIALS
+#define ZPSE_L4_TRIALS 4u
+#endif
+
 /* How many full-block trials a sweep that cuts tied fields may spend on a
  * FULL-SIZE block, 0 = every survivor the price kept.
  *
@@ -2503,7 +2522,7 @@ static const ZpseLevel zpse_level[10] = {
     /* 3 FASTER: the same prescreen, three trials. */
     { 3u, 0u, 0u, 0u, 0u },
     /* 4: four trials, still no match finder. */
-    { 4u, 0u, 0u, 0u, 0u },
+    { (uint8_t)ZPSE_L4_TRIALS, 0u, 0u, 0u, 0u },
     /* 5 BALANCED (default): every survivor, 1.25x screen, 8 B/command, and a
      * guarded field cut to its best two on price. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_BALANCED, 2u,
@@ -5428,7 +5447,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
                 if (zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
                                       e->tstage, lz_cap, e->lz,
-                                      (uint32_t)ZPSE_LZ_HASH_BITS,
+                                      (uint32_t)ZPSE_LZ_HASH_BITS_WIDE,
                                       (uint32_t)ZPSE_LZ_LAZY_MAX, &lz_lazy,
                                       &lz_lazy_cmds) == ZPSE_OK &&
                     lz_lazy < lz_total) {

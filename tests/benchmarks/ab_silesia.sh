@@ -15,6 +15,7 @@
 #   flags      extra CLI option letters for both builds, e.g. "F" for the
 #              fast LZ form, "c" for the payload checksum, "Fc" for both
 #   SILESIA_DIR  an already-extracted corpus; downloaded when unset
+#   BLOCK      block size for both builds (`-b`), default the CLI's own
 #   CC         compiler for both builds, default cc
 #
 # Both builds go through `git archive`, so the base revision is built from the
@@ -84,6 +85,7 @@ command -v taskset >/dev/null 2>&1 && pin="taskset -c 0"
 
 opt=""
 [ -n "$level" ] && opt="-l $level"
+[ -n "${BLOCK:-}" ] && opt="$opt -b ${BLOCK}"
 for ((i = 0; i < ${#extra}; i++)); do
     opt="$opt -${extra:$i:1}"
 done

@@ -41,23 +41,23 @@ int zpse_compress_block(const uint8_t *in, uint32_t n,
                         uint8_t *out, uint32_t out_cap,
                         uint32_t *out_len_out,
                         uint32_t seq, int is_last,
-                        void *enc_arena_448k)
+                        void *enc_arena)
 {
     /* The default stream carries no optional fields: no payload CRC. */
     return zpse_compress_block_ex(in, n, out, out_cap, out_len_out, seq,
-                                  is_last, 0u, enc_arena_448k);
+                                  is_last, 0u, enc_arena);
 }
 
 int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
                            uint8_t *out, uint32_t out_cap,
                            uint32_t *out_len_out,
                            uint32_t seq, int is_last, uint32_t enc_flags,
-                           void *enc_arena_448k)
+                           void *enc_arena)
 {
     ZpseEncoder enc;
     int rc;
 
-    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
+    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena == 0) {
         return ZPSE_BAD_ARG;
     }
     if (n == 0 || n > 65536u) {
@@ -66,7 +66,7 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
     if (!enc_flags_ok(enc_flags)) {
         return ZPSE_BAD_ARG;
     }
-    rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
+    rc = zpse_encoder_init(&enc, enc_arena, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
         return rc;
     }
@@ -110,23 +110,23 @@ int zpse_compress_frame(const uint8_t *in, size_t n,
                         uint8_t *out, size_t out_cap,
                         size_t *out_len_out,
                         uint32_t nominal_block_size,
-                        void *enc_arena_448k)
+                        void *enc_arena)
 {
     /* The default stream carries no optional fields: no payload CRC. */
     return zpse_compress_frame_ex(in, n, out, out_cap, out_len_out,
-                                  nominal_block_size, 0u, enc_arena_448k);
+                                  nominal_block_size, 0u, enc_arena);
 }
 
 int zpse_compress_frame_ex(const uint8_t *in, size_t n,
                            uint8_t *out, size_t out_cap,
                            size_t *out_len_out,
                            uint32_t nominal_block_size, uint32_t enc_flags,
-                           void *enc_arena_448k)
+                           void *enc_arena)
 {
     ZpseEncoder enc;
     int rc;
 
-    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
+    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena == 0) {
         return ZPSE_BAD_ARG;
     }
     if (n == 0) {
@@ -138,7 +138,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     if (!enc_flags_ok(enc_flags)) {
         return ZPSE_BAD_ARG;
     }
-    rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
+    rc = zpse_encoder_init(&enc, enc_arena, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
         return rc;
     }
@@ -156,12 +156,12 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
                                 size_t *out_len_out,
                                 uint32_t nominal_block_size,
                                 uint32_t enc_flags,
-                                void *enc_arena_448k)
+                                void *enc_arena)
 {
     ZpseEncoder enc;
     int rc;
 
-    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena_448k == 0) {
+    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena == 0) {
         return ZPSE_BAD_ARG;
     }
     if (n == 0) {
@@ -173,7 +173,7 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
     if (!enc_flags_ok(enc_flags)) {
         return ZPSE_BAD_ARG;
     }
-    rc = zpse_encoder_init(&enc, enc_arena_448k, (size_t)ZPSE_ENC_ARENA_SIZE);
+    rc = zpse_encoder_init(&enc, enc_arena, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
         return rc;
     }
