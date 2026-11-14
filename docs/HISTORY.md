@@ -865,3 +865,22 @@ The predictors say the same thing from the other side: `p0` (CONST_ZERO) and
 not a search among shapes. There is no single mode loop to fix: the cost is
 spread across four packers, which is why the sparse-mask narrowing measured
 flat and was reverted.
+
+## The RUNS payload difference, widened and refused
+
+RUNS is the hot mask on the image files: 20,402 of `mr`'s 44,089 packed tiles
+are (RUNS, EXCLUSION_U8), 46% of them, and `tpack` prices that pair at 794
+cycles. Its payload is the first difference of the edge list, so the write can
+be done eight runs at a time with one 16-bit subtract and one unsigned pack
+(`packus` cannot saturate: no run exceeds nt-1 <= 255). Same bytes, verified
+equal in every cell, and it is not faster: five alternating rounds at level 6
+gave `mr` 322.4 -> 320.0 MB/s, `x-ray` 471.5 -> 454.2, `xml` 558.6 -> 536.5,
+`nci` 591.9 -> 578.6, `ooffice` 239.0 -> 236.9, `reymont` 332.7 -> 327.4,
+`mozilla` 333.3 -> 332.3, `samba` 426.1 -> 433.9.
+
+So the per-run loop was not the cost either. With the sparse-mask narrowing
+above it, both edits that targeted the mask payload came back flat or behind,
+which says the time in these packs is in the edge scan (one ctz per transition)
+and in the classify that produced the mask, not in the byte write. The RUNS
+edit is reverted; the measurement stays here so the next pass does not retry
+it.
