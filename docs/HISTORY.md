@@ -944,3 +944,34 @@ For scale, HUF is only reachable at level 9 and above (ZPSE_HUF_MIN_LEVEL) or
 with ZPSE_ENC_HUF, and at 1.6 GB/s its encode is a few percent of a level-9
 block whose LZ parse runs at 100-250 MB/s. There is no speed in this stage to
 find; the level-9 and level-6 time is in the parse and the tile classify.
+
+## Two ways to break the Huffman decode's LUT chain, both refused
+
+The decode loop is four streams, five lookups per refill, one symbol per
+lookup (`src/huf.c`). Its serial chain is index -> table load -> shift -> next
+index, so the only speed left is more independent work per cycle. Two
+rewrites were tried on `build/hufbench` (32 KiB payloads, decode clocked on
+payloads encoded before the clock starts: 1.35-1.44 GB/s, ~2.8 cycles a
+symbol).
+
+1. Hoist the run bound. The loop recomputed its affordable-run count every
+   iteration: eight integer divisions by five, four of them on output room and
+   four on input room. A run consumes exactly five symbols and at most seven
+   bytes, so the bound can be taken once. It is valid and it is SLOWER:
+   `dickens` 1388 -> 785 MB/s, `mr` 1407 -> 613, `xml` 1405 -> 849 -- a 45%
+   loss on every file, uniformly, from nothing but the loop's shape. The
+   counted loop makes the compiler generate different register allocation for
+   the twenty lookups, and it loses far more than the divisions cost.
+
+2. Interleave the four streams a symbol at a time: refill all four windows,
+   then twenty lookups in stream order (LOOK4) instead of five per stream
+   (RUN_DO). Same symbols, same order per stream, bytes identical. Measured
+   within this host's spread both ways: `ooffice` 1417 -> 1508, `samba` 1362 ->
+   1408, `dickens` 1414 -> 1440, `mr` 1434 -> 1407, `xml` 1405 -> 1358,
+   `mozilla` unchanged. No sign, so it is not kept.
+
+Both are reverted. What the two together say is that the compiler already
+overlaps the four chains as well as the register file allows, and that the
+table load is unavoidable: at 2.8 cycles a symbol the stage is within reach of
+the load-to-use latency of the lookup itself, which is the floor for any
+table-driven decoder.
