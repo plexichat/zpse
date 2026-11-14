@@ -732,3 +732,50 @@ entropy pass costs 19% of the encode rate (it was 15% when level 6 encoded at
 146 MB/s and now that level 6 encodes at 158). The per-file profile table in
 the README was regenerated with `build/blkstat` for the same reason: it reports
 the trial share, and that share is what the cap change moved.
+
+## The two macro tables, re-read on the shipped scripts
+
+Nothing in the library changed here. `tests/benchmarks/silesia.sh` and
+`tests/benchmarks/bench_pareto.sh` were run on the tree as it stands -- with
+lz4 v1.10.0 built from source for the pareto rows, because this host has no
+`make` and the script's source build needs one; CMake produced the same
+binary -- and their output replaces the README rows.
+
+Silesia at level 6, 202 MiB, two reps: the corpus is 101,881,161 bytes packed
+(2.08:1) at 408 MB/s encode and 1908 MB/s decode. Every row moved up on this
+host relative to the recorded table (`dickens` 510 -> 830 MB/s encode,
+`webster` 269 -> 345, `x-ray` 295 -> 475), which is a host difference as much
+as a tree difference: the same binary produces the same bytes, and the ratio
+column moved only where the encoder did (mozilla 2.01 -> 2.02, x-ray 1.72 ->
+1.71, from the one-trial full block).
+
+The cross-tool table now carries every row the script measures instead of the
+single lz4 point the old README quoted. On the same 202 MiB and one pass each,
+`lz4 1` is 1333/1541 MB/s at 2.10:1 against zpse 6's 363/1143 at 2.08:1 --
+about four times the encode rate for the same ratio, which is the trade the
+README's short version names -- and `zstd 19` is 4.01:1 at 5 MB/s. The
+frontier column is computed by the script: at these settings `zpse 1`, `lz4 1`,
+`lz4 3`, `lz4 9`, `lz4 12` and the three zstd rows are on it, and zpse 5, 6 and
+9 are not -- lz4 1 is at least as good as zpse 6 on all three columns. The
+README's table prints the bytes and rates and leaves the verdict in prose.
+
+## What is left in a trial, and in the page finder
+
+The one-trial full block makes the trial the shape decision and nothing else,
+and on the two files with no finder pass it is still over half the encode:
+`build/blkstat` at level 6 reads `mr` at 51.3% trial / 12.3% probe / 34.9%
+rest and `x-ray` at 54.1% / 18.4% / 26.7%, with one trial per block and the
+remainder spread over the transform staging, the candidate list and the
+writer. Those two are the ceiling now, and what saturates them is the per-tile
+pipeline itself: a nine-predictor AVX2 prescreen (about 30 ns a tile), a
+classify and mode search for the winner, and a pack. The all-hit run already
+skips all three for tiles whose cheap proof holds, which is why the cost is
+where it is rather than higher.
+
+On the page path the finder is the whole of a `LZ_FAST` page and a fraction of
+the rest. The finder measured alone (`bench_lz2`, `ZPSE_LZ2_BLOCK=4096`) reads
+576-600 MB/s over the page corpus after the lazy probe's wide measurement,
+with the 16 KiB table clear, the per-position hash and the probe's dependent
+chain accounting for what is left. The clear is 16 KiB per 4 KiB page at
+thirteen bits, but shrinking it means fewer hash bits and therefore different
+matches: that is a ratio trade, not a speed change, and it is not taken here.
