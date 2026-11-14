@@ -907,3 +907,40 @@ the walk itself and the classify above it. `mr` runs ~296 packed tiles per
 tiles are smooth -- few transitions, so there was little list to save. On these
 files classify is ~400-700 cycles per 256-byte tile, i.e. roughly half the
 trial, and that, not any packer, is what the next pass has to attack.
+
+## The Huffman LUT, priced
+
+Asked whether the Huffman stage could be compiled without its lookup table.
+It cannot be made faster that way, and the numbers below are why.
+
+`build/hufbench` times the stage alone (32 KiB payloads, decode clocked on
+payloads encoded before the clock starts):
+
+| file      | bits/byte | encode      | decode      |
+|-----------|-----------|-------------|-------------|
+| dickens   | 7.86      | 1593 MB/s   | 1350 MB/s   |
+| samba     | 7.82      | 1492 MB/s   | 1263 MB/s   |
+| mr        | 5.29      | 1610 MB/s   | 1439 MB/s   |
+| mozilla   | 7.05      | 1517 MB/s   | 1345 MB/s   |
+| xml       | 8.00      | 1757 MB/s   | 1377 MB/s   |
+| ooffice   | 7.60      | 1623 MB/s   | 1391 MB/s   |
+
+At 7.9 bits per byte that is about 1.06 symbols per byte, so decode is ~2.8
+cycles per symbol, and the table load is the head of that chain: index, load,
+shift, next index. The entry is two bytes and the tables are static read-only
+data -- there is no per-block table build to remove, which is the cost zstd's
+HUF pays and this format does not. A bit-by-bit canonical walk would replace
+one load with a loop of up to eleven shifts and compares, which is the shape
+every Huffman decoder had before LUTs for exactly this reason.
+
+The window is already the right size. The four books have an 11-bit longest
+code, so 2^11 entries cover every code in one level; a 15-bit window, which is
+what a two-symbol entry needs (an LZ payload averages ~7 bits a symbol, so a
+pair needs ~14), is 32768 four-byte entries per book, 512 KiB for four books,
+and leaves L1. The two-symbol version was measured before the format was
+frozen: 101% payload, because the pair almost never fits.
+
+For scale, HUF is only reachable at level 9 and above (ZPSE_HUF_MIN_LEVEL) or
+with ZPSE_ENC_HUF, and at 1.6 GB/s its encode is a few percent of a level-9
+block whose LZ parse runs at 100-250 MB/s. There is no speed in this stage to
+find; the level-9 and level-6 time is in the parse and the tile classify.
