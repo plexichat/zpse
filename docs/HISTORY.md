@@ -812,3 +812,21 @@ the prescreen -- not a scalar classify that could be widened. Reusing the
 prescreen's counters for the mask cannot work either: the AVX2 prescreen
 accumulates nine byte-lane COUNTS, and a count does not carry where the misses
 are, which is exactly what `cl->words` stores.
+
+## The tile pipeline's split, measured
+
+`build/tpack` (classify, then choose_modes, then pack, each step timed on the
+same tiles) says the pack is the bigger half of a searched tile: on seven
+columnar shapes classify is 406-698 cycles, choose_modes adds 38-72, and the
+pack adds another 490-1,380 -- 49-65% of the three. `build/ucost` puts the
+same split in absolute terms: on a random 256-byte tile classify is 269
+cycles and pack 141, of which the mask encoder is 67 and the residual encoder
+29; on a four-value tile pack is 31.
+
+The mode histogram is the target. Over the columnar corpus, SPARSE_U8 +
+RAW_ACTUAL is 17,140 packs at 364 cycles each and RAW_BITMAP + RAW_ACTUAL is
+12,480 at 794 -- the second is 8 stores and a `k`-byte copy of data the
+classify already gathered (`cl->act_at_exc`, `act_valid == 1`), so 794 is the
+next thing to explain rather than the cost of the bytes it writes. Nothing
+was changed on that reading: it is a profile note for the next pass, taken so
+the pack path is entered with a number rather than an assumption.
