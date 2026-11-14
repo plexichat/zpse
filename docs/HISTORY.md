@@ -787,7 +787,28 @@ round and about 569 against 551 by median, and writes 7,599,177 bytes against
 7,591,788 (+0.097%); level 6, which does not take the fast form on every
 page, is byte-identical and inside the noise either way. Twelve bits is
 therefore both slower and larger, which is the same verdict the tree already
-recorded against the 16-bit arm, and the page table stays at thirteen. The
-clear is not the cost it looks like: the finder is bound by the dependent
+recorded against the 16-bit arm, and the page table stays at thirteen.The clear is not the cost it looks like: the finder is bound by the dependent
 chain of hash, table load and candidate load, so halving the footprint does
 not buy back the collisions it adds.
+
+## There is no scalar classify left to vectorise
+
+The next idea on the list was to give the tile trial an AVX2 classify for the
+nine screened predictors, on the theory that the prescreen counts misses with
+SIMD and the winner is then re-classified a byte at a time. The premise is
+wrong, and the source says so: `tile_classify` already dispatches to
+`tile_classify_avx2` whenever `nt >= 32` and the family is CONST, LANEHIST or
+STRIDE (`tile_fam_is_vectorisable`), and `zpse_tile_fill_at_pred_reset` has an
+AVX2 twin for the SIGNED_DELTA operand. That is every screened family, and
+every tile but the last of a plane is 256 bytes. What is left of the scalar
+loop is the short tail tile and the `-DZPSE_FORCE_SCALAR` reference build.
+
+Measured rather than assumed, level 6, 64 KiB blocks, `build/blkstat` built
+twice: the scalar build runs `mr` at 73.2 MB/s against the shipped 332.1 and
+`x-ray` at 100.2 against 454.2, with the trial share going 71.7% -> 51.1% and
+65.7% -> 53.5%. So the vector path is already worth 4.5x on the two files the
+trial dominates, and the remaining trial time is the pack, the mode search and
+the prescreen -- not a scalar classify that could be widened. Reusing the
+prescreen's counters for the mask cannot work either: the AVX2 prescreen
+accumulates nine byte-lane COUNTS, and a count does not carry where the misses
+are, which is exactly what `cl->words` stores.
