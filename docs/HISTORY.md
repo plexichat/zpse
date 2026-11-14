@@ -884,3 +884,26 @@ which says the time in these packs is in the edge scan (one ctz per transition)
 and in the classify that produced the mask, not in the byte write. The RUNS
 edit is reverted; the measurement stays here so the next pass does not retry
 it.
+
+## The RUNS edge list, removed and still flat
+
+The RUNS payload is a list of run lengths, and each length is the distance
+from the previous transition to the one the `ctz` just found -- so the 258-entry
+uint16 edge list existed only so a second pass could subtract neighbours into
+the payload. Removing it (write the byte in the walk, with `last` carried)
+deletes one store, one load and one subtract per run and the whole array.
+
+Stream-identical: all four files, every cell, byte for byte. Flat on the clock.
+Five alternating rounds per file at level 6, then thirty more of the minimum
+(the min is the noise-free estimator on this host): `mr` 320.8 -> 320.6 MB/s,
+`x-ray` 451.8 -> 453.3, `mozilla` 337.0 -> 335.8, `samba` 434.7 -> 428.6. The
+suite passed on the modified build (`ALL SUITES PASS`, parallel digest
+cec73f05), so the edit was correct and merely free of gain; it is reverted.
+
+That is the third stream-identical edit on this path to measure flat, and
+together they locate the cost: not the payload write, not the edge list, but
+the walk itself and the classify above it. `mr` runs ~296 packed tiles per
+64 KiB block (256 trial + 40 price), the trial is 51% of its encode, and its
+tiles are smooth -- few transitions, so there was little list to save. On these
+files classify is ~400-700 cycles per 256-byte tile, i.e. roughly half the
+trial, and that, not any packer, is what the next pass has to attack.
