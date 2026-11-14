@@ -830,3 +830,19 @@ classify already gathered (`cl->act_at_exc`, `act_valid == 1`), so 794 is the
 next thing to explain rather than the cost of the bytes it writes. Nothing
 was changed on that reading: it is a profile note for the next pass, taken so
 the pack path is entered with a number rather than an assumption.
+
+## The sparse mask's narrowing loop was not what cost
+
+`zpse_mask_encode`'s SPARSE_U8 branch collected exception positions into a
+`uint16_t c[256]` and then narrowed them to the payload one byte at a time.
+Since a tile holds at most 256 positions, every position already fits a byte,
+so the array can be `uint8_t` and the write one `memcpy`. It is the same
+payload, in the same order, from the same ctz walk -- and it is not faster.
+Five alternating rounds per file at level 6, byte-identical output in every
+cell: `nci` 589.2 -> 580.4 MB/s, `ooffice` 242.6 -> 235.0, `xml` 554.3 ->
+536.2, `reymont` 350.5 -> 345.2, `x-ray` 451.7 -> 448.3, `mozilla` 335.2 ->
+333.7, `mr` unchanged at 320.5, `samba` 426.2 -> 434.7. That is the host's
+spread with no sign, so the change was reverted rather than kept as a
+tidy-up: the mask branch was never where the pack time went, and the 794-cycle
+RAW_BITMAP figure belongs to a different composition than the one this
+touched.
