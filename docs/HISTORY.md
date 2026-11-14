@@ -778,4 +778,16 @@ the rest. The finder measured alone (`bench_lz2`, `ZPSE_LZ2_BLOCK=4096`) reads
 with the 16 KiB table clear, the per-position hash and the probe's dependent
 chain accounting for what is left. The clear is 16 KiB per 4 KiB page at
 thirteen bits, but shrinking it means fewer hash bits and therefore different
-matches: that is a ratio trade, not a speed change, and it is not taken here.
+matches: that is a ratio trade, not a speed change.
+
+It was measured rather than assumed. Twelve bits on the 16 MiB page corpus,
+five alternating rounds, `-b 4096`, best of each arm: `LZ_FAST` (the arm that
+actually uses the page table) reads 603.1 against 558.7 MB/s at the best
+round and about 569 against 551 by median, and writes 7,599,177 bytes against
+7,591,788 (+0.097%); level 6, which does not take the fast form on every
+page, is byte-identical and inside the noise either way. Twelve bits is
+therefore both slower and larger, which is the same verdict the tree already
+recorded against the 16-bit arm, and the page table stays at thirteen. The
+clear is not the cost it looks like: the finder is bound by the dependent
+chain of hash, table load and candidate load, so halving the footprint does
+not buy back the collisions it adds.
