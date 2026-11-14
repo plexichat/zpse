@@ -846,3 +846,22 @@ spread with no sign, so the change was reverted rather than kept as a
 tidy-up: the mask branch was never where the pack time went, and the 794-cycle
 RAW_BITMAP figure belongs to a different composition than the one this
 touched.
+
+## What mr and x-ray actually pack
+
+`build/modestat` (scratch, `-DZPSE_TRIAL_STATS`) prints the encoder's own
+(mask, residual) histogram for a file. Level 6, 64 KiB blocks:
+
+* `mr`: 44,089 searched tiles. RAW_BITMAP-family + EXCLUSION_U8 20,402 (46%),
+  a bit-packed pair 12,481, SIGNED_DELTA buckets 7,919, the rest under 2,800.
+* `x-ray`: 26,165 tiles. 10,153 in one bit-packed pair and 8,371 in another,
+  so 70% of its tiles land in two modes, with SIGNED_DELTA at 4,400.
+* `samba` is the same shape as `mr` (7,393 of 9,784 in one mode); `dickens`
+  and `xml` never leave EXCLUSION_U8 on the tiles they search at all.
+
+The predictors say the same thing from the other side: `p0` (CONST_ZERO) and
+`p5` account for 43,440 of `mr`'s 44,089 tiles and 30,942 of `x-ray`'s 26,165
+-- so the trial on these files is sparse masks over a constant or a stride,
+not a search among shapes. There is no single mode loop to fix: the cost is
+spread across four packers, which is why the sparse-mask narrowing measured
+flat and was reverted.
