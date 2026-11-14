@@ -185,6 +185,29 @@ static uint8_t *lz_put_varint(uint8_t *p, uint32_t v)
 #define ZPSE_LZ_LAZY_WIDE 1
 #endif
 
+/* Does the backward walk into the pending literals step eight bytes at a
+ * time?
+ *
+ * The walk only ever starts a match earlier, and it is bounded by `anchor`
+ * (the end of the previous match), so on prose -- where the pending run is
+ * about a byte per command -- it takes one or two steps and the wide loop
+ * never runs. It is a long run or a periodic block that walks far, and there
+ * the byte loop is eight compares per eight bytes for nothing. Stepping a
+ * word while all eight bytes match is exactly the same walk, only faster: the
+ * byte loop below still runs from wherever it stops, so a mismatch inside a
+ * word costs the word's bytes and no more.
+ *
+ * Measured and REFUSED: five alternating runs per arm, payload bytes identical
+ * in every cell, LZ encode MB/s with the walk bytewise -> wide -- `dickens`
+ * 321.5 -> 310.0, `mozilla` 493.1 -> 470.1, `nci` 793.4 -> 749.9, `xml` 585.1
+ * -> 576.8 at 4 KiB blocks and 299.6 -> 282.3, 435.0 -> 422.3, 861.2 -> 843.5,
+ * 670.8 -> 653.4 at 16 KiB, and the 16 MiB page corpus 605.0 -> 576.5. The
+ * walk is nearly always short, so the word loop almost never runs and its two
+ * bounds are paid on every match. 0 is the shipped arm. */
+#ifndef ZPSE_LZ_BACK_WIDE
+#define ZPSE_LZ_BACK_WIDE 0
+#endif
+
 /* Lazy matching by LENGTH, for pages only.
  *
  * The probe above asks one question -- "is there an eight-byte match one
@@ -577,6 +600,13 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
          * longer match for the same four bytes. It can never cross the
          * last match's end, so the decoder's view of the stream does not
          * change. */
+#if ZPSE_LZ_BACK_WIDE
+        while (pos - anchor >= 8u && cand >= 8u &&
+               lz_load64(in + pos - 8u) == lz_load64(in + cand - 8u)) {
+            pos -= 8u;
+            cand -= 8u;
+        }
+#endif
         while (pos > anchor && cand > 0u && in[pos - 1u] == in[cand - 1u]) {
             pos--;
             cand--;

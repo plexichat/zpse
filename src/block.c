@@ -2492,10 +2492,27 @@ typedef struct {
  * Measured over Silesia at level 6 (203 MiB, RAM-resident, best of two, one
  * core): 377.2 -> 392.7 MB/s for +7,662 bytes over the corpus (0.0075%, i.e.
  * 2.080:1 either way). The gain is where the trials were: mr 242 -> 273
- * MB/s, x-ray 397 -> 443, samba 395 -> 425, nci 564 -> 605. A cap of 1 is
- * another 2.5% of rate for another 0.09% of size; that one is not worth it. */
+ * MB/s, x-ray 397 -> 443, samba 395 -> 425, nci 564 -> 605.
+ *
+ * A cap of 1 was measured against 2 and, in the tree as it stands, taken.
+ * Over Silesia at level 6, five alternating rounds per arm (each run best of
+ * two, arms in both orders), packed bytes deterministic: mr -2,651, mozilla
+ * -3,781, ooffice -839, x-ray +18,687, the other eight files identical, the
+ * corpus 101,869,745 -> 101,881,161 (+11,416, +0.011%). Encode: mr 253.9 ->
+ * 320.5 MB/s, x-ray 394.4 -> 455.8, mozilla 334.0 -> 340.2, dickens 808.0 ->
+ * 834.6, samba 430.1 -> 440.1, and reymont/sao/xml 1-2% behind inside this
+ * host's spread. Levels 5 and 7 pay and gain the same, byte for byte, because
+ * the cap collapses their streams onto the same one-trial block.
+ *
+ * The earlier reading -- a cap of 1 for another 0.09% of size -- was taken
+ * before the tile-body and LZ forms could win a block, so the second trial
+ * was the only thing that could still change the stream. With them, x-ray's
+ * +0.38% is the corpus's whole size cost and the rate gain lands exactly on
+ * the two files that run no finder pass (mr and x-ray were 62% and 64%
+ * trial). They still spend over half their encode in the one trial, which is
+ * the shape decision itself -- that is where the ceiling sits now. */
 #ifndef ZPSE_TRIAL_CAP_FULL
-#define ZPSE_TRIAL_CAP_FULL 2
+#define ZPSE_TRIAL_CAP_FULL 1
 #endif
 
 /* Whether the trial cap also applies to a level whose row does NOT cut tied

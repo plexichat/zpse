@@ -355,6 +355,16 @@ static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
 #define ZPSE_LZ2_PIPE_NEXT 1
 #endif
 
+/* Does the backward walk into the pending literals step eight bytes at a
+ * time? Same walk, same bound (`anchor`): a word is stepped only when all
+ * eight of its bytes match, and the byte loop below then resolves the byte a
+ * mismatching word stopped on. See src/lz.c's ZPSE_LZ_BACK_WIDE: measured
+ * and refused (the loop is nearly always short, so the extra bounds cost more
+ * than the word steps save, 3.6-5.5% of LZ encode). 0 is the shipped arm. */
+#ifndef ZPSE_LZ2_BACK_WIDE
+#define ZPSE_LZ2_BACK_WIDE 0
+#endif
+
 /* Tagged with the rest of the hot set: this finder is the whole of the F
  * form's encode, and it was the one kernel in the tree left at the build's
  * own level. */
@@ -504,6 +514,13 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * measured from the new start, so the walked bytes are bytes the
          * match now covers rather than bytes it has to give back, and
          * `mcand > 0` keeps the reference inside the block. */
+#if ZPSE_LZ2_BACK_WIDE
+        while (mpos - anchor >= 8u && mcand >= 8u &&
+               lz2_load64(in + mpos - 8u) == lz2_load64(in + mcand - 8u)) {
+            mpos -= 8u;
+            mcand -= 8u;
+        }
+#endif
         while (mpos > anchor && mcand > 0u && in[mpos - 1u] == in[mcand - 1u]) {
             mpos--;
             mcand--;

@@ -666,3 +666,69 @@ what a page block that writes no LZ form should do).
 Sizes did not move, which is the whole claim: the 768-case size gate reports the
 same `delta=-435636 bytes`, `LZ: ALL OK (1191 checks)` pins the payloads this
 pass writes, and the parallel digest is unchanged.
+
+## A wide walk that lost, one trial on a full block, and a page table re-read
+
+Three follow-ups in one pass. One changed which blocks the encoder writes; two
+change nothing in the library at all.
+
+**The backward walk stays bytewise.** The walk into the pending literals is the
+last loop in the LZ finders that steps one byte at a time, so widening it to
+compare eight bytes and step only while they all match looked free: it is the
+same walk, and the byte loop still resolves the byte a mismatching word stopped
+on, so it cannot change a payload. It is not free. Five alternating runs per
+arm, payload bytes identical in every cell, LZ encode MB/s bytewise -> wide:
+`dickens` 321.5 -> 310.0, `mozilla` 493.1 -> 470.1, `nci` 793.4 -> 749.9, `xml`
+585.1 -> 576.8 at 4 KiB blocks; 299.6 -> 282.3, 435.0 -> 422.3, 861.2 -> 843.5
+and 670.8 -> 653.4 at 16 KiB; the 16 MiB page corpus 605.0 -> 576.5. The walk
+is bounded by `anchor`, the end of the previous match, so on prose it takes one
+or two steps and the word loop almost never runs -- and its two bounds plus the
+loop setup are paid on every match. `ZPSE_LZ_BACK_WIDE`, `ZPSE_LZ2_BACK_WIDE`
+and `ZPSE_LZH_BACK_WIDE` stay in the tree at 0 so the measurement can be
+repeated.
+
+**A full-size block now spends one trial, not two.** The cap was two, on the
+argument that a full block's price window is a fifth of the block and the two
+survivors behind it are the ones the price could not separate. Re-measured at
+level 6 over Silesia, five alternating rounds per arm (each run best of two,
+arms in both orders), packed bytes deterministic: `mr` -2,651, `mozilla`
+-3,781, `ooffice` -839, `x-ray` +18,687, the other eight files identical, the
+corpus 101,869,745 -> 101,881,161 (+11,416, +0.011%). Encode: `mr` 253.9 ->
+320.5 MB/s, `x-ray` 394.4 -> 455.8, `mozilla` 334.0 -> 340.2, `dickens` 808.0
+-> 834.6, `samba` 430.1 -> 440.1; `reymont`, `sao` and `xml` are 1-2% behind,
+inside this host's spread. Levels 5 and 7 pay and gain the same bytes, because
+the cap collapses their streams onto the same one-trial block.
+
+The earlier reading of a one-trial cap -- 2.5% of rate for 0.09% of size -- was
+taken before the tile-body and LZ forms could win a block, so the second trial
+was the only thing left that could change the stream. With them, `x-ray`'s
++0.38% is the whole size cost, and the rate gain lands where the trials were:
+the two files that run no finder pass. `mr` and `x-ray` still spend 51% and
+54% of a block in the one trial, which is the shape decision itself; that is
+where their ceiling sits now.
+
+The gates agree with the claim. The 768-case size gate still reports no case
+grown (`grew=0` over 768, `roundtrip_bad=0`) and its total is 88 bytes smaller
+than before (`delta=-435548` against `-435636`); `LZ: ALL OK (1191 checks)` and
+the parallel digest `cec73f05` are unchanged, because neither form is affected
+by the tile sweep; and the scalar/swap parity builds still produce identical
+digests.
+
+**The page table was re-measured on the tree's own corpus.** The 4 KiB rows in
+the README were taken before the page path got its wide lazy probe, so they
+were re-read from a freshly generated `pages-nonzero.bin` (16 MiB, sha256
+`c9c0e860…`, `corpus_write --pages`) with the CLI at `-b 4096`, three rounds of
+best-of-four, median reported. Packed bytes are properties of the stream and
+were identical in every round and every arm: 1.74:1, 2.40:1, 2.56:1 for levels
+1, 6 and 9, 1.52:1 for `PAGE_FAST` and 2.21:1 for `LZ_FAST`. Rates, old ->
+new: level 1 244/2514 -> 250/2506, level 6 146/1290 -> 158/1639, level 9
+124/1196 -> 128/1243, `PAGE_FAST` 807/2222 -> 888/3059, `LZ_FAST` 537/1912 ->
+591/1988. On the same stream with one zero page in eight, level 6 reads 2.67:1
+and decodes at 1954 MB/s (was 1760).
+
+Two claims above the table were re-derived rather than copied: `LZ_FAST` now
+gives up 8.6% of the packed size for 3.7 times the encode rate, and level 9's
+entropy pass costs 19% of the encode rate (it was 15% when level 6 encoded at
+146 MB/s and now that level 6 encodes at 158). The per-file profile table in
+the README was regenerated with `build/blkstat` for the same reason: it reports
+the trial share, and that share is what the cap change moved.

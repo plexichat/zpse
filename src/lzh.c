@@ -288,6 +288,16 @@ static int lzh_literals(LzhWr *w, const uint8_t *in, uint32_t *rep,
     return lzh_cmd(w, in, rep, lit_off, run, 0u, 0u);
 }
 
+/* Does the backward walk into the pending literals step eight bytes at a
+ * time? Same walk, same bound (`anchor`): a word is stepped only when all
+ * eight of its bytes match, and the byte loop below then resolves the byte a
+ * mismatching word stopped on. See src/lz.c's ZPSE_LZ_BACK_WIDE: measured
+ * and refused (the loop is nearly always short, so the extra bounds cost more
+ * than the word steps save). 0 is the shipped arm. */
+#ifndef ZPSE_LZH_BACK_WIDE
+#define ZPSE_LZH_BACK_WIDE 0
+#endif
+
 ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                                   uint32_t cap, void *table, uint32_t hash_bits)
 {
@@ -347,6 +357,13 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             h = lzh_hash(cur, hash_bits);
             continue;
         }
+#if ZPSE_LZH_BACK_WIDE
+        while (mpos - anchor >= 8u && mcand >= 8u &&
+               lzh_load64(in + mpos - 8u) == lzh_load64(in + mcand - 8u)) {
+            mpos -= 8u;
+            mcand -= 8u;
+        }
+#endif
         while (mpos > anchor && mcand > 0u && in[mpos - 1u] == in[mcand - 1u]) {
             mpos--;
             mcand--;

@@ -125,22 +125,22 @@ Half of Silesia is English prose, the shape the tile model is weakest on.
 `build/blkstat` (a scratch tool, not part of the suite) reads the library's own
 `ZPSE_BLOCK_STATS` cycle counters and attributes a block's encode to the
 decision probe, the full trials, the match-finder pass and the two pre-passes.
-Level 6, 64 KiB blocks, same run as the table above:
+Level 6, 64 KiB blocks, best of three passes per file:
 
 | file | finder | probe | trials | gate + order | rest | block MB/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `webster` | 91.6% | 0.0% | 0.1% | 5.7% | 2.6% | 322 |
-| `reymont` | 90.4% | 0.2% | 0.0% | 6.0% | 3.3% | 245 |
-| `xml` | 81.2% | 1.5% | 1.5% | 9.7% | 6.1% | 573 |
-| `ooffice` | 78.9% | 8.9% | 5.5% | 0.5% | 6.2% | 176 |
-| `mozilla` | 68.2% | 9.9% | 8.1% | 0.7% | 13.1% | 319 |
-| `samba` | 67.8% | 6.3% | 8.6% | 5.5% | 11.7% | 328 |
-| `nci` | 63.4% | 22.1% | 2.5% | 5.2% | 6.9% | 570 |
-| `dickens` | 58.4% | 1.0% | 9.6% | 12.7% | 18.3% | 786 |
-| `osdb` | 43.6% | 21.5% | 20.3% | 1.2% | 13.4% | 603 |
-| `sao` | 28.3% | 36.3% | 12.3% | 1.6% | 21.4% | 594 |
-| `mr` | 0.4% | 9.7% | 63.5% | 0.7% | 25.8% | 251 |
-| `x-ray` | 0.0% | 16.2% | 61.9% | 0.8% | 21.1% | 439 |
+| `webster` | 91.0% | 0.0% | 0.1% | 6.1% | 2.8% | 340 |
+| `reymont` | 90.9% | 0.3% | 0.0% | 5.5% | 3.2% | 366 |
+| `xml` | 79.3% | 2.0% | 1.7% | 10.1% | 6.9% | 620 |
+| `ooffice` | 80.2% | 8.0% | 5.0% | 0.5% | 6.4% | 243 |
+| `mozilla` | 68.5% | 10.7% | 6.8% | 0.7% | 13.2% | 351 |
+| `samba` | 70.5% | 7.1% | 6.3% | 5.1% | 10.9% | 450 |
+| `nci` | 63.1% | 22.5% | 2.6% | 5.0% | 6.7% | 604 |
+| `dickens` | 59.3% | 1.1% | 7.7% | 13.3% | 18.6% | 878 |
+| `osdb` | 43.1% | 22.3% | 20.0% | 1.0% | 13.7% | 690 |
+| `sao` | 31.1% | 34.8% | 9.3% | 1.8% | 23.0% | 1075 |
+| `mr` | 0.5% | 12.3% | 51.3% | 0.9% | 34.9% | 344 |
+| `x-ray` | 0.0% | 18.4% | 54.1% | 0.7% | 26.7% | 470 |
 
 That is the answer to "why is the whole path not 500 MB/s": on the text and
 executable files the block is one match-finder pass, and the finder runs at
@@ -149,17 +149,18 @@ three passes: `dickens` 219, `webster` 271, `mozilla` 309, `osdb` 326,
 `xml` 552, `nci` 787 MB/s). A pass at that rate cannot produce a block faster
 than that rate, and the rest of the pipeline cannot win back what the pass
 spends. The two files that are not finder-bound are bound by the trial loop
-instead -- `x-ray` (medical image) and `mr` spend 62% and 64% of a block in two
-full shape trials. Raising the ceiling means either a faster finder or fewer
-finder passes, and fewer passes costs ratio: level 1 writes no LZ form at all
-and runs at 816 MB/s for 1.24:1, and `LZ_FAST` is one pass at 2.19:1.
+instead -- `x-ray` (medical image) and `mr` spend 54% and 51% of a block in
+their one full shape trial. Raising the ceiling means either a faster finder
+or fewer finder passes, and fewer passes costs ratio: level 1 writes no LZ
+form at all and runs at 816 MB/s for 1.24:1, and `LZ_FAST` is one pass at
+2.19:1.
 
 The finder is one hash probe per position over a 2^15-entry table, with a
 one-byte lazy lookahead limited to short matches: the lookahead is a dependent
 chain of two loads, so past a dozen bytes it costs the same and buys nothing.
 The trial loop is the second ceiling. A full-size block's price window is a
-fifth of the block, so a block runs two full shape trials, and the survivors
-the sweep abandons after them are the ones the price could not separate by more
+fifth of the block, so a block runs one full shape trial, and the survivors
+the sweep abandons after it are the ones the price could not separate by more
 than a sixteenth.
 
 The cross-tool comparison uses `tests/benchmarks/bench_pareto.sh`, which
@@ -258,21 +259,21 @@ own, measured with the CLI at `-b 4096` over the 16 MiB non-zero corpus.
 
 | codec | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| zpse 1 `FASTEST` | 1.74:1 | 244 | 2514 |
-| zpse 6 (default) | 2.40:1 | 146 | 1290 |
-| zpse 9 `MAX` | 2.57:1 | 124 | 1196 |
-| zpse 6 `PAGE_FAST` | 1.52:1 | 807 | 2222 |
-| zpse 6 `LZ_FAST` | 2.22:1 | 537 | 1912 |
+| zpse 1 `FASTEST` | 1.74:1 | 250 | 2506 |
+| zpse 6 (default) | 2.40:1 | 158 | 1639 |
+| zpse 9 `MAX` | 2.56:1 | 128 | 1243 |
+| zpse 6 `PAGE_FAST` | 1.52:1 | 888 | 3059 |
+| zpse 6 `LZ_FAST` | 2.21:1 | 591 | 1988 |
 
-`LZ_FAST` is the cheap way to a page: one finder pass, no decision, 537 MB/s
-of encode, and it gives up a fifth of the ratio (2.22:1 against 2.40:1) for
-nearly four times the rate. `PAGE_FAST` is the other end of that trade, 807
-MB/s for 1.52:1. Level 9's entropy pass is what turns 2.40:1 into 2.57:1, and
-it costs 15% of the encode rate.
+`LZ_FAST` is the cheap way to a page: one finder pass, no decision, 591 MB/s
+of encode, and it gives up 8.6% of the packed size (2.21:1 against 2.40:1) for
+3.7 times the rate. `PAGE_FAST` is the other end of that trade, 888 MB/s for
+1.52:1. Level 9's entropy pass is what turns 2.40:1 into 2.56:1, and it costs
+19% of the encode rate.
 
 **Zero pages are a separate class.** Untouched anonymous pages are a large
 share of a real footprint and compress to almost nothing. On the same stream
-with one zero page in eight, zpse 6 scores 2.67:1 and decodes at 1760 MB/s;
+with one zero page in eight, zpse 6 scores 2.67:1 and decodes at 1954 MB/s;
 dropping the zero pages from that same file leaves 2.40:1. The headline table
 uses the non-zero file, so the ratio describes content, not untouched memory.
 
