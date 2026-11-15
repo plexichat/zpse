@@ -849,7 +849,6 @@ static int cmd_codec(int argc, char **argv)
     size_t out_len = 0u;
     size_t out_cap;
     void **enc_arenas = NULL;
-    void **dec_arenas = NULL;
     int rc;
     int i = 2;
 
@@ -949,12 +948,20 @@ static int cmd_codec(int argc, char **argv)
         free_arenas(enc_arenas, threads);
         return rc;
     }
-    if (!compress && threads == 1u) {
+    if (!compress) {
         /* Peek the header straight from the file. Every frame decodes
          * sequentially block by block, indexed or not, and that needs no copy
          * of the frame in memory at all -- see decode_stream for what the copy
          * cost. An indexed frame also has to carry its block count, which is
-         * what the table is checked against. */
+         * what the table is checked against.
+         *
+         * A worker count does not change this. The workers decode into one
+         * caller buffer, so a frame has to be resident twice before the first
+         * block comes out, and on a file that is a page fault per 4 KiB of it:
+         * webster's 41 MiB frame decoded in 122 ms from the file and 382 ms
+         * through the buffered worker call, while the decode itself is 20 ms
+         * on one core and 5 ms on eight. The streamed path is the fast one at
+         * any thread count, so -t means nothing on decode. */
         ZpseFrameHeader ph;
         uint8_t head[ZPSE_FRAME_HEADER_SIZE];
         int peek = 0;
@@ -986,12 +993,16 @@ static int cmd_codec(int argc, char **argv)
             free_arenas(arenas, 1u);
             return drc;
         }
+        /* No content size means no way to size the output, and every frame
+         * this library writes carries one. */
+        fprintf(stderr, "zpse_cli: not a zpse frame with a content size\n");
+        return 1;
     }
     in = read_file(in_path, &in_len);
     if (in == NULL) {
         return 1;
     }
-    if (compress) {
+    {
         size_t ser = frame_bound(in_len, block, indexed);
         size_t par = zpse_parallel_bound(in_len, block, indexed);
 
@@ -1000,32 +1011,9 @@ static int cmd_codec(int argc, char **argv)
          * costs a byte of the result. */
         out_cap = par > ser ? par : ser;
         enc_arenas = alloc_arenas(threads, ZPSE_ENC_ARENA_SIZE);
-    } else {
-        ZpseFrameHeader h;
-
-        memset(&h, 0, sizeof h);
-        /* The frame the encoder writes always carries the content size
-         * (ZPSE_F_CONTENT_SIZE, sentinel UINT64_MAX when absent), so the
-         * decompressor can size its output exactly instead of guessing. */
-        if (in_len < 32u ||
-            zpse_frame_header_read(&h, in) != 0 ||
-            (h.frame_flags & (uint16_t)ZPSE_F_CONTENT_SIZE) == 0u ||
-            h.content_size == UINT64_MAX ||
-            h.content_size > (uint64_t)SIZE_MAX - 1u) {
-            fprintf(stderr, "zpse_cli: not a zpse frame with a content size\n");
-            free(in);
-            return 1;
-        }
-        out_cap = (size_t)h.content_size;
-        /* A frame that declares an index takes the whole-frame path, which is
-         * what validates the index against the stream it describes; the
-         * single-threaded case without one was handled above, from the file. */
-        dec_arenas = alloc_arenas(threads, ZPSE_DEC_ARENA_SIZE);
     }
-    if (compress ? (enc_arenas == NULL) : (dec_arenas == NULL)) {
+    if (enc_arenas == NULL) {
         fprintf(stderr, "zpse_cli: arena allocation failed\n");
-        free_arenas(enc_arenas, threads);
-        free_arenas(dec_arenas, threads);
         free(in);
         return 1;
     }
@@ -1033,33 +1021,21 @@ static int cmd_codec(int argc, char **argv)
     if (out == NULL) {
         fprintf(stderr, "zpse_cli: out of memory\n");
         free_arenas(enc_arenas, threads);
-        free_arenas(dec_arenas, threads);
         free(in);
         return 1;
     }
 
-    if (compress) {
-        rc = compress_mem(in, in_len, out, out_cap, &out_len, block, enc_flags,
-                          indexed, enc_arenas, threads);
-    } else {
-        /* Frames written with -x decode block by block, so -t applies here
-         * too; a frame without an index decodes sequentially inside the same
-         * call, which is why the thread count is not an error there. */
-        rc = zpse_decompress_frame_parallel(in, in_len, out, out_cap,
-                                            &out_len, threads, dec_arenas,
-                                            threads);
-    }
+    rc = compress_mem(in, in_len, out, out_cap, &out_len, block, enc_flags,
+                      indexed, enc_arenas, threads);
     if (rc != 0) {
         fprintf(stderr, "zpse_cli: codec failed rc=%d\n", rc);
         free_arenas(enc_arenas, threads);
-        free_arenas(dec_arenas, threads);
         free(out);
         free(in);
         return 1;
     }
     rc = write_file(out_path, out, out_len);
     free_arenas(enc_arenas, threads);
-    free_arenas(dec_arenas, threads);
     free(out);
     free(in);
     return rc;

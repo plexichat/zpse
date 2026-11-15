@@ -521,8 +521,9 @@ zpse_cli x FILE BLOCK OUT      decode one block through the index
 ```
 
 Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
-pages), `-t N` workers, `-x` writes an index, `-F` requests `LZ_FAST`, and
-`-n BYTES` limits how much of each input `bench` reads.
+pages), `-t N` compression workers (decompression always streams), `-x` writes
+an index, `-F` requests `LZ_FAST`, and `-n BYTES` limits how much of each input
+`bench` reads.
 
 ## Documentation
 

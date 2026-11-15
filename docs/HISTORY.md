@@ -1143,3 +1143,35 @@ refused it: 90 -> 110 ms on webster and 111 -> 110 ms on mozilla, minimum of
 seven. The decode sink keeps the default buffer, which is the useful half of
 the result -- the shape of the loop predicts the win, and the measurement is
 what decides it.
+
+## Decode is I/O, and the CLI decodes one way
+
+The encode side's remaining cost is inside the match finder; the decode side
+turned out to have no such cost at all, and getting to that answer meant
+correcting a figure first. Time the decode call alone, with the frame and the
+output already resident, and the codec decodes 41.5 MB of webster in 20.4 ms on
+one core -- 2.0 GB/s -- and 4.5 ms on twelve; mozilla's 51.2 MB goes 36.2 to
+6.6 ms. The workers scale the decode 4.5 to 5.5x, so the "460 MB/s decode"
+quoted earlier in this file was a disk: a CLI decode's wall clock is the read
+of the frame and the write of the output, not the codec.
+
+That measurement also settled a suspicion about the worker path. Its workers
+hand the decoder the nominal block size as the room for the block, where the
+serial path hands it the rest of the frame, and a decoder that tests the room
+in front of every store could be much slower tight than loose -- which would
+explain text blocks (match-heavy) losing far more than binary ones. Removing
+the clamp measured 4.4 to 7.0 ms at twelve workers against 4.5 to 6.9 clamped,
+inside the host's band at both ends, and it would let a worker write into the
+block next to it, so the clamp stays and the anomaly was the host.
+
+The CLI had a real regression on top of this: `d -t N` read the whole frame,
+allocated the whole output and decoded into it, so a file paid a page fault per
+4 KiB of frame and of output before the first block came out -- while the
+streamed path at one worker already writes blocks out of one reused buffer.
+Minimum of nine alternating runs over webster: `-t 8` went from 406 to 96 ms on
+a plain frame and 353 to 95 ms on an indexed one; the binary frames were a wash
+(mozilla 134 to 109, indexed mozilla 99 to 110). The workers are not the
+problem -- 5 ms against 20 -- the frame held twice is. So decode now always
+streams, `-t` is a compression option, and the buffered decode machinery is
+gone from the tool. Decoded output was compared against the corpus for all
+four frames.
