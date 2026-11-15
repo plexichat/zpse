@@ -41,14 +41,14 @@
  * a bench reads each input once, before the clock starts, and keeps every
  * buffer in memory.
  *
- * A single-threaded frame is streamed, not buffered: the input is read a slab
- * at a time and each block is written to the output as it is finished, so
- * neither the file nor the frame is ever resident whole -- and that holds for
- * -x too, because the table is recorded as the blocks go rather than walked
- * off the file afterwards. -t and `bench` use the buffered worker call, which
- * needs the whole frame: `bench` is measuring the codec rather than writing a
- * file, and the streamed worker path is withheld until its slot handoff is
- * proven (see src/parallel.c). */
+ * A frame is streamed, not buffered: the input is read a slab at a time and
+ * each block is written to the output as it is finished, so neither the file
+ * nor the frame is ever resident whole -- and that holds for -x too, because
+ * the table is recorded as the blocks go rather than walked off the file
+ * afterwards. -t keeps that path and hands the slab to the worker ring, so
+ * the workers hold a few slots between them rather than the frame. `bench`
+ * is the one caller that still buffers, because it is measuring the codec in
+ * memory rather than writing a file. */
 /* clock_gettime is POSIX, and a strict -std=c11 hides it unless the
  * feature-test macro asks for it (the in-tree benchmarks do the same). */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
@@ -907,21 +907,29 @@ static int cmd_codec(int argc, char **argv)
     }
     in_path = argv[i];
     out_path = argv[i + 1];
-    /* One thread streams: the frame is written block by block straight to the
-     * output file, and the index rides along because the writer records where
-     * each block went as it writes it (see zpse_frame_stream_index). Nothing
-     * here holds the input or the frame, which is what a whole-file encode
-     * spends a quarter of its time on. -t takes the buffered worker call: the
-     * streamed worker path is withheld, see the note in src/parallel.c. */
-    if (compress && threads == 1u) {
-        enc_arenas = alloc_arenas(1u, ZPSE_ENC_ARENA_SIZE);
+    /* The frame is written block by block straight to the output file, and
+     * the index rides along because the writer records where each block went
+     * as it writes it (see zpse_frame_stream_index). Nothing here holds the
+     * input or the frame, which is what a whole-file encode spends a quarter
+     * of its time on. */
+    if (compress) {
+        /* A worker count does not change the path: this one takes it too, as
+         * it always could. The buffered worker call it used to take for -t
+         * reserves a slot per block in the caller's buffer and compacts the
+         * frame afterwards, so a 50 MiB file wanted the frame's size in
+         * memory plus a serial memmove over all of it -- on exactly the runs
+         * where the workers were supposed to be the point. The streamed
+         * worker path writes the same bytes; test_parallel.c compares its
+         * block region against the serial frame at every worker count and
+         * both ring depths. */
+        enc_arenas = alloc_arenas(threads, ZPSE_ENC_ARENA_SIZE);
         if (enc_arenas == NULL) {
             fprintf(stderr, "zpse_cli: arena allocation failed\n");
             return 1;
         }
-        rc = encode_stream(in_path, out_path, block, enc_flags, indexed, 1u,
-                           (void *const *)enc_arenas);
-        free_arenas(enc_arenas, 1u);
+        rc = encode_stream(in_path, out_path, block, enc_flags, indexed,
+                           threads, (void *const *)enc_arenas);
+        free_arenas(enc_arenas, threads);
         return rc;
     }
     if (!compress && threads == 1u) {
