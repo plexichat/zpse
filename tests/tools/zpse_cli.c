@@ -24,9 +24,14 @@
  *              shape decision; ignored above a page. See ZPSE_ENC_PAGE_FAST
  *   -c         emit the per-block payload CRC32-C (verified on decode)
  *   -b N       nominal block size, 1..65536 (default 65536)
+ *   -D         decode-first: keep an intra-block LZ form only when it is at
+ *              least 1/8 smaller than the best tile stream; see
+ *              ZPSE_ENC_DECODE_FAST
  *   -x         append the FrameIndex (random access); bench also seeks
- *   -t N       encode with N worker threads (default 1: the single-core
- *              path every figure in the README was measured on)
+ *   -t N       use N worker threads (default 1: the single-core path every
+ *              figure in the README was measured on). On decode the blocks
+ *              are read in a batch and decoded side by side, and written in
+ *              order, so neither the frame nor the output is resident whole.
  *   -r N       bench repetitions per file (0 = pick from the file size)
  *   -n N       bench: time only the first N bytes of each file (0 = the
  *              whole file), for one case without the whole corpus
@@ -339,15 +344,72 @@ static void free_arenas(void **a, unsigned threads)
  *
  * Returns 0 on success, 1 on any failure, matching write_file. A failure
  * removes the partial output, because this path writes as it goes. */
+/* One compressed block in the batch, header and payload back to back, and
+ * one output slot per block. Both are a block's maximum possible size, so a
+ * batch is a fixed allocation the decoder reuses. */
+#define ZPSE_CLI_DEC_SLOT \
+    ((size_t)ZPSE_BLOCK_HEADER_SIZE + (size_t)ZPSE_MAX_BLOCK_SIZE)
+
+/* Decode the blocks held in the batch and write them, in order.
+ *
+ * This is what makes -t mean something on a decode that is streaming: the
+ * caller reads the blocks, the workers decode them side by side, and the
+ * writer emits them in order. Memory is the batch, not the frame. Returns 0
+ * on success, 1 after reporting (the caller removes the partial output). */
+static int decode_flush(FILE *f, const char *out_path, uint8_t *slot_mem,
+                        const uint32_t *off, const uint32_t *len,
+                        const uint32_t *expect, uint32_t *got,
+                        uint8_t *out_buf, unsigned held, unsigned threads,
+                        void *const arenas[], size_t *out_pos)
+{
+    unsigned k;
+    int rc;
+
+    if (held == 0u) {
+        return 0;
+    }
+    rc = zpse_decompress_batch_parallel(slot_mem, off, len, held, out_buf,
+                                        (uint32_t)ZPSE_MAX_BLOCK_SIZE, got,
+                                        threads, arenas, threads);
+    if (rc != ZPSE_OK) {
+        fprintf(stderr, "zpse_cli: block does not decode\n");
+        return 1;
+    }
+    for (k = 0u; k < held; k++) {
+        if (got[k] != expect[k]) {
+            fprintf(stderr, "zpse_cli: block does not decode\n");
+            return 1;
+        }
+        if (got[k] > 0u &&
+            fwrite(out_buf + (size_t)k * (size_t)ZPSE_MAX_BLOCK_SIZE, 1u,
+                   (size_t)got[k], f) != (size_t)got[k]) {
+            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+            return 1;
+        }
+        *out_pos += (size_t)got[k];
+    }
+    return 0;
+}
+
 static int decode_stream(const char *in_path, const char *out_path,
-                         const ZpseFrameHeader *fh, void *dec_arena,
+                         const ZpseFrameHeader *fh,
+                         void *const dec_arenas[], unsigned threads,
                          int indexed)
 {
     FILE *f = NULL;
     FILE *fi = NULL;
     /* One block: its header, then its payload directly behind it. */
     uint8_t blk[ZPSE_BLOCK_HEADER_SIZE + ZPSE_MAX_BLOCK_SIZE];
-    uint8_t out[ZPSE_MAX_BLOCK_SIZE];
+    uint8_t *slot_mem = NULL;
+    uint8_t *out_buf = NULL;
+    uint32_t *slot_off = NULL;
+    uint32_t *slot_len = NULL;
+    uint32_t *slot_expect = NULL;
+    uint32_t *slot_got = NULL;
+    /* Eight blocks a worker: a batch wants enough work per thread to pay for
+     * the handoff, and the ring the workers fill is a few MiB either way. */
+    unsigned batch = threads * 8u;
+    unsigned held = 0u;
     size_t out_pos = 0u;
     size_t nblocks = 0u;
     int have_last = 0;
@@ -385,11 +447,24 @@ static int decode_stream(const char *in_path, const char *out_path,
         fprintf(stderr, "zpse_cli: cannot write %s\n", out_path);
         goto fail;
     }
+    if (batch > 64u) {
+        batch = 64u;
+    }
+    slot_mem = (uint8_t *)malloc((size_t)batch * ZPSE_CLI_DEC_SLOT);
+    out_buf = (uint8_t *)malloc((size_t)batch * (size_t)ZPSE_MAX_BLOCK_SIZE);
+    slot_off = (uint32_t *)malloc((size_t)batch * sizeof *slot_off);
+    slot_len = (uint32_t *)malloc((size_t)batch * sizeof *slot_len);
+    slot_expect = (uint32_t *)malloc((size_t)batch * sizeof *slot_expect);
+    slot_got = (uint32_t *)malloc((size_t)batch * sizeof *slot_got);
+    if (slot_mem == NULL || out_buf == NULL || slot_off == NULL ||
+        slot_len == NULL || slot_expect == NULL || slot_got == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        goto fail;
+    }
     for (;;) {
         ZpseBlockHeader bh;
         uint32_t comp_sz;
         uint32_t hdr_sz;
-        uint32_t blk_out = 0u;
         size_t got = fread(blk, 1u, (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT, fi);
 
         /* End of file exactly on a block boundary: legal only for a frame
@@ -431,26 +506,39 @@ static int decode_stream(const char *in_path, const char *out_path,
             fprintf(stderr, "zpse_cli: frame ends mid-block\n");
             goto fail;
         }
-        if (zpse_decompress_block(blk, comp_sz, out, (uint32_t)sizeof out,
-                                  &blk_out, dec_arena) != ZPSE_OK ||
-            blk_out != bh.uncompressed_size) {
-            fprintf(stderr, "zpse_cli: block %zu does not decode\n", nblocks);
-            goto fail;
-        }
-        if (blk_out > 0u && fwrite(out, 1u, blk_out, f) != blk_out) {
-            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
-            goto fail;
-        }
-        out_pos += (size_t)blk_out;
+        memcpy(slot_mem + (size_t)held * ZPSE_CLI_DEC_SLOT, blk,
+               (size_t)comp_sz);
+        slot_off[held] = (uint32_t)((size_t)held * ZPSE_CLI_DEC_SLOT);
+        slot_len[held] = comp_sz;
+        slot_expect[held] = bh.uncompressed_size;
+        held++;
         nblocks++;
         if ((bh.block_flags & (uint8_t)ZPSE_B_LAST) != 0u) {
             have_last = 1;
+        }
+        if (held == batch || have_last) {
+            if (decode_flush(f, out_path, slot_mem, slot_off, slot_len,
+                             slot_expect, slot_got, out_buf, held, threads,
+                             dec_arenas, &out_pos) != 0) {
+                goto fail;
+            }
+            held = 0u;
+        }
+        if (have_last) {
             break;
         }
         if (has_count && (uint64_t)nblocks > (uint64_t)fh->block_count) {
             fprintf(stderr, "zpse_cli: more blocks than the frame declares\n");
             goto fail;
         }
+    }
+    /* A frame with no last-block flag ends at EOF: whatever is still held is
+     * the tail of the frame and has to be decoded and written like any
+     * other batch. */
+    if (decode_flush(f, out_path, slot_mem, slot_off, slot_len, slot_expect,
+                     slot_got, out_buf, held, threads, dec_arenas,
+                     &out_pos) != 0) {
+        goto fail;
     }
     if (!have_last &&
         (!has_count || (uint64_t)nblocks != (uint64_t)fh->block_count)) {
@@ -502,6 +590,12 @@ static int decode_stream(const char *in_path, const char *out_path,
         remove(out_path);
         return 1;
     }
+    free(slot_mem);
+    free(out_buf);
+    free(slot_off);
+    free(slot_len);
+    free(slot_expect);
+    free(slot_got);
     free(blk_off);
     free(blk_len);
     return 0;
@@ -514,6 +608,12 @@ fail:
     if (fi != NULL) {
         fclose(fi);
     }
+    free(slot_mem);
+    free(out_buf);
+    free(slot_off);
+    free(slot_len);
+    free(slot_expect);
+    free(slot_got);
     free(blk_off);
     free(blk_len);
     return 1;
@@ -871,6 +971,12 @@ static int cmd_codec(int argc, char **argv)
              * a page, where the flag has no meaning. */
             enc_flags |= ZPSE_ENC_PAGE_FAST;
             break;
+        case 'D':
+            /* Decode-first: an LZ form has to be 1/8 smaller than the tile
+             * stream to be written at all. The streams are the sweep's own,
+             * so every decoder reads them. */
+            enc_flags |= ZPSE_ENC_DECODE_FAST;
+            break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;
             break;
@@ -955,13 +1061,13 @@ static int cmd_codec(int argc, char **argv)
          * cost. An indexed frame also has to carry its block count, which is
          * what the table is checked against.
          *
-         * A worker count does not change this. The workers decode into one
-         * caller buffer, so a frame has to be resident twice before the first
-         * block comes out, and on a file that is a page fault per 4 KiB of it:
-         * webster's 41 MiB frame decoded in 122 ms from the file and 382 ms
-         * through the buffered worker call, while the decode itself is 20 ms
-         * on one core and 5 ms on eight. The streamed path is the fast one at
-         * any thread count, so -t means nothing on decode. */
+         * A worker count keeps this path: the walk reads a batch of blocks
+         * and hands it to the worker pool, which decodes them side by side
+         * into one batch-sized buffer, and the writer emits them in order.
+         * That is the streamed path with the blocks spread over the cores,
+         * not the buffered worker call it used to be -- that one wanted the
+         * whole frame and the whole output resident, so webster's 41 MiB
+         * frame cost 382 ms through it against 122 ms from the file. */
         ZpseFrameHeader ph;
         uint8_t head[ZPSE_FRAME_HEADER_SIZE];
         int peek = 0;
@@ -981,16 +1087,16 @@ static int cmd_codec(int argc, char **argv)
             fclose(pf);
         }
         if (peek) {
-            void **arenas = alloc_arenas(1u, ZPSE_DEC_ARENA_SIZE);
+            void **arenas = alloc_arenas(threads, ZPSE_DEC_ARENA_SIZE);
             int drc;
 
             if (arenas == NULL) {
                 fprintf(stderr, "zpse_cli: arena allocation failed\n");
                 return 1;
             }
-            drc = decode_stream(in_path, out_path, &ph, (void *)arenas[0],
-                                indexed);
-            free_arenas(arenas, 1u);
+            drc = decode_stream(in_path, out_path, &ph,
+                                (void *const *)arenas, threads, indexed);
+            free_arenas(arenas, threads);
             return drc;
         }
         /* No content size means no way to size the output, and every frame
@@ -1129,6 +1235,12 @@ static int cmd_bench(int argc, char **argv)
              * verbatim copy and nothing else priced or tried. Ignored above
              * a page, where the flag has no meaning. */
             enc_flags |= ZPSE_ENC_PAGE_FAST;
+            break;
+        case 'D':
+            /* Decode-first: an LZ form has to be 1/8 smaller than the tile
+             * stream to be written at all. The streams are the sweep's own,
+             * so every decoder reads them. */
+            enc_flags |= ZPSE_ENC_DECODE_FAST;
             break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;

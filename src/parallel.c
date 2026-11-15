@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "zpse/api.h"
 #include "zpse/arena.h"
 #include "zpse/block.h"
 #include "zpse/constants.h"
@@ -1157,4 +1158,217 @@ int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
     return zpse_mt_serial(in, n, out, out_cap, out_len_out,
                           nominal_block_size, enc_flags, with_index,
                           enc_arenas);
+}
+
+/* ---- batch decode ---------------------------------------------------
+ *
+ * The frame-level parallel decode needs the whole frame resident, because it
+ * finds block k through the FrameIndex. A caller that is streaming a file
+ * out has the blocks in hand already -- it just read them -- so what it needs
+ * is the decode side of the same pool over a batch it owns: `count`
+ * independent compressed blocks at known offsets, decoded side by side into a
+ * contiguous output buffer. Nothing here looks at a frame or an index, and
+ * nothing allocates; the caller reuses one batch of buffers.
+ *
+ * A block writes exactly its own bytes and nothing else (that bound is the
+ * block decoder's, not this loop's), so two workers cannot touch the same
+ * byte of `out` at a stride of `stride`.
+ */
+
+static int zpse_mt_batch_one(const uint8_t *in, const uint32_t *offsets,
+                             const uint32_t *lens, size_t i, uint8_t *out,
+                             uint32_t stride, uint32_t *out_lens, void *arena)
+{
+    uint32_t got = 0u;
+    int rc;
+
+    rc = zpse_decompress_block(in + offsets[i], lens[i],
+                               out + i * (size_t)stride, stride, &got, arena);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    if (got > stride) {
+        return ZPSE_OUTPUT_OVERFLOW;
+    }
+    out_lens[i] = got;
+    return ZPSE_OK;
+}
+
+#if defined(ZPSE_MT)
+
+typedef struct ZpseMtBatchJob {
+    const uint8_t *in;
+    const uint32_t *offsets;
+    const uint32_t *lens;
+    uint8_t *out;
+    uint32_t stride;
+    uint32_t *out_lens;
+    size_t count;
+    volatile long next;
+    volatile int failed;
+} ZpseMtBatchJob;
+
+typedef struct ZpseMtBatchArg {
+    ZpseMtBatchJob *job;
+    void *arena;
+} ZpseMtBatchArg;
+
+static void zpse_mt_batch_fail(ZpseMtBatchJob *j, int rc)
+{
+    if (j->failed == 0) {
+        j->failed = (rc < 0) ? rc : ZPSE_BAD_HEADER;
+    }
+}
+
+static void zpse_mt_batch_worker(ZpseMtBatchJob *j, void *arena)
+{
+    for (;;) {
+        size_t i;
+        int rc;
+
+        if (j->failed != 0) {
+            return;
+        }
+        i = zpse_mt_claim(&j->next, j->count);
+        if (i == SIZE_MAX) {
+            return;
+        }
+        rc = zpse_mt_batch_one(j->in, j->offsets, j->lens, i, j->out,
+                               j->stride, j->out_lens, arena);
+        if (rc != ZPSE_OK) {
+            zpse_mt_batch_fail(j, rc);
+            return;
+        }
+    }
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI zpse_mt_batch_entry(LPVOID p)
+{
+    ZpseMtBatchArg *a = (ZpseMtBatchArg *)p;
+
+    zpse_mt_batch_worker(a->job, a->arena);
+    return 0;
+}
+#else
+static void *zpse_mt_batch_entry(void *p)
+{
+    ZpseMtBatchArg *a = (ZpseMtBatchArg *)p;
+
+    zpse_mt_batch_worker(a->job, a->arena);
+    return 0;
+}
+#endif
+
+static int zpse_mt_batch_run(const uint8_t *in, const uint32_t *offsets,
+                             const uint32_t *lens, uint32_t count,
+                             uint8_t *out, uint32_t stride,
+                             uint32_t *out_lens, unsigned threads,
+                             void *const arenas[])
+{
+    ZpseMtBatchJob job;
+    ZpseMtBatchArg args[ZPSE_MT_MAX_THREADS];
+#if defined(_WIN32)
+    HANDLE handles[ZPSE_MT_MAX_THREADS];
+#else
+    pthread_t handles[ZPSE_MT_MAX_THREADS];
+#endif
+    unsigned started = 0u;
+    unsigned w;
+
+    job.in = in;
+    job.offsets = offsets;
+    job.lens = lens;
+    job.out = out;
+    job.stride = stride;
+    job.out_lens = out_lens;
+    job.count = (size_t)count;
+    job.next = 0;
+    job.failed = 0;
+
+    /* The calling thread is worker 0: a dedicated writer thread is a seventh
+     * thread on a six-CPU host and takes a core from the decoders. */
+    for (w = 1u; w < threads; w++) {
+        args[w].job = &job;
+        args[w].arena = arenas[w];
+#if defined(_WIN32)
+        handles[w] = CreateThread(NULL, 0, zpse_mt_batch_entry, &args[w], 0,
+                                  NULL);
+        if (handles[w] == NULL) {
+            break;
+        }
+#else
+        if (pthread_create(&handles[w], NULL, zpse_mt_batch_entry, &args[w]) !=
+            0) {
+            break;
+        }
+#endif
+        started++;
+    }
+    zpse_mt_batch_worker(&job, arenas[0]);
+    for (w = 1u; w <= started; w++) {
+#if defined(_WIN32)
+        WaitForSingleObject(handles[w], INFINITE);
+        CloseHandle(handles[w]);
+#else
+        pthread_join(handles[w], NULL);
+#endif
+    }
+    return job.failed != 0 ? job.failed : ZPSE_OK;
+}
+
+#endif /* ZPSE_MT */
+
+int zpse_decompress_batch_parallel(const uint8_t *in,
+                                   const uint32_t *offsets,
+                                   const uint32_t *lens, uint32_t count,
+                                   uint8_t *out, uint32_t stride,
+                                   uint32_t *out_lens, unsigned threads,
+                                   void *const dec_arenas[],
+                                   unsigned arena_count)
+{
+    uint32_t i;
+
+    if (in == 0 || offsets == 0 || lens == 0 || out == 0 || out_lens == 0 ||
+        dec_arenas == 0 || dec_arenas[0] == 0 || arena_count == 0u) {
+        return ZPSE_BAD_ARG;
+    }
+    if (count == 0u || stride == 0u || stride > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+        return ZPSE_BAD_ARG;
+    }
+#if defined(ZPSE_MT)
+    if (threads > 1u && (size_t)threads * 4u <= (size_t)count) {
+        unsigned t = threads;
+
+        if (t > arena_count) {
+            t = arena_count;
+        }
+        if (t > ZPSE_MT_MAX_THREADS) {
+            t = ZPSE_MT_MAX_THREADS;
+        }
+        if ((size_t)t > (size_t)count) {
+            t = count;
+        }
+        /* Four blocks per worker before a thread is worth starting: a block
+         * decodes in a few microseconds and a thread start costs a hundred,
+         * so a small batch runs on the caller's thread and writes the same
+         * bytes. */
+        if (t > 1u) {
+            return zpse_mt_batch_run(in, offsets, lens, count, out, stride,
+                                     out_lens, t, dec_arenas);
+        }
+    }
+#else
+    (void)threads;
+    (void)arena_count;
+#endif
+    for (i = 0u; i < count; i++) {
+        int rc = zpse_mt_batch_one(in, offsets, lens, (size_t)i, out, stride,
+                                   out_lens, dec_arenas[0]);
+
+        if (rc != ZPSE_OK) {
+            return rc;
+        }
+    }
+    return ZPSE_OK;
 }

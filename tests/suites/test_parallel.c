@@ -192,6 +192,61 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
           "%u workers: parallel decoded bytes (n %u, block %u, index %d)",
           threads, n, block, indexed);
 
+    /* The batch decoder a streaming caller uses: the frame's blocks handed
+     * over in one call, decoded side by side, must be the sequential decode
+     * block for block. This is the read side the CLI drives while it walks a
+     * file, so it is checked against the bytes rather than against itself. */
+    if (nblocks <= 128u) {
+        static uint8_t bin[COMP_CAP];
+        static uint8_t bout[MAXN];
+        uint32_t boff[128], blen[128], bgot[128];
+        size_t pos = (size_t)ZPSE_FRAME_HEADER_SIZE;
+        uint32_t k;
+        int brc = ZPSE_OK;
+
+        for (k = 0u; k < nblocks && brc == ZPSE_OK; k++) {
+            ZpseBlockHeader bh;
+
+            if (zpse_block_header_parse(&bh, par + pos,
+                                        (uint32_t)ZPSE_BLOCK_HEADER_SIZE) !=
+                    ZPSE_OK ||
+                bh.compressed_block_size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE ||
+                pos + (size_t)bh.compressed_block_size > plen) {
+                brc = ZPSE_BAD_HEADER;
+                break;
+            }
+            memcpy(bin + pos, par + pos, (size_t)bh.compressed_block_size);
+            boff[k] = (uint32_t)pos;
+            blen[k] = bh.compressed_block_size;
+            pos += (size_t)bh.compressed_block_size;
+        }
+        if (brc == ZPSE_OK) {
+            brc = zpse_decompress_batch_parallel(
+                bin, boff, blen, nblocks, bout, block, bgot, threads,
+                (void *const *)decs, MAXTHREADS);
+        }
+        CHECK(brc == ZPSE_OK,
+              "%u workers: batch decode (n %u, block %u): %s", threads, n,
+              block, zpse_status_name(brc));
+        if (brc == ZPSE_OK) {
+            for (k = 0u; k < nblocks; k++) {
+                uint32_t want = (k + 1u == nblocks) ? (uint32_t)(n - (size_t)k * block)
+                                                    : block;
+
+                if (want > block) {
+                    want = block;
+                }
+                if (bgot[k] != want ||
+                    memcmp(bout + (size_t)k * block, in + (size_t)k * block,
+                           want) != 0) {
+                    CHECK(0, "%u workers: batch block %u (n %u, block %u)",
+                          threads, k, n, block);
+                    break;
+                }
+            }
+        }
+    }
+
     if (indexed) {
         uint32_t count = 0u;
         uint32_t last = nblocks - 1u;

@@ -2989,20 +2989,51 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return 1;
 }
 
+/* Whether the caller asked for decode rate over ratio (ZPSE_ENC_DECODE_FAST),
+ * and how much smaller an LZ form has to be than the tile winner when it did.
+ *
+ * One constant for every LZ form, because they all trade the same thing: the
+ * tile path reconstructs through a vectorised kernel at 5-13 GB/s and a
+ * command loop decodes at 1-4 GB/s. 1/8 is the margin where the tile stream's
+ * decode win is worth the bytes on the corpora this was measured on; the
+ * default 1/32 is the size-only rule (see ZPSE_LZ_MIN_WIN_DIV). */
+#ifndef ZPSE_DECODE_FAST_DIV
+#define ZPSE_DECODE_FAST_DIV 8u
+#endif
+
+static int zpse_block_lz_decode_first(uint32_t enc_flags)
+{
+    return (enc_flags & (uint32_t)ZPSE_ENC_DECODE_FAST) != 0u;
+}
+
+static uint32_t zpse_block_lz_win_div(uint32_t enc_flags)
+{
+    return zpse_block_lz_decode_first(enc_flags)
+               ? (uint32_t)ZPSE_DECODE_FAST_DIV
+               : (uint32_t)ZPSE_LZ_MIN_WIN_DIV;
+}
+
 /* Is this LZ stream worth taking? Smaller than the tile winner (or the
  * sweep found nothing at all, in which case there is no tile stream to
  * compare against), inside the level's acceleration factor, and smaller by
  * enough to pay for the decode it gives up. `lz_cmds == 0` cannot happen
  * from zpse_lz_encode (its stream always ends in a command) but is kept as
- * "no evidence either way" rather than a division by zero. */
+ * "no evidence either way" rather than a division by zero.
+ *
+ * `decode_first` is ZPSE_ENC_DECODE_FAST, and it only raises the margin the
+ * form has to beat the tile stream by; it can never make a stream larger than
+ * it would have been with the tile form winning, because the tile form is
+ * what the caller gets instead. */
 static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
                               int have_best, uint32_t best_total,
-                              uint32_t speed)
+                              uint32_t speed, int decode_first)
 {
+    uint32_t div = decode_first ? (uint32_t)ZPSE_DECODE_FAST_DIV
+                                : (uint32_t)ZPSE_LZ_MIN_WIN_DIV;
+
     if (have_best &&
         (lz_total >= best_total ||
-         best_total - lz_total < best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV +
-                                     1u)) {
+         best_total - lz_total < best_total / div + 1u)) {
         return 0;
     }
     if (lz_cmds != 0u && n / lz_cmds < zpse_lz_min_bpc(speed)) {
@@ -4895,7 +4926,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
                 if (rc == ZPSE_OK &&
                     zpse_block_lz_wins(n, lz_cmds, lz_total, 1, atotal,
-                                       lz_speed)) {
+                                       lz_speed,
+                                       zpse_block_lz_decode_first(
+                                           e->enc_flags))) {
                     /* ---- The gate's total is arithmetic, so the trial is
                      * not needed to settle it ---------------------------
                      *
@@ -5026,6 +5059,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * this was accepted under (no case may grow by more than 1/64 of its
      * input) rather than the absolute "no case grows" it used to. */
     if (!direct_out && !lz_done && e->lz != 0 && ncand > 0 &&
+        !zpse_block_lz_decode_first(e->enc_flags) &&
         n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
@@ -5068,7 +5102,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (lrc == ZPSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
             lz_total <= out_cap && lz_total >= n / 64u &&
             zpse_block_lz_wins(n, lz_cmds, lz_total, 0, 0u,
-                               e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
+                               e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
+                               zpse_block_lz_decode_first(e->enc_flags))) {
             memcpy(out, e->cand, lz_total);
             lz_total = zpse_block_shrink_page(out, n, lz_total);
             zpse_block_hist_set(e, out, lz_total);
@@ -5487,7 +5522,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * came from. */
             if (rc == ZPSE_OK &&
                 zpse_block_lz_wins(n, lz_cmds, lz_total, have_best,
-                                   best_total, lz_speed)) {
+                                   best_total, lz_speed,
+                                   zpse_block_lz_decode_first(
+                                       e->enc_flags))) {
                 if (direct_out) {
                     /* In direct_out mode, `out` is the caller's buffer with
                      * capacity `tcap` (= out_cap). `lz_total` can be up to
@@ -5568,8 +5605,19 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #endif
             uint32_t tot = (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) + pl;
 
-            if (pl != 0u &&
-                tot + tot / (uint32_t)ZPSE_LZ_TILE_DIV <= best_total &&
+            /* Same decode-first rule as the pure LZ forms: the tile body is
+             * read through a match finder before the reconstruction, so a
+             * decode-first caller wants it only when it pays well. Pricing
+             * the pass by the payload's share of the block instead was tried
+             * (`pl <= n / 8`): it refused wraps that save a third of a block
+             * and cost 1.8-3.1% of the frame on nci, xml and dickens for no
+             * decode time this host could measure, so the margin stayed. See
+             * docs/HISTORY.md. */
+            uint32_t tdiv = zpse_block_lz_decode_first(e->enc_flags)
+                                ? (uint32_t)ZPSE_DECODE_FAST_DIV
+                                : (uint32_t)ZPSE_LZ_TILE_DIV;
+
+            if (pl != 0u && tot + tot / tdiv <= best_total &&
                 tot <= out_cap) {
                 wh.block_flags = (uint8_t)((wh.block_flags &
                                             ~(uint8_t)(ZPSE_B_RAW |
@@ -5712,7 +5760,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, e->cand,
                                (uint32_t)ZPSE_E_SZ_CAND, &t2, &cmds2) ==
                 ZPSE_OK &&
-            t2 < best_total && (!direct_out || t2 <= out_cap)) {
+            t2 < best_total &&
+            (!zpse_block_lz_decode_first(e->enc_flags) ||
+             best_total - t2 >=
+                 best_total / zpse_block_lz_win_div(e->enc_flags) + 1u) &&
+            (!direct_out || t2 <= out_cap)) {
             if (direct_out) {
                 memcpy(out, e->cand, t2);
             } else {
@@ -5747,6 +5799,7 @@ lz2_done:
      * fallback for bytes that did not compress, and coding it would make a
      * block that had already lost try again with a pass that cannot win. */
     if (!page_fast_page && have_best &&
+        !zpse_block_lz_decode_first(e->enc_flags) &&
         zpse_block_huf_level(e->enc_flags) &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + ZPSE_HUF_MIN_PAYLOAD)) {
         uint8_t *win = direct_out ? out : e->best;

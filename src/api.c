@@ -29,7 +29,8 @@ static int enc_flags_ok(uint32_t enc_flags)
     if ((enc_flags &
          ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK |
                      ZPSE_ENC_LZ_FAST | ZPSE_ENC_PAGE_FAST |
-                     ZPSE_ENC_LZ_HEX | ZPSE_ENC_HUF)) != 0u) {
+                     ZPSE_ENC_LZ_HEX | ZPSE_ENC_HUF |
+                     ZPSE_ENC_DECODE_FAST)) != 0u) {
         return 0;
     }
     lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>

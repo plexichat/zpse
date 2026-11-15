@@ -201,6 +201,30 @@
  * Levels 1-4 write no LZ form, so the bit has nothing to act on there. */
 #define ZPSE_ENC_HUF            (UINT32_C(1) << 8)
 
+/* Decode-first mode: keep an intra-block LZ form only when it is at least
+ * 1/8 smaller than the best tile or raw stream the same block produced.
+ *
+ * The tile path reconstructs through a vectorised kernel at 5-13 GB/s and an
+ * LZ command loop decodes at 1-4 GB/s, so "the smallest stream" is not always
+ * the fastest one to read. At the default level the LZ form is only taken
+ * when it is already more than 1/32 smaller, which on prose is far too small
+ * a margin to matter (the form wins by a quarter) but on structured files is
+ * exactly the range where a tile stream a few percent larger decodes several
+ * times faster. This flag raises that margin to 1/8 for every LZ form --
+ * token, fast, hex, the LZ-wrapped tile body and the Huffman wrapper -- and
+ * stops the finder-first path from writing LZ into a block whose tile stream
+ * was never priced, because that path has no tile total to compare against.
+ *
+ * It changes no format: the streams it writes are the ones the sweep would
+ * have written on a block where the tile form won, so every decoder reads
+ * them. The cost is ratio, and only on blocks where the two forms are close.
+ * Off by default, so nothing an existing caller writes moves.
+ *
+ * A level still sets its own acceleration bill, so ZPSE_ENC_LZ_FAST (which
+ * asks for the fast form and nothing else) takes precedence when both are
+ * set: a caller who named the form explicitly meant it. */
+#define ZPSE_ENC_DECODE_FAST    (UINT32_C(1) << 9)
+
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
  * 2,4,6,...,18. This trades compressed size for encode time and never

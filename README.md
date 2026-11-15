@@ -384,6 +384,16 @@ A worker decodes straight into the caller's buffer at its block's offset, so a
 block decode writes exactly its own bytes and nothing else; that is what makes
 every row above byte-identical at every worker count.
 
+That call wants the frame and its output resident, because a block's offset
+lives only in the FrameIndex. A reader walking a file already holds the blocks
+it just read, so `zpse_decompress_batch_parallel` decodes a caller-owned batch
+of independent blocks instead: the CLI's `d -t N` reads a batch, spreads it
+over the pool and writes the results in order, keeping memory at the batch
+rather than the frame. With the payloads already in memory
+(`tests/benchmarks/bench_batch_decode.c`) that batch decodes at 4.0x on six
+workers of a 202 MiB corpus, against 1.3-1.6x for the same frame streamed from
+disk -- the difference is the frame read, not the codec.
+
 ## What it does
 
 A **frame** is a 32-byte header (magic `PSE1`, version, content size, block
@@ -497,6 +507,9 @@ benchmarks are all under `tests/benchmarks/`:
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
 | `bench_pagedict.c` | page-dictionary hit rate and encode rate on repeat pages |
 | `bench_parallel.c` | worker scaling and byte-identity |
+| `bench_batch_decode.c` | batch decode in memory, one worker to N (codec only) |
+| `bench_decode_first.c` | which blocks `DECODE_FAST` moves, and the size delta |
+| `decode_round.sh` | the decode tables in one pass: batch scaling, decode-first blocks, streaming decode |
 | `huf_train.c` | refits the four Huffman tables into `src/huf_tables.inc` |
 | `binary_size.sh` | compiled library size |
 | `refresh_tables.sh` | regenerates the reproducible tables in one pass |
@@ -521,9 +534,11 @@ zpse_cli x FILE BLOCK OUT      decode one block through the index
 ```
 
 Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
-pages), `-t N` compression workers (decompression always streams), `-x` writes
-an index, `-F` requests `LZ_FAST`, and `-n BYTES` limits how much of each input
-`bench` reads.
+pages), `-t N` workers (encode streams through the worker ring; decode reads a
+batch of blocks and decodes them side by side, writing them in order, so a
+frame is still never resident whole), `-x` writes an index, `-F` requests
+`LZ_FAST`, `-D` requests `DECODE_FAST`, and `-n BYTES` limits how much of each
+input `bench` reads.
 
 ## Documentation
 
@@ -546,7 +561,10 @@ an index, `-F` requests `LZ_FAST`, and `-n BYTES` limits how much of each input
   zpse's stream is 42% smaller.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
-  is the only metric, level 4 or `PAGE_FAST` is the lever.
+  is the only metric, level 4 or `PAGE_FAST` is the lever, and
+  `ZPSE_ENC_DECODE_FAST` (`-D`) is the per-block one: it keeps an LZ form only
+  when it is an eighth smaller than the tile stream, so a block where the two
+  forms are close is written the way the decoder reads fastest.
 * **No column semantics.** The format does not know record boundaries or null
   meanings; the byte transpose recovers the split for fixed-width records by
   accident. A nullable column costs more than null suppression would.

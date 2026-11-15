@@ -194,7 +194,7 @@ int main(void) {
         CHECK(zpse_compress_block_ex(in, sizeof in, comp, sizeof comp, &cl_bal,
                                      0, 1,
                                      (uint32_t)ZPSE_ENC_SPEED_BALANCED |
-                                         (UINT32_C(1) << 9), ea) ==
+                                         (UINT32_C(1) << 11), ea) ==
               ZPSE_BAD_ARG, "unknown enc flag refused");
     }
 

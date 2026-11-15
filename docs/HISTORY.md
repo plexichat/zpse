@@ -1208,3 +1208,113 @@ workers is roughly 24 ms of encoder and 5 ms of reading, with writing the
 19.7 MB frame costing about 2 (76 ms to `nul` against 78 to a file). There is
 no lever left there either -- which is the answer this round produced, and the
 reason the last four candidates were refused rather than shipped.
+
+## The decode round that produced no second speedup
+
+The goal for this round was twice the single-stream decode rate. The profile
+that opened it said the tile path was not where any of it could come from:
+tile blocks decode at 12-15 GB/s on real Silesia files, against 64 GB/s for a
+block of zeros and 51 GB/s for `memcpy`, so the vectorised reconstruction is
+already at the machine. What is left is the intra-block LZ command loops, at
+2.0-2.4 GB/s (`lz2` on webster 2 383 MB/s over 622 of its 633 blocks, the token
+form 3 833 on nci), and they set the file's rate rather than share it: 98% of
+webster's bytes are in one `lz2` stream, so doubling the file means doubling
+that loop. It is 1.25x behind lz4's decoder as it stands.
+
+Three changes to the loop were tried and all three were reverted. Eliding the
+dead stores a command overwrites, `restrict` on the decode pointers, and
+reading the distance byte before the literal stores: each builds, each passes
+`test_lz`, `test_lzh`, `test_roundtrip` and `test_hostile`, and none survives
+measurement. Six alternated rounds of two binaries, medians per file, put the
+decode ratios at webster 1.12, mozilla 0.83, nci 0.96, xml 0.96, dickens 0.75,
+reymont 1.28 -- ±28% with no consistent sign. That is this host's run-to-run
+spread, not a result, and it is far too wide to keep a change on.
+
+The only single-core idea left with a 2x ceiling was interleaving two
+independent block decodes, since a command loop is one dependency chain and a
+superscalar window with two of them has more to overlap. A prototype ran the
+same single-command step over two prebuilt payloads two ways, drained
+sequentially and advanced alternately, so the only difference was the order:
+0.854 webster, 0.817 nci, 0.851 xml, 0.892 dickens, 0.806 mozilla. Interleaving
+lost on every file, by 11-19%, because the second state's bookkeeping and
+branches cost more than the extra chain buys. The prototype is not the shipped
+decoder -- no fast-region split, and a 16-byte match head with a byte tail --
+but both drivers share that code, so the ratio is the interleaving's and the
+idea is refused.
+
+What did come out of the round is the read side. `zpse_decompress_batch_parallel`
+decodes a caller-owned batch of independent blocks, and the CLI's `d -t N`
+drives it while streaming a file: read a batch, decode it across the pool,
+write in order. On the 202 MiB Silesia frame decoded to `/dev/null`, three
+alternated rounds measured 266/273/235 ms on one worker against 209/183/175 ms
+on six. The wall clock is I/O-bound -- the frame read is most of it -- so that
+is a 1.35x process, not a codec ratio, but it is the first decode path here
+that uses more than one core without holding the frame. A later run of the
+same frame measured 201 ms against 128 ms, 1.57x; the process figures move
+with the drive, which is why the question below is asked in memory.
+
+With the payloads packed once and held (`tests/benchmarks/bench_batch_decode.c`),
+the batch is pure codec, and there it scales to 4.0x -- 3 234 blocks of the
+202 MiB corpus, three reps best of:
+
+| workers | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MB/s | 1 707 | 3 362 | 4 820 | 6 213 | 6 851 | 6 840 |
+| speedup | 1.00x | 1.97x | 2.82x | 3.64x | 4.01x | 4.01x |
+
+Five workers is the peak and the sixth adds nothing: this host has six
+physical cores and the caller is one of them. So the codec does take the
+cores -- 7.4 GB/s of tile and command-loop decode -- and the file figure is
+the read plus the process, as the `bench` numbers in the other direction have
+been all along.
+
+The other addition is `ZPSE_ENC_DECODE_FAST`, the decode-first preset: an LZ
+form is kept only when it is an eighth smaller than the tile stream, and the
+stage that wraps a tile body in LZ has to clear the same margin. Over the
+whole Silesia corpus at level 6 it moves blocks in four of the twelve files
+(`tests/benchmarks/bench_decode_first.c`):
+
+| file | blocks | changed | level 6 | -D | delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dickens | 156 | 0 | 8 560 304 | 8 560 304 | 0.000% |
+| mozilla | 782 | 87 | 25 417 832 | 24 969 579 | -1.764% |
+| mr | 153 | 135 | 3 988 520 | 4 256 995 | +6.731% |
+| nci | 512 | 0 | 6 183 514 | 6 183 514 | 0.000% |
+| ooffice | 94 | 4 | 4 133 008 | 4 128 235 | -0.115% |
+| osdb | 154 | 0 | 8 804 209 | 8 804 209 | 0.000% |
+| reymont | 102 | 0 | 3 335 151 | 3 335 151 | 0.000% |
+| samba | 330 | 9 | 8 273 879 | 8 302 823 | +0.350% |
+| sao | 111 | 0 | 7 194 251 | 7 194 251 | 0.000% |
+| webster | 633 | 0 | 19 772 012 | 19 772 012 | 0.000% |
+| x-ray | 130 | 0 | 4 952 647 | 4 952 647 | 0.000% |
+| xml | 82 | 0 | 1 265 450 | 1 265 450 | 0.000% |
+
+The frame total moves 101 881 161 -> 101 725 554 bytes, -0.15%: nearly a wash,
+but not a ratio lever, because `mr` pays 6.7% of a file and samba 0.35%. The
+movement goes both ways, which is what a margin gate does: 58 803 -> 65 305 on
+one mozilla block, where the tile form replaces a command loop, and 30 451 ->
+24 388 on another, where refusing the LZ form frees the tile stream enough for
+the LZ-over-tile stage to win. Decode rates stayed inside the host's band on
+every file. The flag is for a caller whose only metric is decode, not a
+default.
+
+### Pricing the wrapped tile by its payload
+
+The stage that wraps a tile body in LZ was the one form whose decode cost
+depends on how much it wraps, so a variant priced it directly instead of by
+the total: the match finder walks the payload `pl`, so accept the wrap when
+`pl <= n / 8` and it is smaller at all. At the measured 2.4 GB/s command loop
+and 12 GB/s tile kernel that is at most 62% more decode for the block, against
+the plain tile stream. The model is right and the rule still lost: it refuses
+wraps that save a third of a block. Over five files it moved 9 nci blocks
+(20 293 -> 32 565 bytes, +1.84% of the file), one xml block (+3.11%), 4
+dickens (+0.52%), 174 mozilla (+2.74%) -- +2.7% across the five frames. Decode
+at one worker on mozilla, three rounds in each order to take the order out:
+medians 100 / 98 / 97 ms (level 6 / margin / payload) with a 94-116 ms spread,
+so there was nothing to buy the bytes with. Refused; the margin stayed, and
+the comment beside it records why.
+
+Everything above is regenerated by `bash tests/benchmarks/decode_round.sh`
+with a Silesia tree in `SILESIA_DIR`: the in-memory scaling table, the
+per-block decode-first table, the level 6 against level 6|-D frame tables, and
+the streaming decode.

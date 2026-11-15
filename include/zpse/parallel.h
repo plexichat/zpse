@@ -167,6 +167,34 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    void *const dec_arenas[],
                                    unsigned arena_count);
 
+/* Decode a batch of independent blocks on several workers.
+ *
+ * This is the read side a streaming caller needs. The frame call above needs
+ * the whole frame resident because a block's offset lives only in the
+ * FrameIndex; a reader that is walking a file has just read the blocks it is
+ * about to decode, so it can hand them over as a batch instead. `count`
+ * blocks sit at `in + offsets[i]` with `lens[i]` bytes each, and block i
+ * decodes into `out + i * stride`, whose length is written to `out_lens[i]`. A
+ * block writes exactly its own bytes and nothing else, so two workers cannot
+ * touch the same byte and the result is the sequential one, block for block.
+ *
+ * `stride` is the nominal block size; a short final block is fine, and any
+ * block whose decoded length exceeds `stride` is refused rather than
+ * truncated. The caller owns the batch buffers and reuses them, so nothing
+ * here allocates and memory is bounded by the batch, not the frame.
+ *
+ * A batch shorter than four blocks per worker runs serially on the calling
+ * thread: a block decodes in a few microseconds and a thread start costs more
+ * than the blocks it would take. Without ZPSE_MT this is the serial loop.
+ * Returns ZPSE_OK, or the first negative status any block reported. */
+int zpse_decompress_batch_parallel(const uint8_t *in,
+                                   const uint32_t *offsets,
+                                   const uint32_t *lens, uint32_t count,
+                                   uint8_t *out, uint32_t stride,
+                                   uint32_t *out_lens, unsigned threads,
+                                   void *const dec_arenas[],
+                                   unsigned arena_count);
+
 #ifdef __cplusplus
 }
 #endif
