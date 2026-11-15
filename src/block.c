@@ -167,6 +167,12 @@ uint32_t zpse_block_probe_correct;
  * to wall-clock time. */
 uint64_t zpse_block_probe_cycles;
 uint64_t zpse_block_trial_cycles;
+/* The two stages that are part of a block's encode but not of its decision:
+ * the tile-body (v2) finder pass and the Huffman wrap. Without them the
+ * reader's remainder column carries a third of a page-like block's cycles
+ * and reads as bookkeeping; with them every percent above 3.7 is named. */
+uint64_t zpse_block_v2_cycles;
+uint64_t zpse_block_huf_cycles;
 /* Cycles spent in the two decisions taken before any candidate is priced:
  * the ASCII gate and the attempt-order sample. Together with the probe, the
  * trials and the LZ stages they account for the block's encode; the rest is
@@ -5550,10 +5556,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 btab = e->cand;
                 bhb = 15u;
             }
+#if defined(ZPSE_BLOCK_STATS)
+            uint64_t t_v2 = blk_rdtsc();
+#endif
             uint32_t pl = zpse_lz_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
                                          blen, e->tstage,
                                          (uint32_t)ZPSE_E_SZ_TSTAGE, btab,
                                          bhb);
+#if defined(ZPSE_BLOCK_STATS)
+            zpse_block_v2_cycles += blk_rdtsc() - t_v2;
+#endif
             uint32_t tot = (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) + pl;
 
             if (pl != 0u &&
@@ -5749,10 +5761,16 @@ lz2_done:
             if (form == (uint8_t)ZPSE_B_LZ || form == (uint8_t)ZPSE_B_LZ2 ||
                 form == (uint8_t)ZPSE_B_LZ_HEX) {
                 uint32_t plen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
+#if defined(ZPSE_BLOCK_STATS)
+                uint64_t t_huf = blk_rdtsc();
+#endif
                 uint32_t hl = zpse_huf_encode(win + ZPSE_BLOCK_HEADER_SIZE,
                                               plen, e->tstage,
                                               (uint32_t)ZPSE_E_SZ_TSTAGE,
                                               form);
+#if defined(ZPSE_BLOCK_STATS)
+                zpse_block_huf_cycles += blk_rdtsc() - t_huf;
+#endif
 
                 /* Strictly smaller is not enough for a form that costs a
                  * decode pass: it has to be 1/ZPSE_HUF_DIV smaller, which at

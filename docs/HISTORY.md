@@ -1075,3 +1075,40 @@ the token form and the fast form stays behind its flag.
 
 The diff itself is unchanged and still parked: the gate fix and the stage
 probes used here were scratch and are not landed.
+
+## Where a default-level block spends its cycles
+
+The block stats carried five brackets -- the ASCII gate, the attempt-order
+sample, the pricing pass, the trials and the match-finder stages -- and a
+remainder that looked like bookkeeping: 26% of a level-6 `x-ray` block and
+34.5% of an `mr` block. It was not bookkeeping. The tile-body pass ("v2", the
+finder over the winning tile stream) and the Huffman wrap had no bracket, and
+the tile-body pass is most of that remainder. With both counted, the remainder
+is in the single digits on every file measured.
+
+Level 6, 64 KiB blocks, share of encode cycles:
+
+| file    | probe | trial | finder |  v2  | gate  | rest |
+|---------|-------|-------|--------|------|-------|------|
+| dickens |  1.1% |  7.4% |  60.0% | 8.3% | 13.1% | 10.0% |
+| samba   |  7.0% |  6.1% |  71.0% | 7.0% |  5.0% |  3.7% |
+| mozilla | 10.7% |  6.7% |  68.4% | 9.1% |  0.3% |  4.2% |
+| mr      | 12.3% | 51.7% |   0.4% |28.1% |  0.4% |  6.5% |
+| x-ray   | 19.1% | 54.0% |   0.0% |20.4% |  0.0% |  5.5% |
+
+That splits what is left in two, and neither half still has a lever the
+entries above have not already measured and refused. Text is the finder: one
+or two left-to-right passes over the block, where prefetching the next
+position and resizing the table were both tried and lost. Page-like binary is
+the trial -- one or two full block encodes, with the probe's window already
+cut from 16 KiB to 12 -- plus the tile-body finder, which is the same finder
+over a body that has to compress by 1/32 to be kept at all, so capping it at
+the size it could still win at saves a percentage point of a stage that
+already stops near there. The gate is 13.1% of prose and is already an AVX2
+scan over the block plus the 2 KiB sample that prices it; the scan is not
+where that 13% goes.
+
+The point of the table is the negative that was missing before: the share
+that looked unexplained is named, it is necessary work, and the earlier hunt
+for a cut in it was chasing a stage that was already counted as something
+else.
