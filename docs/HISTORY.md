@@ -545,6 +545,60 @@ level 6 over the twelve-file corpus, ahead in three rounds of four (median 392
 against 376 MB/s) with the payload identical to the byte, 169,502,562 bytes
 both ways.
 
+## lz4's one-byte shift in the fast form's probe
+
+The fast form's lazy probe asks one question: would a match starting one byte
+later run longer than the one in hand? It answered by hashing the four bytes at
+`pos + 1`, loading the candidate they name and extending it -- two dependent
+loads, a hash and a table read, on every match the lazy ceiling lets through.
+lz4 answers it for free in the common case: if the eight bytes after the match's
+own start equal the eight after its candidate, the same match shifted by one is
+at least eight long, which is already longer than any match the ceiling (12)
+would spend a probe on.
+
+Measured alone on whole 64 KiB Silesia blocks with the table bits held equal
+(2^13, best of three): `dickens` 280.9 -> 345.9 MB/s (+23.1%) for 40,474 ->
+42,141 bytes (+4.1%), `mozilla` 422.2 -> 461.2 (+9.2%) for +3.6%, `webster`
+316.0 -> 376.4 (+19.1%) for +3.8%. That is the right trade for a rung whose
+promise is rate, and the wrong one for a rung whose promise is size: through
+the whole block encoder at the default level, prose grew about 4%, which is the
+shape `test_sizes` exists to refuse.
+
+Every shape that keeps the probe was measured at BALANCED and none of them pays.
+The shift in place of the probe for matches under eight, gated by the caller's
+level field so that only BALANCED and below take it, is +2.6% of encode on
+`dickens` (491.9 -> 504.9 MB/s) and +5.5% on `webster` (283.4 -> 298.9) for
++0.25% and +5.9% of packed bytes, and over all twelve Silesia files at 64 KiB it
+is 105,451,298 -> 107,445,043 bytes (+1.89%) for a mean +6.3% of encode that is
+better on seven files and worse on five: `reymont` +12.4% and `xml` +7.5% of
+payload, `webster` +5.9%, `samba` +2.6%, then a tenth of a point or nothing on
+the rest; `xml` -9.4%, `x-ray` -8.0%, `nci` -5.6%, `mr` -2.7% and `mozilla`
+-1.1% of rate. As a pre-filter for matches under six, with the probe still
+deciding everything else, BALANCED is byte-identical to the baseline on all
+twelve files -- 105,451,298 bytes either way -- and the rate is inside this
+host's spread, because the only probes it can skip are ones whose answer it
+already agrees with; the eight-byte gate with the probe still running is
+identical again. The shift's gain IS the probe it replaces, so a rung that keeps
+the probe buys a compare per short match and nothing else.
+
+That is why the arm was removed rather than shipped dormant. 1.89% of payload
+for a rate this host cannot resolve outside prose is not what BALANCED is for,
+and 0.25% of payload for no rate is not a feature: the code, the two knobs and
+the level argument on `zpse_lz2_encode` are gone, and this entry is the record
+of what the shift is worth and where it stops paying.
+
+The default level got its own attempts and kept none of them. Inlining
+`lz2_hash`, `lz2_load64` and `lz2_extend` leaves the payload unchanged, and the
+finder reads 287.1 / 401.7 / 332.3 MB/s against 280.9 / 422.2 / 316.0 -- inside
+this host's spread, both signs. Changing its decisions instead, over all twelve
+files, best of three rounds each: the skip shift from 5 to 6 writes 101,843,154
+bytes against 101,881,161 (-0.04%) with the rate mixed-sign and summing
+negative (+2.9% on `osdb`, -4.3% on `sao`, -3.8% on `xml`); the lazy ceiling at
+10 and at 8 costs 101,920,094 (+0.04%) and 101,967,508 (+0.09%) for no rate; the
+two together is 101,882,391 (+0.001%) and again inside the spread. Level 6 pays
+for the finder pass itself, not for the decisions it makes inside it, so the
+rung keeps its parse.
+
 ## Wider steps in the match copy
 
 Both LZ decoders copy a long match eight bytes at a store once the distance is
