@@ -94,6 +94,86 @@ static const uint32_t pinned[ZPSE_CORPUS_CASES] = {
       444,   730,  1016,  1302,  1558,  1874,  2446,  2958,  3590,  4704,  5608,  6752,  8800, 10608, 12896, 16992,
 };
 
+/* ---- The 64 KiB prose and run guards ---------------------------------
+ *
+ * The 768 cases above are synthetic shapes at sixteen sizes, and the one
+ * class of block they do not model is a full-size page of prose. That is how
+ * the 64 KiB Silesia total moved by +2.99 MB with every case in the table
+ * unchanged: the loss was osdb +1.0 MB, ooffice +0.64, dickens +0.55, nci
+ * +0.31 -- all text -- and the shapes below all stayed flat. A full-size text
+ * block reaches the encoder through the ASCII gate and the tile-body stage
+ * rather than through a generated shape, so nothing in the 768 could see it.
+ *
+ * Two blocks are pinned here instead. The prose case is the one the gate
+ * reads (word-level repetition, which is what a 64 KiB finder exploits); the
+ * run case is the one the tile-body stage wins, where tiles plus LZ write 116
+ * bytes and the finder's own stream is 766 -- the exact pair that made the
+ * deepest level write a larger block than the balanced one. Both are decoded
+ * and byte-compared, so a payload that keeps its size and stops being right
+ * still fails.
+ *
+ * These are absolute caps, not the growth gate above: a case may not grow
+ * past the number this encoder wrote when the guards were added. */
+#define TEXT64_PINNED 1071u
+#define RUNS64_PINNED 766u
+
+static uint8_t guard_in[65536];
+
+/* Deterministic prose from a 24-word vocabulary, a full stop every sentence.
+ * No RNG: the pinned number is this exact byte stream. */
+static void make_prose(uint32_t n)
+{
+    static const char *const w[24] = {
+        "the", "of", "and", "a", "to", "in", "is", "that", "for",
+        "it", "as", "was", "with", "be", "by", "on", "not", "he",
+        "this", "are", "or", "his", "from", "at"
+    };
+    uint32_t at = 0u;
+    uint32_t k = 0u;
+
+    while (at < n) {
+        const char *s = w[k % 24u];
+        uint32_t j;
+
+        for (j = 0; s[j] != '\0' && at < n; j++) {
+            guard_in[at++] = (uint8_t)s[j];
+        }
+        if (at < n) {
+            guard_in[at++] = (uint8_t)((k % 17u == 16u) ? '.' : ' ');
+        }
+        k++;
+    }
+}
+
+/* Encode, decode and compare one pinned block; returns 0 when it is inside
+ * its cap and correct. */
+static int guard_case(uint32_t n, uint32_t pin, const char *name,
+                      uint32_t *clen)
+{
+    uint32_t cl = 0u;
+    uint32_t ol = 0u;
+    int rc;
+
+    rc = zpse_compress_block(guard_in, n, comp, sizeof comp, &cl, 0, 1, E);
+    if (rc != 0) {
+        printf("FAIL %s: compress rc=%d(%s)\n", name, rc,
+               zpse_status_name(rc));
+        return 1;
+    }
+    rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, D);
+    if (rc != 0 || ol != n || memcmp(guard_in, out, n) != 0) {
+        printf("FAIL %s: roundtrip rc=%d olen=%u\n", name, rc, ol);
+        return 1;
+    }
+    *clen = cl;
+    if (cl > pin) {
+        printf("FAIL %s: clen=%u grew from %u (+%u)\n", name, cl, pin,
+               cl - pin);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     long cases = 0;
@@ -147,6 +227,26 @@ int main(void)
                 }
                 cases++;
             }
+        }
+    }
+
+    /* The two full-size guards (see above). */
+    {
+        uint32_t ct = 0u;
+        uint32_t cr = 0u;
+        uint32_t i;
+        int bad = 0;
+
+        make_prose(65536u);
+        bad += guard_case(65536u, TEXT64_PINNED, "text64", &ct);
+        for (i = 0; i < 65536u; i++) {
+            guard_in[i] = (uint8_t)(i < 32768u ? 0u : 0x33u);
+        }
+        bad += guard_case(65536u, RUNS64_PINNED, "runs64", &cr);
+        printf("SIZES: guard text64=%u runs64=%u (pinned %u/%u)\n", ct, cr,
+               (unsigned)TEXT64_PINNED, (unsigned)RUNS64_PINNED);
+        if (bad != 0) {
+            grew += bad;
         }
     }
 
