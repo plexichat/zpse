@@ -1175,3 +1175,36 @@ problem -- 5 ms against 20 -- the frame held twice is. So decode now always
 streams, `-t` is a compression option, and the buffered decode machinery is
 gone from the tool. Decoded output was compared against the corpus for all
 four frames.
+
+## What is left in a CLI encode, and what was ruled out of it
+
+The streamed encoder's ring depth and the tool's slab size were the two
+assumptions left unmeasured, and both turned out to be no-ops. Eight slots per
+worker instead of four, on webster and mozilla at eight and twelve workers:
+77/79 against 79/79 ms and 98/93 against 94/97, inside the host's band, with
+the frame byte-identical to the four-slot one at one, eight and twelve
+workers. A slab of 128 blocks (8 MiB) rather than 64 measured the same way and
+also wrote the same bytes. Both refused -- the header's claim that four slots
+are enough because the writer stops being on the critical path survives
+because nothing measured beat it, not because it was argued well.
+
+With those two gone, the question was what the rest of the wall clock is. Read
+a corpus file in the tool's 4 MiB slabs and the 41 MB of webster arrives in
+4.9 ms (8.5 GB/s), so the input side is nothing. Stream the same resident
+bytes through `zpse_compress_frame_stream` and discarding the blocks, at
+1/2/3/4/6/8/10/12 workers, gives 116.5 / 61.6 / 42.7 / 31.9 / 28.1 / 23.7 /
+21.2 / 25.3 ms for webster and 148.6 / 80.3 / 58.9 / 48.1 / 41.8 / 33.9 /
+31.5 / 35.1 ms for mozilla. Ten workers is the peak at 5.5x; twelve is worse
+because the writer makes thirteen threads on twelve cores. That peak does not
+survive the round trip through the tool -- `c -t 8`, `-t 10` and `-t 12` come
+out 75/75/75 ms on webster and 92/89/90 on mozilla -- which is the useful
+part: the tool no longer exposes a difference the library has.
+
+What it does expose is the process. A hello-world takes 38 ms on this host,
+the CLI with no arguments takes 39, and a compress of one 64 KiB block takes
+37, so about 38 ms of every CLI figure in this file is the OS starting a
+process, not the codec. Subtract it and a level-6 webster encode at eight
+workers is roughly 24 ms of encoder and 5 ms of reading, with writing the
+19.7 MB frame costing about 2 (76 ms to `nul` against 78 to a file). There is
+no lever left there either -- which is the answer this round produced, and the
+reason the last four candidates were refused rather than shipped.
