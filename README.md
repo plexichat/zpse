@@ -390,9 +390,15 @@ it just read, so `zpse_decompress_batch_parallel` decodes a caller-owned batch
 of independent blocks instead: the CLI's `d -t N` reads a batch, spreads it
 over the pool and writes the results in order, keeping memory at the batch
 rather than the frame. With the payloads already in memory
-(`tests/benchmarks/bench_batch_decode.c`) that batch decodes at 4.0x on six
-workers of a 202 MiB corpus, against 1.3-1.6x for the same frame streamed from
-disk -- the difference is the frame read, not the codec.
+(`tests/benchmarks/bench_batch_decode.c`) that batch decodes at 4.1x on six
+workers of a 202 MiB corpus. The output write used to take turns with the read
+and the decode and cost about a third of a streamed decode, so the CLI now
+hands each decoded batch to a writer thread and reads the next one behind it:
+the same frame streamed takes 220 ms on one worker and 147 ms at six, where
+writing on the decoding thread put it at 217-234 ms at six; discarding the
+output (to `NUL`) takes 139-152 ms. Pages gain less from the workers because
+they start faster -- 4 KiB pages decode at 3.2 GB/s on one worker and 7.7 GB/s
+on six (2.4x), where 64 KiB blocks go from 1.8 to 7.3 GB/s (4.1x).
 
 ## What it does
 
@@ -507,9 +513,9 @@ benchmarks are all under `tests/benchmarks/`:
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
 | `bench_pagedict.c` | page-dictionary hit rate and encode rate on repeat pages |
 | `bench_parallel.c` | worker scaling and byte-identity |
-| `bench_batch_decode.c` | batch decode in memory, one worker to N (codec only) |
+| `bench_batch_decode.c` | batch decode in memory, one worker to N, 64 KiB blocks or 4 KiB pages (codec only) |
 | `bench_decode_first.c` | which blocks `DECODE_FAST` moves, and the size delta |
-| `decode_round.sh` | the decode tables in one pass: batch scaling, decode-first blocks, streaming decode |
+| `decode_round.sh` | the decode tables in one pass: batch scaling for blocks and pages, decode-first blocks, streaming decode |
 | `huf_train.c` | refits the four Huffman tables into `src/huf_tables.inc` |
 | `binary_size.sh` | compiled library size |
 | `refresh_tables.sh` | regenerates the reproducible tables in one pass |
@@ -535,8 +541,9 @@ zpse_cli x FILE BLOCK OUT      decode one block through the index
 
 Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
 pages), `-t N` workers (encode streams through the worker ring; decode reads a
-batch of blocks and decodes them side by side, writing them in order, so a
-frame is still never resident whole), `-x` writes an index, `-F` requests
+batch of blocks, decodes them side by side and writes them in order on its own
+thread, so a frame is still never resident whole), `-x` writes an index, `-F`
+requests
 `LZ_FAST`, `-D` requests `DECODE_FAST`, and `-n BYTES` limits how much of each
 input `bench` reads.
 

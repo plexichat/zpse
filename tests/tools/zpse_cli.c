@@ -30,8 +30,10 @@
  *   -x         append the FrameIndex (random access); bench also seeks
  *   -t N       use N worker threads (default 1: the single-core path every
  *              figure in the README was measured on). On decode the blocks
- *              are read in a batch and decoded side by side, and written in
- *              order, so neither the frame nor the output is resident whole.
+ *              are read in a batch and decoded side by side, written in
+ *              order, and the write of a batch runs on its own thread behind
+ *              the read of the next one, so neither the frame nor the output
+ *              is resident whole.
  *   -r N       bench repetitions per file (0 = pick from the file size)
  *   -n N       bench: time only the first N bytes of each file (0 = the
  *              whole file), for one case without the whole corpus
@@ -69,6 +71,9 @@
 #include <windows.h>
 #else
 #include <sys/mman.h> /* encode maps its input instead of copying it */
+#if defined(ZPSE_MT)
+#include <pthread.h> /* the decode writer thread, beside the worker pool */
+#endif
 #endif
 
 #include "zpse/zpse.h"
@@ -350,24 +355,288 @@ static void free_arenas(void **a, unsigned threads)
 #define ZPSE_CLI_DEC_SLOT \
     ((size_t)ZPSE_BLOCK_HEADER_SIZE + (size_t)ZPSE_MAX_BLOCK_SIZE)
 
-/* Decode the blocks held in the batch and write them, in order.
+/* The output write, on its own thread.
+ *
+ * A streaming decode is three phases per batch -- read the frame, decode the
+ * batch, write the batch -- and they take turns on one thread. Measured on
+ * the 202 MiB Silesia frame at six workers: 62 ms to read the frame, 35 ms in
+ * the codec, and about 100 ms to write the output, a third of the wall clock
+ * that no worker count touches. So the write is handed to this thread and the
+ * read of the next batch starts at once.
+ *
+ * Two slots is the whole queue: the writer only has to stay one batch behind, 
+ * which it does -- a batch is 3 MiB at six workers and the write of one takes
+ * less time than the read and decode of the next.
+ *
+ * Every slot's write order follows the block order, so the file gets the
+ * frame's bytes in the frame's order even though the write runs beside the
+ * decode. A short write is remembered and reported by the finish call, which
+ * is when all writes have completed; the caller removes the partial output.
+ * With ZPSE_MT undefined, or if the thread cannot be started, the same two
+ * buffers are used and the write happens on the calling thread, so this is
+ * not a second code path for correctness. */
+#define ZPSE_CLI_WRITE_SLOTS 2
+/* One output batch: the decode batches at most this many blocks (see the
+ * clamp in decode_stream), and the writer needs their lengths per slot. */
+#define ZPSE_CLI_DEC_BATCH_MAX 64u
+
+typedef struct {
+    FILE *f;
+    const char *path;
+    uint8_t *buf[ZPSE_CLI_WRITE_SLOTS];
+    uint32_t got[ZPSE_CLI_WRITE_SLOTS][ZPSE_CLI_DEC_BATCH_MAX];
+    unsigned nblk[ZPSE_CLI_WRITE_SLOTS];
+    /* 0 free, 1 filled (the writer's to pick up), 2 being written. */
+    int state[ZPSE_CLI_WRITE_SLOTS];
+    unsigned cur;
+    int quit;
+    int error;
+    int async;
+#if defined(ZPSE_MT)
+#if defined(_WIN32)
+    CRITICAL_SECTION mu;
+    CONDITION_VARIABLE cv;
+    HANDLE th;
+#else
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_t th;
+#endif
+#endif
+} ZpseCliWriter;
+
+#if defined(ZPSE_MT)
+#if defined(_WIN32)
+#define ZPSE_CLI_WLOCK(w) EnterCriticalSection(&(w)->mu)
+#define ZPSE_CLI_WUNLOCK(w) LeaveCriticalSection(&(w)->mu)
+#define ZPSE_CLI_WWAIT(w) \
+    SleepConditionVariableCS(&(w)->cv, &(w)->mu, INFINITE)
+#define ZPSE_CLI_WSIGNAL(w) WakeAllConditionVariable(&(w)->cv)
+#else
+#define ZPSE_CLI_WLOCK(w) pthread_mutex_lock(&(w)->mu)
+#define ZPSE_CLI_WUNLOCK(w) pthread_mutex_unlock(&(w)->mu)
+#define ZPSE_CLI_WWAIT(w) pthread_cond_wait(&(w)->cv, &(w)->mu)
+#define ZPSE_CLI_WSIGNAL(w) pthread_cond_broadcast(&(w)->cv)
+#endif
+
+/* The writer's loop: take a filled slot, write it, release it. A submitted
+ * slot is always written, even after `quit` -- quit only ends the loop once
+ * there is nothing left to write. */
+static void zpse_cli_writer_run(ZpseCliWriter *w)
+{
+    ZPSE_CLI_WLOCK(w);
+    for (;;) {
+        unsigned s = ZPSE_CLI_WRITE_SLOTS;
+        unsigned k;
+        int err = 0;
+
+        for (k = 0; k < ZPSE_CLI_WRITE_SLOTS; k++) {
+            if (w->state[k] == 1) {
+                s = k;
+                break;
+            }
+        }
+        if (s == ZPSE_CLI_WRITE_SLOTS) {
+            if (w->quit) {
+                break;
+            }
+            ZPSE_CLI_WWAIT(w);
+            continue;
+        }
+        w->state[s] = 2;
+        ZPSE_CLI_WUNLOCK(w);
+        if (w->error == 0) {
+            for (k = 0; k < w->nblk[s]; k++) {
+                uint32_t n = w->got[s][k];
+
+                if (n > 0u &&
+                    fwrite(w->buf[s] + (size_t)k * (size_t)ZPSE_MAX_BLOCK_SIZE,
+                           1u, (size_t)n, w->f) != (size_t)n) {
+                    err = 1;
+                    break;
+                }
+            }
+        }
+        ZPSE_CLI_WLOCK(w);
+        w->state[s] = 0;
+        if (err != 0) {
+            w->error = 1;
+        }
+        ZPSE_CLI_WSIGNAL(w);
+    }
+    ZPSE_CLI_WUNLOCK(w);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI zpse_cli_writer_entry(LPVOID p)
+{
+    zpse_cli_writer_run((ZpseCliWriter *)p);
+    return 0;
+}
+#else
+static void *zpse_cli_writer_entry(void *p)
+{
+    zpse_cli_writer_run((ZpseCliWriter *)p);
+    return NULL;
+}
+#endif
+#endif /* ZPSE_MT */
+
+/* Allocate the output batches and, when threads exist, start the writer.
+ * `slot_bytes` is one whole batch of output. */
+static int writer_init(ZpseCliWriter *w, FILE *f, const char *path,
+                       size_t slot_bytes, int async)
+{
+    unsigned i;
+
+    memset(w, 0, sizeof *w);
+    w->f = f;
+    w->path = path;
+    for (i = 0; i < ZPSE_CLI_WRITE_SLOTS; i++) {
+        w->buf[i] = (uint8_t *)malloc(slot_bytes);
+        if (w->buf[i] == NULL) {
+            fprintf(stderr, "zpse_cli: out of memory\n");
+            while (i-- > 0u) {
+                free(w->buf[i]);
+            }
+            return 1;
+        }
+    }
+#if defined(ZPSE_MT)
+    if (async != 0) {
+#if defined(_WIN32)
+        InitializeCriticalSection(&w->mu);
+        InitializeConditionVariable(&w->cv);
+        w->th = CreateThread(NULL, 0, zpse_cli_writer_entry, w, 0, NULL);
+        if (w->th != NULL) {
+            w->async = 1;
+        } else {
+            DeleteCriticalSection(&w->mu);
+        }
+#else
+        if (pthread_mutex_init(&w->mu, NULL) == 0) {
+            if (pthread_cond_init(&w->cv, NULL) == 0) {
+                if (pthread_create(&w->th, NULL, zpse_cli_writer_entry, w) ==
+                    0) {
+                    w->async = 1;
+                } else {
+                    pthread_cond_destroy(&w->cv);
+                    pthread_mutex_destroy(&w->mu);
+                }
+            } else {
+                pthread_mutex_destroy(&w->mu);
+            }
+        }
+#endif
+    }
+#else
+    (void)async;
+#endif
+    return 0;
+}
+
+/* The buffer to decode the next batch into. Waits for the writer to release
+ * it, which is one batch of slack: the writer is writing the previous one. */
+static uint8_t *writer_reserve(ZpseCliWriter *w)
+{
+#if defined(ZPSE_MT)
+    if (w->async != 0) {
+        ZPSE_CLI_WLOCK(w);
+        while (w->state[w->cur] != 0) {
+            ZPSE_CLI_WWAIT(w);
+        }
+        ZPSE_CLI_WUNLOCK(w);
+    }
+#endif
+    return w->buf[w->cur];
+}
+
+/* Hand the decoded batch over and pick the other slot for the next one. */
+static int writer_commit(ZpseCliWriter *w, const uint32_t *got, unsigned n)
+{
+    unsigned k;
+
+#if defined(ZPSE_MT)
+    if (w->async != 0) {
+        ZPSE_CLI_WLOCK(w);
+        for (k = 0; k < n; k++) {
+            w->got[w->cur][k] = got[k];
+        }
+        w->nblk[w->cur] = n;
+        w->state[w->cur] = 1;
+        ZPSE_CLI_WSIGNAL(w);
+        w->cur = (w->cur + 1u) % ZPSE_CLI_WRITE_SLOTS;
+        ZPSE_CLI_WUNLOCK(w);
+        return 0;
+    }
+#endif
+    for (k = 0; k < n; k++) {
+        if (got[k] > 0u &&
+            fwrite(w->buf[0] + (size_t)k * (size_t)ZPSE_MAX_BLOCK_SIZE, 1u,
+                   (size_t)got[k], w->f) != (size_t)got[k]) {
+            fprintf(stderr, "zpse_cli: short write on %s\n", w->path);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Wait for every submitted batch to be written and free the buffers. Returns
+ * non-zero if a write failed at any point. */
+static int writer_finish(ZpseCliWriter *w)
+{
+    unsigned i;
+    int err;
+
+#if defined(ZPSE_MT)
+    if (w->async != 0) {
+        ZPSE_CLI_WLOCK(w);
+        w->quit = 1;
+        ZPSE_CLI_WSIGNAL(w);
+        ZPSE_CLI_WUNLOCK(w);
+#if defined(_WIN32)
+        WaitForSingleObject(w->th, INFINITE);
+        CloseHandle(w->th);
+        DeleteCriticalSection(&w->mu);
+#else
+        pthread_join(w->th, NULL);
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+#endif
+        w->async = 0;
+    }
+#endif
+    err = w->error;
+    if (err != 0) {
+        fprintf(stderr, "zpse_cli: short write on %s\n", w->path);
+    }
+    for (i = 0; i < ZPSE_CLI_WRITE_SLOTS; i++) {
+        free(w->buf[i]);
+        w->buf[i] = NULL;
+    }
+    return err;
+}
+
+/* Decode the blocks held in the batch and hand them to the writer, in order.
  *
  * This is what makes -t mean something on a decode that is streaming: the
  * caller reads the blocks, the workers decode them side by side, and the
  * writer emits them in order. Memory is the batch, not the frame. Returns 0
  * on success, 1 after reporting (the caller removes the partial output). */
-static int decode_flush(FILE *f, const char *out_path, uint8_t *slot_mem,
-                        const uint32_t *off, const uint32_t *len,
-                        const uint32_t *expect, uint32_t *got,
-                        uint8_t *out_buf, unsigned held, unsigned threads,
-                        void *const arenas[], size_t *out_pos)
+static int decode_flush(uint8_t *slot_mem, const uint32_t *off,
+                        const uint32_t *len, const uint32_t *expect,
+                        uint32_t *got, ZpseCliWriter *w, unsigned held,
+                        unsigned threads, void *const arenas[],
+                        size_t *out_pos)
 {
+    uint8_t *out_buf;
     unsigned k;
     int rc;
 
     if (held == 0u) {
         return 0;
     }
+    out_buf = writer_reserve(w);
     rc = zpse_decompress_batch_parallel(slot_mem, off, len, held, out_buf,
                                         (uint32_t)ZPSE_MAX_BLOCK_SIZE, got,
                                         threads, arenas, threads);
@@ -380,15 +649,9 @@ static int decode_flush(FILE *f, const char *out_path, uint8_t *slot_mem,
             fprintf(stderr, "zpse_cli: block does not decode\n");
             return 1;
         }
-        if (got[k] > 0u &&
-            fwrite(out_buf + (size_t)k * (size_t)ZPSE_MAX_BLOCK_SIZE, 1u,
-                   (size_t)got[k], f) != (size_t)got[k]) {
-            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
-            return 1;
-        }
         *out_pos += (size_t)got[k];
     }
-    return 0;
+    return writer_commit(w, got, held);
 }
 
 static int decode_stream(const char *in_path, const char *out_path,
@@ -401,7 +664,8 @@ static int decode_stream(const char *in_path, const char *out_path,
     /* One block: its header, then its payload directly behind it. */
     uint8_t blk[ZPSE_BLOCK_HEADER_SIZE + ZPSE_MAX_BLOCK_SIZE];
     uint8_t *slot_mem = NULL;
-    uint8_t *out_buf = NULL;
+    ZpseCliWriter writer;
+    int writer_ready = 0;
     uint32_t *slot_off = NULL;
     uint32_t *slot_len = NULL;
     uint32_t *slot_expect = NULL;
@@ -451,16 +715,20 @@ static int decode_stream(const char *in_path, const char *out_path,
         batch = 64u;
     }
     slot_mem = (uint8_t *)malloc((size_t)batch * ZPSE_CLI_DEC_SLOT);
-    out_buf = (uint8_t *)malloc((size_t)batch * (size_t)ZPSE_MAX_BLOCK_SIZE);
     slot_off = (uint32_t *)malloc((size_t)batch * sizeof *slot_off);
     slot_len = (uint32_t *)malloc((size_t)batch * sizeof *slot_len);
     slot_expect = (uint32_t *)malloc((size_t)batch * sizeof *slot_expect);
     slot_got = (uint32_t *)malloc((size_t)batch * sizeof *slot_got);
-    if (slot_mem == NULL || out_buf == NULL || slot_off == NULL ||
-        slot_len == NULL || slot_expect == NULL || slot_got == NULL) {
+    if (slot_mem == NULL || slot_off == NULL || slot_len == NULL ||
+        slot_expect == NULL || slot_got == NULL) {
         fprintf(stderr, "zpse_cli: out of memory\n");
         goto fail;
     }
+    if (writer_init(&writer, f, out_path,
+                    (size_t)batch * (size_t)ZPSE_MAX_BLOCK_SIZE, 1) != 0) {
+        goto fail;
+    }
+    writer_ready = 1;
     for (;;) {
         ZpseBlockHeader bh;
         uint32_t comp_sz;
@@ -517,9 +785,9 @@ static int decode_stream(const char *in_path, const char *out_path,
             have_last = 1;
         }
         if (held == batch || have_last) {
-            if (decode_flush(f, out_path, slot_mem, slot_off, slot_len,
-                             slot_expect, slot_got, out_buf, held, threads,
-                             dec_arenas, &out_pos) != 0) {
+            if (decode_flush(slot_mem, slot_off, slot_len, slot_expect,
+                             slot_got, &writer, held, threads, dec_arenas,
+                             &out_pos) != 0) {
                 goto fail;
             }
             held = 0u;
@@ -535,9 +803,8 @@ static int decode_stream(const char *in_path, const char *out_path,
     /* A frame with no last-block flag ends at EOF: whatever is still held is
      * the tail of the frame and has to be decoded and written like any
      * other batch. */
-    if (decode_flush(f, out_path, slot_mem, slot_off, slot_len, slot_expect,
-                     slot_got, out_buf, held, threads, dec_arenas,
-                     &out_pos) != 0) {
+    if (decode_flush(slot_mem, slot_off, slot_len, slot_expect, slot_got,
+                     &writer, held, threads, dec_arenas, &out_pos) != 0) {
         goto fail;
     }
     if (!have_last &&
@@ -585,13 +852,25 @@ static int decode_stream(const char *in_path, const char *out_path,
         }
     }
     fclose(fi);
+    writer_ready = 0;
+    if (writer_finish(&writer) != 0) {
+        fclose(f);
+        remove(out_path);
+        free(slot_mem);
+        free(slot_off);
+        free(slot_len);
+        free(slot_expect);
+        free(slot_got);
+        free(blk_off);
+        free(blk_len);
+        return 1;
+    }
     if (fclose(f) != 0) {
         fprintf(stderr, "zpse_cli: close failed on %s\n", out_path);
         remove(out_path);
         return 1;
     }
     free(slot_mem);
-    free(out_buf);
     free(slot_off);
     free(slot_len);
     free(slot_expect);
@@ -601,6 +880,9 @@ static int decode_stream(const char *in_path, const char *out_path,
     return 0;
 
 fail:
+    if (writer_ready != 0) {
+        (void)writer_finish(&writer);
+    }
     if (f != NULL) {
         fclose(f);
         remove(out_path);
@@ -609,7 +891,6 @@ fail:
         fclose(fi);
     }
     free(slot_mem);
-    free(out_buf);
     free(slot_off);
     free(slot_len);
     free(slot_expect);

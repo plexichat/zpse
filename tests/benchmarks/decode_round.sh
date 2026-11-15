@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # The decode round's figures, from one script.
 #
-# Three measurements over the same inputs:
+# Four measurements over the same inputs:
 #   1. batch decode in memory, one worker to N, so the scaling curve belongs to
-#      the codec and not to the file read;
+#      the codec and not to the file read -- once for 64 KiB blocks and once
+#      for 4 KiB pages, the two shapes a frame carries;
 #   2. level 6 against level 6|DECODE_FAST, block by block, which is how many
 #      blocks the preset moves and what that costs or saves -- the frame tables
 #      after it show the same thing at frame granularity;
 #   3. the CLI's streaming decode of one concatenated frame, serial against N
-#      workers, which is the process figure docs/HISTORY.md quotes (I/O
+#      workers, which is the process figure docs/HISTORY.md quotes: the write
+#      runs on the CLI's writer thread, so the figure includes it (I/O
 #      included, which is why 1 exists).
 #
 # Usage: bash tests/benchmarks/decode_round.sh [FILE ...]
@@ -93,8 +95,20 @@ $CC -std=c11 -O2 -DZPSE_MT $mt -I"$inc" \
     { echo "decode_round: CLI build failed" >&2; exit 1; }
 
 sec "Batch decode in memory, codec only"
-# shellcheck disable=SC2086
-run env ZPSE_BD_MAXT="$MAXT" ZPSE_BD_REPS="$REPS" "$bench" $files
+# The whole corpus when files are given, so the two block sizes below cover
+# the same bytes; the built-in corpus keeps its own default size otherwise.
+if [ -n "$files" ]; then
+    # shellcheck disable=SC2086
+    run env ZPSE_BD_MAXT="$MAXT" ZPSE_BD_REPS="$REPS" ZPSE_BD_MB=256 \
+        "$bench" $files
+    sec "Batch decode in memory, 4 KiB pages, codec only"
+    # shellcheck disable=SC2086
+    run env ZPSE_BD_MAXT="$MAXT" ZPSE_BD_REPS="$REPS" ZPSE_BD_MB=256 \
+        ZPSE_BD_PAGE=1 "$bench" $files
+else
+    # shellcheck disable=SC2086
+    run env ZPSE_BD_MAXT="$MAXT" ZPSE_BD_REPS="$REPS" "$bench"
+fi
 
 if [ -n "$files" ]; then
     sec "Decode-first, block by block"
@@ -127,10 +141,10 @@ if [ -n "$files" ]; then
             best=""
             for ((i = 0; i < REPS; i++)); do
                 s=$(date +%s%N)
-                "$cli" d -t "$t" "$tmp/all.z" /dev/null >/dev/null 2>&1
+                "$cli" d -t "$t" "$tmp/all.z" "$tmp/all.out" >/dev/null 2>&1
                 st=$?
                 e=$(date +%s%N)
-                if [ "$st" -ne 0 ]; then
+                if [ "$st" -ne 0 ] || ! cmp -s "$tmp/all.out" "$tmp/all.bin"; then
                     echo "decode_round: decode -t $t failed" >&2
                     rc=1
                     break

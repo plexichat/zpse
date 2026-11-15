@@ -21,6 +21,8 @@
  *   ZPSE_BD_REPS  timed runs per row, best of (default 3)
  *   ZPSE_BD_MB    generated corpus size in MiB when there are no files
  *   ZPSE_BD_LEVEL block level to pack with (default 6)
+ *   ZPSE_BD_PAGE  pack 4 KiB pages with ZPSE_ENC_PAGE_FAST instead of
+ *                 64 KiB blocks, the shape a page frame has
  *
  * Prints a markdown table. Links src/zpse_unity.c; build with -DZPSE_MT for
  * more than one worker, or every row decodes on the caller.
@@ -45,9 +47,10 @@
 #include "../corpus/columnar_gen.h"
 
 #define BLK 65536u
-#define MAXB 4096u
+#define PAGE 4096u
+/* 256 MiB at either block size, so the two tables can cover the same bytes. */
+#define MAXB 65536u
 #define MAXT 8u
-#define PAYCAP (BLK + 128u)
 #define REGION (4u * 1024u * 1024u)
 
 static unsigned char enc_mem[MAXT][ZPSE_ENC_ARENA_SIZE]
@@ -128,6 +131,9 @@ int main(int argc, char **argv)
     unsigned max_t = env_u("ZPSE_BD_MAXT", 6u);
     unsigned reps = env_u("ZPSE_BD_REPS", 3u);
     unsigned level = env_u("ZPSE_BD_LEVEL", 6u);
+    unsigned page = env_u("ZPSE_BD_PAGE", 0u);
+    uint32_t blk = page != 0u ? PAGE : BLK;
+    uint32_t enc_flags = page != 0u ? (uint32_t)ZPSE_ENC_PAGE_FAST : 0u;
     size_t cap = (size_t)env_u("ZPSE_BD_MB", 64u) * 1024u * 1024u;
     size_t total = 0;
     uint32_t nblk, i, poff = 0;
@@ -138,8 +144,8 @@ int main(int argc, char **argv)
     if (max_t > MAXT) {
         max_t = MAXT;
     }
-    if (cap == 0 || cap > (size_t)MAXB * BLK) {
-        cap = (size_t)MAXB * BLK;
+    if (cap == 0 || cap > (size_t)MAXB * (size_t)blk) {
+        cap = (size_t)MAXB * (size_t)blk;
     }
     in = malloc(cap);
     if (in == NULL) {
@@ -164,22 +170,22 @@ int main(int argc, char **argv)
         fill_mixed(in, cap);
         total = cap;
     }
-    if (total < BLK) {
-        fprintf(stderr, "bench_batch_decode: need at least one 64 KiB block\n");
+    if (total < blk) {
+        fprintf(stderr, "bench_batch_decode: need at least one block\n");
         free(in);
         return 1;
     }
-    nblk = (uint32_t)((total + BLK - 1u) / BLK);
+    nblk = (uint32_t)((total + blk - 1u) / blk);
     if (nblk > MAXB) {
         nblk = MAXB;
     }
     for (i = 0; i < nblk; i++) {
-        size_t left = total - (size_t)i * BLK;
+        size_t left = total - (size_t)i * (size_t)blk;
 
-        blen[i] = (uint32_t)(left < BLK ? left : BLK);
+        blen[i] = (uint32_t)(left < blk ? left : blk);
     }
     pay = malloc(total + (size_t)nblk * 256u + 4096u);
-    out = malloc((size_t)nblk * BLK);
+    out = malloc((size_t)nblk * (size_t)blk);
     if (pay == NULL || out == NULL) {
         fprintf(stderr, "bench_batch_decode: out of memory\n");
         free(in);
@@ -189,9 +195,11 @@ int main(int argc, char **argv)
     }
     for (i = 0; i < nblk; i++) {
         uint32_t pl = 0;
-        int rc = zpse_compress_block_ex(in + (size_t)i * BLK, blen[i],
-                                        pay + poff, PAYCAP, &pl, i, 0,
-                                        (uint32_t)(level << 1), enc_arenas[0]);
+        int rc = zpse_compress_block_ex(in + (size_t)i * (size_t)blk,
+                                        blen[i], pay + poff, blk + 128u,
+                                        &pl, i, 0,
+                                        (uint32_t)(level << 1) | enc_flags,
+                                        enc_arenas[0]);
 
         if (rc != ZPSE_OK || pl == 0u) {
             fprintf(stderr, "bench_batch_decode: block %u did not compress\n",
@@ -214,7 +222,7 @@ int main(int argc, char **argv)
         for (r = 0; r < reps; r++) {
             double t0 = now_ns();
             int rc = zpse_decompress_batch_parallel(
-                pay, offs, lens, nblk, out, BLK, got, i, dec_arenas, MAXT);
+                pay, offs, lens, nblk, out, blk, got, i, dec_arenas, MAXT);
 
             if (rc != ZPSE_OK) {
                 fprintf(stderr,
@@ -233,8 +241,8 @@ int main(int argc, char **argv)
         }
         for (uint32_t k = 0; k < nblk; k++) {
             if (got[k] != blen[k] ||
-                memcmp(out + (size_t)k * BLK, in + (size_t)k * BLK,
-                       blen[k]) != 0) {
+                memcmp(out + (size_t)k * (size_t)blk,
+                       in + (size_t)k * (size_t)blk, blen[k]) != 0) {
                 fprintf(stderr,
                         "bench_batch_decode: block %u differs at %u "
                         "worker(s)\n",
@@ -251,8 +259,11 @@ int main(int argc, char **argv)
         printf("| %u | %.0f | %.2f |\n", i,
                (double)total / 1e6 / (best / 1e9), base / best);
     }
-    fprintf(stderr, "bench_batch_decode: %u blocks, %.1f MiB, level %u, %u rep(s)\n",
-            nblk, (double)total / 1048576.0, level, reps);
+    fprintf(stderr,
+            "bench_batch_decode: %u blocks of %u B, %.1f MiB, level %u%s, "
+            "%u rep(s)\n",
+            nblk, blk, (double)total / 1048576.0, level,
+            page != 0u ? " + PAGE_FAST" : "", reps);
 #if !defined(ZPSE_MT)
     fprintf(stderr, "bench_batch_decode: built without ZPSE_MT; every row "
                     "decoded on the caller\n");
