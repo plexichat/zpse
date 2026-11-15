@@ -589,6 +589,9 @@ static int encode_stream(const char *in_path, const char *out_path,
     int *ready = NULL;
     uint32_t *lens = NULL;
     uint8_t hdr[ZPSE_FRAME_HEADER_SIZE];
+    /* The output buffer handed to setvbuf, freed after the close. */
+    char *out_buf = NULL;
+    size_t out_buf_len = 256u << 10;
     /* The ring is ZPSE_MT_MAX_DEPTH slots per worker, which is what lets a
      * worker run ahead of the writer instead of blocking on an emit it has
      * nothing to do with; `zpse_compress_frame_stream` clamps the depth to
@@ -645,6 +648,19 @@ static int encode_stream(const char *in_path, const char *out_path,
         fprintf(stderr, "zpse_cli: cannot write %s\n", out_path);
         fclose(fi);
         return 1;
+    }
+    /* Each finished block is handed straight to `fwrite`, and the default
+     * stdio buffer is 4 KiB (Windows) -- so a corpus-sized frame leaves as
+     * thousands of little WriteFile calls, one per buffer fill, with the
+     * block copied into the buffer first. A quarter mebibyte turns that into
+     * one write per four blocks at the default block size, and 1 MiB and
+     * 4 MiB measured no better (256 KiB: 99 / 85 ms on mozilla / webster at
+     * eight workers, against 107 / 93 ms at the 4 KiB default), so the
+     * smallest of the three wins. The bytes and their order are the same at
+     * any buffer size. */
+    out_buf = (char *)malloc(out_buf_len);
+    if (out_buf != NULL) {
+        setvbuf(fo, out_buf, _IOFBF, out_buf_len);
     }
     /* Map the input rather than copying it in. The slab read this used to
      * do faults a page every 4 KiB on a fresh buffer and then memcpys the
@@ -808,6 +824,7 @@ done:
     free(lens);
     free(blk_off);
     free(blk_len);
+    free(out_buf);
     fclose(fi);
     return rc;
 }

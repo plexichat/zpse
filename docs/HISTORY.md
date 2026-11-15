@@ -1112,3 +1112,28 @@ The point of the table is the negative that was missing before: the share
 that looked unexplained is named, it is necessary work, and the earlier hunt
 for a cut in it was chasing a stage that was already counted as something
 else.
+
+## The CLI's own I/O is part of the wall clock
+
+Every figure in the README measures the codec in memory, so the tool's I/O
+never came up until the streamed path made the wall clock legible. Two
+candidates were tried on a 12-core Windows host. One survived.
+
+The first was to give Windows the input mapping the POSIX path has had since
+the streamed rewrite. Mapping removes the copy and the fault storm the POSIX
+comment blames -- but only where the buffer being filled is fresh and
+frame-sized. This path reuses one 4 MiB slab buffer, so `fread` faults it once
+and then serves it from the page cache; `CreateFileMapping` + `MapViewOfFile`
+trades that for soft faults taken inside the encoder, which is worse. Best of
+five at eight workers, mozilla / webster: 111 / 95 ms mapped against
+111 / 93 ms read. Refused, and the mapping stays POSIX-only.
+
+The second was the output buffer. Each finished block goes straight to
+`fwrite`, and the default stdio buffer is 4 KiB on Windows -- a corpus-sized
+frame left as thousands of `WriteFile` calls with a copy in front of each.
+Handing `setvbuf` a quarter mebibyte took eight-worker mozilla from 107 to
+99 ms and webster from 93 to 85 ms (minimum of seven, alternating), and
+single-worker mozilla from 228 to 221 ms, webster from 192 to 181 ms. 1 MiB
+and 4 MiB measured the same or a little worse on the means, so the smallest
+wins. The frame is byte-identical at any buffer size: 32 comparisons over
+eight corpus files at -t 1, -t 8 and -x agreed exactly.
