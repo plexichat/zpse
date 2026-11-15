@@ -1029,3 +1029,49 @@ overlaps the four chains as well as the register file allows, and that the
 table load is unavoidable: at 2.8 cycles a symbol the stage is within reach of
 the load-to-use latency of the lookup itself, which is the floor for any
 table-driven decoder.
+
+## The parked fast-form diff: why gating it is not a one-line fix
+
+The parked work (tagged table epochs, the greedy fast form, page headers)
+was taken apart again to answer three questions, and two of the three
+answers are "no" for a reason worth writing down.
+
+**The ASCII gate has to fire at every level.** The parked diff had narrowed
+it to the full-size block at level 6 and deeper (`ZPSE_ASCII_GATE_ON`, a
+level term) to protect the level ladder's time check. That is backwards: the
+gate does not compete with the match finder, it only decides what the TILE
+side of a block costs, and `zpse_block_lz_level` still reads the level. With
+the narrowing, level 5 kept the sweep and wrote 116 bytes of tiles on a
+block of two runs where level 9 took the gated path and wrote 476 of LZ2 --
+a deeper rung writing a larger block, which the size ladder forbids. Every
+level gated, as it did before the diff, restored that shape to 116/116.
+
+**It is necessary and not sufficient.** Two 64 KiB shapes still inverted
+after the gate was restored (balanced/deepest, bytes): the sparse
+marker-every-97 shape 816/1236, and the two-run block 116/476. The trace
+says why, and it is stage ORDER, not the gate: on the two-run block the
+sweep's own total is 2610 at both levels, the tile-body stage compresses it
+to 116, and at level 9 the token LZ stage commits 804 bytes first -- which
+overwrites the tile winner, so the tile-body stage has nothing to compress
+and the best the deep rung can do afterwards is 1518 from the fast form
+(1236 after the Huffman wrapper). At level 5 the same 804-byte stream is
+refused by the level's decode-speed guard, the tile body survives, and 116
+ships. A decode-speed guard that differs by level can therefore reorder
+which stage leads, and the ladder inherits the difference. Making the
+tile-body stage compete after the token LZ stage instead of before it is a
+real change to the block encoder's decision order, not a switch, and it
+belongs in its own diff with its own measurements -- which is why this one
+stays parked.
+
+**The fast form is already a flag; the only open question is its default.**
+`ZPSE_ENC_LZ_FAST` is the option, and the diff's block-level wiring is what
+made the default level take its trade implicitly. The trade is real and it
+is large on prose: `dickens` 8 560 336 -> 9 109 041 bytes at 878 -> 1240
+MB/s (one run each on this host, level 6, 64 KiB), i.e. +6.4% of bytes for
+1.4x the rate on the one file the gate owns. `webster` is the other side:
+19 772 044 -> 19 897 137 and slower in the same run (346 -> 300 MB/s). Until
+the ladder and the stage order above are settled, the default level keeps
+the token form and the fast form stays behind its flag.
+
+The diff itself is unchanged and still parked: the gate fix and the stage
+probes used here were scratch and are not landed.
