@@ -1137,3 +1137,9 @@ single-worker mozilla from 228 to 221 ms, webster from 192 to 181 ms. 1 MiB
 and 4 MiB measured the same or a little worse on the means, so the smallest
 wins. The frame is byte-identical at any buffer size: 32 comparisons over
 eight corpus files at -t 1, -t 8 and -x agreed exactly.
+
+Decode writes its blocks the same way, so it got the same treatment and
+refused it: 90 -> 110 ms on webster and 111 -> 110 ms on mozilla, minimum of
+seven. The decode sink keeps the default buffer, which is the useful half of
+the result -- the shape of the loop predicts the win, and the measurement is
+what decides it.
