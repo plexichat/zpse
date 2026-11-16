@@ -4,6 +4,14 @@
 /* Frame-level helpers. Block framing loops live here;
  * per-block work delegates to block.h. */
 
+/* Whole-frame decode of a page-sized frame reads each block's 16-byte header
+ * once (its compressed/uncompressed sizes, flags and decoded CRC from a
+ * single short parse) rather than once per use in the framing loop. Default
+ * on; define to 0 to keep the original probe-then-parse-per-use path. */
+#ifndef ZPSE_FRAME_PAGE_FAST
+#define ZPSE_FRAME_PAGE_FAST 1
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include "arena.h"
@@ -40,6 +48,26 @@ int zpse_frame_encode_ex(ZpseEncoder *e, const uint8_t *in, size_t n,
  * rather than a count. */
 int zpse_frame_index_count(const uint8_t *in, size_t in_len,
                            uint32_t *count_out);
+
+/* Internal: read and validate a frame's header and index in one pass. On
+ * success *entries_out (when asked) points inside `in` at the first index
+ * entry, *count_out holds the block count, and *fh_out (when asked) holds the
+ * validated header. A frame with no index reports count 0 and a null entries
+ * pointer. Shared by the one-shot seek and the parallel decoder so the CRC
+ * over the whole index is not recomputed once per block. */
+int zpse_frame_index_resolve(const uint8_t *in, size_t in_len,
+                             ZpseFrameHeader *fh_out,
+                             const uint8_t **entries_out,
+                             uint32_t *count_out);
+
+/* Internal: decode one block addressed by a validated index entry. Performs
+ * the per-entry bounds, block-header and identity checks that
+ * zpse_frame_seek does after locating the entry, then decodes the block.
+ * Callers must have validated the header and index first, normally with
+ * zpse_frame_index_resolve. `out_len_out` may be null. */
+int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                  uint32_t off, uint32_t size, uint32_t seq,
+                  uint8_t *output, uint32_t out_cap, uint32_t *out_len_out);
 
 /* Validate a FrameIndex a sequential reader has already read out of the file
  * at fh->frame_index_offset, against the blocks that reader walked: `count`

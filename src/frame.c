@@ -16,6 +16,75 @@ static int zpse_frame_index_check(const uint8_t *in, size_t in_len,
                                   const uint8_t **entries_out,
                                   uint32_t *count_out);
 
+#if ZPSE_FRAME_PAGE_FAST
+/* Read a page block's header once for the framing loop. A frame whose blocks
+ * are at most ZPSE_BLOCK_SHORT_MAX normally carries a 16-byte header (short,
+ * token or FLAT). The full loop reads that header four times per block
+ * -- zpse_block_probe, the LAST-flag parse, the payload-CRC parse and the one
+ * inside zpse_block_decode -- so a page frame pays four 14-byte checksums and
+ * four field walks to learn what one gives it. This reads it once and returns
+ * the sizes, flags and decoded CRC the loop needs; the block is then decoded
+ * straight from these bytes with the one decoder the frame already reuses.
+ *
+ * The caller has already established `in` starts with a short, token or FLAT
+ * sync and that `avail` covers a 16-byte header, so this takes the lightweight
+ * short parser path, not the generic dispatch. Every check and status here is
+ * the one zpse_block_probe plus its header parse would return, in the same
+ * order. */
+static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
+                                   uint32_t *comp_out, uint32_t *uncomp_out,
+                                   uint8_t *flags_out, uint32_t *dec_crc_out)
+{
+    ZpseBlockHeader bh;
+    uint16_t sync;
+    int rc;
+
+    if (avail < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_TRUNCATED;
+    }
+    sync = zpse_load_u16le(in);
+    if (sync != (uint16_t)ZPSE_BLOCK_SYNC_SHORT &&
+        sync != (uint16_t)ZPSE_BLOCK_SYNC_TOKEN &&
+        sync != (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        /* Same refusal as zpse_block_probe for an unrecognised sync. */
+        return ZPSE_TRUNCATED;
+    }
+    if (sync == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
+        /* zpse_block_probe validates these bytes before its checksum and
+         * before the ordinary parse. Keep that order so a token corrupt in
+         * two ways is refused with the same status the full path returns. */
+        if (in[4] != 1u || in[5] != 0u ||
+            in[8] != (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT || in[9] != 0u) {
+            return ZPSE_BAD_HEADER;
+        }
+    }
+    /* For a 16-byte header this is the short/token/FLAT parse: a 14-byte
+     * checksum and the handful of page fields, no long-form work. */
+    rc = zpse_block_header_parse(&bh, in, avail);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    if (bh.compressed_block_size < (uint32_t)bh.header_size) {
+        return ZPSE_BAD_BLOCK_SIZE;
+    }
+    if (sync == (uint16_t)ZPSE_BLOCK_SYNC_FLAT &&
+        bh.compressed_block_size == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        /* FLAT has no empty payload: the probe refuses comp == header_size
+         * as BAD_BLOCK_SIZE. Mirror that status so this fast path returns
+         * exactly what zpse_block_probe would. */
+        return ZPSE_BAD_BLOCK_SIZE;
+    }
+    if (avail < bh.compressed_block_size) {
+        return ZPSE_TRUNCATED;
+    }
+    *comp_out = bh.compressed_block_size;
+    *uncomp_out = bh.uncompressed_size;
+    *flags_out = bh.block_flags;
+    *dec_crc_out = bh.decoded_crc32c;
+    return ZPSE_OK;
+}
+#endif /* ZPSE_FRAME_PAGE_FAST */
+
 static void zpse_frame_pack28(uint8_t out[32], const ZpseFrameHeader *h)
 {
     zpse_store_u32le(out + 0, h->magic);
@@ -166,13 +235,55 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         uint32_t comp_sz = 0;
         uint32_t uncomp_sz = 0;
         uint32_t blk_out = 0;
+        uint32_t dec_crc = 0u;
+        uint8_t blk_flags = 0u;
         size_t o_rem;
         uint32_t o_cap;
         int is_last;
+        int page_fast = 0;
 
-        rc = zpse_block_probe(in + pos, avail, &comp_sz, &uncomp_sz);
-        if (rc != ZPSE_OK) {
-            return rc;
+#if ZPSE_FRAME_PAGE_FAST
+        /* A page frame's blocks carry the 16-byte header, so one short parse
+         * supplies the sizes, the LAST flag and the CRC the loop needs. A
+         * long-form block is still legal in such a frame (a header that could
+         * not be shrunk), so fall back to the original path when the sync is
+         * the long one. */
+        if (fh.nominal_block_size <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+            avail >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            uint16_t sync = zpse_load_u16le(in + pos);
+
+            if (sync == (uint16_t)ZPSE_BLOCK_SYNC_SHORT ||
+                sync == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN ||
+                sync == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+                rc = zpse_frame_short_header(in + pos, avail, &comp_sz,
+                                             &uncomp_sz, &blk_flags, &dec_crc);
+                if (rc != ZPSE_OK) {
+                    return rc;
+                }
+                page_fast = 1;
+            }
+            /* A long or unrecognised sync falls through to the original
+             * probe path unchanged. */
+        }
+#endif
+        if (!page_fast) {
+            rc = zpse_block_probe(in + pos, avail, &comp_sz, &uncomp_sz);
+            if (rc != ZPSE_OK) {
+                return rc;
+            }
+            /* Read the flags and decoded CRC once here and reuse them for
+             * LAST and for the payload-CRC check below, instead of parsing
+             * the same header again for each. */
+            {
+                ZpseBlockHeader bh;
+
+                rc = zpse_block_header_parse(&bh, in + pos, comp_sz);
+                if (rc != ZPSE_OK) {
+                    return rc;
+                }
+                blk_flags = bh.block_flags;
+                dec_crc = bh.decoded_crc32c;
+            }
         }
         if (comp_sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             return ZPSE_BAD_HEADER;
@@ -180,18 +291,7 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         if ((size_t)comp_sz > rem) {
             return ZPSE_TRUNCATED;
         }
-        /* The flags byte sits at offset 3 in the long header and at 2 in a
-         * page's 16-byte one, so the LAST flag is read through the parse
-         * rather than off a fixed offset. */
-        {
-            ZpseBlockHeader bh;
-
-            rc = zpse_block_header_parse(&bh, in + pos, comp_sz);
-            if (rc != ZPSE_OK) {
-                return rc;
-            }
-            is_last = (bh.block_flags & ZPSE_B_LAST) != 0;
-        }
+        is_last = (blk_flags & ZPSE_B_LAST) != 0;
         if (uncomp_sz < ZPSE_MIN_BLOCK_SIZE ||
             uncomp_sz > ZPSE_MAX_BLOCK_SIZE) {
             return ZPSE_BAD_BLOCK_SIZE;
@@ -212,18 +312,15 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         }
         /* Payload CRC MUST be verified when the block flag
          * OR the frame flag tags it. The block layer covers its own flag;
-         * close the gap for foreign frames with F_BLOCK_CRC=1, B_CRC=0. */
-        if ((fh.frame_flags & ZPSE_F_BLOCK_CRC) != 0u) {
-            ZpseBlockHeader bh;
-            rc = zpse_block_header_parse(&bh, in + pos, comp_sz);
-            if (rc != ZPSE_OK) {
-                return rc;
-            }
-            if ((bh.block_flags & ZPSE_B_CRC) == 0u) {
-                uint32_t calc = zpse_crc32c(output + out_pos, blk_out);
-                if (calc != bh.decoded_crc32c) {
-                    return ZPSE_BAD_PAYLOAD_CRC;
-                }
+         * close the gap for foreign frames with F_BLOCK_CRC=1, B_CRC=0.
+         * The flags and decoded CRC came from the header parse above, so
+         * no second parse is needed here. */
+        if ((fh.frame_flags & ZPSE_F_BLOCK_CRC) != 0u &&
+            (blk_flags & ZPSE_B_CRC) == 0u) {
+            uint32_t calc = zpse_crc32c(output + out_pos, blk_out);
+
+            if (calc != dec_crc) {
+                return ZPSE_BAD_PAYLOAD_CRC;
             }
         }
         out_pos += (size_t)blk_out;
@@ -303,6 +400,13 @@ static int zpse_frame_index_check(const uint8_t *in, size_t in_len,
         return ZPSE_BAD_HEADER;
     }
     count = zpse_load_u32le(in + off + 4u);
+    /* Guard the size_t multiply against wrap on 32-bit hosts: a hostile
+     * count near 2^32 would otherwise wrap `need` small and pass the check
+     * below, then overrun the entry reads in zpse_frame_seek. */
+    if ((uint64_t)count * (uint64_t)ZPSE_INDEX_ENTRY_SIZE >
+        (uint64_t)((size_t)-1 - (size_t)ZPSE_INDEX_HEADER_SIZE)) {
+        return ZPSE_TRUNCATED;
+    }
     need = (size_t)ZPSE_INDEX_HEADER_SIZE +
            (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
     if (need > in_len - (size_t)off) {
@@ -329,8 +433,16 @@ static int zpse_frame_index_check(const uint8_t *in, size_t in_len,
     return ZPSE_OK;
 }
 
-int zpse_frame_index_count(const uint8_t *in, size_t in_len,
-                           uint32_t *count_out)
+/* Read and validate a frame's header and index in one pass. On success
+ * *entries_out (when asked) points inside `in` at the first index entry and
+ * *count_out holds the block count; a frame with no index reports count 0 and
+ * a null entries pointer. This is the shared front half of the one-shot seek
+ * and of the parallel decoder: the header CRC and the CRC over all count*8
+ * index bytes are paid once per frame, not once per block. */
+int zpse_frame_index_resolve(const uint8_t *in, size_t in_len,
+                             ZpseFrameHeader *fh_out,
+                             const uint8_t **entries_out,
+                             uint32_t *count_out)
 {
     ZpseFrameHeader fh;
     int rc;
@@ -347,9 +459,28 @@ int zpse_frame_index_count(const uint8_t *in, size_t in_len,
     }
     if ((fh.frame_flags & ZPSE_F_FRAME_INDEX) == 0u) {
         *count_out = 0u;
+        if (entries_out != 0) {
+            *entries_out = 0;
+        }
+        if (fh_out != 0) {
+            *fh_out = fh;
+        }
         return ZPSE_OK;
     }
-    return zpse_frame_index_check(in, in_len, &fh, 0, count_out);
+    rc = zpse_frame_index_check(in, in_len, &fh, entries_out, count_out);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    if (fh_out != 0) {
+        *fh_out = fh;
+    }
+    return ZPSE_OK;
+}
+
+int zpse_frame_index_count(const uint8_t *in, size_t in_len,
+                           uint32_t *count_out)
+{
+    return zpse_frame_index_resolve(in, in_len, 0, 0, count_out);
 }
 
 int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
@@ -370,6 +501,10 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
     }
     if (zpse_load_u32le(idx) != ZPSE_INDEX_MAGIC) {
         return ZPSE_BAD_HEADER;
+    }
+    if ((uint64_t)count * (uint64_t)ZPSE_INDEX_ENTRY_SIZE >
+        (uint64_t)((size_t)-1 - (size_t)ZPSE_INDEX_HEADER_SIZE)) {
+        return ZPSE_TRUNCATED;
     }
     need = (size_t)ZPSE_INDEX_HEADER_SIZE +
            (size_t)count * (size_t)ZPSE_INDEX_ENTRY_SIZE;
@@ -412,39 +547,22 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
     return ZPSE_OK;
 }
 
-int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
-                    uint32_t block_index, uint8_t *output, uint32_t out_cap,
-                    uint32_t *out_len_out)
+/* Decode one block addressed by a validated index entry. This is the tail of
+ * zpse_frame_seek: the caller has already read the frame header and validated
+ * the index as a whole, so all that remains is the per-entry bounds, block
+ * header and identity checks, then the block decode. The parallel decoder
+ * hands its workers entries resolved once by zpse_frame_index_resolve and
+ * calls this directly, so the index CRC is not recomputed per block. */
+int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                  uint32_t off, uint32_t size, uint32_t seq,
+                  uint8_t *output, uint32_t out_cap, uint32_t *out_len_out)
 {
-    ZpseFrameHeader fh;
-    const uint8_t *entries = 0;
-    uint32_t count = 0u;
-    uint32_t off;
-    uint32_t size;
     uint32_t got = 0u;
     int rc;
 
     if (d == 0 || in == 0 || output == 0) {
         return ZPSE_BAD_ARG;
     }
-    if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
-        return ZPSE_TRUNCATED;
-    }
-    rc = zpse_frame_header_read(&fh, in);
-    if (rc != ZPSE_OK) {
-        return rc;
-    }
-    rc = zpse_frame_index_check(in, in_len, &fh, &entries, &count);
-    if (rc != ZPSE_OK) {
-        return rc;
-    }
-    if (block_index >= count) {
-        return ZPSE_BAD_ARG;
-    }
-    off = zpse_load_u32le(entries + (size_t)block_index *
-                                       (size_t)ZPSE_INDEX_ENTRY_SIZE);
-    size = zpse_load_u32le(entries + (size_t)block_index *
-                                        (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
     if ((size_t)off < (size_t)ZPSE_FRAME_HEADER_SIZE ||
         size < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
         (uint64_t)off + (uint64_t)size > (uint64_t)in_len) {
@@ -461,7 +579,7 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
          * and it has to be the block that was asked for: a table whose
          * entries point at the wrong blocks is worse than no table. */
         if (bh.compressed_block_size != size ||
-            bh.block_sequence_number != block_index) {
+            bh.block_sequence_number != seq) {
             return ZPSE_BAD_HEADER;
         }
         if (out_cap < bh.uncompressed_size) {
@@ -478,13 +596,53 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     return ZPSE_OK;
 }
 
+int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                    uint32_t block_index, uint8_t *output, uint32_t out_cap,
+                    uint32_t *out_len_out)
+{
+    ZpseFrameHeader fh;
+    const uint8_t *entries = 0;
+    uint32_t count = 0u;
+    uint32_t off;
+    uint32_t size;
+    int rc;
+
+    if (d == 0 || in == 0 || output == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    rc = zpse_frame_index_resolve(in, in_len, &fh, &entries, &count);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    /* A frame without an index is an unsupported seek, not a seek to a
+     * nonexistent block: the one-shot API has always reported that distinctly
+     * and callers rely on it. */
+    if ((fh.frame_flags & ZPSE_F_FRAME_INDEX) == 0u) {
+        return ZPSE_UNSUPPORTED_FEATURE;
+    }
+    if (block_index >= count) {
+        return ZPSE_BAD_ARG;
+    }
+    off = zpse_load_u32le(entries + (size_t)block_index *
+                                       (size_t)ZPSE_INDEX_ENTRY_SIZE);
+    size = zpse_load_u32le(entries + (size_t)block_index *
+                                        (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
+    return zpse_block_at(d, in, in_len, off, size, block_index, output,
+                         out_cap, out_len_out);
+}
+
 int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,
                            uint32_t nominal_block_size, uint64_t content_size,
                            uint32_t block_count, size_t *out_len_out)
 {
     ZpseFrameHeader fh;
-    size_t need = (size_t)ZPSE_INDEX_HEADER_SIZE +
-                  (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count;
+    size_t need;
+    if ((uint64_t)block_count * (uint64_t)ZPSE_INDEX_ENTRY_SIZE >
+        (uint64_t)((size_t)-1 - (size_t)ZPSE_INDEX_HEADER_SIZE)) {
+        return ZPSE_OUTPUT_OVERFLOW;
+    }
+    need = (size_t)ZPSE_INDEX_HEADER_SIZE +
+           (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count;
     uint32_t at;
     uint32_t off;
     uint32_t k;
@@ -558,8 +716,13 @@ int zpse_frame_stream_index(uint8_t hdr_out[32], uint8_t *idx_out,
                             const uint32_t *sizes, size_t *idx_len_out)
 {
     ZpseFrameHeader fh;
-    size_t need = (size_t)ZPSE_INDEX_HEADER_SIZE +
-                  (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count;
+    size_t need;
+    if ((uint64_t)block_count * (uint64_t)ZPSE_INDEX_ENTRY_SIZE >
+        (uint64_t)((size_t)-1 - (size_t)ZPSE_INDEX_HEADER_SIZE)) {
+        return ZPSE_OUTPUT_OVERFLOW;
+    }
+    need = (size_t)ZPSE_INDEX_HEADER_SIZE +
+           (size_t)ZPSE_INDEX_ENTRY_SIZE * (size_t)block_count;
     uint32_t crc;
     uint32_t k;
     int rc;
