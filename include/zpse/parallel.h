@@ -149,7 +149,7 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
  * bytes at one core. Block k lands at k * nominal_block_size in `output`,
  * so the decoded frame is the sequential one, byte for byte.
  *
- * `dec_arenas` holds `arena_count` caller-owned 320 KiB decode arenas
+ * `dec_arenas` holds `arena_count` caller-owned 384 KiB decode arenas
  * (ZPSE_DEC_ARENA_SIZE, 64-B aligned). A worker has no other state and no
  * buffer of its own: it decodes block k into `output + k * nominal` and
  * writes nothing outside it, so two workers cannot touch the same byte. That
@@ -194,6 +194,109 @@ int zpse_decompress_batch_parallel(const uint8_t *in,
                                    uint32_t *out_lens, unsigned threads,
                                    void *const dec_arenas[],
                                    unsigned arena_count);
+
+/* ---- persistent batch pool -------------------------------------------
+ *
+ * A streaming caller decodes one small batch after another. Sending each
+ * batch through zpse_decompress_batch_parallel() creates and joins threads
+ * every time -- a page stream of a few thousand batches pays that thousands
+ * of times. These calls keep the workers alive between batches: the caller
+ * owns one scratch buffer and one decode arena per worker, and the workers
+ * sleep on a condition variable until the next batch is published. The
+ * library still never allocates; threads are capped at arena_count and at
+ * ZPSE_MT_MAX_THREADS. Without ZPSE_MT the pool is a serial decoder behind
+ * the same API, so a caller can ship one build.
+ *
+ * ZPSE_POOL_SCRATCH_SIZE(threads) is the exact byte count of scratch needed
+ * for `threads` participants (the calling thread plus threads-1 long-lived
+ * workers). The scratch must be 64-byte aligned and stay alive until
+ * zpse_batch_pool_free(). `threads` above is capped internally, so sizing
+ * the scratch for the threads you intend to use is enough.
+ */
+size_t zpse_batch_pool_scratch_size(unsigned threads);
+#define ZPSE_POOL_SCRATCH_SIZE(threads) zpse_batch_pool_scratch_size(threads)
+
+/* Opaque pool; lives entirely inside the caller's scratch. */
+typedef struct ZpseBatchPool ZpseBatchPool;
+
+/* Carve a pool out of `scratch` (>= ZPSE_POOL_SCRATCH_SIZE(threads) bytes,
+ * 64-B aligned), init one persistent decoder per worker from
+ * dec_arenas[0..arena_count-1], and start the workers. *pool_out points into
+ * `scratch`. Returns ZPSE_OK or a negative status. */
+int zpse_batch_pool_init(ZpseBatchPool **pool_out, void *scratch,
+                         size_t scratch_len, unsigned threads,
+                         void *const dec_arenas[], unsigned arena_count);
+
+/* Decode one batch. Arguments match zpse_decompress_batch_parallel() minus
+ * the threading/arena ones, which were fixed at init; may be called any
+ * number of times, reusing the same workers. Returns ZPSE_OK or the first
+ * negative status any block reported. */
+int zpse_batch_pool_run(ZpseBatchPool *pool, const uint8_t *in,
+                        const uint32_t *offsets, const uint32_t *lens,
+                        uint32_t count, uint8_t *out, uint32_t stride,
+                        uint32_t *out_lens);
+
+/* Wake and join the workers, destroy the sync objects, and leave `scratch`
+ * reusable. Call once for every successful init. */
+void zpse_batch_pool_free(ZpseBatchPool *pool);
+
+/* ---- persistent encode pool -----------------------------------------
+ *
+ * The streamed encode above starts and joins threads for every slab. A caller
+ * walking a page stream sends a few hundred slabs through it and pays that
+ * start/join cost each time. These calls keep the same workers alive between
+ * slabs: the caller owns one scratch buffer (which holds the pool and one
+ * encoder per participant) and one encode arena per worker, and the workers
+ * sleep on a condition variable until the next slab is published. The library
+ * still never allocates; threads are capped at arena_count and at
+ * ZPSE_MT_MAX_THREADS (internal). Without ZPSE_MT the pool is the serial
+ * stream encoder behind the same API, so a caller can ship one build.
+ *
+ * ZPSE_ENCODE_POOL_SCRATCH_SIZE(threads) is the exact byte count of scratch
+ * needed for `threads` participants (the calling thread plus threads-1
+ * long-lived workers). The scratch must be 64-byte aligned and stay alive
+ * until zpse_encode_pool_free(). `threads` is capped internally, so sizing
+ * for the threads you intend to use is enough.
+ */
+size_t zpse_encode_pool_scratch_size(unsigned threads);
+#define ZPSE_ENCODE_POOL_SCRATCH_SIZE(threads) \
+    zpse_encode_pool_scratch_size(threads)
+
+/* Opaque pool; lives entirely inside the caller's scratch. */
+typedef struct ZpseEncodePool ZpseEncodePool;
+
+/* Carve a pool out of `scratch` (>= ZPSE_ENCODE_POOL_SCRATCH_SIZE(threads)
+ * bytes, 64-B aligned), init one persistent encoder per participant from
+ * enc_arenas[0..arena_count-1], and start the workers. *pool_out points into
+ * `scratch`. Returns ZPSE_OK or a negative status. */
+int zpse_encode_pool_init(ZpseEncodePool **pool_out, void *scratch,
+                          size_t scratch_len, unsigned threads,
+                          void *const enc_arenas[], unsigned arena_count);
+
+/* Encode one slab of a frame. The arguments are those of
+ * zpse_compress_frame_stream() minus the threading/arena ones, which were
+ * fixed at init: `in` holds blocks `first_block`... at `nominal_block_size`
+ * (every block but the last a full one), `is_final_slab` marks the slab that
+ * owns the frame's last block and carries the last-block flag, the workers
+ * write into `slot_mem` (at least one slot per participant, up to
+ * ZPSE_MT_MAX_DEPTH per participant) and `ready`/`lens` are caller-owned
+ * scratch of one entry per slot per ZPSE_MT_CTRL_STRIDE, cleared here.
+ * Finished blocks are handed to `emit` in block order. May be called any
+ * number of times, reusing the same workers. The stream is block for block
+ * the one zpse_compress_frame_stream() writes at the same thread count --
+ * which is the serial stream at one worker -- so a caller may move between
+ * them without changing a byte. Returns ZPSE_OK, a negative status, or the
+ * negative status an `emit` callback returned. */
+int zpse_encode_pool_run(ZpseEncodePool *pool, const uint8_t *in,
+                         size_t in_len, uint32_t nominal_block_size,
+                         uint32_t enc_flags, uint32_t first_block,
+                         int is_final_slab, uint8_t *slot_mem, size_t slot_cap,
+                         int *ready, uint32_t *lens, ZpseBlockEmit emit,
+                         void *emit_ctx);
+
+/* Wake and join the workers, destroy the sync objects, and leave `scratch`
+ * reusable. Call once for every successful init. */
+void zpse_encode_pool_free(ZpseEncodePool *pool);
 
 #ifdef __cplusplus
 }
