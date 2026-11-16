@@ -41,6 +41,28 @@ int main(void) {
         CHECK(zpse_crc32c_init() == 0xFFFFFFFFu, "crc init");
     }
 
+    /* Direct CRC32-C determinism guard for the software tables. The
+     * slice-by-8 and GF(2) combine tables are now static const (no lazy init
+     * and no shared mutable state), so this 64-byte buffer -- long enough to
+     * run the slice-by-8 loop and, on SSE4.2 hosts, the three-chain combine
+     * -- must hash to one fixed constant, and repeated calls must be
+     * bit-identical through the runtime-dispatched paths too. */
+    {
+        uint8_t fixed[64];
+        uint32_t c1, c2, c3;
+        unsigned i;
+
+        for (i = 0; i < sizeof fixed; i++) {
+            fixed[i] = (uint8_t)(i * 7u + 3u);
+        }
+        c1 = zpse_crc32c(fixed, sizeof fixed);
+        c2 = zpse_crc32c(fixed, sizeof fixed);
+        c3 = zpse_crc32c(fixed, sizeof fixed);
+        CHECK(c1 == UINT32_C(0x2884F9F3),
+              "crc fixed64 constant 0x2884F9F3 (got 0x%08X)", c1);
+        CHECK(c1 == c2 && c2 == c3, "crc fixed64 identical on repeated calls");
+    }
+
     /* Repeated-byte CRC: the arithmetic form the block decoder uses for a
      * one-value plane. Must agree with the buffer CRC at every length,
      * including the ones whose binary expansion is not a single power of
@@ -203,14 +225,32 @@ int main(void) {
         ZpseDecoder d; ZpseEncoder e;
         static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
         static unsigned char ea[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
+        /* The init functions size-check against these totals: one byte short
+         * is refused, the exact size is accepted. Pin the totals so a layout
+         * change that moves a carve cannot slip through. */
+        CHECK(ZPSE_DEC_ARENA_SIZE == 0x60000u && ZPSE_ENC_ARENA_SIZE == 0x74000u,
+              "arena totals D=0x60000 E=0x74000");
         CHECK(zpse_decoder_init(NULL, da, sizeof da) == ZPSE_BAD_ARG, "dec null ctx");
         CHECK(zpse_decoder_init(&d, NULL, sizeof da) == ZPSE_BAD_ARG, "dec null mem");
         CHECK(zpse_decoder_init(&d, da, sizeof da - 1) == ZPSE_BAD_ARG, "dec short");
         CHECK(zpse_decoder_init(&d, da + 1, sizeof da - 1) == ZPSE_BAD_ARG, "dec misaligned");
         CHECK(zpse_decoder_init(&d, da, sizeof da) == 0, "dec ok");
         CHECK(d.recon == da + 0x1000 && d.comb == da + 0x41800, "dec carve");
+        CHECK(zpse_encoder_init(&e, ea, sizeof ea - 1) == ZPSE_BAD_ARG, "enc short");
         CHECK(zpse_encoder_init(&e, ea, sizeof ea) == 0, "enc ok");
         CHECK(e.best == ea + 0x31000 && e.hist == ea + 0x63800, "enc carve");
+        CHECK(e.comb == ea + 0x61800, "enc comb offset");
+        /* Combinadic scratch is 8 KiB of arena, not a global table: its region
+         * must stay clear of the neighbouring planes. Adjacent ends are fine
+         * (comb_end == shuf_start, o2_end == comb_start, comb_end == hist_start);
+         * an overlap is not. */
+        CHECK(d.comb + ZPSE_D_SZ_COMB <= d.shuf &&
+              d.recon + ZPSE_D_SZ_RECON <= d.comb,
+              "dec comb clear of recon/shuf");
+        CHECK(e.o2 + ZPSE_E_SZ_O2 <= e.comb &&
+              e.comb + ZPSE_E_SZ_COMB <= e.hist &&
+              e.comb + ZPSE_E_SZ_COMB <= e.lz,
+              "enc comb clear of o2/hist/lz");
         CHECK(!zpse_arena_is_aligned(NULL) && zpse_arena_is_aligned(da), "aligned?");
     }
 

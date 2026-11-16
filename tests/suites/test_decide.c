@@ -46,6 +46,66 @@ static uint8_t out[65536];
 
 static int fails = 0;
 
+/* The decoder and encoder each carve an 8 KiB "comb" scratch out of their
+ * arena for dense/tile exception buffers. It must be its own region: if it
+ * were aliased onto recon/out/shuf/lzbuf (or the encoder's hist/shuf/lz), a
+ * dense/tile exception pass would corrupt a plane being decoded. Both the
+ * struct layout and the carve offsets are public (arena.h), so pin them. */
+static int ranges_overlap(const uint8_t *a, size_t asz,
+                          const uint8_t *b, size_t bsz)
+{
+    uintptr_t x = (uintptr_t)a;
+    uintptr_t y = (uintptr_t)b;
+
+    return x < y + (uintptr_t)bsz && y < x + (uintptr_t)asz;
+}
+
+static void comb_arena(void)
+{
+    ZpseDecoder d;
+    ZpseEncoder e;
+
+    if (zpse_decoder_init(&d, dec_arena, sizeof dec_arena) != ZPSE_OK) {
+        printf("FAIL comb: decoder init\n");
+        fails++;
+        return;
+    }
+    if (d.comb == 0 || d.recon == 0 || d.out_stage == 0 ||
+        d.order1 == 0 || d.o2 == 0 || d.shuf == 0 || d.lzbuf == 0) {
+        printf("FAIL comb: decoder region is null\n");
+        fails++;
+    }
+    if (ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.recon, ZPSE_D_SZ_RECON) ||
+        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.out_stage, ZPSE_D_SZ_OUT) ||
+        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.order1, ZPSE_D_SZ_ORDER1) ||
+        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.o2, ZPSE_D_SZ_O2) ||
+        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.shuf, ZPSE_D_SZ_SHUF) ||
+        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.lzbuf, ZPSE_D_SZ_LZBUF)) {
+        printf("FAIL comb: decoder comb overlaps another region\n");
+        fails++;
+    }
+
+    if (zpse_encoder_init(&e, enc_arena, sizeof enc_arena) != ZPSE_OK) {
+        printf("FAIL comb: encoder init\n");
+        fails++;
+        return;
+    }
+    if (e.comb == 0 || e.input == 0 || e.order1 == 0 || e.o2 == 0 ||
+        e.hist == 0 || e.shuf == 0 || e.lz == 0) {
+        printf("FAIL comb: encoder region is null\n");
+        fails++;
+    }
+    if (ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.input, ZPSE_E_SZ_INPUT) ||
+        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.order1, ZPSE_E_SZ_ORDER1) ||
+        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.o2, ZPSE_E_SZ_O2) ||
+        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.hist, ZPSE_E_SZ_HIST) ||
+        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.shuf, ZPSE_E_SZ_SHUF) ||
+        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.lz, ZPSE_E_SZ_LZ)) {
+        printf("FAIL comb: encoder comb overlaps another region\n");
+        fails++;
+    }
+}
+
 static void check(const char *name, uint32_t n, uint32_t want)
 {
     uint32_t clen = 0;
@@ -79,6 +139,8 @@ static void check(const char *name, uint32_t n, uint32_t want)
 int main(void)
 {
     uint32_t i;
+
+    comb_arena();
 
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
