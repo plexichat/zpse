@@ -2627,8 +2627,6 @@ static int tile_check_modes(uint8_t mask_mode, uint8_t res_mode, uint16_t nt,
     } else {
         if (k < 1u || k >= nt)
             return ZPSE_BAD_MASK;
-        if (mask_mode == (uint8_t)ZPSE_M_ENUMERATIVE && nt < 2u)
-            return ZPSE_BAD_MASK;
     }
     return ZPSE_OK;
 }
@@ -2789,6 +2787,48 @@ ZPSE_HOT void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
 
     *mask_mode_out = best_m;
     *res_mode_out = best_r;
+}
+
+/* Exact record bytes the packer would write, from classification data alone.
+ * See tile.h. Kept here so the mask/residual length rules stay next to the
+ * mode chooser that selects them: the pricing probe calls this instead of
+ * packing a tile it will throw away. */
+uint32_t zpse_tile_record_len(const ZpseTileClass *cl, uint8_t predictor_id,
+                              uint16_t nt, uint8_t mask_mode, uint8_t res_mode)
+{
+    uint32_t n = (uint32_t)ZPSE_TILE_HEADER_SIZE +
+                 (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? 1u : 0u);
+    uint16_t k;
+
+    if (cl == 0)
+        return 0;
+    k = cl->k;
+    switch (mask_mode) {
+    case ZPSE_M_ALL_HIT:
+    case ZPSE_M_ALL_EXCEPTION:
+        /* Both constant masks have empty payloads (their count is proved
+         * against the header, not stored). */
+        break;
+    case ZPSE_M_RAW_BITMAP:
+        n += ((uint32_t)nt + 7u) >> 3;
+        break;
+    case ZPSE_M_SPARSE_U8:
+        n += (uint32_t)k;
+        break;
+    case ZPSE_M_RUNS:
+        /* One byte per run. We pass a limit no real tile can reach so the
+         * walk returns the exact count, not its early "cannot win" bound;
+         * the chooser already proved this mask is RUNS, so the count it used
+         * (with a smaller limit) was this exact value. */
+        n += tile_mask_runs_len(cl->words, nt, 0xFFFFu);
+        break;
+    default:
+        /* Not a mode the search produces (or an invalid one): no exact
+         * length. The caller's defensive fallback handles it. */
+        return 0;
+    }
+    n += tile_res_len(res_mode, cl, nt, k);
+    return n;
 }
 
 
@@ -4673,13 +4713,12 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
  * This is mask.c's ZPSE_M_RAW_BITMAP branch with the three cases that
  * cannot happen here removed, because it is the mask shape of every dense
  * tile (a palette or noise plane: ~118 exceptions in 256 positions, which
- * is why the encoder picks the 32-byte bitmap over RUNS and the
- * enumerative code). Payload length 32 is exactly eight whole
- * little-endian words, so there is nothing to zero first and no partial
- * final word; nt == 256 means no tail bits can be set, so the tail check
- * is gone; and the k check is the same popcount. The bytes and the
- * statuses returned are identical to zpse_mask_decode's for this mode,
- * which is what the scalar/SIMD parity suite and the mask sweep cover. */
+ * is why the encoder picks the 32-byte bitmap over RUNS). Payload length 32
+ * is exactly eight whole little-endian words, so there is nothing to zero
+ * first and no partial final word; nt == 256 means no tail bits can be set,
+ * so the tail check is gone; and the k check is the same popcount. The bytes
+ * and the statuses returned are identical to zpse_mask_decode's for this
+ * mode, which is what the scalar/SIMD parity suite and the mask sweep cover. */
 static int tile_mask_raw_bitmap_256(const uint8_t *payload, uint16_t k,
                                     uint32_t words[8])
 {
@@ -4706,46 +4745,37 @@ static int tile_mask_raw_bitmap_256(const uint8_t *payload, uint16_t k,
 }
 
 /* Resolve one predicted/residual stream in position order, family by
- * family, with the predictor dispatch hoisted out of the byte loop. */
-int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
-                     uint32_t record_len, uint8_t initial_literal,
-                     int tile_reset, const uint8_t *seg_base,
-                     uint32_t seg_pos, uint8_t *out, uint32_t out_cap,
-                     uint8_t *comb_scratch)
+ * family, with the predictor dispatch hoisted out of the byte loop.
+ *
+ * The header parse, size validation and record-size equation live in the
+ * validating zpse_tile_decode wrapper below. This body starts from an
+ * already-parsed header and derived (nt, k), so hostile streams keep using
+ * that wrapper. `th` is by value so the caller's header is never mutated.
+ *
+ * The scratch buffers are supplied by the caller, so this routine owns no
+ * large frame of its own; it is always-inlined into its caller. */
+ZPSE_ALWAYS_INLINE int tile_decode_core(
+                            ZpseLaneState *lanes, const uint8_t *record,
+                            struct ZpseTileHeader th, uint16_t nt, uint16_t k,
+                            uint8_t initial_literal, int tile_reset,
+                            const uint8_t *seg_base, uint32_t seg_pos,
+                            uint8_t *out, uint32_t out_cap,
+                            uint8_t *comb_scratch,
+                            uint32_t words[8], uint8_t *resid, int8_t *deltas)
 {
-    struct ZpseTileHeader th;
-    uint16_t nt = 0;
-    uint16_t k = 0;
     uint8_t mask_mode;
     uint8_t res_mode;
     uint8_t constant_C = 0;
     const uint8_t *mask_ptr;
     const uint8_t *res_ptr;
-    uint32_t words[8];
     uint32_t mw;
-    uint8_t resid[256];
-    int8_t deltas[256];
     uint16_t p;
     uint16_t j;
     int rc;
     int fresh;
     int fam;
 
-    if (lanes == 0 || record == 0 || out == 0)
-        return ZPSE_BAD_ARG;
-    rc = tile_parse_header(record, record_len, &th);
-    if (rc != ZPSE_OK)
-        return rc;
-    nt = (uint16_t)((uint32_t)th.tile_length_minus_1 + (uint32_t)1);
-    rc = zpse_tile_validate(&th, nt, record_len, &nt, &k);
-    if (rc != ZPSE_OK)
-        return rc;
-    /* record_len IS tile_record_size here, so the size equation is exact. */
-    if (tile_record_need(&th) != record_len)
-        return ZPSE_BAD_TILE_SIZE;
-    if ((uint32_t)nt > out_cap)
-        return ZPSE_OUTPUT_OVERFLOW;
-
+    (void)out_cap; /* bounded by the caller before this body is entered */
     mask_mode = zpse_tile_mask_mode(th.tile_flags);
     res_mode = zpse_tile_res_mode(th.tile_flags);
 
@@ -4783,6 +4813,143 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
                                out, nt);
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
         return (int)nt;
+    }
+
+    /* ---- Fast mode dispatch -------------------------------------- *
+     * Three (mask, residual) combinations cover most records the encoder
+     * writes. Each branch skips the generic mask decode, residual decode
+     * and family dispatch. A shape the branch cannot vouch for simply
+     * breaks out to the general path below, which returns exactly what the
+     * un-switched decode did -- so this is a pure fast path, not a
+     * different decoder. The switch is on the mask mode with the residual
+     * mode as the branch predicate: the combination is what decides which
+     * shortcut is legal. */
+    switch (mask_mode) {
+    case (uint8_t)ZPSE_M_ALL_HIT: {
+        /* No exceptions: no mask, no residual units, pure prediction.
+         * The payload-size guards matter for hostile streams: the generic
+         * mask/residual decoders reject a non-empty payload here (and
+         * SIGNED_DELTA rejects even an empty one), so anything but the
+         * canonical shape must keep their exact status. */
+        if (k == 0u && th.mask_payload_size == 0u &&
+            th.residual_payload_size == 0u &&
+            res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8) {
+            int f = tile_family(th.predictor_id);
+
+            if (f == TILE_FAM_CONST || f == TILE_FAM_STRIDE ||
+                (fresh && f != TILE_FAM_ORDER1 && f != TILE_FAM_ORDER2)) {
+                uint8_t ent_last[8];
+                uint8_t ent_second[8];
+
+                if (f == TILE_FAM_STRIDE) {
+                    uint32_t s = tile_stride_of(th.predictor_id);
+                    uint32_t filled = ((uint32_t)nt < s) ? (uint32_t)nt : s;
+
+                    for (p = 0; p < (uint16_t)filled; p++) {
+                        uint32_t abs_pos = seg_pos + (uint32_t)p;
+                        out[p] = (abs_pos < s) ? initial_literal
+                                               : seg_base[abs_pos - s];
+                    }
+                    while (filled < (uint32_t)nt) {
+                        uint32_t chunk = filled;
+                        if (chunk > (uint32_t)nt - filled)
+                            chunk = (uint32_t)nt - filled;
+                        memcpy(out + filled, out, chunk);
+                        filled += chunk;
+                    }
+                } else if (th.predictor_id == (uint8_t)ZPSE_P_CONST_ZERO) {
+                    memset(out, 0, nt);
+                } else if (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
+                    memset(out, constant_C, nt);
+                } else {
+                    /* FAM_LANEHIST: a freshly reset state is a fixed point. */
+                    memset(out, initial_literal, nt);
+                }
+                tile_capture_hist(lanes, ent_last, ent_second);
+                tile_history_fixup(lanes, out, nt, ent_last, ent_second);
+                return (int)nt;
+            }
+        }
+        break;
+    }
+    case (uint8_t)ZPSE_M_ALL_EXCEPTION: {
+        /* Every position is an exception. With RAW_ACTUAL the residual
+         * payload IS the output; for the stateless families and LANEHIST
+         * the end lane state is a function of those bytes alone, so the
+         * O(8) fixup reproduces it. ORDER1/ORDER2 update their tables per
+         * byte and keep the general path. */
+        if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL && k == nt &&
+            th.mask_payload_size == 0u && th.residual_payload_size == k) {
+            int f = tile_family(th.predictor_id);
+
+            if (f == TILE_FAM_CONST || f == TILE_FAM_STRIDE ||
+                f == TILE_FAM_LANEHIST) {
+                uint8_t ent_last[8];
+                uint8_t ent_second[8];
+
+                tile_capture_hist(lanes, ent_last, ent_second);
+                memcpy(out, res_ptr, (size_t)nt);
+                tile_history_fixup(lanes, out, nt, ent_last, ent_second);
+                return (int)nt;
+            }
+        }
+        break;
+    }
+    case (uint8_t)ZPSE_M_SPARSE_U8: {
+        /* Sparse exceptions listed as u8 positions, exclusion residuals:
+         * build the mask directly (no generic mask/residual decode) and
+         * let the constant family write the fill + scatter. Every other
+         * family keeps the general path. Any malformed shape falls through
+         * too, so the generic decoder still produces its exact status. */
+        if (res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8 && k > 0u &&
+            th.mask_payload_size == k && th.residual_payload_size == k) {
+            int f = tile_family(th.predictor_id);
+            uint16_t i;
+            uint16_t prev = 0;
+            int ok = 1;
+
+            zpse_mask_clear(words);
+            for (i = 0; i < k; i++) {
+                uint16_t v = mask_ptr[i];
+
+                if (v >= nt || (i > 0u && v <= prev) ||
+                    res_ptr[i] == 0xFFu) {
+                    ok = 0;
+                    break;
+                }
+                prev = v;
+                words[v >> 5u] |= (uint32_t)1u << (v & 31u);
+            }
+            if (ok && f == TILE_FAM_CONST) {
+                uint8_t c = (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
+                                ? constant_C : 0u;
+                uint8_t ent_last[8];
+                uint8_t ent_second[8];
+                uint16_t wi;
+                uint16_t jj = 0;
+
+                tile_capture_hist(lanes, ent_last, ent_second);
+                memset(out, c, nt);
+                for (wi = 0; wi < 8u && jj < k; wi++) {
+                    uint32_t w = words[wi];
+
+                    while (w != 0u) {
+                        uint16_t pos = (uint16_t)(wi * 32u +
+                                                 (uint32_t)tile_ctz32(w));
+                        out[pos] = zpse_exclusion_inverse(res_ptr[jj++], c);
+                        w &= w - 1u;
+                    }
+                }
+                tile_history_fixup(lanes, out, nt, ent_last, ent_second);
+                if (jj != k)
+                    return ZPSE_BAD_MASK;
+                return (int)nt;
+            }
+        }
+        break;
+    }
+    default:
+        break;
     }
 
     if (mask_mode == (uint8_t)ZPSE_M_RAW_BITMAP && nt == 256u &&
@@ -5166,3 +5333,51 @@ int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
         return ZPSE_BAD_MASK;
     return (int)nt;
 }
+
+/* Single-tile callers: own the scratch (once per call, as before). */
+static int tile_decode_body(ZpseLaneState *lanes, const uint8_t *record,
+                            struct ZpseTileHeader th, uint16_t nt, uint16_t k,
+                            uint8_t initial_literal, int tile_reset,
+                            const uint8_t *seg_base, uint32_t seg_pos,
+                            uint8_t *out, uint32_t out_cap,
+                            uint8_t *comb_scratch)
+{
+    uint32_t words[8];
+    uint8_t resid[256];
+    int8_t deltas[256];
+
+    return tile_decode_core(lanes, record, th, nt, k, initial_literal,
+                            tile_reset, seg_base, seg_pos, out, out_cap,
+                            comb_scratch, words, resid, deltas);
+}
+
+int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
+                     uint32_t record_len, uint8_t initial_literal,
+                     int tile_reset, const uint8_t *seg_base,
+                     uint32_t seg_pos, uint8_t *out, uint32_t out_cap,
+                     uint8_t *comb_scratch)
+{
+    struct ZpseTileHeader th;
+    uint16_t nt = 0;
+    uint16_t k = 0;
+    int rc;
+
+    if (lanes == 0 || record == 0 || out == 0)
+        return ZPSE_BAD_ARG;
+    rc = tile_parse_header(record, record_len, &th);
+    if (rc != ZPSE_OK)
+        return rc;
+    nt = (uint16_t)((uint32_t)th.tile_length_minus_1 + (uint32_t)1);
+    rc = zpse_tile_validate(&th, nt, record_len, &nt, &k);
+    if (rc != ZPSE_OK)
+        return rc;
+    /* record_len IS tile_record_size here, so the size equation is exact. */
+    if (tile_record_need(&th) != record_len)
+        return ZPSE_BAD_TILE_SIZE;
+    if ((uint32_t)nt > out_cap)
+        return ZPSE_OUTPUT_OVERFLOW;
+    return tile_decode_body(lanes, record, th, nt, k, initial_literal,
+                            tile_reset, seg_base, seg_pos, out, out_cap,
+                            comb_scratch);
+}
+

@@ -10,6 +10,8 @@
 #include "predictor.h"
 #include "types.h"
 
+/* A 4 KiB plane is 16 full 256-byte tiles. */
+
 #define ZPSE_TILE_FLAG_MASK_MODE_MASK  UINT8_C(0x07)
 #define ZPSE_TILE_FLAG_RES_MODE_SHIFT  3u
 #define ZPSE_TILE_FLAG_RES_MODE_MASK   UINT8_C(0x38)
@@ -44,8 +46,7 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
 /* Decode one tile's record (record points at the 8-B header, record_len
  * == tile_record_size). Appends Nt transformed bytes at out (capacity
  * checked). Updates lane state. seg_base/seg_pos back STRIDE predictors
- * (Sec. 7). Returns bytes of `out` produced (== Nt) or negative status.
- * comb_scratch: 8 KiB arena region for mode-5 masks. */
+ * (Sec. 7). Returns bytes of `out` produced (== Nt) or negative status. */
 int zpse_tile_decode(ZpseLaneState *lanes, const uint8_t *record,
                      uint32_t record_len, uint8_t initial_literal,
                      int tile_reset, const uint8_t *seg_base,
@@ -100,6 +101,18 @@ typedef struct ZpseTileClass {
  * classification, without encoding anything. */
 void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
                             uint8_t *mask_mode_out, uint8_t *res_mode_out);
+
+/* Exact record bytes zpse_tile_pack would write for this classification and
+ * this (predictor, mask_mode, res_mode) triple, computed purely from the
+ * classifier data -- no packing, no tile walk, no output buffer. This is the
+ * size the pricing probe needs, and it is byte-for-byte the value pack returns:
+ * 8-byte header, +1 for the predictor-9 constant byte, + mask payload
+ * (ALL_HIT/ALL_EXCEPTION 0, RAW_BITMAP ceil(nt/8), SPARSE_U8 k, RUNS the run
+ * count) + residual payload (tile_res_len). `mask_mode` must be one of the
+ * modes zpse_tile_choose_modes produces; any other mode (or a NULL cl)
+ * returns 0 so a caller can fall back to a real pack if it must. */
+uint32_t zpse_tile_record_len(const ZpseTileClass *cl, uint8_t predictor_id,
+                              uint16_t nt, uint8_t mask_mode, uint8_t res_mode);
 
   /* Predict + compare one tile against `actual`, filling cl and advancing
    * the lane state exactly as zpse_tile_decode will while decoding it.
