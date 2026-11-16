@@ -65,8 +65,10 @@
 
 /* Decode one dense record for one segment. `h` is the already-parsed
  * segment header; `payload`/`payload_len` are the segment payload
- * (header included). scratch must hold at least h->segment_decoded_size
- * bytes (the caller passes the 8 KiB combinadic region).
+ * (header included). scratch must hold at least ZPSE_DENSE_MAX_LEN (4096)
+ * bytes: the decoder chunks the plane into records of at most that size and
+ * uses scratch only for the current record's exceptions. segment.c supplies
+ * the 8 KiB comb region.
  * Returns ZPSE_OK, or the same class of status a tile record would:
  * ZPSE_BAD_TILE_SIZE, ZPSE_BAD_MASK, ZPSE_BAD_RESIDUAL,
  * ZPSE_UNSUPPORTED_FEATURE, ZPSE_OUTPUT_OVERFLOW.
@@ -74,7 +76,12 @@
  * On success *all_const is 1 iff every record reconstructed one byte value
  * end to end and all of them agreed on it, which is what the dense constant
  * form written for a one-value plane decodes to; *const_byte is that value
- * then. The block layer uses it to checksum such a plane arithmetically. */
+ * then. The block layer uses it to checksum such a plane arithmetically.
+ *
+ * The reconstruction kernels are bit-identical across the runtime AVX2
+ * dispatch and the scalar fallback (see test_parity.c). Defining
+ * ZPSE_DENSE_AVX2=0 at build time compiles the scalar-only decoder; the
+ * default is 1. Neither setting changes the format or any status. */
 int zpse_dense_decode(const ZpseSegmentHeader *h, const uint8_t *payload,
                       uint32_t payload_len, uint8_t *out, uint32_t out_cap,
                       uint32_t *out_len, uint8_t *scratch, int *all_const,
