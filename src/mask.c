@@ -1,11 +1,19 @@
 #include "zpse/mask.h"
-#include "zpse/combinadic.h"
+#include "zpse/hot.h"    /* ZPSE_AVX2_ABI_OK */
 #include "zpse/status.h"
+#include "zpse/vector.h" /* ZPSE_CPU_CAPS_FAST(): process-wide CPUID cache */
 
 #include <string.h>
 
 /* Unity-build safe: only static helpers plus the public API. No
- * allocation, no globals, C11. */
+ * allocation, no globals, C11. (The cached CPUID probes below use
+ * function-local statics only, exactly as vector.c and crc32c.c do.) */
+
+/* Master switch for the page-oriented fast paths. 0 restores the scalar
+ * decoders and the baseline SSE2 count on every build. */
+#ifndef ZPSE_MASK_FAST4K
+#define ZPSE_MASK_FAST4K 1u
+#endif
 
 static void zpse_mask_set_at(uint32_t words[8], uint16_t pos)
 {
@@ -62,9 +70,6 @@ static void zpse_mask_set_range(uint32_t words[8], uint32_t from,
     }
 }
 
-/* Population count on one dense word. The builtin is available on both
- * compilers this codebase targets through gcc/clang; the fallback keeps
- * the file buildable elsewhere without changing the result. */
 /* Index of the lowest set bit. Caller guarantees w != 0. */
 static unsigned zpse_mask_ctz32(uint32_t w)
 {
@@ -132,7 +137,6 @@ int zpse_mask_derive_k(uint8_t mask_mode, uint8_t exception_count,
     case ZPSE_M_SPARSE_U8:
     case ZPSE_M_SPARSE_GAPS:
     case ZPSE_M_RUNS:
-    case ZPSE_M_ENUMERATIVE:
         k = (uint16_t)exception_count;
         if (k < 1 || k > (uint16_t)(nt - 1u))
             return ZPSE_BAD_MASK;
@@ -160,53 +164,165 @@ int zpse_mask_test(const uint32_t words[8], uint16_t pos)
     return (int)((words[pos >> 5] >> (pos & 31u)) & 1u);
 }
 
-/* 256-bit population count in one pass, for the modes whose count has to
- * agree with the header on every tile (RAW_BITMAP decodes 32 payload bytes
- * and then has to prove they hold exactly k bits; eight SWAR popcounts
- * measured ~95 cycles of that tile's ~1125, which is why the dense path
- * gets a vectorised count). The bit-parallel fold needs only AND/ADD/SHIFT,
- * so SSE2 -- part of the x86-64 baseline -- is enough; SAD then sums the
- * four 64-bit lanes. Same per-function target structure as the other SIMD
- * helpers in this tree, and the scalar loop stays the fallback both when
- * the target is compiled out and when the CPU lacks the level. */
-#if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
-#define ZPSE_MASK_SIMD __attribute__((target("sse2")))
+/* ---- ISA gates -------------------------------------------------------- *
+ * SSE2 is the x86-64 baseline and needs no runtime check. AVX2 and POPCNT
+ * do. The per-function target attributes let this TU be built at the
+ * baseline ISA -- the same shape dense.c, tile.c and vector.c use.
+ * ZPSE_AVX2_ABI_OK keeps the 256-bit helpers out of builds whose ABI cannot
+ * pass a 32-byte vector (MinGW GCC on Windows); those fall back to the
+ * SSE2 count and the scalar decoders, which are bit-identical. */
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+    (defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
+#define ZPSE_MASK_HAVE_X86 1
 #define ZPSE_MASK_HAVE_SIMD 1
-#elif defined(_M_X64)
-#define ZPSE_MASK_SIMD
-#define ZPSE_MASK_HAVE_SIMD 1
+#define ZPSE_MASK_HAVE_POPCNT 1
+#if ZPSE_MASK_FAST4K
+#define ZPSE_MASK_HAVE_AVX2 ZPSE_AVX2_ABI_OK
 #else
-#define ZPSE_MASK_HAVE_SIMD 0
+#define ZPSE_MASK_HAVE_AVX2 0
+#endif
+#if defined(_MSC_VER)
+#define ZPSE_MASK_SIMD
+#define ZPSE_MASK_AVX2
+#define ZPSE_MASK_POPCNT
+#else
+#define ZPSE_MASK_SIMD   __attribute__((target("sse2")))
+#define ZPSE_MASK_AVX2   __attribute__((target("avx2")))
+#define ZPSE_MASK_POPCNT __attribute__((target("popcnt")))
 #endif
 #else
+#define ZPSE_MASK_HAVE_X86 0
 #define ZPSE_MASK_HAVE_SIMD 0
+#define ZPSE_MASK_HAVE_POPCNT 0
+#define ZPSE_MASK_HAVE_AVX2 0
 #endif
 
-#if !ZPSE_MASK_HAVE_SIMD
-/* Population count on one dense word. The builtin is available on both
- * compilers this codebase targets through gcc/clang; the fallback keeps
- * the file buildable elsewhere without changing the result. */
-static int zpse_mask_popcount32(uint32_t w)
+#if ZPSE_MASK_HAVE_SIMD
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#include <nmmintrin.h> /* _mm_popcnt_u32 */
+#include <stdatomic.h>
+#endif
+#include <emmintrin.h>
+#endif
+#if ZPSE_MASK_HAVE_AVX2
+#include <immintrin.h>
+#endif
+
+/* Branch-free SWAR popcount, kept as the fallback on every build. The
+ * builtin lowers to a libgcc call (__popcountdi2) unless the whole build is
+ * compiled with -mpopcnt, which this portable codebase is not. */
+static int zpse_mask_popcount32_swar(uint32_t w)
 {
-    /* Branch-free SWAR popcount. __builtin_popcount lowers to a libgcc
-     * call (__popcountdi2) unless the whole build is compiled with
-     * -mpopcnt, which this portable codebase is not. */
     w = w - ((w >> 1) & 0x55555555u);
     w = (w & 0x33333333u) + ((w >> 2) & 0x33333333u);
     w = (w + (w >> 4)) & 0x0F0F0F0Fu;
     return (int)((w * 0x01010101u) >> 24);
 }
+
+#if ZPSE_MASK_HAVE_POPCNT
+/* One-time CPUID probe, cached exactly like crc32c.c's SSE4.2 probe and
+ * vector.c's caps word: CPUID is serialising (microseconds under
+ * virtualisation) and a mask count happens once or twice per tile. The
+ * caps word is the first gate, so ZPSE_FORCE_SCALAR and non-x86 builds
+ * never issue the probe. Idempotent computation, relaxed atomics, no
+ * barrier on the hot path. */
+#if defined(_MSC_VER)
+static int zpse_mask_popcnt_cached = -1; /* -1 = not yet computed */
+static int zpse_mask_popcnt_get(void)
+{
+    return zpse_mask_popcnt_cached;
+}
+static void zpse_mask_popcnt_set(int v)
+{
+    zpse_mask_popcnt_cached = v;
+}
+#else
+static _Atomic int zpse_mask_popcnt_cached = -1;
+static int zpse_mask_popcnt_get(void)
+{
+    return atomic_load_explicit(&zpse_mask_popcnt_cached,
+                                memory_order_relaxed);
+}
+static void zpse_mask_popcnt_set(int v)
+{
+    atomic_store_explicit(&zpse_mask_popcnt_cached, v, memory_order_relaxed);
+}
 #endif
 
-#if ZPSE_MASK_HAVE_SIMD
-#include <emmintrin.h>
+static int zpse_mask_have_popcnt(void)
+{
+    int present = zpse_mask_popcnt_get();
 
+    if (present >= 0) {
+        return present;
+    }
+    if (ZPSE_CPU_CAPS_FAST() == 0u) {
+        present = 0;
+    } else {
+#if defined(_MSC_VER)
+        int info[4];
+
+        __cpuid(info, 1);
+        present = (info[2] >> 23) & 1; /* POPCNT: leaf 1, ECX bit 23 */
+#else
+        unsigned int a = 0;
+        unsigned int b = 0;
+        unsigned int c = 0;
+        unsigned int d = 0;
+
+        present = 0;
+        if (__get_cpuid(1, &a, &b, &c, &d)) {
+            present = (int)((c >> 23) & 1u);
+        }
+#endif
+    }
+    zpse_mask_popcnt_set(present);
+    return present;
+}
+
+static ZPSE_MASK_POPCNT int zpse_mask_popcount32_hw(uint32_t w)
+{
+    return (int)_mm_popcnt_u32(w);
+}
+
+/* Eight words with the dispatch hoisted out of the loop: the cached answer
+ * is read once, not once per word. */
+static ZPSE_MASK_POPCNT int zpse_mask_popcount256_hw(const uint32_t words[8])
+{
+    return zpse_mask_popcount32_hw(words[0]) +
+           zpse_mask_popcount32_hw(words[1]) +
+           zpse_mask_popcount32_hw(words[2]) +
+           zpse_mask_popcount32_hw(words[3]) +
+           zpse_mask_popcount32_hw(words[4]) +
+           zpse_mask_popcount32_hw(words[5]) +
+           zpse_mask_popcount32_hw(words[6]) +
+           zpse_mask_popcount32_hw(words[7]);
+}
+#endif /* ZPSE_MASK_HAVE_POPCNT */
+
+/* Runtime-dispatched count of one dense word: hardware POPCNT when CPUID
+ * says it is there, the SWAR fold otherwise (all non-x86 builds). */
+static int zpse_mask_popcount32(uint32_t w)
+{
+#if ZPSE_MASK_HAVE_POPCNT
+    if (zpse_mask_have_popcnt()) {
+        return zpse_mask_popcount32_hw(w);
+    }
+#endif
+    return zpse_mask_popcount32_swar(w);
+}
+
+#if ZPSE_MASK_HAVE_SIMD
 /* Count of the one bits in one 16-byte half. Straight-line on purpose:
  * the same fold written as a four-iteration loop was miscompiled by the
  * MinGW GCC used for the Windows builds -- it summed stale lanes and
  * returned 20..26 bits for a mask holding one -- while this unrolled form
- * is exactly what the scalar count says. Two halves per call, no loop. */
+ * is exactly what the scalar count says. Two halves per call, no loop.
+ * Kept as the fallback for CPUs without POPCNT; the bit-parallel fold needs
+ * only AND/ADD/SHIFT, so SSE2 is enough. */
 static ZPSE_MASK_SIMD int zpse_mask_popcount16_sse2(__m128i v)
 {
     const __m128i m1 = _mm_set1_epi8((char)0x55);
@@ -234,75 +350,318 @@ static ZPSE_MASK_SIMD int zpse_mask_popcount256_sse2(const uint32_t words[8])
 }
 #endif /* ZPSE_MASK_HAVE_SIMD */
 
-int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
+/* 256-bit count, one cached dispatch for the whole mask: hardware POPCNT
+ * where CPUID says it exists, the baseline SSE2 fold next, and the scalar
+ * word loop (through the runtime-dispatched one-word count) elsewhere. */
+static int zpse_mask_popcount256(const uint32_t words[8])
 {
-    if (words == 0 || nt == 0)
-        return 0;
-    if (nt > 256)
-        nt = 256;
-#if ZPSE_MASK_HAVE_SIMD
-    /* A full 256-position mask needs no trimming, so the copy, the
-     * zero-fill and the final AND below are all no-ops for it -- and a full
-     * tile is what every dense shape has. Counting the caller's words
-     * directly is one 32-byte read instead of a read, a copy and two
-     * writes; this runs once per packed tile (the encoder re-checks the
-     * count it is about to size the mask from). */
-    if (nt == 256u)
-        return zpse_mask_popcount256_sse2(words);
-    {
-        /* Trim the bits at or above nt in a local copy (the caller's
-         * array is read-only here), then one vector pass counts the lot:
-         * a short final tile costs a 32-byte copy, not eight SWAR
-         * popcounts. SSE2 is part of the x86-64 baseline, so no runtime
-         * capability check is needed -- the compile-time test above is the
-         * only gate. */
-        uint32_t w[8];
-        uint16_t last = (uint16_t)((nt - 1u) >> 5);
-        uint32_t keep = (uint32_t)(((uint64_t)1u << (((nt - 1u) & 31u) + 1u))
-                                   - 1u);
-        int k;
-
-        memcpy(w, words, sizeof w);
-        for (k = (int)last + 1; k < 8; k++)
-            w[k] = 0u;
-        w[last] &= keep;
-        return zpse_mask_popcount256_sse2(w);
+#if ZPSE_MASK_HAVE_POPCNT
+    if (zpse_mask_have_popcnt()) {
+        return zpse_mask_popcount256_hw(words);
     }
+#endif
+#if ZPSE_MASK_HAVE_SIMD
+    /* The single-word dispatcher is the fallback on builds without this
+     * fold; keep it live here so -Wunused-function stays quiet. */
+    (void)zpse_mask_popcount32;
+    return zpse_mask_popcount256_sse2(words);
 #else
-    /* The scalar reference: eight SWAR popcounts, the fallback for a build
-     * without the SSE2 kernels. */
     {
         int n = 0;
         int i;
 
-        for (i = 0; i < 8; i++) {
-            uint32_t w = words[i];
-            uint16_t base = (uint16_t)(i * 32);
-            uint32_t m;
-
-            if (base >= nt) {
-                break;
-            } else if (nt - base < 32) {
-                m = (uint32_t)(((uint64_t)1u << (nt - base)) - 1u);
-                w &= m;
-            }
-            n += zpse_mask_popcount32(w);
-        }
+        for (i = 0; i < 8; i++)
+            n += zpse_mask_popcount32(words[i]);
         return n;
     }
 #endif
 }
 
+int zpse_mask_count_bits(const uint32_t words[8], uint16_t nt)
+{
+    uint32_t w[8];
+    const uint32_t *src = words;
+
+    if (words == 0 || nt == 0)
+        return 0;
+    if (nt > 256)
+        nt = 256;
+    /* A full 256-position mask needs no trimming, so the copy, the zero-fill
+     * and the final AND are all no-ops for it -- and a full tile is what
+     * every dense shape has. Counting the caller's words directly is one
+     * 32-byte read instead of a read, a copy and two writes. */
+    if (nt != 256u) {
+        /* Trim the bits at or above nt in a local copy (the caller's array
+         * is read-only here). The same bits were ignored by the old scalar
+         * loop's per-word mask. */
+        uint16_t last = (uint16_t)((nt - 1u) >> 5);
+        uint32_t keep = (uint32_t)(((uint64_t)1u << (((nt - 1u) & 31u) + 1u))
+                                   - 1u);
+        int ki;
+
+        memcpy(w, words, sizeof w);
+        for (ki = (int)last + 1; ki < 8; ki++)
+            w[ki] = 0u;
+        w[last] &= keep;
+        src = w;
+    }
+    return zpse_mask_popcount256(src);
+}
+
+/* The two scalar decoders are also the error-path reference for their AVX2
+ * twins. A rejected payload leaves partially built words behind; callers
+ * discard them, but replaying the scalar walk from a clean mask on rejection
+ * keeps the two paths bit-identical even there. */
+static int zpse_mask_sparse_u8_scalar(uint32_t words[8], const uint8_t *payload,
+                                      uint16_t k, uint16_t nt)
+{
+    uint16_t prev = 0;
+    uint16_t j;
+
+    for (j = 0; j < k; j++) {
+        uint16_t v = payload[j];
+
+        if (v >= nt || (j > 0u && v <= prev))
+            return ZPSE_BAD_MASK;
+        prev = v;
+        zpse_mask_set_at(words, v);
+    }
+    return ZPSE_OK;
+}
+
+static int zpse_mask_runs_scalar(uint32_t words[8], const uint8_t *payload,
+                                 uint16_t payload_len, uint16_t nt, uint16_t k)
+{
+    uint32_t sum = 0u;
+    uint32_t miss = 0u;
+    uint32_t pos = 0u;
+    uint16_t r;
+
+    for (r = 0; r < payload_len; r++) {
+        uint32_t len = payload[r];
+
+        sum += len;
+        if (sum > nt)
+            return ZPSE_BAD_MASK;
+        if (r & 1u) {
+            miss += len;
+            if (miss > k)
+                return ZPSE_BAD_MASK;
+            zpse_mask_set_range(words, pos, len);
+        }
+        pos += len;
+    }
+    if (sum != nt || miss != k)
+        return ZPSE_BAD_MASK;
+    return ZPSE_OK;
+}
+
+/* ---- AVX2 mask decoders ------------------------------------------------ *
+ * Every helper below is bit-exact to the scalar branch it replaces: same
+ * words, same ZPSE_BAD_MASK decisions. They are called only when the cached
+ * CPU caps say AVX2 is present, and every one has a scalar fall-through in
+ * zpse_mask_decode for the other builds and CPUs. */
+#if ZPSE_MASK_HAVE_AVX2
+
+/* The clear at the top of every mask decode: eight scalar stores -> one. */
+static ZPSE_MASK_AVX2 void zpse_mask_clear_avx2(uint32_t words[8])
+{
+    _mm256_storeu_si256((__m256i *)(void *)words, _mm256_setzero_si256());
+}
+
+/* ALL_EXCEPTION: words = bits [0, nt). words[] is already zero. One masked
+ * store writes whole words for the 32-position blocks below nt; only the
+ * partial final word needs a scalar AND. */
+static ZPSE_MASK_AVX2 void zpse_mask_all_exception_avx2(uint32_t words[8],
+                                                        uint16_t nt)
+{
+    const __m256i idx = _mm256_setr_epi32(0, 32, 64, 96, 128, 160, 192, 224);
+    const __m256i ntv = _mm256_set1_epi32((int)nt);
+    const __m256i ones = _mm256_set1_epi32(-1);
+    const __m256i have = _mm256_cmpgt_epi32(ntv, idx); /* lane base < nt */
+
+    _mm256_maskstore_epi32((int *)(void *)words, have, ones);
+    if ((nt & 31u) != 0u) {
+        uint16_t last = (uint16_t)((nt - 1u) >> 5u);
+
+        words[last] &= (uint32_t)((UINT64_C(1) << (nt & 31u)) - 1u);
+    }
+}
+
+/* RAW_BITMAP, whole payload: one 32-byte load and store. Only called when
+ * need == 32 (nt in 249..256), so it never reads past the payload. On
+ * little-endian hosts this is the same byte-for-byte copy memcpy makes. */
+static ZPSE_MASK_AVX2 void zpse_mask_bitmap_copy_avx2(
+    uint32_t words[8], const uint8_t *payload)
+{
+    __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)payload);
+
+    _mm256_storeu_si256((__m256i *)(void *)words, v);
+}
+
+/* SPARSE_U8 for k >= 8. The eight ascending positions in a chunk are
+ * validated with two compares (range, order) instead of one branch per
+ * byte; one variable-shift vector builds the eight bit masks in parallel.
+ * The stores into words stay scalar -- AVX2 has no scatter -- but positions
+ * are ascending, so consecutive lanes hit the same or the next word. */
+static ZPSE_MASK_AVX2 int zpse_mask_sparse_u8_avx2(
+    uint32_t words[8], const uint8_t *payload, uint16_t k, uint16_t nt)
+{
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i ntv = _mm256_set1_epi32((int)nt);
+    const __m256i mask31 = _mm256_set1_epi32(31);
+    /* Lane 7 compares against itself (false); it is checked against the
+     * first byte of the next chunk by the cross-chunk test below. */
+    const __m256i next_lane = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7);
+    uint32_t bits[8];
+    uint16_t prev = 0;
+    uint16_t j = 0;
+    int i;
+
+    for (; (uint16_t)(j + 8u) <= k; j = (uint16_t)(j + 8u)) {
+        __m256i v = _mm256_cvtepu8_epi32(
+            _mm_loadl_epi64((const __m128i *)(const void *)(payload + j)));
+        __m256i nxt = _mm256_permutevar8x32_epi32(v, next_lane);
+        __m256i range_ok = _mm256_cmpgt_epi32(ntv, v);  /* v < nt */
+        __m256i order_ok = _mm256_cmpgt_epi32(nxt, v);  /* v[i] < v[i+1] */
+        unsigned good;
+
+        if ((uint32_t)_mm256_movemask_epi8(range_ok) != 0xFFFFFFFFu)
+            goto reject;
+        good = (unsigned)_mm256_movemask_epi8(order_ok) & 0x0FFFFFFFu;
+        if (good != 0x0FFFFFFFu || (j > 0u && (uint16_t)payload[j] <= prev))
+            goto reject;
+
+        _mm256_storeu_si256(
+            (__m256i *)(void *)bits,
+            _mm256_sllv_epi32(one, _mm256_and_si256(v, mask31)));
+        for (i = 0; i < 8; i++)
+            words[payload[j + (uint16_t)i] >> 5u] |= bits[i];
+        prev = payload[j + 7u];
+    }
+    /* Tail (0..7 positions) and the cross-chunk order check, scalar. */
+    for (; j < k; j++) {
+        uint16_t v = payload[j];
+
+        if (v >= nt || (j > 0u && v <= prev))
+            goto reject;
+        prev = v;
+        words[v >> 5u] |= (uint32_t)1u << (v & 31u);
+    }
+    return ZPSE_OK;
+
+reject:
+    /* Malformed stream: replay the scalar walk so even the partial words it
+     * leaves behind are the ones the scalar decoder would have produced. */
+    zpse_mask_clear(words);
+    return zpse_mask_sparse_u8_scalar(words, payload, k, nt);
+}
+
+/* RUNS for payload_len >= 8. The eight run lengths are prefix-summed in
+ * one vector (three shuffles plus one cross-lane add), which removes the
+ * serial pos += len chain; the miss-run lengths are prefix-summed the same
+ * way for the k check. Both totals are non-decreasing, so their last lanes
+ * are the running maxima and one test each replaces a branch per run. */
+static ZPSE_MASK_AVX2 int zpse_mask_runs_avx2(
+    uint32_t words[8], const uint8_t *payload, uint16_t payload_len,
+    uint16_t nt, uint16_t k)
+{
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i odd = _mm256_setr_epi32(0, -1, 0, -1, 0, -1, 0, -1);
+    uint32_t base = 0u; /* lengths of all runs so far */
+    uint32_t miss = 0u; /* lengths of the miss (odd) runs so far */
+    unsigned r = 0u;
+
+    for (; r + 8u <= (unsigned)payload_len; r += 8u) {
+        __m256i lens = _mm256_cvtepu8_epi32(
+            _mm_loadl_epi64((const __m128i *)(const void *)(payload + r)));
+        __m256i s;
+        __m256i ml;
+        __m256i carry;
+        uint32_t pos[8];
+        uint32_t mp[8];
+        unsigned i;
+
+        s = _mm256_add_epi32(lens, _mm256_slli_si256(lens, 4));
+        s = _mm256_add_epi32(s, _mm256_slli_si256(s, 8));
+        carry = _mm256_shuffle_epi32(s, _MM_SHUFFLE(3, 3, 3, 3));
+        s = _mm256_add_epi32(s, _mm256_permute2x128_si256(zero, carry, 0x20));
+
+        ml = _mm256_and_si256(lens, odd);
+        ml = _mm256_add_epi32(ml, _mm256_slli_si256(ml, 4));
+        ml = _mm256_add_epi32(ml, _mm256_slli_si256(ml, 8));
+        carry = _mm256_shuffle_epi32(ml, _MM_SHUFFLE(3, 3, 3, 3));
+        ml = _mm256_add_epi32(ml, _mm256_permute2x128_si256(zero, carry, 0x20));
+
+        s = _mm256_add_epi32(s, _mm256_set1_epi32((int)base));
+        ml = _mm256_add_epi32(ml, _mm256_set1_epi32((int)miss));
+        _mm256_storeu_si256((__m256i *)(void *)pos, s);
+        _mm256_storeu_si256((__m256i *)(void *)mp, ml);
+
+        if (pos[7] > (uint32_t)nt || mp[7] > (uint32_t)k)
+            goto reject;
+
+        for (i = 0u; i < 8u; i++) {
+            uint32_t from = (i == 0u) ? base : pos[i - 1u];
+
+            if (((r + i) & 1u) != 0u && pos[i] > from)
+                zpse_mask_set_range(words, from, pos[i] - from);
+        }
+        base = pos[7];
+        miss = mp[7];
+    }
+
+    /* Tail runs, same checks and same order as the scalar decoder. */
+    for (; r < (unsigned)payload_len; r++) {
+        uint32_t len = payload[r];
+
+        base += len;
+        if (base > (uint32_t)nt)
+            goto reject;
+        if ((r & 1u) != 0u) {
+            miss += len;
+            if (miss > (uint32_t)k)
+                goto reject;
+            zpse_mask_set_range(words, base - len, len);
+        }
+    }
+    if (base != (uint32_t)nt || miss != (uint32_t)k)
+        goto reject;
+    return ZPSE_OK;
+
+reject:
+    zpse_mask_clear(words);
+    return zpse_mask_runs_scalar(words, payload, payload_len, nt, k);
+}
+
+#endif /* ZPSE_MASK_HAVE_AVX2 */
+
 int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
                      uint16_t payload_len, uint16_t nt, uint16_t k,
                      uint32_t words[8], uint8_t *comb_scratch)
 {
-    int i;
+    (void)comb_scratch; /* kept in the signature; only mode 5 ever used it */
+#if ZPSE_MASK_HAVE_AVX2
+    int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u;
+#endif
 
     if (words == 0)
         return ZPSE_BAD_ARG;
-    for (i = 0; i < 8; i++)
-        words[i] = 0;
+#if ZPSE_MASK_HAVE_AVX2
+    if (have_avx2) {
+        zpse_mask_clear_avx2(words);
+    } else {
+        int i;
+        for (i = 0; i < 8; i++)
+            words[i] = 0;
+    }
+#else
+    {
+        int i;
+        for (i = 0; i < 8; i++)
+            words[i] = 0;
+    }
+#endif
     if (!zpse_mask_nt_ok(nt))
         return ZPSE_BAD_MASK;
     if (payload_len > 0 && payload == 0)
@@ -319,6 +678,12 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
         /* Every position is an exception, so the mask is [0, nt) as one
          * run: a word at a time instead of nt load-OR-store rounds on the
          * same eight words, each waiting on the store before it. */
+#if ZPSE_MASK_HAVE_AVX2
+        if (have_avx2) {
+            zpse_mask_all_exception_avx2(words, nt);
+            return ZPSE_OK;
+        }
+#endif
         zpse_mask_set_range(words, 0u, nt);
         return ZPSE_OK;
     case ZPSE_M_RAW_BITMAP: {
@@ -347,7 +712,18 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
          * `need` stay zero from the clear above either way. */
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
     __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if ZPSE_MASK_HAVE_AVX2
+        /* A full 32-byte bitmap is exactly eight words. One vector load
+         * and store; need < 32 keeps the memcpy so no byte past the payload
+         * is ever read. */
+        if (have_avx2 && need == 32u) {
+            zpse_mask_bitmap_copy_avx2(words, payload);
+        } else {
+            memcpy(words, payload, (size_t)need);
+        }
+#else
         memcpy(words, payload, (size_t)need);
+#endif
         (void)byte_i;
 #else
         for (byte_i = 0; byte_i + 4u <= (unsigned)need; byte_i += 4u) {
@@ -371,35 +747,22 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
             return ZPSE_BAD_MASK;
         return ZPSE_OK;
     }
-    case ZPSE_M_SPARSE_U8: {
-        uint16_t j;
-
+    case ZPSE_M_SPARSE_U8:
         if (k < 1 || k > (uint16_t)(nt - 1u))
             return ZPSE_BAD_MASK;
         if (payload_len != k)
             return ZPSE_BAD_MASK;
-        {
-            /* The ascending-order test compares against the previous
-             * decoded position. Keeping it in a local removes the reload
-             * of payload[j - 1] per iteration and cannot change any
-             * decision: the loop has already returned unless every
-             * earlier byte was < nt <= 256, so the local holds exactly
-             * the byte the reload would have produced. */
-            uint16_t prev = 0;
-
-            for (j = 0; j < k; j++) {
-                uint16_t v = payload[j];
-
-                if (v >= nt)
-                    return ZPSE_BAD_MASK;
-                if (j > 0 && v <= prev)
-                    return ZPSE_BAD_MASK;
-                prev = v;
-                zpse_mask_set_at(words, v);
-            }
-        }
-        return ZPSE_OK;
-    }
+#if ZPSE_MASK_HAVE_AVX2
+        /* For a short exception list the scalar loop is cheaper than the
+         * vector setup; from eight positions the batched validation and
+         * variable shifts pay for themselves. */
+        if (have_avx2 && k >= 8u)
+            return zpse_mask_sparse_u8_avx2(words, payload, k, nt);
+#endif
+        /* The ascending-order test compares against the previous decoded
+         * position; zpse_mask_sparse_u8_scalar keeps that byte in a local
+         * instead of reloading payload[j - 1] each iteration. */
+        return zpse_mask_sparse_u8_scalar(words, payload, k, nt);
     case ZPSE_M_SPARSE_GAPS: {
         uint8_t flag;
         uint16_t need;
@@ -435,41 +798,16 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
         }
         return ZPSE_OK;
     }
-    case ZPSE_M_RUNS: {
-        uint32_t sum = 0;
-        uint32_t miss = 0;
-        uint32_t pos = 0;
-        uint16_t r;
-
+    case ZPSE_M_RUNS:
         if (k < 1 || k > (uint16_t)(nt - 1u))
             return ZPSE_BAD_MASK;
         if (payload_len < 2)
             return ZPSE_BAD_MASK;
-        for (r = 0; r < payload_len; r++) {
-            uint32_t len = payload[r];
-
-            sum += len;
-            if (sum > nt)
-                return ZPSE_BAD_MASK;
-            if (r & 1u) {
-                miss += len;
-                if (miss > k)
-                    return ZPSE_BAD_MASK;
-                zpse_mask_set_range(words, pos, len);
-            }
-            pos += len;
-        }
-        if (sum != nt || miss != k)
-            return ZPSE_BAD_MASK;
-        return ZPSE_OK;
-    }
-    case ZPSE_M_ENUMERATIVE:
-        if (k < 1 || k > (uint16_t)(nt - 1u))
-            return ZPSE_BAD_MASK;
-        if (payload_len == 0)
-            return ZPSE_BAD_MASK;
-        return zpse_comb_unrank(nt, k, payload, payload_len, words,
-                               comb_scratch);
+#if ZPSE_MASK_HAVE_AVX2
+        if (have_avx2 && payload_len >= 8u)
+            return zpse_mask_runs_avx2(words, payload, payload_len, nt, k);
+#endif
+        return zpse_mask_runs_scalar(words, payload, payload_len, nt, k);
     default:
         return ZPSE_BAD_MASK;
     }
@@ -723,13 +1061,6 @@ int zpse_mask_encode(uint8_t mask_mode, const uint32_t words[8],
         }
         return (int)o;
     }
-    case ZPSE_M_ENUMERATIVE:
-        if (k < 1 || k > (uint16_t)(nt - 1u))
-            return ZPSE_BAD_MASK;
-        nc = zpse_mask_collect(words, nt, c);
-        if (nc != k)
-            return ZPSE_BAD_MASK;
-        return zpse_comb_rank_to_bytes(c, k, nt, payload_out, payload_cap);
     default:
         break;
     }

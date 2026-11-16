@@ -3,8 +3,7 @@
 
 /* Exception masks. Positions are ascending zero-based
  * byte indices within the tile. Dense output is a 256-bit bitmask as
- * 8x u32 words (bit p = word[p>>5] >> (p&31) & 1), matching the
- * combinadic reference decoder. */
+ * 8x u32 words (bit p = word[p>>5] >> (p&31) & 1). */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -15,7 +14,7 @@ typedef enum ZpseMaskMode {
     ZPSE_M_SPARSE_U8  = 2,
     ZPSE_M_SPARSE_GAPS = 3,
     ZPSE_M_RUNS       = 4,
-    ZPSE_M_ENUMERATIVE = 5,
+    /* 5 was ZPSE_M_ENUMERATIVE (removed); value retired, not reused. */
     ZPSE_M_ALL_EXCEPTION = 6,
     /* No exception mask at all: the tile's payload is the tile itself with
      * the eighth bit of every byte dropped (Sec. 6.2, mode 7). Only a tile
@@ -37,8 +36,7 @@ int zpse_mask_derive_k(uint8_t mask_mode, uint8_t exception_count,
 
 /* Decode a mask payload into dense words[8] (zeroed by caller).
  * payload_len MUST equal the tile's mask_payload_size; nt/K already
- * validated. comb_scratch is the 8 KiB arena region (only mode 5 uses
- * it; may be NULL otherwise). */
+ * validated. comb_scratch is retained for API compatibility and is unused. */
 int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
                      uint16_t payload_len, uint16_t nt, uint16_t k,
                      uint32_t words[8], uint8_t *comb_scratch);
