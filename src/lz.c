@@ -24,6 +24,11 @@
  * is not a legitimate entry. */
 #define LZ_EMPTY 0xFFFFu
 
+/* Hash slot access: one uint16_t array of caller-owned scratch, cleared per
+ * call. LZ_EMPTY is the marker for a slot that holds no position. */
+#define LZ_TAB_GET(h) ((tab)[(h)])
+#define LZ_TAB_SET(h, v) do { (tab)[(h)] = (uint16_t)(v); } while (0)
+
 static uint32_t lz_hash(uint32_t v, uint32_t hash_bits)
 {
     /* One multiply of the first four bytes at the cursor, top bits kept:
@@ -405,15 +410,23 @@ ZPSE_HOT uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 #define ZPSE_LZ_PIPE_NEXT 1
 #endif
 
-ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
-                                    uint8_t *dst, uint32_t cap, void *table,
-                                    uint32_t hash_bits, uint32_t lazy_max)
+/* The one finder body behind every encode entry point. `sample_n == 0` is a
+ * full pass (the original clear); a nonzero `sample_n` prices a sample of that
+ * many bytes and clears only the slots a position in [0,sample_n) can hash to.
+ * The two paths share every decision and store, so their streams are the same. */
+static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
+                               uint32_t cap, void *table, uint32_t hash_bits,
+                               uint32_t lazy_max, uint32_t sample_n)
 {
     uint16_t *tab = (uint16_t *)table;
     LzOut o;
     uint32_t pos, anchor, misses;
     uint32_t cur, h, cand;
-    uint32_t entries = 1u << hash_bits;
+    /* hb is the width every hash in this pass uses: the clear, the finder
+     * and the lazy probes all read it. It is the width the caller asked for;
+     * every stream is the one the caller asked for. */
+    uint32_t hb = hash_bits;
+    uint32_t entries = 1u << hb;
 
     if (in == 0 || dst == 0 || tab == 0) {
         return 0u;
@@ -426,14 +439,37 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
     if (cap < ZPSE_LZ_MIN_PAYLOAD) {
         return 0u;
     }
-    /* The loop this replaces was one 16-bit store per iteration, and at -O2
-     * gcc does not vectorise it: 8192 iterations of store, increment, compare
-     * and branch, per block, on a table whose only purpose at that moment is
-     * to be overwritten. The table is 16 KiB and the pass around it reads it
-     * constantly, so the clear is paid every block of every file. LZ_EMPTY is
-     * 0xFFFF and the table is uint16_t, so all-ones bytes are exactly the
-     * empty marker. */
-    memset(tab, 0xFF, (size_t)entries * sizeof *tab);
+#if (ZPSE_LZ_LAZY_LEN == 0)
+    (void)lazy_max;
+#endif
+    /* The full clear was a 16 KiB memset per call: at -O2 gcc does not
+     * vectorise the 16-bit fill loop, and a screen used to pay it to look at
+     * 512 bytes. A SAMPLE call (sample_n != 0) only ever reads a slot named
+     * by the 4-byte key at a position in [0, sample_n), so it clears just
+     * those slots instead: the hash is a key hash, not a position hash, so
+     * the set is found by running the very same hash over every key in the
+     * sample; accelerator-skipped positions only make the clear a superset.
+     * The one-byte-ahead eight-byte probe uses ZPSE_LZ_HASH_BITS_FAST, so
+     * those slots are cleared as well. No decision changes.
+     *
+     * LZ_EMPTY is 0xFFFF and the table is uint16_t, so all-ones bytes are
+     * exactly the empty marker. */
+    {
+        uint32_t ce = (sample_n != 0u && sample_n < n) ? sample_n : n;
+
+        if (sample_n == 0u) {
+            memset(tab, 0xFF, (size_t)entries * sizeof *tab);
+        } else if (ce >= ZPSE_LZ_MIN_MATCH) {
+            uint32_t p;
+
+            for (p = 0u; p + ZPSE_LZ_MIN_MATCH <= ce; p++) {
+                uint32_t k = zpse_load_u32le(in + p);
+
+                LZ_TAB_SET(lz_hash(k, hb), LZ_EMPTY);
+                LZ_TAB_SET(lz_hash(k, ZPSE_LZ_HASH_BITS_FAST), LZ_EMPTY);
+            }
+        }
+    }
     o.dst = dst;
     o.cap = cap;
     o.pos = (uint32_t)LZ_HDR;
@@ -470,11 +506,11 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
      * the shootout's own generators): 1.03x geomean, `zeros_burst` 1.10x and
      * `sparse_mix` 1.09x, where a walk is most of the pass. */
     cur = zpse_load_u32le(in + pos);
-    h = lz_hash(cur, hash_bits);
+    h = lz_hash(cur, hb);
     /* The candidate at the cursor, carried across iterations: the entry the
      * top of the loop reads is the one the previous iteration or the miss
      * path already loaded (see ZPSE_LZ_PIPE_NEXT). */
-    cand = tab[h];
+    cand = LZ_TAB_GET(h);
 
     while (pos + ZPSE_LZ_MIN_MATCH <= n) {
         uint32_t len;
@@ -483,7 +519,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
         uint16_t nxt_cand = LZ_EMPTY;
 #endif
 
-        tab[h] = (uint16_t)pos;
+        LZ_TAB_SET(h, pos);
 #if ZPSE_LZ_PIPE_NEXT
         /* The key and the slot for pos + 1, read BEFORE the candidate at the
          * cursor is tested.
@@ -503,8 +539,8 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
          * way. Everything else the next iteration reads is unchanged. */
         if (pos + 1u + ZPSE_LZ_MIN_MATCH <= n) {
             nxt_cur = zpse_load_u32le(in + pos + 1u);
-            nxt_h = lz_hash(nxt_cur, hash_bits);
-            nxt_cand = tab[nxt_h];
+            nxt_h = lz_hash(nxt_cur, hb);
+            nxt_cand = LZ_TAB_GET(nxt_h);
             nxt_ok = 1u;
         }
 #endif
@@ -542,6 +578,37 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
              * miss until thirty-two in a row make it accelerate, and the
              * iteration has already read that position's key and slot. */
             if (nxt_ok != 0u && (misses >> 5) == 0u) {
+#if ZPSE_LZ_FAST4K
+                /* Two consecutive misses in one iteration. `nxt_cand` is the
+                 * pos+1 slot as it stood after this iteration's top-of-loop
+                 * store; LZ_EMPTY is a value no position can take, so an
+                 * empty slot is a miss without loading the word it names.
+                 * Reading pos+2's key and slot here, after committing the
+                 * store the skipped iteration would have made at its top,
+                 * gives exactly the entry that iteration would have used --
+                 * reading it at the top of this one would return the stale
+                 * value when pos+1 and pos+2 share a slot. `misses < 31` is
+                 * the single step's limit applied twice: at 31 its second
+                 * step takes the accelerating path instead.
+                 *
+                 * Doing this work only on the miss path matters: fetching
+                 * pos+2's key and hash on every position cost 4-16% on the
+                 * miss-heavy rows of the 4 KiB bench, while fetching it here
+                 * is a wash-to-7% win on all twelve. */
+                if (pos + 2u + ZPSE_LZ_MIN_MATCH <= n && misses < 31u &&
+                    nxt_cand == LZ_EMPTY) {
+                    uint32_t c2 = zpse_load_u32le(in + pos + 2u);
+                    uint32_t h2 = lz_hash(c2, hb);
+
+                    LZ_TAB_SET(nxt_h, pos + 1u);
+                    cur = c2;
+                    h = h2;
+                    cand = LZ_TAB_GET(h2);
+                    pos += 2u;
+                    misses += 2u;
+                    continue;
+                }
+#endif
                 pos += 1u;
                 misses++;
                 cur = nxt_cur;
@@ -558,15 +625,21 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                 break;
             }
             cur = zpse_load_u32le(in + pos);
-            h = lz_hash(cur, hash_bits);
-            cand = tab[h];
+            h = lz_hash(cur, hb);
+            cand = LZ_TAB_GET(h);
             continue;
         }
-        /* Lazy matching: if pos+1 has an 8-byte match, skip this position */
+        /* Lazy matching: if pos+1 has an 8-byte match, skip this position.
+         *
+         * The probe indexes the table with ZPSE_LZ_HASH_BITS_FAST (11). That
+         * is the lower quarter of every wider table the finder uses, and the
+         * main loop writes those slots whenever its own hash lands there, so
+         * the probe is live at every width -- it cannot be dropped as dead
+         * work. */
         if (pos + 9u <= n) {
             uint32_t v1 = zpse_load_u32le(in + pos + 1u);
             uint32_t h1 = lz_hash(v1, ZPSE_LZ_HASH_BITS_FAST);
-            uint32_t cand1 = tab[h1];
+            uint32_t cand1 = LZ_TAB_GET(h1);
 
             /* cand1 == pos is not a prior occurrence: when h1 == h the
              * entry the probe reads is the one this iteration wrote a few
@@ -590,8 +663,8 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                 pos++;
                 misses = 0;
                 cur = v1;
-                h = lz_hash(cur, hash_bits);
-                cand = tab[h];
+                h = lz_hash(cur, hb);
+                cand = LZ_TAB_GET(h);
                 continue;
             }
         }
@@ -663,8 +736,8 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
 #if (ZPSE_LZ_LAZY_LEN > 0)
         if (lazy_max != 0u && n <= lazy_max && pos + len + 1u < n) {
             uint32_t v1 = zpse_load_u32le(in + pos + 1u);
-            uint32_t h1 = lz_hash(v1, hash_bits);
-            uint32_t cand1 = tab[h1];
+            uint32_t h1 = lz_hash(v1, hb);
+            uint32_t cand1 = LZ_TAB_GET(h1);
 
             if (cand1 != LZ_EMPTY && cand1 < pos + 1u && cand1 + 4u <= n &&
                 zpse_load_u32le(in + cand1) == v1) {
@@ -678,7 +751,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                     misses = 0u;
                     cur = v1;
                     h = h1;
-                    cand = tab[h];
+                    cand = LZ_TAB_GET(h);
                     continue;
                 }
 #else
@@ -686,18 +759,26 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                     uint32_t l1 = ZPSE_LZ_MIN_MATCH;
 
 #if ZPSE_LZ_LAZY_WIDE
-                    /* Only the larger cursor needs the bound: cand1 is
-                     * below pos + 1, so eight readable bytes at pos + 1 + l1
-                     * are eight readable bytes at cand1 + l1 as well. */
-                    while (pos + 1u + l1 + 8u <= n) {
-                        uint64_t x = lz_load64(in + pos + 1u + l1) ^
-                                     lz_load64(in + cand1 + l1);
+                    /* The 8-byte arm of this lazy probe cannot start with
+                     * fewer than twelve bytes left (l1 begins at four), so
+                     * do not set it up in the tail -- the byte loop below is
+                     * the whole measurement there. The guard is
+                     * byte-identical: the while's own bound is false for
+                     * those positions. */
+                    if (n - pos >= 12u) {
+                        /* Only the larger cursor needs the bound: cand1 is
+                         * below pos + 1, so eight readable bytes at
+                         * pos + 1 + l1 are eight at cand1 + l1 as well. */
+                        while (pos + 1u + l1 + 8u <= n) {
+                            uint64_t x = lz_load64(in + pos + 1u + l1) ^
+                                         lz_load64(in + cand1 + l1);
 
-                        if (x != 0u) {
-                            l1 += (uint32_t)(zpse_ctz64(x) >> 3);
-                            break;
+                            if (x != 0u) {
+                                l1 += (uint32_t)(zpse_ctz64(x) >> 3);
+                                break;
+                            }
+                            l1 += 8u;
                         }
-                        l1 += 8u;
                     }
 #endif
                     /* The tail, and with the wide loop off the whole of it:
@@ -712,7 +793,7 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
                         misses = 0u;
                         cur = v1;
                         h = h1;
-                        cand = tab[h];
+                        cand = LZ_TAB_GET(h);
                         continue;
                     }
                 }
@@ -731,8 +812,8 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
             break;
         }
         cur = zpse_load_u32le(in + pos);
-        h = lz_hash(cur, hash_bits);
-        cand = tab[h];
+        h = lz_hash(cur, hb);
+        cand = LZ_TAB_GET(h);
     }
     /* Trailing literals: no match left to code, so offset 0. What a run
      * of `run` literals does to both regions is known before a byte of it
@@ -771,6 +852,25 @@ ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
     zpse_store_u32le(dst, o.lit_total);
     zpse_store_u32le(dst + 4u, o.cmds);
     return o.pos;
+}
+
+ZPSE_HOT uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n,
+                                    uint8_t *dst, uint32_t cap, void *table,
+                                    uint32_t hash_bits, uint32_t lazy_max)
+{
+    return lz_encode_impl(in, n, dst, cap, table, hash_bits, lazy_max, 0u);
+}
+
+/* Price a sample of sn bytes (the length passed as `n`): identical stream to
+ * zpse_lz_encode, but the clear touches only the slots a position in [0,sn)
+ * can hash to rather than the whole table. */
+ZPSE_HOT uint32_t zpse_lz_encode_sample(const uint8_t *in, uint32_t n,
+                                        uint8_t *dst, uint32_t cap,
+                                        void *table, uint32_t hash_bits,
+                                        uint32_t sn)
+{
+    return lz_encode_impl(in, n, dst, cap, table, hash_bits,
+                          (uint32_t)ZPSE_BLOCK_SHORT_MAX, sn);
 }
 
 /* Literals are copied a 16-byte step at a time -- the size the compiler

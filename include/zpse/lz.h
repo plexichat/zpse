@@ -91,6 +91,14 @@
  * src/block.c). Callers of the wide table must supply 2^14 entries. */
 #define ZPSE_LZ_HASH_BITS_WIDE  14u
 
+/* `ZPSE_LZ_FAST4K` selects the byte-identical short-input loop changes in
+ * src/lz.c: the two-miss unroll with its pos+2 slot prefetch. On by default;
+ * set it to 0 to time the old loop. No state is allocated: it all lives in
+ * the caller's table. */
+#ifndef ZPSE_LZ_FAST4K
+#define ZPSE_LZ_FAST4K 1
+#endif
+
 
 
 /* The smallest possible command: a token byte and one offset byte. A
@@ -134,6 +142,15 @@ uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n, uint8_t *dst,
                            uint32_t cap, void *table, uint32_t hash_bits,
                            uint32_t lazy_max);
+
+/* Price a small sample without clearing the whole hash table. `sn` is the
+ * sample length (the `n` this call encodes); only the slots a position in
+ * [0,sn) can hash to are cleared. The stream is byte-identical to the one
+ * zpse_lz_encode writes for the same input, and `table` still needs the full
+ * ZPSE_LZ_TABLE_BYTES of scratch. */
+uint32_t zpse_lz_encode_sample(const uint8_t *in, uint32_t n, uint8_t *dst,
+                               uint32_t cap, void *table, uint32_t hash_bits,
+                               uint32_t sn);
 
 /* Decode a payload of in_len bytes into exactly n bytes at out. Returns
  * ZPSE_OK, or a negative status for any stream that does not decode to
