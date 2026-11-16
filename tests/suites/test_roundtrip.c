@@ -53,6 +53,39 @@ int main(void) {
     for (i = 0; i < 2048; i++) input[i] = (uint8_t)((i / 4 + (i % 4) * 64) & 0xFF);
     trial("strided/2048", 2048, 303);
 
+    /* FLAT page corpus: every page-sized block goes through the FLAT writer,
+     * so add one deterministic page per codec shape (RAW, BIT2, NIBBLE4,
+     * SUBLANE) to the round-trip matrix. */
+    {
+        static const char *const flat_names[4] = {
+            "flat_raw/4096", "flat_bit2/4096",
+            "flat_nibble4/4096", "flat_sublane/4096"
+        };
+        int f;
+        uint32_t k;
+
+        for (f = 0; f < 4; f++) {
+            if (f == 0) {
+                rng = 91;
+                for (k = 0; k < 4096u; k++) input[k] = rnd();
+            } else if (f == 1) {
+                for (k = 0; k < 4096u; k++)
+                    input[k] = (k & 1u) ? 0xFFu : 0x00u;
+            } else if (f == 2) {
+                rng = 17;
+                for (k = 0; k < 4096u; k++) input[k] = (uint8_t)(rnd() & 0x0Fu);
+            } else {
+                for (k = 0; k < 4096u; k += 4u) {
+                    input[k] = (uint8_t)(k / 4u);
+                    input[k + 1u] = 0x7Fu;
+                    input[k + 2u] = 0u;
+                    input[k + 3u] = 0u;
+                }
+            }
+            trial(flat_names[f], 4096u, 400u + (uint32_t)f);
+        }
+    }
+
     { /* frame level */
         size_t flen = 0, olen = 0;
         static uint8_t fout[70000];
