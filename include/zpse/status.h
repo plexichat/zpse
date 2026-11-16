@@ -15,7 +15,7 @@ typedef enum ZpseStatus {
     ZPSE_BAD_TILE_SIZE          = -8,
     ZPSE_BAD_PREDICTOR          = -9,
     ZPSE_BAD_MASK               = -10,
-    ZPSE_BAD_ENUMERATIVE_RANK   = -11,
+    /* -11 was ZPSE_BAD_ENUMERATIVE_RANK (removed); value retired, not reused. */
     ZPSE_BAD_RESIDUAL           = -12,
     ZPSE_UNSUPPORTED_FEATURE    = -13,
     ZPSE_TRUNCATED              = -14,
@@ -44,7 +44,6 @@ static inline const char *zpse_status_name(int s) {
     case ZPSE_BAD_TILE_SIZE: return "ZPSE_BAD_TILE_SIZE";
     case ZPSE_BAD_PREDICTOR: return "ZPSE_BAD_PREDICTOR";
     case ZPSE_BAD_MASK: return "ZPSE_BAD_MASK";
-    case ZPSE_BAD_ENUMERATIVE_RANK: return "ZPSE_BAD_ENUMERATIVE_RANK";
     case ZPSE_BAD_RESIDUAL: return "ZPSE_BAD_RESIDUAL";
     case ZPSE_UNSUPPORTED_FEATURE: return "ZPSE_UNSUPPORTED_FEATURE";
     case ZPSE_TRUNCATED: return "ZPSE_TRUNCATED";
