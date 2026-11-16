@@ -10,11 +10,26 @@
 #include <stdint.h>
 #include "arena.h"
 #include "predictor.h"
+#include "types.h"
 
 int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
                         const uint8_t *payload, uint32_t payload_len,
                         uint8_t *decoded_out, uint32_t decoded_cap,
                         uint32_t *decoded_len_out);
+
+/* Internal decode entry for a caller (block.c) that already parsed the
+ * 8-byte segment header and checked the envelope it owns. `h` is the parsed
+ * header; `payload` still points at the segment payload (header included),
+ * as in zpse_segment_decode. Everything below the header parse -- dense
+ * record handling, tile loop, lane state, status codes -- is identical to
+ * zpse_segment_decode, so a caller that has done that parse once for layout
+ * purposes does not pay for it twice. Hostile/unknown streams should keep
+ * using the validating zpse_segment_decode wrapper. */
+int zpse_segment_decode_preparsed(ZpseDecoder *d, ZpseLaneState *lanes,
+                                  const ZpseSegmentHeader *h,
+                                  const uint8_t *payload, uint32_t payload_len,
+                                  uint8_t *decoded_out, uint32_t decoded_cap,
+                                  uint32_t *decoded_len_out);
 
 /* 1 iff p[0..n) is one byte value. The AVX2 test the constant-plane
  * shortcut uses, exposed so a caller that needs the answer for its own
@@ -96,13 +111,5 @@ void zpse_segment_prescreen(const uint8_t *a, uint16_t nt,
                             const uint8_t *seg_base, uint32_t seg_pos,
                             uint8_t initial_literal, uint16_t ks[12],
                             uint32_t enc_flags);
-
-/* Reorder the prescreen's scan by predictor win count. Call once per block,
- * at the start of the first segment encode; the win counters are reset after
- * ranking. A pure speed decision: every rule that reads "which predictor
- * comes first" (the tie between equal miss counts, and what a run
- * continuation has to rule out) goes through the fixed seg_pred_rank table,
- * so any permutation of the scan writes the same bytes. */
-void seg_screen_rank(void);
 
 #endif /* ZPSE_SEGMENT_H */

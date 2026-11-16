@@ -386,12 +386,17 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     return 1;
 }
 
-int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
-                        const uint8_t *payload, uint32_t payload_len,
-                        uint8_t *decoded_out, uint32_t decoded_cap,
-                        uint32_t *decoded_len_out)
+/* Body of segment decode once the 8-byte segment header has been parsed.
+ * Split out so a caller that already holds a parsed header (block.c) can skip
+ * the duplicate parse and envelope work through
+ * zpse_segment_decode_preparsed; hostile streams keep using the fully
+ * validating wrapper below. `h` is passed by value so the body that follows
+ * is otherwise unchanged. */
+static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
+                           ZpseSegmentHeader h, const uint8_t *payload,
+                           uint32_t payload_len, uint8_t *decoded_out,
+                           uint32_t decoded_cap, uint32_t *decoded_len_out)
 {
-    ZpseSegmentHeader h;
     int rc;
     uint32_t expect_tc;
     uint32_t pos;
@@ -410,19 +415,6 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     uint64_t prev_key = 0u;
     int prev_ok = 0;
 
-    if (d == 0 || lanes == 0 || payload == 0 || decoded_out == 0 ||
-        decoded_len_out == 0) {
-        return ZPSE_BAD_ARG;
-    }
-    /* Cleared here, set only by the dense constant form below: block
-     * decode reads it after the loop to decide whether the payload CRC
-     * can be arithmetic, so it must never describe an earlier segment. */
-    d->seg_const = 0u;
-    d->seg_const_byte = 0u;
-    rc = zpse_segment_header_parse(&h, payload, payload_len);
-    if (rc != ZPSE_OK) {
-        return rc;
-    }
     if (h.segment_decoded_size < 1u ||
         h.segment_decoded_size > (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
         return ZPSE_BAD_SEGMENT_DIRECTORY;
@@ -941,6 +933,48 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
     return ZPSE_OK;
 }
 
+int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
+                        const uint8_t *payload, uint32_t payload_len,
+                        uint8_t *decoded_out, uint32_t decoded_cap,
+                        uint32_t *decoded_len_out)
+{
+    ZpseSegmentHeader h;
+    int rc;
+
+    if (d == 0 || lanes == 0 || payload == 0 || decoded_out == 0 ||
+        decoded_len_out == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    /* Cleared before the parse, as before: on a rejected header the decoder
+     * state must not describe an earlier segment. */
+    d->seg_const = 0u;
+    d->seg_const_byte = 0u;
+    rc = zpse_segment_header_parse(&h, payload, payload_len);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    return seg_decode_body(d, lanes, h, payload, payload_len, decoded_out,
+                           decoded_cap, decoded_len_out);
+}
+
+int zpse_segment_decode_preparsed(ZpseDecoder *d, ZpseLaneState *lanes,
+                                  const ZpseSegmentHeader *h,
+                                  const uint8_t *payload, uint32_t payload_len,
+                                  uint8_t *decoded_out, uint32_t decoded_cap,
+                                  uint32_t *decoded_len_out)
+{
+    if (d == 0 || lanes == 0 || h == 0 || payload == 0 || decoded_out == 0 ||
+        decoded_len_out == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    /* Same clear as the validating wrapper: block decode reads this after
+     * every segment and it must never describe an earlier one. */
+    d->seg_const = 0u;
+    d->seg_const_byte = 0u;
+    return seg_decode_body(d, lanes, *h, payload, payload_len, decoded_out,
+                           decoded_cap, decoded_len_out);
+}
+
 /* ---- Encoder tile search (PSE SELECT) -------------------------------
  *
  * A tile always starts from the reset lane state, so the predictions of
@@ -975,10 +1009,6 @@ int zpse_segment_decode(ZpseDecoder *d, ZpseLaneState *lanes,
  * lose to STRIDE and the lane-history family on essentially every input
  * this format targets. They stay fully decodable (tile.c) so foreign
  * and hostile streams remain conformant.
- *
- * 9 (TILE_LOCAL_CONSTANT) is only trial-ed when the eight cheap
- * predictors all miss badly, which is the only situation where a
- * different constant can beat "predict the byte 8 positions back".
  */
 
 /* Exact K for the closed-form families. ks[] is indexed by predictor
@@ -1061,21 +1091,20 @@ static void seg_prescreen_counts(const uint8_t *a, uint16_t nt,
 /* STRIDE_3 is last on purpose: the winner is the first predictor with the
  * strictly smallest miss count, so appending it can only change a tile
  * where it is strictly better than every earlier candidate. The order is
- * static at startup but can be reordered by the dynamic ranker (see
- * `seg_screen_rank`) at block boundaries, so the most-winning predictor is
- * tried first. */
-static uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
-                                     7u, 8u, 10u, 11u};
+ * fixed. A dynamic ranker once reordered it at block boundaries by win
+ * count, but the win increment was disabled for debugging and every
+ * decision uses seg_pred_rank rather than scan position, so reordering was
+ * both inert and (across encode workers) a data race. It is gone. */
+static const uint8_t seg_screen_pred[9] = {0u, 1u, 2u, 5u, 6u,
+                                           7u, 8u, 10u, 11u};
 
 /* Priority of each predictor id, i.e. the order the winner rule is DEFINED
- * in. This is a constant and seg_screen_pred is not: the scan order may be
- * permuted for speed (seg_screen_rank), but every decision that depends on
- * which predictor comes first -- the tie between equal miss counts, and
- * which predictors a run continuation has to rule out -- reads this table
- * instead of the scan position. That is what keeps a permuted scan from
- * writing a different stream: the winner is the smallest count, ties to the
- * lowest priority, whatever order the scan happened to visit them in. An
- * id that is not screened at all has no priority. */
+ * in. Both this and the scan order (seg_screen_pred) are constants now, but
+ * every decision that depends on which predictor comes first -- the tie
+ * between equal miss counts, and which predictors a run continuation has to
+ * rule out -- reads this table rather than the scan position, so the winner
+ * is the smallest count with ties to the lowest priority regardless of scan
+ * order. An id that is not screened at all has no priority. */
 static const uint8_t seg_pred_rank[12] = {
     0u, 1u, 2u, 0xFFu, 0xFFu, 3u, 4u, 5u, 6u, 0xFFu, 7u, 8u
 };
@@ -1122,54 +1151,6 @@ static void seg_scan_two(const uint16_t ks[12], uint8_t *best,
     }
     *best = p0;
     *second = p1;
-}
-
-/* Win count per predictor id, used by the dynamic ranker. Indexed by
- * predictor id (0-11); entries for ORDER1/ORDER2/TILE_CONSTANT stay at 0
- * because they are never in seg_screen_pred. */
-static uint32_t seg_pred_wins[12];
-
-/* Reorder seg_screen_pred so the predictor with the most wins runs first,
- * ties broken by the existing order. Called once per block (or whenever the
- * caller wants a fresh ranking); the rank is a pure function of the wins
- * seen so far, so it is deterministic across builds, and it cannot change a
- * byte of output because nothing reads scan position as a priority: the
- * winner rule and the run continuation both use seg_pred_rank. */
-void seg_screen_rank(void)
-{
-    uint8_t order[9];
-    uint8_t used[9];
-    uint32_t i;
-    uint32_t j;
-    uint32_t n;
-
-    for (i = 0; i < 9u; i++) {
-        order[i] = seg_screen_pred[i];
-        used[i] = 0u;
-    }
-    for (n = 0u; n < 9u; n++) {
-        uint32_t best = 0u;
-        uint8_t best_p = 0u;
-        uint32_t bi = 0u;
-        int found = 0;
-
-        for (i = 0; i < 9u; i++) {
-            if (used[i] != 0u) {
-                continue;
-            }
-            if (!found || (uint32_t)seg_pred_wins[order[i]] > best) {
-                best = seg_pred_wins[order[i]];
-                best_p = order[i];
-                bi = i;
-                found = 1;
-            }
-        }
-        used[bi] = 1u;
-        seg_screen_pred[n] = best_p;
-    }
-    for (j = 0; j < 12u; j++) {
-        seg_pred_wins[j] = 0u;
-    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -2976,30 +2957,44 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
             uint8_t rr;
             int n;
 
+            /* Lower-bound prune for the second candidate, the same rule the
+             * main encoder's tile loop uses: a record with sk exceptions
+             * costs at least 10 bytes (8 header + >=1 mask + >=1 residual).
+             * If that floor already meets the winner's length the second
+             * candidate cannot be strictly smaller, so skip its classify
+             * and mode search. The price is unchanged either way. A
+             * tile_len still at -1 (first candidate failed) leaves this
+             * false, so the second candidate is still tried. */
+            if (ci == 1u && second_p != 0xFFu &&
+                10u + (uint32_t)ks[second_p] >= (uint32_t)tile_len) {
+                continue;
+            }
+
             if (zpse_tile_classify_lean(lanes, actual, nt, pred,
                                         initial_literal, 1, plane, seg_pos,
                                         &cl) != ZPSE_OK) {
                 continue;
             }
             zpse_tile_choose_modes(&cl, nt, &mm, &rr);
-            /* Only SIGNED_DELTA reads the predictions: PALETTE_BITS and
-             * PACKED_BASE_M pack cl->res_at_exc, which the classification
-             * already filled, so materialising at_pred for them is a walk
-             * over the tile whose bytes nothing reads afterwards. */
-            if (rr == (uint8_t)ZPSE_R_SIGNED_DELTA) {
-                (void)zpse_tile_fill_at_pred_reset(pred, actual, nt, plane,
-                                                   seg_pos, initial_literal,
-                                                   &cl);
-            }
-            n = zpse_tile_pack(pred, &cl, nt, actual, mm, rr, 1, e->hist,
-                               4096u, e->comb);
+            /* The probe only needs the record's SIZE, so compute it from the
+             * classifier instead of packing a tile whose bytes are thrown
+             * away. The old code packed every sampled tile into a 4 KiB
+             * scratch (a full mask + residual walk for each of the two modes)
+             * just to read zpse_tile_pack's return value; the length is a
+             * closed form of (cl, nt, chosen modes) and at_pred -- which only
+             * SIGNED_DELTA's packer reads -- is never needed here. */
+            n = (int)zpse_tile_record_len(&cl, pred, nt, mm, rr);
             if (n < 8) {
+                /* Defensive fallback: the always-legal minimal pair, exactly
+                 * as the main tile loop uses. Kept for the same reason it is
+                 * there -- a mode the search produced that the packer would
+                 * reject falls back to the one that always packs. */
                 mm = (cl.k == 0u) ? 0u
                      : (cl.k == nt) ? 6u
                      : ((uint32_t)cl.k <= (((uint32_t)nt + 7u) >> 3) ? 2u
                                                                      : 1u);
-                n = zpse_tile_pack(pred, &cl, nt, actual, mm, 0u, 1, e->hist,
-                                   4096u, e->comb);
+                rr = 0u;
+                n = (int)zpse_tile_record_len(&cl, pred, nt, mm, rr);
             }
             if (n < 8) {
                 continue;
@@ -3848,7 +3843,14 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             if (n < 8) {
                 continue;
             }
-            if (best_len < 0 || n < best_len) {
+            /* Strictly smaller wins. On a tie the lower seg_pred_rank wins,
+             * not the earlier entry in cand[]: every candidate is appended
+             * in rank order (best_p, second_p, then any rank-0xFF trial
+             * last), so this is equivalent to the old first-wins rule but
+             * states the order-independent decision explicitly. An id with
+             * no rank (0xFF) can never win a tie. */
+            if (best_len < 0 || n < best_len ||
+                (n == best_len && seg_pred_rank[pred] < seg_pred_rank[best_p])) {
                 if (!direct) {
                     memcpy(bst, tmp, (size_t)n);
                 }
@@ -3864,7 +3866,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 break;
             }
         }
-        /* seg_pred_wins[best_p]++; -- disabled for debugging */
 
         if (best_len < 0) {
             return ZPSE_BAD_RESIDUAL;
@@ -4117,5 +4118,10 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
             return dn;
         }
     }
+    /* Retired candidate: a 4 KiB page as ONE dense record with a single cheap
+     * predictor. It bought ~7% of packed bytes on 4 KiB pointer pages
+     * (2.71 -> 2.90:1 at FASTEST) but cut decode from 2865 to 1079 MB/s,
+     * because a 4 KiB dense record still walks its residual scatter scalar.
+     * Removed; default builds are byte-identical. */
     return (int)pos;
 }
