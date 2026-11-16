@@ -38,11 +38,33 @@ int zpse_transform_forward_planes(const ZpseTransformMeta *meta,
                                   uint32_t n, uint8_t *segs[16],
                                   const uint32_t seg_lens[16]);
 
+/* In-place delta/xor prefix chain over one contiguous plane already staged
+ * by the forward transpose: p[j] = p[j] - p[j-1] (delta != 0) or
+ * p[j] ^ p[j-1] (delta == 0), with p[-1] == seed. This is the same kernel the
+ * full forward transform uses, so chaining a plain-staged plane produces the
+ * same bytes as staging it with the chain in the first place. */
+void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed, int delta);
+
 /* Inverse: interleave W segment buffers into native output. Handles
  * non-divisible tails (scalar epilogue). */
 int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
                            const uint8_t *segs[16], const uint32_t seg_lens[16],
                            uint8_t *out, uint32_t n);
+
+/* Internal inverse entry for the decoder, which has already validated the
+ * segment sizes and plane disjointness on the same arguments. It skips the
+ * duplicate `zpse_transform_validate_sizes` and the O(w^2) plane-overlap
+ * passes that zpse_transform_inverse repeats; every cheap check (nulls, n
+ * range, width agreement, seed requirement) stays, and on a 4 KiB page with
+ * 64-byte-aligned planes it takes a staging-free direct path (see
+ * ZPSE_XFORM_PAGE_FAST in transform.c). Byte-for-byte identical output.
+ * Only block.c's decode-side call should use this: a caller that has not
+ * validated must use zpse_transform_inverse. */
+int zpse_transform_inverse_trusted(const ZpseTransformMeta *meta,
+                                   uint8_t seg_count,
+                                   const uint8_t *segs[16],
+                                   const uint32_t seg_lens[16], uint8_t *out,
+                                   uint32_t n);
 
 /* Delta8 / Xor8 per-segment helpers (with explicit seed). */
 void zpse_delta8_encode(const uint8_t *in, uint8_t *enc, uint32_t n, uint8_t seed);

@@ -7,6 +7,18 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Page-specialized inverse. On a block of at most 4096 bytes every plane
+ * of a transposed block is at most 256 bytes, so the whole inverse is L1
+ * resident and the staged / skewed forms (built only to break the L1 set
+ * conflict of planes 4096 bytes apart on a 64 KiB block) are pure cost.
+ * When on, the trusted inverse entry reads 64-byte-aligned planes straight
+ * into registers with aligned loads and writes the output directly, with
+ * no staging copy. Set to 0 to disable it; the bytes are identical either
+ * way (conformance builds can turn this off without changing output). */
+#ifndef ZPSE_XFORM_PAGE_FAST
+#define ZPSE_XFORM_PAGE_FAST 1
+#endif
+
 /* ------------------------------------------------------------------ *
  * SSE2 fast paths for the transform widths. For a block of 16 bytes or
  * more `zpse_block_encode` only ever forwards transform ids 0 (RAW_BYTES),
@@ -251,10 +263,13 @@ ZPSE_DEFINE_PREFIX_SCAN(zpse_prefix_xor16, _mm_xor_si128, ZPSE_XOR8)
 #if ZPSE_T_HAVE_AVX2
 #include <immintrin.h>
 
-/* Runtime gate for the AVX2 kernels, cached by zpse_cpu_caps(). */
+/* Runtime gate for the AVX2 kernels. The caps answer is process-invariant,
+ * so use the call-site cache rather than the full CPUID/atomic-load body:
+ * this gate is asked several times per tile in the forward and inverse
+ * staging paths. */
 static int zpse_t_avx2(void)
 {
-    return (zpse_cpu_caps() & (uint32_t)ZPSE_CPU_AVX2) != 0u;
+    return (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u;
 }
 
 /* Defines `kernel_name(src, dst, n, seed)` for one of the two operators:
@@ -294,7 +309,8 @@ static const uint8_t zpse_avx2_ctl15_all[32] = {
  * two constant tables above, loaded once by the kernel, because a byte-wise
  * scan runs these helpers twice per 32-byte block and a register the kernel
  * already holds beats a memory operand in that position. */
-static ZPSE_T_AVX2 __m256i zpse_avx2_lane_total(__m256i ctl, __m256i x)
+ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
+zpse_avx2_lane_total(__m256i ctl, __m256i x)
 {
     /* vpshufb is per 128-bit lane, so index 15 in the low lane copies
      * byte 15 into every byte of that lane, and the 0x80 indices (bit 7
@@ -312,7 +328,8 @@ static ZPSE_T_AVX2 __m256i zpse_avx2_lane_total(__m256i ctl, __m256i x)
  * byte 15 of each lane into every byte of that lane. Two shuffle-port ops
  * and no vector->GPR round trip, which is what lets the chunk loop below
  * keep the whole carry chain in vector registers. */
-static ZPSE_T_AVX2 __m256i zpse_avx2_bcast_hi_byte(__m256i ctl, __m256i x)
+ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
+zpse_avx2_bcast_hi_byte(__m256i ctl, __m256i x)
 {
     __m256i m = _mm256_permute2x128_si256(x, x, 0x11);
 
@@ -890,8 +907,8 @@ static ZPSE_T_AVX2 void zpse_plane_chain32(uint8_t *p, uint32_t n,
  * what made it slow; the plane is contiguous by the time this runs, so a
  * 16-byte step only needs the previous chunk's last byte as the incoming
  * "prv[0]". That byte is read before the store overwrites it. */
-static void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
-                                     int delta)
+void zpse_plane_chain_inplace(uint8_t *p, uint32_t n, uint8_t seed,
+                              int delta)
 {
     uint8_t prev = seed;
     uint32_t q;
@@ -1267,7 +1284,8 @@ static void zpse_merge8(uint8_t *out, const uint8_t *const segs[16],
  * inserts and eight extra loads.
  *
  * A half is 16 rows of w bytes, so the pairing offset is 16*w. */
-static ZPSE_T_AVX2 __m256i zpse_parity_evens256(__m256i a, __m256i b)
+ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
+zpse_parity_evens256(__m256i a, __m256i b)
 {
     const __m256i mask = _mm256_set1_epi16(0x00FF);
 
@@ -1275,7 +1293,8 @@ static ZPSE_T_AVX2 __m256i zpse_parity_evens256(__m256i a, __m256i b)
                                _mm256_and_si256(b, mask));
 }
 
-static ZPSE_T_AVX2 __m256i zpse_parity_odds256(__m256i a, __m256i b)
+ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
+zpse_parity_odds256(__m256i a, __m256i b)
 {
     return _mm256_packus_epi16(_mm256_srli_epi16(a, 8),
                                _mm256_srli_epi16(b, 8));
@@ -1458,52 +1477,9 @@ static void zpse_split_narrow(uint8_t *const segs[16], const uint8_t *in,
  * the arithmetic is the one those scans are tested against. Byte 31 of the
  * result is the 32-byte chunk's total, which is what `carry` becomes, in
  * the same way byte 15 of a 16-byte chunk is in the SSE form. */
-/* Two twins rather than one function with a `delta` argument. The flag never
- * changes inside a merge loop, and a function that carries it cannot be
- * inlined without leaving a test per 32 bytes: this used to be an
- * out-of-line call taking two 256-bit values BY VALUE (the shape hot.h
- * warns about) plus a carry pointer, twice per 32-row group for two planes
- * and eight times for eight -- 57 million calls on the columnar corpus, at
- * 7.6% of the whole benchmark's self time. Always-inlined into the
- * target("avx2") loops below, the ladder, the lane-total cross-link and the
- * carry all stay in registers. */
-ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
-zpse_chain_add32(__m256i ctl, __m256i x, uint8_t *carry)
-{
-    uint8_t c = *carry;
-    uint8_t add;
-
-    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 1));
-    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 2));
-    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 4));
-    x = _mm256_add_epi8(x, _mm256_slli_si256(x, 8));
-    x = _mm256_add_epi8(x, zpse_avx2_lane_total(ctl, x));
-    add = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);
-    x = _mm256_add_epi8(x, _mm256_set1_epi8((char)c));
-    *carry = (uint8_t)(c + add);
-    return x;
-}
-
-ZPSE_T_AVX2 ZPSE_ALWAYS_INLINE __m256i
-zpse_chain_xor32(__m256i ctl, __m256i x, uint8_t *carry)
-{
-    uint8_t c = *carry;
-    uint8_t add;
-
-    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 1));
-    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 2));
-    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 4));
-    x = _mm256_xor_si256(x, _mm256_slli_si256(x, 8));
-    x = _mm256_xor_si256(x, zpse_avx2_lane_total(ctl, x));
-    add = (uint8_t)(_mm256_extract_epi16(x, 15) >> 8);
-    x = _mm256_xor_si256(x, _mm256_set1_epi8((char)c));
-    *carry = (uint8_t)(c ^ add);
-    return x;
-}
-
-/* The same two chains with the carry kept in the vector domain.
+/* The two chain undos, with the carry kept in the vector domain.
  *
- * The scalar forms above update `*carry` through memory on every 32 bytes:
+ * An earlier form updated `*carry` through memory on every 32 bytes:
  * vpextrw the chunk's total out to a GPR, add it to the scalar carry, store
  * it, then vpbroadcastb it back on the next iteration. That is 2 shuffle-port
  * ops plus a store, a load and a scalar add per plane per chunk -- and the
@@ -1570,12 +1546,10 @@ zpse_chain_xor32v(__m256i ctl, __m256i ctl_all, __m256i x, __m256i *c)
  * merge loop was a branch per 32 bytes on the file's hottest path, and the
  * `carry == 0` shapes (the identity and plain-transpose inverses, i.e. most
  * of a decode) paid it to test a pointer. The loop bodies are therefore
- * written once as macros over the chain, and instantiated three times: no
- * chain, the additive chain, the xor chain. UNDO is a macro name so its
- * unused carry argument disappears entirely in the no-chain form. */
+ * written once as macros over the chain, instantiated with the no-chain
+ * form. UNDO is a macro name so its unused carry argument disappears
+ * entirely here. */
 #define ZPSE_CHAIN_NONE(CTL, X, C) (X)
-#define ZPSE_CHAIN_ADD(CTL, X, C) zpse_chain_add32((CTL), (X), (C))
-#define ZPSE_CHAIN_XOR(CTL, X, C) zpse_chain_xor32((CTL), (X), (C))
 
 #define ZPSE_MERGE2_BODY(UNDO)                                                 \
     for (g = 0; (size_t)g + 32u <= (size_t)rows; g += 32u) {                   \
@@ -2042,6 +2016,470 @@ static void zpse_merge_narrow(uint8_t *out, const uint8_t *const segs[16],
 }
 #endif /* ZPSE_T_HAVE_SSE2 */
 
+/* ------------------------------------------------------------------ *
+ * Page-specialized inverse (ZPSE_XFORM_PAGE_FAST).
+ *
+ * A page-sized block is at most 4096 bytes; for the transpose widths the
+ * planes are 256/512/1024/2048 bytes and sit that far apart in the
+ * decoder's recon region, so they are on distinct L1 sets and all in L1.
+ * The staged inverse (zpse_t16x16_inverse_blocked / _delta16_inverse_avx2)
+ * and the skew layout exist only for 64 KiB blocks, where planes 4096 bytes
+ * apart all hit one L1 set. On a page they are pure cost.
+ *
+ * Everything below is the SSE2 network from above verbatim -- same parity
+ * merges, same 16x16 transpose, same in-register chain undo -- with one
+ * change: the plane loads are ALIGNED (_mm_load_si128 rather than loadu).
+ * The decoder's recon planes are 64-byte aligned (ZPSE_ARENA_ALIGN) and
+ * every load offset is a multiple of 16, so that is valid; zpse_pf_ok()
+ * checks it before this path is taken and the caller falls back to the
+ * unaligned loops otherwise. There is no staging buffer and no heap.
+ * Because only the load instruction differs, the output is bit-identical
+ * to the ordinary inverse (and to the staged AVX2 form).
+ * ------------------------------------------------------------------ */
+#if ZPSE_XFORM_PAGE_FAST && ZPSE_T_HAVE_SSE2
+
+/* Defined just below with the public size helpers. */
+static int zpse_needs_delta(uint8_t tid, uint8_t flags);
+static int zpse_needs_xor(uint8_t tid);
+
+#define ZPSE_PF_LOAD(p_)                                                      \
+    _mm_load_si128((const __m128i *)(const void *)(p_))
+
+static void zpse_pf_merge2(uint8_t *out, const uint8_t *const segs[16],
+                           uint32_t rows, uint8_t *carry, int delta)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        __m128i a = ZPSE_PF_LOAD(segs[0] + g);
+        __m128i b = ZPSE_PF_LOAD(segs[1] + g);
+        uint8_t *d = out + (size_t)g * 2u;
+
+        if (carry != 0) {
+            a = zpse_chain_undo(a, carry, delta);
+            b = zpse_chain_undo(b, carry + 1, delta);
+        }
+        _mm_storeu_si128((__m128i *)(void *)d, _mm_unpacklo_epi8(a, b));
+        _mm_storeu_si128((__m128i *)(void *)(d + 16),
+                         _mm_unpackhi_epi8(a, b));
+    }
+}
+
+static void zpse_pf_merge4(uint8_t *out, const uint8_t *const segs[16],
+                           uint32_t rows, uint8_t *carry, int delta)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        __m128i p[4];
+        __m128i lo[2];
+        __m128i hi[2];
+        uint8_t *d = out + (size_t)g * 4u;
+        unsigned t;
+
+        for (t = 0; t < 4u; t++) {
+            __m128i x = ZPSE_PF_LOAD(segs[t] + g);
+
+            p[t] = carry != 0 ? zpse_chain_undo(x, carry + t, delta) : x;
+        }
+        lo[0] = _mm_unpacklo_epi8(p[0], p[1]);
+        hi[0] = _mm_unpackhi_epi8(p[0], p[1]);
+        lo[1] = _mm_unpacklo_epi8(p[2], p[3]);
+        hi[1] = _mm_unpackhi_epi8(p[2], p[3]);
+        _mm_storeu_si128((__m128i *)(void *)d,
+                         _mm_unpacklo_epi16(lo[0], lo[1]));
+        _mm_storeu_si128((__m128i *)(void *)(d + 16),
+                         _mm_unpackhi_epi16(lo[0], lo[1]));
+        _mm_storeu_si128((__m128i *)(void *)(d + 32),
+                         _mm_unpacklo_epi16(hi[0], hi[1]));
+        _mm_storeu_si128((__m128i *)(void *)(d + 48),
+                         _mm_unpackhi_epi16(hi[0], hi[1]));
+    }
+}
+
+static void zpse_pf_merge8(uint8_t *out, const uint8_t *const segs[16],
+                           uint32_t rows, uint8_t *carry, int delta)
+{
+    uint32_t g;
+
+    for (g = 0; (size_t)g + 16u <= (size_t)rows; g += 16u) {
+        __m128i c[8];
+        uint8_t *d = out + (size_t)g * 8u;
+        unsigned t;
+
+        for (t = 0; t < 8u; t++) {
+            __m128i x = ZPSE_PF_LOAD(segs[t] + g);
+
+            c[t] = carry != 0 ? zpse_chain_undo(x, carry + t, delta) : x;
+        }
+        {
+            __m128i p0 = _mm_unpacklo_epi8(c[0], c[4]);
+            __m128i p1 = _mm_unpackhi_epi8(c[0], c[4]);
+            __m128i p2 = _mm_unpacklo_epi8(c[1], c[5]);
+            __m128i p3 = _mm_unpackhi_epi8(c[1], c[5]);
+            __m128i p4 = _mm_unpacklo_epi8(c[2], c[6]);
+            __m128i p5 = _mm_unpackhi_epi8(c[2], c[6]);
+            __m128i p6 = _mm_unpacklo_epi8(c[3], c[7]);
+            __m128i p7 = _mm_unpackhi_epi8(c[3], c[7]);
+            __m128i ev01 = _mm_unpacklo_epi8(p0, p4);
+            __m128i ev23 = _mm_unpackhi_epi8(p0, p4);
+            __m128i ev45 = _mm_unpacklo_epi8(p1, p5);
+            __m128i ev67 = _mm_unpackhi_epi8(p1, p5);
+            __m128i od01 = _mm_unpacklo_epi8(p2, p6);
+            __m128i od23 = _mm_unpackhi_epi8(p2, p6);
+            __m128i od45 = _mm_unpacklo_epi8(p3, p7);
+            __m128i od67 = _mm_unpackhi_epi8(p3, p7);
+
+            _mm_storeu_si128((__m128i *)(void *)d,
+                             _mm_unpacklo_epi8(ev01, od01));
+            _mm_storeu_si128((__m128i *)(void *)(d + 16),
+                             _mm_unpackhi_epi8(ev01, od01));
+            _mm_storeu_si128((__m128i *)(void *)(d + 32),
+                             _mm_unpacklo_epi8(ev23, od23));
+            _mm_storeu_si128((__m128i *)(void *)(d + 48),
+                             _mm_unpackhi_epi8(ev23, od23));
+            _mm_storeu_si128((__m128i *)(void *)(d + 64),
+                             _mm_unpacklo_epi8(ev45, od45));
+            _mm_storeu_si128((__m128i *)(void *)(d + 80),
+                             _mm_unpackhi_epi8(ev45, od45));
+            _mm_storeu_si128((__m128i *)(void *)(d + 96),
+                             _mm_unpacklo_epi8(ev67, od67));
+            _mm_storeu_si128((__m128i *)(void *)(d + 112),
+                             _mm_unpackhi_epi8(ev67, od67));
+        }
+    }
+}
+
+/* The 16-wide page inverse, chained or plain. `pv` is the per-plane chain
+ * carry (seeds on entry, advanced a group at a time); it is ignored when
+ * `chained == 0`. Groups [g0, g0+n) are done: one group is 16 rows, 16 bytes
+ * per plane in and 256 bytes of output out. The chain, the byte-15 carry
+ * and the transpose are the ones the ordinary SSE2 w==16 inverse uses. */
+static void zpse_pf_inv16(uint8_t *out, const uint8_t *const segs[16],
+                          uint32_t g0, uint32_t groups, uint8_t *pv,
+                          int chained, int delta)
+{
+    uint32_t g;
+
+    for (g = g0; g < g0 + groups; g++) {
+        __m128i r[16];
+        unsigned t;
+
+        for (t = 0; t < 16u; t++) {
+            __m128i v = ZPSE_PF_LOAD(segs[t] + (size_t)g * 16u);
+
+            if (chained) {
+                uint8_t add;
+
+                if (delta) {
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
+                } else {
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 1));
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 2));
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 4));
+                    v = _mm_xor_si128(v, _mm_slli_si128(v, 8));
+                }
+                add = (uint8_t)_mm_cvtsi128_si32(_mm_srli_si128(v, 15));
+                v = delta ? _mm_add_epi8(v, _mm_set1_epi8((char)pv[t]))
+                          : _mm_xor_si128(v, _mm_set1_epi8((char)pv[t]));
+                pv[t] = (uint8_t)(delta ? (uint8_t)(pv[t] + add)
+                                        : (uint8_t)(pv[t] ^ add));
+            }
+            r[t] = v;
+        }
+        zpse_t16x16(r);
+        for (t = 0; t < 16u; t++) {
+            _mm_storeu_si128(
+                (__m128i *)(void *)(out + (size_t)g * 256u + (size_t)t * 16u),
+                r[t]);
+        }
+    }
+}
+
+#if ZPSE_T_HAVE_AVX2
+/* The 16x16 network fed from registers instead of memory.
+ *
+ * zpse_t16x16_avx2 takes its eight input registers as pairs of 16-byte rows
+ * read from sixteen plane pointers. The stage-free delta inverse below has
+ * the two 128-bit halves of each de-chained plane already in registers, so
+ * this is the same network with those eight registers passed in. Same four
+ * stages, same emit, same bytes -- only the source of a0..a7 changes. */
+static ZPSE_T_AVX2 void zpse_pf_t16_regs(const __m256i a[8],
+                                         uint8_t *const out[16],
+                                         uint32_t out_off)
+{
+    __m256i t0, t1, t2, t3, t4, t5, t6, t7;
+    __m256i u0, u1, u2, u3, u4, u5, u6, u7;
+    __m256i v0, v1, v2, v3, v4, v5, v6, v7;
+    __m256i w0, w1, w2, w3, w4, w5, w6, w7;
+
+    t0 = _mm256_unpacklo_epi8(a[0], a[1]);
+    t1 = _mm256_unpackhi_epi8(a[0], a[1]);
+    t2 = _mm256_unpacklo_epi8(a[2], a[3]);
+    t3 = _mm256_unpackhi_epi8(a[2], a[3]);
+    t4 = _mm256_unpacklo_epi8(a[4], a[5]);
+    t5 = _mm256_unpackhi_epi8(a[4], a[5]);
+    t6 = _mm256_unpacklo_epi8(a[6], a[7]);
+    t7 = _mm256_unpackhi_epi8(a[6], a[7]);
+    u0 = _mm256_unpacklo_epi16(t0, t2);
+    u1 = _mm256_unpackhi_epi16(t0, t2);
+    u2 = _mm256_unpacklo_epi16(t1, t3);
+    u3 = _mm256_unpackhi_epi16(t1, t3);
+    u4 = _mm256_unpacklo_epi16(t4, t6);
+    u5 = _mm256_unpackhi_epi16(t4, t6);
+    u6 = _mm256_unpacklo_epi16(t5, t7);
+    u7 = _mm256_unpackhi_epi16(t5, t7);
+    v0 = _mm256_unpacklo_epi32(u0, u4);
+    v1 = _mm256_unpackhi_epi32(u0, u4);
+    v2 = _mm256_unpacklo_epi32(u1, u5);
+    v3 = _mm256_unpackhi_epi32(u1, u5);
+    v4 = _mm256_unpacklo_epi32(u2, u6);
+    v5 = _mm256_unpackhi_epi32(u2, u6);
+    v6 = _mm256_unpacklo_epi32(u3, u7);
+    v7 = _mm256_unpackhi_epi32(u3, u7);
+    w0 = _mm256_unpacklo_epi64(v0, v4);
+    w1 = _mm256_unpackhi_epi64(v0, v4);
+    w2 = _mm256_unpacklo_epi64(v1, v5);
+    w3 = _mm256_unpackhi_epi64(v1, v5);
+    w4 = _mm256_unpacklo_epi64(v2, v6);
+    w5 = _mm256_unpackhi_epi64(v2, v6);
+    w6 = _mm256_unpacklo_epi64(v3, v7);
+    w7 = _mm256_unpackhi_epi64(v3, v7);
+
+#define ZPSE_PF_T16_EMIT(WK, IDX)                                              \
+    do {                                                                       \
+        const __m128i lo_ = _mm256_castsi256_si128(WK);                        \
+        const __m128i hi_ = _mm256_extracti128_si256(WK, 1);                   \
+        _mm_storeu_si128((__m128i *)(void *)(out[IDX] + out_off),              \
+                         _mm_unpacklo_epi64(lo_, hi_));                        \
+        _mm_storeu_si128((__m128i *)(void *)(out[(IDX) + 8u] + out_off),       \
+                         _mm_unpackhi_epi64(lo_, hi_));                        \
+    } while (0)
+
+    ZPSE_PF_T16_EMIT(w0, 0u);
+    ZPSE_PF_T16_EMIT(w1, 1u);
+    ZPSE_PF_T16_EMIT(w2, 2u);
+    ZPSE_PF_T16_EMIT(w3, 3u);
+    ZPSE_PF_T16_EMIT(w4, 4u);
+    ZPSE_PF_T16_EMIT(w5, 5u);
+    ZPSE_PF_T16_EMIT(w6, 6u);
+    ZPSE_PF_T16_EMIT(w7, 7u);
+#undef ZPSE_PF_T16_EMIT
+}
+
+/* The delta/xor 16-wide page inverse, with no staging copy.
+ *
+ * The ordinary AVX2 form (zpse_delta16_inverse_avx2) first prefix-scans a
+ * plane into a 4 KiB buffer and only then transposes it: that copy is needed
+ * on a 64 KiB block to avoid the set conflict, but a page's planes are all
+ * in L1 on distinct sets. Here the chain is undone 32 bytes at a time in
+ * registers (the same zpse_chain_*32v ladders the merge kernels use), and
+ * the two 128-bit halves of each result are the two 16-row groups the
+ * existing 16x16 network wants, so the de-chained bytes go straight from
+ * the chain's registers into the transpose and out to the caller. No plane
+ * is ever written before its bytes reach `out`.
+ *
+ * The carry is kept as a broadcast per plane across the 32-row loop and
+ * written back once, exactly as the AVX2 merge kernels do; the SSE2 helper
+ * above finishes any odd group from those same bytes. */
+static ZPSE_T_AVX2 void zpse_pf_inv16_chain_avx2(
+    uint8_t *out, const uint8_t *const segs[16], uint32_t groups,
+    uint8_t carry[16], int delta)
+{
+    const __m256i ctl = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15);
+    const __m256i ctl_all = _mm256_loadu_si256(
+        (const __m256i *)(const void *)zpse_avx2_ctl15_all);
+    __m256i c[16];
+    uint8_t *tout[16];
+    uint32_t g = 0u;
+    unsigned t;
+    unsigned k;
+
+    for (t = 0; t < 16u; t++) {
+        c[t] = _mm256_set1_epi8((char)carry[t]);
+        tout[t] = out + (size_t)t * 16u;
+    }
+    for (; (g + 2u) <= groups; g += 2u) {
+        __m256i pt[16];
+        __m256i a0[8];
+        __m256i a1[8];
+
+        for (t = 0; t < 16u; t++) {
+            /* 32-byte aligned: the plane base is 64-byte aligned and g is
+             * even, so the offset is a multiple of 32. */
+            __m256i x = _mm256_load_si256(
+                (const __m256i *)(const void *)(segs[t] + (size_t)g * 16u));
+
+            pt[t] = delta ? zpse_chain_add32v(ctl, ctl_all, x, &c[t])
+                          : zpse_chain_xor32v(ctl, ctl_all, x, &c[t]);
+        }
+        /* a[k] = [rows of plane k | rows of plane k+8] for each of the two
+         * 16-row halves -- exactly the layout zpse_t16x16_avx2 builds from
+         * its sixteen plane pointers. */
+        for (k = 0; k < 8u; k++) {
+            a0[k] = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm256_castsi256_si128(pt[k])),
+                _mm256_castsi256_si128(pt[k + 8u]), 1);
+            a1[k] = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm256_extracti128_si256(pt[k], 1)),
+                _mm256_extracti128_si256(pt[k + 8u], 1), 1);
+        }
+        zpse_pf_t16_regs(a0, tout, g * 256u);
+        zpse_pf_t16_regs(a1, tout, (g + 1u) * 256u);
+    }
+    for (t = 0; t < 16u; t++) {
+        carry[t] = (uint8_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(c[t]));
+    }
+    /* At most one odd group (rows is a multiple of 16). */
+    if (g < groups) {
+        zpse_pf_inv16(out, segs, g, groups - g, carry, 1, delta);
+    }
+}
+#endif /* ZPSE_T_HAVE_AVX2 */
+
+/* The aligned loads are valid only when every plane starts on a cache line.
+ * The decoder's recon planes are 64-byte aligned when n is a multiple of the
+ * width (the common 4 KiB case); any other layout falls back to the
+ * unaligned loops, which produce the very same bytes. */
+static int zpse_pf_ok(const uint8_t *const segs[16], uint8_t w)
+{
+    unsigned t;
+
+    for (t = 0; t < (unsigned)w; t++) {
+        if ((((uintptr_t)segs[t]) & (uintptr_t)63u) != 0u) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Whole page inverse: full 16-row groups through the aligned networks above,
+ * the ragged tail through the scalar loops shared with the ordinary inverse. */
+static void zpse_transform_inverse_page(const ZpseTransformMeta *meta,
+                                        uint8_t w,
+                                        const uint8_t *const segs[16],
+                                        const uint32_t seg_lens[16],
+                                        uint8_t *out, uint32_t n)
+{
+    uint32_t rows = seg_lens[0];
+    uint32_t full;
+    uint8_t s;
+    int delta = zpse_needs_delta(meta->transform_id, meta->stride_flags);
+    int xorr = zpse_needs_xor(meta->transform_id);
+
+    (void)n;
+    for (s = 1; s < w; s++) {
+        if (seg_lens[s] < rows) {
+            rows = seg_lens[s];
+        }
+    }
+    full = (rows / 16u) * 16u;
+
+    if (!delta && !xorr) {
+        if (w == 16u) {
+#if ZPSE_T_HAVE_AVX2
+            if (zpse_t_avx2()) {
+                const uint8_t *tin[16];
+                uint8_t *tout[16];
+                unsigned t;
+
+                /* No staged copy, no skew decision: a page's planes are in
+                 * L1 on distinct sets, so read them straight through the
+                 * existing direct gather. */
+                for (t = 0; t < 16u; t++) {
+                    tin[t] = segs[t];
+                    tout[t] = out + (size_t)t * 16u;
+                }
+                zpse_t16x16_inverse_direct(tin, tout, full / 16u);
+            } else
+#endif
+                zpse_pf_inv16(out, segs, 0, full / 16u, 0, 0, 0);
+            for (s = 0; s < w; s++) {
+                const uint8_t *src = segs[s];
+                uint32_t len = seg_lens[s];
+                uint32_t jj;
+
+                for (jj = full; jj < len; jj++) {
+                    out[(uint32_t)s + jj * 16u] = src[jj];
+                }
+            }
+        } else {
+            if (w == 2u) {
+                zpse_pf_merge2(out, segs, full, 0, 0);
+            } else if (w == 4u) {
+                zpse_pf_merge4(out, segs, full, 0, 0);
+            } else {
+                zpse_pf_merge8(out, segs, full, 0, 0);
+            }
+            for (s = 0; s < w; s++) {
+                uint32_t len = seg_lens[s];
+                uint32_t r2;
+
+                for (r2 = full; r2 < len; r2++) {
+                    out[(uint32_t)s + r2 * (uint32_t)w] = segs[s][r2];
+                }
+            }
+        }
+        return;
+    }
+    {
+        uint8_t carry[16];
+
+        for (s = 0; s < w; s++) {
+            carry[s] = meta->seeds[s];
+        }
+        if (w == 16u) {
+#if ZPSE_T_HAVE_AVX2
+            if (zpse_t_avx2()) {
+                zpse_pf_inv16_chain_avx2(out, segs, full / 16u, carry, delta);
+            } else
+#endif
+                zpse_pf_inv16(out, segs, 0, full / 16u, carry, 1, delta);
+            for (s = 0; s < w; s++) {
+                const uint8_t *src = segs[s];
+                uint32_t len = seg_lens[s];
+                uint8_t p = carry[s];
+                uint32_t jj;
+
+                for (jj = full; jj < len; jj++) {
+                    uint8_t e = src[jj];
+                    uint8_t d = delta ? (uint8_t)(e + p) : (uint8_t)(e ^ p);
+
+                    p = d;
+                    out[(uint32_t)s + jj * 16u] = d;
+                }
+            }
+        } else {
+            if (w == 2u) {
+                zpse_pf_merge2(out, segs, full, carry, delta);
+            } else if (w == 4u) {
+                zpse_pf_merge4(out, segs, full, carry, delta);
+            } else {
+                zpse_pf_merge8(out, segs, full, carry, delta);
+            }
+            for (s = 0; s < w; s++) {
+                uint32_t len = seg_lens[s];
+                uint8_t p = carry[s];
+                uint32_t r2;
+
+                for (r2 = full; r2 < len; r2++) {
+                    uint8_t e = segs[s][r2];
+                    uint8_t d = delta ? (uint8_t)(e + p) : (uint8_t)(e ^ p);
+
+                    p = d;
+                    out[(uint32_t)s + r2 * (uint32_t)w] = d;
+                }
+            }
+        }
+    }
+}
+
+#endif /* ZPSE_XFORM_PAGE_FAST && ZPSE_T_HAVE_SSE2 */
+
 static int zpse_valid_count(uint8_t v)
 {
     return (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) ? 1 : 0;
@@ -2228,7 +2666,8 @@ int zpse_transform_validate_sizes(uint8_t transform_id, uint8_t segment_count,
  */
 static ZPSE_HOT int zpse_transform_forward_impl(
     const ZpseTransformMeta *meta, uint8_t seg_count, const uint8_t *in,
-    uint32_t n, uint8_t *segs[16], const uint32_t seg_lens[16], int trusted)
+    uint32_t n, uint8_t *segs[16], const uint32_t seg_lens[16], int trusted,
+    int stage_plain)
 {
     uint8_t w = 0;
     uint8_t s;
@@ -2265,8 +2704,13 @@ static ZPSE_HOT int zpse_transform_forward_impl(
             return ZPSE_BAD_ARG;
         }
     }
-    delta = zpse_needs_delta(meta->transform_id, meta->stride_flags);
-    xorr = zpse_needs_xor(meta->transform_id);
+    /* `stage_plain` stages only the permutation and leaves the delta/xor
+     * chain for the caller to apply per plane with zpse_plane_chain_inplace.
+     * The bytes written to a plane are the transpose's, bit-for-bit the same
+     * prefix the full transform chains in place. */
+    delta = stage_plain ? 0 : zpse_needs_delta(meta->transform_id,
+                                               meta->stride_flags);
+    xorr = stage_plain ? 0 : zpse_needs_xor(meta->transform_id);
     if ((delta || xorr) && !meta->has_seeds) {
         return ZPSE_BAD_ARG;
     }
@@ -2467,7 +2911,7 @@ ZPSE_HOT int zpse_transform_forward(const ZpseTransformMeta *meta, uint8_t seg_c
                            uint8_t *segs[16], const uint32_t seg_lens[16])
 {
     return zpse_transform_forward_impl(meta, seg_count, in, n, segs, seg_lens,
-                                      0);
+                                      0, 0);
 }
 
 ZPSE_HOT int zpse_transform_forward_planes(const ZpseTransformMeta *meta,
@@ -2476,12 +2920,17 @@ ZPSE_HOT int zpse_transform_forward_planes(const ZpseTransformMeta *meta,
                                           const uint32_t seg_lens[16])
 {
     return zpse_transform_forward_impl(meta, seg_count, in, n, segs, seg_lens,
-                                      1);
+                                      1, 0);
 }
 
-ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_count,
-                           const uint8_t *segs[16], const uint32_t seg_lens[16],
-                           uint8_t *out, uint32_t n)
+/* `trusted` skips the two duplicate validation passes -- the decoded-shape
+ * check and the O(w^2) plane-overlap checks -- that the decoder has already
+ * answered. Everything cheap stays in both forms; see the header. */
+static int zpse_transform_inverse_impl(const ZpseTransformMeta *meta,
+                                       uint8_t seg_count,
+                                       const uint8_t *segs[16],
+                                       const uint32_t seg_lens[16],
+                                       uint8_t *out, uint32_t n, int trusted)
 {
     uint8_t w = 0;
     uint8_t s;
@@ -2507,10 +2956,12 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
     if (meta->width_W != w || seg_count != w) {
         return ZPSE_BAD_TRANSFORM;
     }
-    rc = zpse_transform_validate_sizes(meta->transform_id, seg_count, n,
-                                       seg_lens);
-    if (rc != ZPSE_OK) {
-        return rc;
+    if (!trusted) {
+        rc = zpse_transform_validate_sizes(meta->transform_id, seg_count, n,
+                                           seg_lens);
+        if (rc != ZPSE_OK) {
+            return rc;
+        }
     }
     for (s = 0; s < w; s++) {
         if (segs[s] == 0) {
@@ -2522,20 +2973,33 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
     if ((delta || xorr) && !meta->has_seeds) {
         return ZPSE_BAD_ARG;
     }
-    for (s = 0; s < w; s++) {
-        if (zpse_ranges_overlap(out, n, segs[s], seg_lens[s])) {
-            return ZPSE_BAD_ARG;
-        }
-    }
-    for (s = 0; s < w; s++) {
-        uint8_t t;
-        for (t = (uint8_t)(s + 1u); t < w; t++) {
-            if (zpse_ranges_overlap(segs[s], seg_lens[s],
-                                    segs[t], seg_lens[t])) {
+    if (!trusted) {
+        for (s = 0; s < w; s++) {
+            if (zpse_ranges_overlap(out, n, segs[s], seg_lens[s])) {
                 return ZPSE_BAD_ARG;
             }
         }
+        for (s = 0; s < w; s++) {
+            uint8_t t;
+            for (t = (uint8_t)(s + 1u); t < w; t++) {
+                if (zpse_ranges_overlap(segs[s], seg_lens[s],
+                                        segs[t], seg_lens[t])) {
+                    return ZPSE_BAD_ARG;
+                }
+            }
+        }
     }
+#if ZPSE_XFORM_PAGE_FAST && ZPSE_T_HAVE_SSE2
+    /* A page fits in L1 and its planes sit on distinct sets, so the staged
+     * and skewed forms above are pure cost here. Only the plain and delta
+     * transpose ids have planes to interleave; the page kernel is
+     * stage-free, uses aligned loads, and is byte-identical. */
+    if (n <= 4096u && meta->transform_id >= 3u &&
+        meta->transform_id <= 10u && zpse_pf_ok(segs, w)) {
+        zpse_transform_inverse_page(meta, w, segs, seg_lens, out, n);
+        return ZPSE_OK;
+    }
+#endif
     /* Per-segment loops instead of a single i loop with `i % w` and
      * `i / w`: those are two integer divisions per output byte when `w`
      * is not a compile-time constant, which dominated decode for the
@@ -2828,6 +3292,26 @@ ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta, uint8_t seg_c
         }
     }
     return ZPSE_OK;
+}
+
+ZPSE_HOT int zpse_transform_inverse(const ZpseTransformMeta *meta,
+                                    uint8_t seg_count,
+                                    const uint8_t *segs[16],
+                                    const uint32_t seg_lens[16], uint8_t *out,
+                                    uint32_t n)
+{
+    return zpse_transform_inverse_impl(meta, seg_count, segs, seg_lens, out, n,
+                                       0);
+}
+
+ZPSE_HOT int zpse_transform_inverse_trusted(const ZpseTransformMeta *meta,
+                                            uint8_t seg_count,
+                                            const uint8_t *segs[16],
+                                            const uint32_t seg_lens[16],
+                                            uint8_t *out, uint32_t n)
+{
+    return zpse_transform_inverse_impl(meta, seg_count, segs, seg_lens, out, n,
+                                       1);
 }
 
 void zpse_delta8_encode(const uint8_t *in, uint8_t *enc, uint32_t n,
