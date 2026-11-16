@@ -70,7 +70,7 @@
  * ---------------------------------------------------------------------------
  * The tables, and why they are in the format
  * ---------------------------------------------------------------------------
- * Four tables, 11-bit lookup, 256 symbols each, trained offline on the
+ * Four tables, 10-bit lookup, 256 symbols each, trained offline on the
  * payloads the LZ forms actually produce (tests/benchmarks/huf_train.c) and
  * checked in as src/huf_tables.inc. The encoder picks one per block by
  * pricing all four against a strided sample of the block's bytes -- 4 x 256
@@ -108,16 +108,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Bits of one decode lookup. 11 covers a 256-symbol Huffman code with room to
- * spare (a 256-leaf tree needs 8 bits on average and 11 only for very skewed
- * distributions), so a lookup always yields a whole symbol. One symbol per
- * lookup, not two: see the dtab note below for why two does not fit this
- * data. */
-#define ZPSE_HUF_TABLE_LOG   11u
+/* Bits of one decode lookup. The four trained code books top out at ten bits
+ * -- that is what the checked-in ctab measures -- so a 10-bit window always
+ * yields a whole symbol with room to spare (a 256-leaf tree needs eight bits
+ * on average). One symbol per lookup, not two: see the dtab note below for why
+ * two does not fit this data. */
+#define ZPSE_HUF_TABLE_LOG   10u
 #define ZPSE_HUF_TABLE_SIZE  (1u << ZPSE_HUF_TABLE_LOG)
-/* Longest code a table may contain. Clamping to this is what makes the
- * lookup one level deep; the trainer rebalances to stay inside it. */
-#define ZPSE_HUF_MAX_LEN     11u
+/* Longest code a table may contain. The trainer clamps to this (via HUF_LOG)
+ * and the encoder's worst-case sizing and decoder's refill arithmetic round
+ * up to it, so no code is longer than the LUT is deep. */
+#define ZPSE_HUF_MAX_LEN     10u
 #define ZPSE_HUF_TABLES      4u
 #define ZPSE_HUF_SYMBOLS     256u
 #define ZPSE_HUF_STREAMS     4u
@@ -139,6 +140,15 @@
 #ifndef ZPSE_HUF_DIV
 #define ZPSE_HUF_DIV         64u
 #endif
+/* Stride of the sample histogram that ranks the four code books. The default
+ * looks at one byte in eight; build with -DZPSE_HUF_SAMPLE=1u to rank from
+ * every byte instead. Both are deterministic and produce the same bytes for a
+ * given input -- the sample only ranks fixed books, the stream lengths are
+ * exact either way -- so this is a speed knob, not a format knob. See
+ * zpse_huf_encode in src/huf.c for what each choice costs. */
+#ifndef ZPSE_HUF_SAMPLE
+#define ZPSE_HUF_SAMPLE 8u
+#endif
 /* Deepest rung that offers it without ZPSE_ENC_HUF. MAX is the level whose
  * trade is size over everything; the rungs below it are where the encode time
  * this pass costs is worth more than the bytes. */
@@ -150,11 +160,11 @@
  * if the table has no code for the symbol (it always does). */
 #define ZPSE_HUF_CTAB_BYTES (ZPSE_HUF_TABLES * ZPSE_HUF_SYMBOLS * 2u)
 /* zpse_huf_dtab[t][i] = (nbBits << 8) | symbol: exactly one symbol per
- * lookup. A two-symbol entry needs both codes inside the eleven-bit window,
+ * lookup. A two-symbol entry needs both codes inside the ten-bit window,
  * which an LZ payload (about seven bits per symbol) almost never has, so it
  * was measured and dropped -- see src/huf.c. */
 #define ZPSE_HUF_DTAB_BYTES (ZPSE_HUF_TABLES * ZPSE_HUF_TABLE_SIZE * 2u)
-/* What the tables add to the binary: 2 KiB of codes and 16 KiB of lookups,
+/* What the tables add to the binary: 2 KiB of codes and 8 KiB of lookups,
  * as read-only data. */
 #define ZPSE_HUF_TABLE_BYTES (ZPSE_HUF_CTAB_BYTES + ZPSE_HUF_DTAB_BYTES)
 
