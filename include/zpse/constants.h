@@ -27,6 +27,35 @@
  * sees 0x50B7 knows the block is a page's and reads 16 bytes before the
  * payload, and any other sync is the 32-byte header it has always been. */
 #define ZPSE_BLOCK_SYNC_SHORT   ((uint16_t)0x50B7)
+/* A one-value page: the 16-byte page header with the value in transform_id
+ * and no payload at all. The decoder fills the block with that byte. A zero
+ * page used to spend 16 header + 8 segment directory + 8 segment header +
+ * 12 dense record = 44 bytes to say "4096 zeros"; the token says it in 16.
+ * This is a v1.1 wire addition: an older reader sees an unknown sync and
+ * refuses the block, which is the point of the sync byte. */
+#define ZPSE_BLOCK_SYNC_TOKEN   ((uint16_t)0x50B8)
+/* The FLAT page form: a 16-byte header that names a flat payload codec
+ * instead of a transform + segment directory. This is a BREAKING wire change
+ * (allowed here); the new sync is what selects it. All header bytes are
+ * little-endian:
+ *   [0..2)   u16 sync = ZPSE_BLOCK_SYNC_FLAT (0x50B9)
+ *   [2]      u8  flags -- ZPSE_B_RESET required, ZPSE_B_LAST optional; every
+ *                         other bit (RAW, CRC, HAS_META, LZ*, reserved) is
+ *                         rejected
+ *   [3]      u8  codec -- one of the ZPSE_FLAT_* values below
+ *   [4]      u8  param -- codec parameter (becomes transform_meta_size)
+ *   [5]      u8  reserved, MUST be 0
+ *   [6..8)   u16 n     -- uncompressed size, 1..ZPSE_BLOCK_SHORT_MAX
+ *   [8..10)  u16 c     -- compressed total size, >= 16
+ *   [10..14) u32 seq   -- block sequence number
+ *   [14..16) u16 crc16 -- low 16 bits of crc32c over bytes [0..14)
+ */
+#define ZPSE_BLOCK_SYNC_FLAT    ((uint16_t)0x50B9)
+/* Values of FLAT header byte [3]. */
+#define ZPSE_FLAT_RAW           ((uint8_t)0)
+#define ZPSE_FLAT_NIBBLE4       ((uint8_t)1)
+#define ZPSE_FLAT_BIT2          ((uint8_t)2)
+#define ZPSE_FLAT_SUBLELANE     ((uint8_t)3)
 
 #define ZPSE_FRAME_HEADER_SIZE  32u
 #define ZPSE_BLOCK_HEADER_SIZE  32u
@@ -76,7 +105,6 @@
 
 #define ZPSE_MAX_SEGMENTS       16u /* max segment_count value (1,2,4,8,16) */
 #define ZPSE_ORDER2_SIZE        4096u
-#define ZPSE_COMB_MAX_BYTES     32u /* C(256,128) fits in 4x u64 limbs */
 
 /* Frame flags (Sec. 3.2). */
 #define ZPSE_F_BLOCK_CRC        (UINT16_C(1) << 0)
@@ -224,6 +252,21 @@
  * asks for the fast form and nothing else) takes precedence when both are
  * set: a caller who named the form explicitly meant it. */
 #define ZPSE_ENC_DECODE_FAST    (UINT32_C(1) << 9)
+
+/* Page turbo: a fixed, cheap page profile that skips the multi-candidate
+ * decision entirely. It asks for one LZ pass (the fast form) and keeps it
+ * only when it clearly beats a verbatim copy, and it applies the page
+ * decode-first margin so a page that barely compresses is written raw.
+ * It is the rung for a zram store that wants the encode rate of lz4 with a
+ * stream a decoder reads faster; it changes no wire form and needs no
+ * decoder option. Requires a page-sized block (n <= ZPSE_BLOCK_SHORT_MAX). */
+#define ZPSE_ENC_PAGE_TURBO     (UINT32_C(1) << 10)
+
+/* Allow the Huffman wrapper on a 4 KiB page at any LZ level, not just at
+ * level 9. The wrapper is more effective on page payloads (an 11.3% cut in
+ * the wrapped bytes against 6.9% on Silesia) but costs an extra entropy pass
+ * on both sides, so it is opt-in rather than the default page profile. */
+#define ZPSE_ENC_PAGE_HUF       (UINT32_C(1) << 12)
 
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is
