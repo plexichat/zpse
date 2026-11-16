@@ -2,8 +2,14 @@
 #define ZPSE_CRC32C_H
 
 /* CRC32-C (Castagnoli, reflected, poly 0x1EDC6F41).
- * init 0xFFFFFFFF, xorout 0xFFFFFFFF. Slice-by-1 software fallback;
- * SIMD/hardware variants live in vector.h and MUST be bit-identical. */
+ * init 0xFFFFFFFF, xorout 0xFFFFFFFF. The portable slice-by-8/slice-by-1
+ * fallback and the run-time-dispatched SSE4.2 (crc32 instruction) path live
+ * together in src/crc32c.c and are bit-identical: every entry point here
+ * returns the same 32 bits whichever path ran, so callers may truncate that
+ * value (a page header carries CRC & 0xFFFF) without knowing the path.
+ * The software lookup tables are static const (no runtime/lazy init), so
+ * results are byte-identical across worker counts and builds.
+ * The hardware path can be disabled at build time with -DZPSE_CRC32C_HW=0. */
 
 #include <stddef.h>
 #include <stdint.h>
