@@ -20,7 +20,8 @@
  *
  * The store loop at the end is the caller's sequence from
  * docs/page-dictionary.md run end to end: hash, look up, serve or encode,
- * insert only what compressed, and decode every hit. */
+ * insert every page that misses (a RAW block included), and decode every
+ * hit. */
 
 #include <stdio.h>
 #include <string.h>
@@ -31,7 +32,7 @@ static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
 
 #define PAGE 4096u
 /* 0..7 unique and compressible, 8..15 copies of them, 16..17 two copies of one
- * page that does not compress (so neither is worth an entry). */
+ * page that does not compress (its RAW block is stored on the first copy). */
 #define NPAGES 18u
 /* Wide enough that the corpus's eight compressible tags do not collide: with
  * 8 tags in 1,024 slots the index is the mapping being tested, not the hash.
@@ -325,17 +326,16 @@ static void test_store(void)
                                      ea);
             CHECK(rc == ZPSE_OK, "encode failed: %s", zpse_status_name(rc));
             misses++;
-            /* Only what compressed is worth an entry: a RAW page's "block" is
-             * longer than the page, so storing it would cost more than the
-             * hash it saves. */
-            if (len < PAGE) {
-                poff[next_slot] = pool_used;
-                plen[next_slot] = len;
-                memcpy(pool + pool_used, blk[q], len);
-                pool_used += len;
-                zpse_pagedict_insert(&d, lo, hi, next_slot);
-                next_slot++;
-            }
+            /* Store whatever the block came out as. A RAW page's block is a
+             * block too: retagging it for a repeat writes exactly the bytes a
+             * fresh encode of that page at that position would, so it is
+             * worth an entry whenever the page repeats. */
+            poff[next_slot] = pool_used;
+            plen[next_slot] = len;
+            memcpy(pool + pool_used, blk[q], len);
+            pool_used += len;
+            zpse_pagedict_insert(&d, lo, hi, next_slot);
+            next_slot++;
         }
         blen[q] = len;
 
@@ -366,10 +366,10 @@ static void test_store(void)
             }
         }
     }
-    /* Pages 8..15 repeat 0..7 and hit; 16,17 are one noise page twice, and a
-     * RAW block is never inserted, so both encode. */
-    CHECK(hits == 8u, "expected 8 hits, got %u", hits);
-    CHECK(misses == NPAGES - 8u, "expected %u misses, got %u", NPAGES - 8u,
+    /* Pages 8..15 repeat 0..7 and hit; 16 is the first noise page and misses,
+     * its RAW block is stored, and 17 repeats it and hits too. */
+    CHECK(hits == 9u, "expected 9 hits, got %u", hits);
+    CHECK(misses == NPAGES - 9u, "expected %u misses, got %u", NPAGES - 9u,
           misses);
     CHECK(last_ok, "a block's is-last flag disagrees with its position");
     CHECK(pool_used > 0u && pool_used < (uint32_t)sizeof pool,
