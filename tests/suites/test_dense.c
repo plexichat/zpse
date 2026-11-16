@@ -207,6 +207,40 @@ static int decode(uint32_t payload_len, uint8_t *got, uint32_t *got_len)
                                ZPSE_DENSE_MAX_LEN, got_len);
 }
 
+/* A hostile record must never write past the plane it declares. This decode
+ * fills a guard buffer with 0xC7 and, after the call, checks [guard_from, cap)
+ * for any change -- so a bogus K or residual length that made the decoder
+ * store past nt is caught even when the record is (correctly) refused. */
+static uint8_t outguard[ZPSE_DENSE_MAX_LEN + 128];
+
+static int decode_guarded(uint32_t payload_len, uint32_t guard_from,
+                          uint32_t *got_len, int *guard_hit)
+{
+    ZpseDecoder d;
+    ZpseLaneState lanes;
+    uint32_t i;
+    int rc;
+
+    memset(outguard, 0xC7u, sizeof outguard);
+    *guard_hit = 0;
+    rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    lanes.order1 = d.order1;
+    lanes.o2 = d.o2;
+    lanes.gen = 0u;
+    rc = zpse_segment_decode(&d, &lanes, seg, payload_len, outguard,
+                             (uint32_t)sizeof outguard, got_len);
+    for (i = guard_from; i < (uint32_t)sizeof outguard; i++) {
+        if (outguard[i] != 0xC7u) {
+            *guard_hit = 1;
+            break;
+        }
+    }
+    return rc;
+}
+
 static void fill_plane(uint8_t *plane, uint32_t nt, int kind)
 {
     uint32_t i;
@@ -553,6 +587,122 @@ static void hostile(void)
     }
 }
 
+/* Exception counts and payload lengths a hostile record declares past the
+ * 4096-byte scratch budget must be refused cleanly, with no store past the
+ * plane. The base is a full 4096-byte record with a real bitmap; each field
+ * is then tampered with and the record is decoded through the guarded buffer. */
+static void hostile_scratch_budget(void)
+{
+    static uint8_t plane[ZPSE_DENSE_MAX_LEN];
+    static uint8_t saved[ZPSE_DENSE_MAX_LEN + 16];
+    uint32_t len;
+    uint32_t gl;
+    uint32_t base;
+    int rc;
+    int guard;
+
+    fill_plane(plane, ZPSE_DENSE_MAX_LEN, 5); /* sparse spikes -> real bitmap */
+    len = build(plane, ZPSE_DENSE_MAX_LEN, 0x11u, ZPSE_P_CONST_ZERO, 0u,
+                ZPSE_M_RAW_BITMAP, ZPSE_R_EXCLUSION_U8);
+    cases++;
+    CHECK(len != 0u, "scratch-budget base builds");
+    if (len == 0u) {
+        return;
+    }
+    memcpy(saved, seg, len);
+
+    /* K = 65535: a bitmap with nt == 4096 can hold at most nt-1 exceptions. */
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 6] = 0xFFu;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 7] = 0xFFu;
+    rc = decode_guarded(len, ZPSE_DENSE_MAX_LEN, &gl, &guard);
+    CHECK(rc != ZPSE_OK && guard == 0,
+          "K=65535 under bitmap rejected without overwrite");
+    memcpy(seg, saved, len);
+
+    /* K = 4097: one byte past the budget, still past nt. */
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 6] = 0x01u;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 7] = 0x10u;
+    rc = decode_guarded(len, ZPSE_DENSE_MAX_LEN, &gl, &guard);
+    CHECK(rc != ZPSE_OK && guard == 0,
+          "K=4097 under bitmap rejected without overwrite");
+    memcpy(seg, saved, len);
+
+    /* K = 65535 with ALL_EXCEPTION, which demands K == nt == 4096. */
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 2] =
+        (uint8_t)((seg[ZPSE_SEGMENT_HEADER_SIZE + 2] & 0xF8u) |
+                  (uint8_t)ZPSE_M_ALL_EXCEPTION);
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 6] = 0xFFu;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 7] = 0xFFu;
+    rc = decode_guarded(len, ZPSE_DENSE_MAX_LEN, &gl, &guard);
+    CHECK(rc != ZPSE_OK && guard == 0,
+          "K=65535 under all-exception rejected without overwrite");
+    memcpy(seg, saved, len);
+
+    /* residual_len = 4097: the mask is still valid, so this reaches the
+     * residual decoder, which must reject the length mismatch. Keep the
+     * size equation consistent and stretch the payload to the new span. */
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 10] = 0x01u;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 11] = 0x10u;
+    base = (uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 8] |
+           ((uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 9] << 8);
+    {
+        uint32_t newlen = base + 4097u + 10u;
+
+        seg[ZPSE_SEGMENT_HEADER_SIZE] = (uint8_t)(newlen & 0xFFu);
+        seg[ZPSE_SEGMENT_HEADER_SIZE + 1] = (uint8_t)(newlen >> 8);
+        rc = decode_guarded((uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u + newlen,
+                            ZPSE_DENSE_MAX_LEN, &gl, &guard);
+        CHECK(rc != ZPSE_OK && guard == 0,
+              "residual_len=4097 rejected without overwrite");
+    }
+    memcpy(seg, saved, len);
+
+    /* mask_len = 4097: a bitmap over 4096 bytes must be exactly 512 bytes. */
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 8] = 0x01u;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 9] = 0x10u;
+    base = (uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 10] |
+           ((uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 11] << 8);
+    {
+        uint32_t newlen = 4097u + base + 10u;
+
+        seg[ZPSE_SEGMENT_HEADER_SIZE] = (uint8_t)(newlen & 0xFFu);
+        seg[ZPSE_SEGMENT_HEADER_SIZE + 1] = (uint8_t)(newlen >> 8);
+        rc = decode_guarded((uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u + newlen,
+                            ZPSE_DENSE_MAX_LEN, &gl, &guard);
+        CHECK(rc != ZPSE_OK && guard == 0,
+              "mask_len=4097 rejected without overwrite");
+    }
+    memcpy(seg, saved, len);
+}
+
+/* A valid record that spans the whole 4096-byte scratch budget: a full-plane
+ * bitmap plus one residual byte per exception, decoded back to the exact
+ * plane. This is the well-formed counterpart to hostile_scratch_budget. */
+static void maximal_record(void)
+{
+    static uint8_t plane[ZPSE_DENSE_MAX_LEN];
+    uint32_t len;
+    uint32_t got_len = 0u;
+    int rc;
+
+    fill_plane(plane, ZPSE_DENSE_MAX_LEN, 5);
+    len = build(plane, ZPSE_DENSE_MAX_LEN, 0x11u, ZPSE_P_CONST_ZERO, 0u,
+                ZPSE_M_RAW_BITMAP, ZPSE_R_EXCLUSION_U8);
+    cases++;
+    CHECK(len != 0u, "maximal record builds");
+    if (len == 0u) {
+        return;
+    }
+    CHECK(((uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 8] |
+           ((uint32_t)seg[ZPSE_SEGMENT_HEADER_SIZE + 9] << 8)) ==
+              (uint32_t)(ZPSE_DENSE_MAX_LEN / 8u),
+          "maximal record carries a 512-byte bitmap");
+    rc = decode(len, out, &got_len);
+    CHECK(rc == ZPSE_OK && got_len == ZPSE_DENSE_MAX_LEN &&
+              memcmp(out, plane, ZPSE_DENSE_MAX_LEN) == 0,
+          "maximal 4096-byte dense record round-trips");
+}
+
 /* ---- Emitter --------------------------------------------------------
  *
  * zpse_segment_encode writes tile records first and replaces them with the
@@ -880,8 +1030,13 @@ static void emitter_block(uint32_t n, uint8_t v)
          * page's 16-byte one, so read it through the parse. */
         CHECK(zpse_block_header_parse(&bh, comp, clen) == ZPSE_OK,
               "constant block header parses");
-        if ((bh.block_flags &
-             (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) != 0) {
+        if (comp[0] == ((uint8_t)ZPSE_BLOCK_SYNC_TOKEN & 0xFFu) &&
+            comp[1] == (uint8_t)(ZPSE_BLOCK_SYNC_TOKEN >> 8)) {
+            /* v1.1 one-value page: a 16-byte header and no payload at all. */
+            CHECK(clen == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
+                  "block: one-value token size");
+        } else if ((bh.block_flags &
+                    (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) != 0) {
             CHECK(clen < 32u + 8u + ZPSE_SEGMENT_HEADER_SIZE + 10u * ((n + 255u) / 256u),
                   "block: a compressed form beats the tiles on a constant "
                   "block");
@@ -962,6 +1117,8 @@ int main(void)
     }
 
     hostile();
+    hostile_scratch_budget();
+    maximal_record();
     emitter();
 
     printf("DENSE: cases=%d failures=%d\n", cases, failures);

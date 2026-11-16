@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "zpse/mask.h"
 #include "zpse/predictor.h"
 #include "zpse/status.h"
 #include "zpse/tile.h"
@@ -35,6 +36,12 @@
 static uint8_t plane[1024 + 64];
 static uint8_t o1[8 * 256];
 static uint8_t o2[8 * 4096 * 4];
+
+/* Buffers for the hostile tile-record checks below. */
+static uint8_t tile[256];
+static uint8_t trec[64];
+static uint8_t tout[256];
+static uint8_t tcomb[8192];
 
 
 static ZpseTileClass ref_cl;
@@ -120,6 +127,97 @@ static int cmp_cl(const char *what, const ZpseTileClass *a,
         }
     }
     return 0;
+}
+
+/* A tile record naming a mask mode the format no longer defines (5 was the
+ * removed enumerative form), one with the reserved flag bit set (a mode byte
+ * past 7), or one whose residual payload does not fit the record, must be
+ * refused with a status -- never decoded into the output. The base record is
+ * a valid 256-byte RAW_BITMAP + EXCLUSION_U8 tile with eight exceptions; it
+ * is decoded once so the refusals below are pinned on the tampering, not on
+ * a broken base. */
+static void hostile_tile_records(uint32_t *checks_out, uint32_t *fails_out)
+{
+    ZpseLaneState lanes;
+    uint32_t i;
+    int n;
+    int rc;
+
+    for (i = 0; i < 256u; i++) {
+        tile[i] = (i % 32u == 0u) ? (uint8_t)(i + 1u) : 0u;
+    }
+    memset(tcomb, 0, sizeof tcomb);
+    memset(o1, 0, sizeof o1);
+    memset(o2, 0, sizeof o2);
+
+    /* 8-byte header: flags (mask mode 1, residual 0), CONST_ZERO, nt-1=255,
+     * K=8, mask_len=32 (256/8), residual_len=8 (one unit per exception). */
+    memset(trec, 0, sizeof trec);
+    trec[0] = (uint8_t)ZPSE_M_RAW_BITMAP;
+    trec[1] = (uint8_t)ZPSE_P_CONST_ZERO;
+    trec[2] = 255u;
+    trec[3] = 8u;
+    trec[4] = 32u;
+    trec[6] = 8u;
+    for (i = 0; i < 8u; i++) {
+        trec[8u + i * 4u] = 0x01u;               /* exception at 0,32,..,224 */
+        trec[8u + 32u + i] = (uint8_t)(i * 32u); /* exclusion residual */
+    }
+    n = 8 + 32 + 8; /* 48-byte record */
+
+    memset(&lanes, 0, sizeof lanes);
+    lanes.order1 = o1;
+    lanes.o2 = o2;
+    lanes.gen = 0u;
+    memset(tout, 0xA5, sizeof tout);
+    rc = zpse_tile_decode(&lanes, trec, (uint32_t)n, 0u, 1, tile, 0u,
+                          tout, (uint32_t)sizeof tout, tcomb);
+    if (rc != 256 || memcmp(tout, tile, 256u) != 0) {
+        printf("FAIL hostile tile: base record rc=%d\n", rc);
+        (*fails_out)++;
+    }
+    (*checks_out)++;
+
+    /* Mask mode 5: the enumerative form was removed, so derive_k refuses. */
+    trec[0] = 5u;
+    rc = zpse_tile_decode(&lanes, trec, (uint32_t)n, 0u, 1, tile, 0u,
+                          tout, (uint32_t)sizeof tout, tcomb);
+    if (rc != ZPSE_BAD_MASK) {
+        printf("FAIL hostile tile: mask mode 5 rc=%d\n", rc);
+        (*fails_out)++;
+    }
+    (*checks_out)++;
+
+    /* Reserved flag bit 6: the flags byte read as a mode is 0x41 (> 7). */
+    trec[0] = (uint8_t)(ZPSE_TILE_FLAG_RESERVED_BIT | ZPSE_M_RAW_BITMAP);
+    rc = zpse_tile_decode(&lanes, trec, (uint32_t)n, 0u, 1, tile, 0u,
+                          tout, (uint32_t)sizeof tout, tcomb);
+    if (rc != ZPSE_UNSUPPORTED_FEATURE) {
+        printf("FAIL hostile tile: reserved flag / mode > 7 rc=%d\n", rc);
+        (*fails_out)++;
+    }
+    (*checks_out)++;
+    trec[0] = (uint8_t)ZPSE_M_RAW_BITMAP;
+
+    /* Residual payload truncated: the record is a byte short of the span
+     * its header declares. */
+    rc = zpse_tile_decode(&lanes, trec, (uint32_t)(n - 1), 0u, 1, tile, 0u,
+                          tout, (uint32_t)sizeof tout, tcomb);
+    if (rc != ZPSE_BAD_TILE_SIZE) {
+        printf("FAIL hostile tile: truncated record rc=%d\n", rc);
+        (*fails_out)++;
+    }
+    (*checks_out)++;
+
+    /* Declared residual length past the record (need becomes 49 > 48). */
+    trec[7] = 9u;
+    rc = zpse_tile_decode(&lanes, trec, (uint32_t)n, 0u, 1, tile, 0u,
+                          tout, (uint32_t)sizeof tout, tcomb);
+    if (rc != ZPSE_BAD_TILE_SIZE) {
+        printf("FAIL hostile tile: oversized residual_len rc=%d\n", rc);
+        (*fails_out)++;
+    }
+    (*checks_out)++;
 }
 
 int main(void)
@@ -232,6 +330,7 @@ int main(void)
         fails++;
     }
     checks += 3u;
+    hostile_tile_records(&checks, &fails);
 
     if (fails != 0) {
         printf("FILLPRED: %u FAILURES of %u checks\n", fails, checks);
