@@ -20,7 +20,9 @@ uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len)
     if (sync == ZPSE_BLOCK_SYNC) {
         return (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
     }
-    if (sync == ZPSE_BLOCK_SYNC_SHORT) {
+    if (sync == ZPSE_BLOCK_SYNC_SHORT ||
+        sync == ZPSE_BLOCK_SYNC_TOKEN ||
+        sync == ZPSE_BLOCK_SYNC_FLAT) {
         return (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
     }
     return 0u;
@@ -176,6 +178,152 @@ void zpse_frame_header_serialize(uint8_t out[32], const ZpseFrameHeader *h)
     zpse_store_u32le(out + 28, crc);
 }
 
+/* A one-value token (v1.1) is the 16-byte page header with a different sync
+ * and the fill byte in transform_id, so the short parser's tid check cannot
+ * be reused. Every other field has exactly one legal value and the 16-bit CRC
+ * covers the first fourteen bytes. This is the one definition of a legal
+ * token: the block parser dispatches here and the block layer's fast paths
+ * call the same function, so the two cannot drift apart. */
+int zpse_block_token_build(ZpseBlockHeader *out, const uint8_t *buf,
+                           uint32_t len)
+{
+    uint8_t flags, scount, meta8;
+    uint32_t uncomp, comp, seq;
+    uint16_t stored, calc;
+
+    if (out == 0 || buf == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_TRUNCATED;
+    }
+    if (zpse_load_u16le(buf + 0) != (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
+        return ZPSE_BAD_HEADER;
+    }
+
+    flags = buf[2];
+    scount = buf[4];
+    meta8 = buf[5];
+    uncomp = (uint32_t)zpse_load_u16le(buf + 6);
+    comp = (uint32_t)zpse_load_u16le(buf + 8);
+    seq = zpse_load_u32le(buf + 10);
+    stored = zpse_load_u16le(buf + 14);
+    calc = (uint16_t)(zpse_crc32c(buf, 14) & UINT32_C(0xFFFF));
+
+    if (calc != stored) {
+        return ZPSE_BAD_HEADER_CRC;
+    }
+    /* RAW and RESET are required-1 bits and LAST is the only optional one;
+     * every other bit names a form or a feature this header has no room for.
+     * The fixed fields (segcount, meta, comp) are checked here as well as
+     * being forced by the serializer, so a hand-built token is held to the
+     * exact same envelope. */
+    if ((flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET)) !=
+            (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET) ||
+        (flags & (uint8_t)(ZPSE_B_CRC | ZPSE_B_HAS_META | ZPSE_B_LZ |
+                           ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                           ZPSE_B_RESERVED_MASK)) != 0u ||
+        scount != 1u || meta8 != 0u ||
+        comp != (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
+        uncomp < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
+        uncomp > ZPSE_MAX_BLOCK_SIZE) {
+        return ZPSE_BAD_HEADER;
+    }
+    out->sync = ZPSE_BLOCK_SYNC_TOKEN;
+    out->block_version = ZPSE_BLOCK_VERSION;
+    out->block_flags = flags;
+    out->uncompressed_size = uncomp;
+    out->compressed_block_size = comp;
+    out->transform_id = buf[3]; /* the fill value */
+    out->segment_count = 1u;
+    out->transform_meta_size = 0u;
+    out->tile_size = (uint16_t)ZPSE_TILE_SIZE;
+    out->predictor_profile = 0u;
+    out->reserved0 = 0u;
+    out->block_sequence_number = seq;
+    out->decoded_crc32c = 0u;
+    out->header_crc32c = stored;
+    out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    return ZPSE_OK;
+}
+
+/* The FLAT page form (BREAKING wire change): the 16-byte header names a flat
+ * payload codec rather than a transform + segment directory, so the "transform
+ * metadata" slot carries the codec's one parameter. CRC over bytes [0..14),
+ * reserved byte 0, exactly RESET (+ optional LAST), codec 0..3, comp >= 16 and
+ * n in 1..4096 are the whole envelope; the block parser dispatches here. */
+int zpse_block_header_parse_flat(ZpseBlockHeader *out, const uint8_t *buf,
+                                 uint32_t len)
+{
+    uint8_t flags, codec, param, reserved;
+    uint32_t uncomp, comp, seq;
+    uint16_t stored, calc;
+
+    if (out == 0 || buf == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_TRUNCATED;
+    }
+    if (zpse_load_u16le(buf + 0) != (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        return ZPSE_BAD_HEADER;
+    }
+
+    flags = buf[2];
+    codec = buf[3];
+    param = buf[4];
+    reserved = buf[5];
+    uncomp = (uint32_t)zpse_load_u16le(buf + 6);
+    comp = (uint32_t)zpse_load_u16le(buf + 8);
+    seq = zpse_load_u32le(buf + 10);
+    stored = zpse_load_u16le(buf + 14);
+    calc = (uint16_t)(zpse_crc32c(buf, 14) & UINT32_C(0xFFFF));
+
+    if (calc != stored) {
+        return ZPSE_BAD_HEADER_CRC;
+    }
+    if (reserved != 0u) {
+        return ZPSE_BAD_HEADER;
+    }
+    /* RESET is the only required-1 bit and LAST the only optional one; every
+     * other bit names a form or feature this header has no room for. */
+    if ((flags & (uint8_t)ZPSE_B_RESET) == 0u ||
+        (flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_CRC | ZPSE_B_HAS_META |
+                           ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                           ZPSE_B_RESERVED_MASK)) != 0u) {
+        return ZPSE_BAD_HEADER;
+    }
+    if (codec > (uint8_t)ZPSE_FLAT_SUBLELANE) {
+        return ZPSE_BAD_TRANSFORM;
+    }
+    if (comp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_BAD_BLOCK_SIZE;
+    }
+    if (uncomp < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
+        uncomp > (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
+        return ZPSE_BAD_BLOCK_SIZE;
+    }
+
+    out->sync = ZPSE_BLOCK_SYNC_FLAT;
+    out->block_version = ZPSE_BLOCK_VERSION;
+    out->block_flags = flags;
+    out->uncompressed_size = uncomp;
+    out->compressed_block_size = comp;
+    out->transform_id = codec;
+    /* A FLAT payload has no segment directory; 1 is the minimal legal count
+     * (as for a token) and the flat decoder does not consult it. */
+    out->segment_count = 1u;
+    out->transform_meta_size = (uint16_t)param;
+    out->tile_size = (uint16_t)ZPSE_TILE_SIZE;
+    out->predictor_profile = 0u;
+    out->reserved0 = 0u;
+    out->block_sequence_number = seq;
+    out->decoded_crc32c = 0u;
+    out->header_crc32c = stored;
+    out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    return ZPSE_OK;
+}
+
 int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len)
 {
     uint16_t sync;
@@ -203,6 +351,12 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     }
     if (len < hsz) {
         return ZPSE_TRUNCATED;
+    }
+    if (zpse_load_u16le(buf) == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
+        return zpse_block_token_build(out, buf, len);
+    }
+    if (zpse_load_u16le(buf) == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        return zpse_block_header_parse_flat(out, buf, len);
     }
     if (hsz == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
         return zpse_block_header_parse_short(out, buf);
@@ -294,6 +448,53 @@ void zpse_block_header_serialize_short(uint8_t out[16], const ZpseBlockHeader *h
     out[3] = h->transform_id;
     out[4] = h->segment_count;
     out[5] = (uint8_t)h->transform_meta_size;
+    zpse_store_u16le(out + 6, (uint16_t)h->uncompressed_size);
+    zpse_store_u16le(out + 8, (uint16_t)h->compressed_block_size);
+    zpse_store_u32le(out + 10, h->block_sequence_number);
+    crc = zpse_crc32c(out, 14);
+    zpse_store_u16le(out + 14, (uint16_t)(crc & UINT32_C(0xFFFF)));
+}
+
+/* The token's envelope is fixed, so the serializer writes the fixed fields
+ * rather than trusting them to `h`: a header built by a caller with, say, a
+ * stale segment_count still emits the one layout every decoder reads. The
+ * variable fields (flags, fill, size, seq) come from `h` and must have been
+ * validated first; zpse_block_token_build is both the validator and the
+ * reader that guarantees it. */
+void zpse_block_header_serialize_token(uint8_t out[16], const ZpseBlockHeader *h)
+{
+    uint32_t crc;
+
+    if (out == 0 || h == 0) {
+        return;
+    }
+    zpse_store_u16le(out + 0, (uint16_t)ZPSE_BLOCK_SYNC_TOKEN);
+    out[2] = h->block_flags;
+    out[3] = h->transform_id; /* the fill value */
+    out[4] = 1u;              /* one segment, always */
+    out[5] = 0u;              /* no transform metadata, always */
+    zpse_store_u16le(out + 6, (uint16_t)h->uncompressed_size);
+    zpse_store_u16le(out + 8, (uint16_t)ZPSE_BLOCK_HEADER_SIZE_SHORT);
+    zpse_store_u32le(out + 10, h->block_sequence_number);
+    crc = zpse_crc32c(out, 14);
+    zpse_store_u16le(out + 14, (uint16_t)(crc & UINT32_C(0xFFFF)));
+}
+
+/* Mirror of the FLAT parser: the sync and reserved byte are fixed, flags and
+ * codec/param are taken from an already-validated `h`, and the 16-bit CRC is
+ * recomputed over the first fourteen bytes. */
+void zpse_block_header_serialize_flat(uint8_t out[16], const ZpseBlockHeader *h)
+{
+    uint32_t crc;
+
+    if (out == 0 || h == 0) {
+        return;
+    }
+    zpse_store_u16le(out + 0, (uint16_t)ZPSE_BLOCK_SYNC_FLAT);
+    out[2] = h->block_flags;
+    out[3] = h->transform_id;                  /* codec */
+    out[4] = (uint8_t)h->transform_meta_size;  /* param */
+    out[5] = 0u;                               /* reserved, always */
     zpse_store_u16le(out + 6, (uint16_t)h->uncompressed_size);
     zpse_store_u16le(out + 8, (uint16_t)h->compressed_block_size);
     zpse_store_u32le(out + 10, h->block_sequence_number);

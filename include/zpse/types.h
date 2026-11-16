@@ -101,6 +101,42 @@ uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len);
 /* The 16-byte page header. Requires block_flags without ZPSE_B_CRC and an
  * uncompressed size of at most ZPSE_BLOCK_SHORT_MAX. */
 void zpse_block_header_serialize_short(uint8_t out[16], const ZpseBlockHeader *h);
+
+/* One-value page token (v1.1, sync ZPSE_BLOCK_SYNC_TOKEN): the 16-byte page
+ * header with no payload, the fill byte in transform_id, segment_count 1,
+ * meta 0 and comp == 16. LAST is the only optional flag bit.
+ *
+ * zpse_block_token_build validates EVERY field and the 16-bit CRC over the
+ * first 14 bytes, then fills `out`. Returns ZPSE_OK on success, ZPSE_BAD_ARG
+ * for a null pointer, ZPSE_TRUNCATED when fewer than 16 bytes are available,
+ * ZPSE_BAD_HEADER_CRC on a CRC mismatch and ZPSE_BAD_HEADER for any illegal
+ * field value. It is the single definition of what a legal token is: the
+ * block parser dispatches to it, so the block layer's fast paths can call it
+ * directly instead of repeating the field checks.
+ *
+ * zpse_block_header_serialize_token is the mirror of the short serializer:
+ * it writes a legal token envelope from a (validated) parsed header and
+ * recomputes the CRC. Fixed fields are written by the serializer, not taken
+ * from `h`, so a token it emits always parses back cleanly. */
+int zpse_block_token_build(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len);
+void zpse_block_header_serialize_token(uint8_t out[16], const ZpseBlockHeader *h);
+
+/* The FLAT page form (sync ZPSE_BLOCK_SYNC_FLAT): a 16-byte header that names
+ * a flat payload codec instead of a transform + segment directory.
+ *
+ * zpse_block_header_parse_flat validates the whole envelope -- the 16-bit CRC
+ * over bytes [0..14), reserved byte 0, RESET (+optional LAST) with every other
+ * flag bit refused, codec in 0..3, comp >= 16 and n in 1..4096 -- and fills
+ * `out`. Returns ZPSE_OK, or ZPSE_BAD_ARG / ZPSE_TRUNCATED /
+ * ZPSE_BAD_HEADER_CRC / ZPSE_BAD_HEADER / ZPSE_BAD_TRANSFORM /
+ * ZPSE_BAD_BLOCK_SIZE. The block parser dispatches here on the FLAT sync.
+ *
+ * zpse_block_header_serialize_flat is the mirror serializer: it writes the
+ * fixed sync and reserved byte, takes flags/codec/param/sizes/seq from `h`
+ * (which must have been validated), and recomputes the CRC. */
+int zpse_block_header_parse_flat(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len);
+void zpse_block_header_serialize_flat(uint8_t out[16], const ZpseBlockHeader *h);
+
 int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32_t len);
 void zpse_segment_header_serialize(uint8_t out[8], const ZpseSegmentHeader *h);
 int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len);
