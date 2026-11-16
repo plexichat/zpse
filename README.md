@@ -68,7 +68,7 @@ and the lz4 *CLI* are not the same encoder.
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 296 | 1369 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 408 | 1908 |
 | | zpse 1 `FASTEST` | 1.24:1 | 816 | 2998 |
 | | zpse 9 `MAX` | 2.31:1 | 183 | 1087 |
 | 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.25:1 | 719 | 8562 |
@@ -86,7 +86,7 @@ The short version:
   match finder when values are monotone, fixed-width or dictionary-coded.
 * **Text is the weak case, and the match finder is why.** On Silesia the LZ
   pass is between 33% and 92% of a block's encode, and the finder itself runs
-  at 278-881 MB/s on those files. The probe, the trials and the entropy pass
+  at 220-790 MB/s on those files. The probe, the trials and the entropy pass
   are the minority of the time; the pass is the ceiling.
 * **Decode is fast** because the tile path is a vectorised reconstruction
   rather than a serial command loop, and the LZ forms decode through a lookup.
@@ -251,38 +251,54 @@ footprint contains: code, rodata, pointer-heavy heap, object heap, slab
 strings, a b-tree page, a hash table, a JSON arena, a thread stack, a float
 series, an incompressible blob and a mixed heap.
 
-`tests/benchmarks/page_table.sh` runs every page as its own block for every
-codec. zstd and lz4/lz4hc are called once per 4 KiB page through their shared
-libraries, so no frame spans two pages; packed bytes include each codec's
-framing. That harness needs `dlopen`, which this host does not have, so the
-cross-codec page comparison cannot be built here; the rows below are zpse's
-own, measured with the CLI at `-b 4096` over the 16 MiB non-zero corpus.
+`tests/benchmarks/page_table_static.sh` runs every page as its own block for
+every codec. It links lz4 1.10.0 in instead of loading it through `dlopen`,
+so the cross-codec comparison builds on hosts without shared-library loading;
+packed bytes include each codec's framing (two length bytes are charged to a
+raw lz4 block). `tests/benchmarks/refresh_tables.sh` still regenerates the
+`dlopen` variant. Rates below are best-of-five, one process, 16 MiB non-zero
+corpus, and the corpus sha256 is pinned by the generator.
 
 | codec | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: |
-| zpse 1 `FASTEST` | 1.74:1 | 250 | 2506 |
-| zpse 6 (default) | 2.40:1 | 158 | 1639 |
-| zpse 9 `MAX` | 2.56:1 | 128 | 1243 |
-| zpse 6 `PAGE_FAST` | 1.52:1 | 888 | 3059 |
-| zpse 6 `LZ_FAST` | 2.21:1 | 591 | 1988 |
+| zpse 1 `FASTEST` | 1.66:1 | 321 | 2646 |
+| zpse 6 (default) | 2.28:1 | 215 | 1891 |
+| zpse 9 `MAX` | 2.43:1 | 160 | 1387 |
+| lz4 1 | 2.03:1 | 1047 | 3761 |
+| lz4hc 4 | 2.26:1 | 190 | 4372 |
+| lz4hc 9 | 2.30:1 | 70 | 4489 |
+| lz4hc 12 | 2.31:1 | 22 | 4660 |
 
-`LZ_FAST` is the cheap way to a page: one finder pass, no decision, 591 MB/s
-of encode, and it gives up 8.6% of the packed size (2.21:1 against 2.40:1) for
-3.7 times the rate. `PAGE_FAST` is the other end of that trade, 888 MB/s for
-1.52:1. Level 9's entropy pass is what turns 2.40:1 into 2.56:1, and it costs
-19% of the encode rate.
+Pages now take a single one-pass path. A 16-byte **FLAT** block carries a
+constant page as a token, an irregular low-alphabet page as packed NIBBLE4 or
+BIT2 indices, and a pointer-lane page as SUBLANE; these decode in one SIMD pass
+at roughly 9 GB/s *on the shapes they cover*. Structured pages (ramps, strides,
+alternation, text) fall through to the same 9-level ladder larger blocks use,
+because FLAT's fixed-width packing loses badly to the ladder's DELTA and tile
+forms on them. The old `PAGE_FAST`, `LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags
+are retired: every level now picks the same page form for the same bytes, so
+the ladder is monotonic on pages as it is elsewhere. The ratios above reflect
+that split -- level 9's entropy pass turns 2.28:1 into 2.43:1.
+
+The honest decode result: because most content pages take the ladder, the
+**mixed-corpus decode rate is about 1.9 GB/s, not 5 GB/s**. The 9 GB/s FLAT
+kernels are reached on constant, zero and low-alphabet pages (the zram pages
+that are cheapest to begin with); on those classes decode runs at 20-75 GB/s.
+lz4 1 still has the faster mixed-corpus decode loop (3.8 GB/s) and, at 2.03:1,
+slightly less ratio than the default. No single page mode leads on all three
+axes at once.
 
 **Zero pages are a separate class.** Untouched anonymous pages are a large
-share of a real footprint and compress to almost nothing. On the same stream
-with one zero page in eight, zpse 6 scores 2.67:1 and decodes at 1954 MB/s;
-dropping the zero pages from that same file leaves 2.40:1. The headline table
-uses the non-zero file, so the ratio describes content, not untouched memory.
+share of a real footprint and compress to almost nothing: a zero page is a
+16-byte token and decodes at about 75 GB/s. Dropping the zero pages from the
+stream leaves the 2.28:1 in the headline table, so the ratio describes content,
+not untouched memory.
 
-The per-class split needs the same `dlopen` harness (`bench_pages`), so it is
-not in this table. What the corpus is for still holds: on a 4 KiB
-page the encoder has a sixteenth of the input to decide on, so the page path is
-where `PAGE_FAST` and `LZ_FAST` exist at all, and the ones placed above are the
-rates a page store has to choose between.
+`page_table_static.sh` also prints a per-class decode table. It is where the
+FLAT kernels show their speed: the zero and constant classes run at 20-75 GB/s
+while content pages that take the ladder run at 1.4-2.8 GB/s. That split is the
+reason the mixed-corpus rate sits around 1.9 GB/s even though the FLAT path by
+itself reaches about 9 GB/s.
 
 ### 64 KiB byte patterns
 
@@ -390,15 +406,15 @@ it just read, so `zpse_decompress_batch_parallel` decodes a caller-owned batch
 of independent blocks instead: the CLI's `d -t N` reads a batch, spreads it
 over the pool and writes the results in order, keeping memory at the batch
 rather than the frame. With the payloads already in memory
-(`tests/benchmarks/bench_batch_decode.c`) that batch decodes at 4.1x on six
-workers of a 202 MiB corpus. The output write used to take turns with the read
-and the decode and cost about a third of a streamed decode, so the CLI now
-hands each decoded batch to a writer thread and reads the next one behind it:
-the same frame streamed takes 220 ms on one worker and 147 ms at six, where
-writing on the decoding thread put it at 217-234 ms at six; discarding the
-output (to `NUL`) takes 139-152 ms. Pages gain less from the workers because
-they start faster -- 4 KiB pages decode at 3.2 GB/s on one worker and 7.7 GB/s
-on six (2.4x), where 64 KiB blocks go from 1.8 to 7.3 GB/s (4.1x).
+(`tests/benchmarks/bench_batch_decode.c`) that batch decodes at 4.3x on six
+workers of a 202 MiB corpus. The read and the write used to take turns with
+the decode and cost about a third of a streamed decode between them, so the
+CLI reads the next batch and writes the last one on their own threads: the
+same frame streamed takes 174 ms on one worker and 131 ms at six, where the
+decode thread did both itself at 217-234 ms at six; discarding the output (to
+`NUL`) takes 87-98 ms. Pages gain less from the workers because they start
+faster -- 4 KiB pages decode at 3.4 GB/s on one worker and 7.9 GB/s on six
+(2.3x), where 64 KiB blocks go from 1.8 to 7.7 GB/s (4.3x).
 
 ## What it does
 
@@ -433,7 +449,7 @@ from level 7 up. Every form is kept only when it is strictly smaller than
 everything already tried.
 
 At the deepest level a block's LZ payload may be coded a second time, by
-**Huffman**: four fixed eleven-bit tables, fitted offline on real LZ payloads
+**Huffman**: four fixed ten-bit tables, fitted offline on real LZ payloads
 (`tests/benchmarks/huf_train.c`) and compiled in, with each block naming the
 one it used. The payload is split into four independent bit streams, so the
 entropy layer has four chains to run side by side and no dictionary to carry,
@@ -442,7 +458,7 @@ finder -- which is why it composes with every LZ form. It is offered from
 level 9 up, or at any level with `ZPSE_ENC_HUF`, and kept only when it saves at
 least a sixty-fourth of the payload it wraps. Over `dickens`, `nci` and
 `mozilla` at level 9 it takes 71% of blocks and cuts the payloads it wraps by
-6.9%, for 18 KiB of read-only tables. The writer runs at 1.66-1.70 cycles per
+6.9%, for 10 KiB of read-only tables. The writer runs at 1.66-1.70 cycles per
 byte of payload (2.2 GB/s) on real Silesia payloads and the reader at 2.4
 (1.5 GB/s), both scalar, with no per-block state and no allocation.
 
@@ -511,6 +527,7 @@ benchmarks are all under `tests/benchmarks/`:
 | `bench_pareto.sh` | ratio/encode/decode frontier against lz4 and zstd |
 | `silesia.sh` | Silesia per-file table (downloads the corpus) |
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
+| `page_table_static.sh` | 4 KiB page corpus against statically linked lz4 (no `dlopen`) |
 | `bench_pagedict.c` | page-dictionary hit rate and encode rate on repeat pages |
 | `bench_parallel.c` | worker scaling and byte-identity |
 | `bench_batch_decode.c` | batch decode in memory, one worker to N, 64 KiB blocks or 4 KiB pages (codec only) |
@@ -541,11 +558,10 @@ zpse_cli x FILE BLOCK OUT      decode one block through the index
 
 Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
 pages), `-t N` workers (encode streams through the worker ring; decode reads a
-batch of blocks, decodes them side by side and writes them in order on its own
-thread, so a frame is still never resident whole), `-x` writes an index, `-F`
-requests
-`LZ_FAST`, `-D` requests `DECODE_FAST`, and `-n BYTES` limits how much of each
-input `bench` reads.
+batch of blocks on one thread, decodes them side by side and writes them in
+order on another, so a frame is still never resident whole), `-x` writes an
+index, `-F` requests `LZ_FAST`, `-D` requests `DECODE_FAST`, and `-n BYTES`
+limits how much of each input `bench` reads.
 
 ## Documentation
 
@@ -563,7 +579,7 @@ input `bench` reads.
   Ratio loses to zstd on redundant text and on memory pages.
 * **Encode is slower than lz4's** because every block is decided, not merely
   encoded, and because the match finder runs once per block at 220-790 MB/s on
-  real data. On Silesia the default level is about 62% of the lz4 CLI's encode
+  real data. On Silesia the default level is about 27% of the lz4 CLI's encode
   rate at the same ratio; on typed columns the two run at the same rate and
   zpse's stream is 42% smaller.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
