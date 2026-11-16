@@ -22,6 +22,23 @@
 #define LZH_REP_BASE 0xFCu
 #define LZH_TOK_ESC 15u
 
+/* Prefetch the finder's distance table (the hash slots holding candidate
+ * positions). A hint only: it compiles to nothing where the toolchain has no
+ * builtin, and it cannot change a byte of the stream. */
+#ifndef ZPSE_LZH_DIST_PREFETCH
+#define ZPSE_LZH_DIST_PREFETCH 1
+#endif
+#if ZPSE_LZH_DIST_PREFETCH && (defined(__GNUC__) || defined(__clang__))
+#define LZH_PREFETCH(p) __builtin_prefetch((p), 0, 1)
+#else
+#define LZH_PREFETCH(p) ((void)0)
+#endif
+
+/* Hash slot access: one uint16_t array of caller-owned scratch, cleared per
+ * call. LZH_EMPTY is the marker for a slot that holds no position. */
+#define LZH_TAB_GET(h) ((tab)[(h)])
+#define LZH_TAB_SET(h, v) do { (tab)[(h)] = (uint16_t)(v); } while (0)
+
 /* The fifteen nibble codes: {literal run, match length}, length 0 meaning a
  * literal-only command. The order is the corpus ranking in
  * include/zpse/lzh.h; the index is what the nibble carries. Fifteen and not
@@ -75,30 +92,37 @@ static void lzh_rep_move(uint32_t *rep, uint32_t off, uint32_t idx)
     rep[0] = off;
 }
 
-/* The book above, indexed [run][len]: the nibble for that pair, or 15 when
- * the book does not carry it and the byte token has to spell the fields out.
- * This is the same answer the writer used to search for -- the scan walked up
- * to fifteen two-byte entries, twice per token -- in one load. The table is
- * transposed from zpse_lzh_book, which the decoder reads; a pair the book
- * misses spells itself out, so a disagreement between the two would change
- * bytes but never break a round trip, which is why the escaped and unescaped
- * spellings' packed totals are compared whenever either table is touched. */
-static const uint8_t lzh_book_code[5][16] = {
-    { 15u, 15u, 15u, 15u, 1u, 5u, 9u, 8u,
-      2u, 13u, 15u, 15u, 15u, 15u, 15u, 15u },
-    { 4u, 15u, 15u, 15u, 15u, 7u, 11u, 0u,
-      15u, 15u, 15u, 15u, 15u, 15u, 15u, 6u },
-    { 10u, 15u, 15u, 15u, 15u, 15u, 3u, 15u,
-      15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u },
-    { 14u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
-      15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u },
-    { 12u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
-      15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u }
+/* The book above, flattened to one LUT with a sixteen-entry column per run
+ * (run 0..4) plus an escape row and column. The writer used to pay a taken
+ * branch per command for the range test and a two-dimensional load for the
+ * answer; saturating the indices into the all-escape row/column makes it one
+ * load and two conditional moves. The table is transposed from
+ * zpse_lzh_book, which the decoder reads; a pair the book misses spells
+ * itself out, so a disagreement between the two would change bytes but never
+ * break a round trip, which is why the escaped and unescaped spellings'
+ * packed totals are compared whenever either table is touched. */
+#define LZH_CODE_COLS 17u /* sixteen lengths plus the escape column */
+static const uint8_t lzh_code_lut[6u * LZH_CODE_COLS] = {
+    /* run 0 */ 15u, 15u, 15u, 15u, 1u, 5u, 9u, 8u, 2u, 13u,
+                15u, 15u, 15u, 15u, 15u, 15u, 15u,
+    /* run 1 */ 4u, 15u, 15u, 15u, 15u, 7u, 11u, 0u, 15u, 15u,
+                15u, 15u, 15u, 15u, 15u, 6u, 15u,
+    /* run 2 */ 10u, 15u, 15u, 15u, 15u, 15u, 3u, 15u, 15u, 15u,
+                15u, 15u, 15u, 15u, 15u, 15u, 15u,
+    /* run 3 */ 14u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
+                15u, 15u, 15u, 15u, 15u, 15u, 15u,
+    /* run 4 */ 12u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
+                15u, 15u, 15u, 15u, 15u, 15u, 15u,
+    /* escape row */ 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
+                     15u, 15u, 15u, 15u, 15u, 15u, 15u
 };
 
 static uint32_t lzh_code_of(uint32_t run, uint32_t len)
 {
-    return (run > 4u || len > 15u) ? LZH_TOK_ESC : (uint32_t)lzh_book_code[run][len];
+    /* One load, no taken branch: an out-of-book field saturates into a row
+     * or column whose every entry is the escape nibble. */
+    return (uint32_t)lzh_code_lut[(run < 5u ? run : 5u) * LZH_CODE_COLS +
+                                  (len < 16u ? len : 16u)];
 }
 
 /* A command: the literal run in front of it (a byte offset into the input,
@@ -298,15 +322,41 @@ static int lzh_literals(LzhWr *w, const uint8_t *in, uint32_t *rep,
 #define ZPSE_LZH_BACK_WIDE 0
 #endif
 
-ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                                  uint32_t cap, void *table, uint32_t hash_bits)
+/* Carry the candidate at the cursor across iterations, and read the next
+ * position's key, hash and slot right after filing the current one, before the
+ * candidate is tested (src/lz2.c's ZPSE_LZ2_PIPE_NEXT). The lookahead reads
+ * are taken AFTER the table store, so a slot the store just wrote reads back
+ * exactly what the next iteration would have found; the miss path's byte step
+ * is otherwise the same, and so is the stream. 0 builds the finder without
+ * the lookahead, which is what the measurement compares against. */
+#ifndef ZPSE_LZH_PIPE_NEXT
+#define ZPSE_LZH_PIPE_NEXT 1
+#endif
+
+/* Issue the lazy probe's two loads before the backward walk and the forward
+ * extension, so their latency overlaps that work (src/lz2.c's
+ * ZPSE_LZ2_PROBE_EARLY). With PIPE_NEXT the values are the lookahead's, already
+ * in hand; without it they are read here, still before the walk. The probe
+ * itself is unchanged: it runs only when the match starts at the cursor, with
+ * the same candidate bound and the same 24-byte ceiling. */
+#ifndef ZPSE_LZH_PROBE_EARLY
+#define ZPSE_LZH_PROBE_EARLY 1
+#endif
+
+/* The one finder body behind every entry point. `sample_n == 0` is a full
+ * pass; a nonzero `sample_n` prices a sample and clears only the slots that a
+ * position in [0,sample_n) can hash to. Every decision and store is shared. */
+static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
+                                uint32_t cap, void *table, uint32_t hash_bits,
+                                uint32_t sample_n)
 {
     uint16_t *tab = (uint16_t *)table;
-    uint32_t entries = 1u << hash_bits;
+    uint32_t entries;
     uint32_t pos, anchor, misses;
     uint32_t cur, h, limit;
     uint32_t rep[4] = { 1u, 1u, 1u, 1u };
     LzhWr w;
+    entries = 1u << hash_bits;
 
     if (in == 0 || dst == 0 || tab == 0) {
         return 0u;
@@ -318,10 +368,24 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         return 0u;
     }
     /* LZH_EMPTY is 0xFFFF and the table is uint16_t, so all-ones bytes are
-     * exactly the empty marker. One memset beats the 16-bit fill loop, which
-     * gcc does not vectorise at -O2, and the clear is paid once per block;
-     * src/lz.c has the measurement and the same change. */
-    memset(tab, 0xFF, (size_t)entries * sizeof *tab);
+     * exactly the empty marker. A full pass clears it with one memset; a
+     * sample pass clears only the slots a position in [0, sample_n) can hash
+     * to (a key hash, so the slots are found by hashing every sample key).
+     * See src/lz.c's clear. */
+    {
+        uint32_t ce = (sample_n != 0u && sample_n < n) ? sample_n : n;
+
+        if (sample_n == 0u) {
+            memset(tab, 0xFF, (size_t)entries * sizeof *tab);
+        } else if (ce >= ZPSE_LZH_MIN_MATCH) {
+            uint32_t p;
+
+            for (p = 0u; p + ZPSE_LZH_MIN_MATCH <= ce; p++) {
+                LZH_TAB_SET(lzh_hash(zpse_load_u32le(in + p), hash_bits),
+                            LZH_EMPTY);
+            }
+        }
+    }
     w.dst = dst;
     w.cap = cap;
     w.pos = LZH_HDR;
@@ -338,16 +402,57 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     limit = n - ZPSE_LZH_MIN_MATCH;
     cur = zpse_load_u32le(in + pos);
     h = lzh_hash(cur, hash_bits);
+#if ZPSE_LZH_PIPE_NEXT
+    /* The candidate at the cursor, carried across iterations: the miss path
+     * reads it while the word at the candidate is being compared (see the
+     * knob above). */
+    uint32_t cand = LZH_TAB_GET(h);
+#endif
 
     while (pos <= limit) {
-        uint32_t cand = tab[h];
+#if ZPSE_LZH_PIPE_NEXT
         uint32_t len = ZPSE_LZH_MIN_MATCH;
         uint32_t mpos = pos;
         uint32_t mcand = cand;
+        uint32_t nx_cur = 0u, nx_h = 0u, nx_c = LZH_EMPTY;
+        int nx_ok = 0;
+#else
+        uint32_t cand = LZH_TAB_GET(h);
+        uint32_t len = ZPSE_LZH_MIN_MATCH;
+        uint32_t mpos = pos;
+        uint32_t mcand = cand;
+#endif
 
-        tab[h] = (uint16_t)pos;
+        LZH_TAB_SET(h, pos);
+#if ZPSE_LZH_PIPE_NEXT
+        /* The next position's chain, read after the store above, exactly as
+         * src/lz2.c does: a slot the store just wrote reads back what the next
+         * iteration would have found. */
+        if (pos + 1u + ZPSE_LZH_MIN_MATCH <= n) {
+            nx_cur = zpse_load_u32le(in + pos + 1u);
+            nx_h = lzh_hash(nx_cur, hash_bits);
+            /* Issue the distance table's next slot before the probe reads it.
+             * The hint is dead code when the toolchain has no prefetch
+             * builtin. */
+            LZH_PREFETCH((const void *)&tab[nx_h]);
+            nx_c = LZH_TAB_GET(nx_h);
+            nx_ok = 1;
+        }
+#endif
         if (ZPSE_LIKELY(cand == LZH_EMPTY ||
                         zpse_load_u32le(in + cand) != cur)) {
+#if ZPSE_LZH_PIPE_NEXT
+            /* One byte on, the ordinary miss: the key, hash and slot are
+             * already in hand from the lookahead above. */
+            if (nx_ok != 0 && (misses >> 5u) == 0u) {
+                pos += 1u;
+                misses++;
+                cur = nx_cur;
+                h = nx_h;
+                cand = nx_c;
+                continue;
+            }
+#endif
             pos += 1u + (misses >> 5u);
             misses++;
             if (pos > limit) {
@@ -355,100 +460,149 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             }
             cur = zpse_load_u32le(in + pos);
             h = lzh_hash(cur, hash_bits);
+#if ZPSE_LZH_PIPE_NEXT
+            cand = LZH_TAB_GET(h);
+#endif
             continue;
         }
-#if ZPSE_LZH_BACK_WIDE
-        while (mpos - anchor >= 8u && mcand >= 8u &&
-               lzh_load64(in + mpos - 8u) == lzh_load64(in + mcand - 8u)) {
-            mpos -= 8u;
-            mcand -= 8u;
-        }
-#endif
-        while (mpos > anchor && mcand > 0u && in[mpos - 1u] == in[mcand - 1u]) {
-            mpos--;
-            mcand--;
-        }
+#if ZPSE_LZH_PROBE_EARLY
+        /* The lazy probe's two loads (and the slot they name), issued now so
+         * their latency overlaps the backward walk and the forward extension
+         * below, before the probe that uses them. Read after the table store
+         * above, so a self-hit sees the position just filed, as before. */
         {
-            int tail = 0;
+            uint32_t p_cur = 0u, p_h = 0u, p_c1 = LZH_EMPTY;
+            int p_ok = 0;
 
-            while (mpos + len + 8u <= n) {
-                uint64_t x = lzh_load64(in + mpos + len) ^
-                             lzh_load64(in + mcand + len);
-
-                if (x != 0u) {
-                    len += zpse_ctz64(x) >> 3;
-                    tail = 1;
-                    break;
-                }
-                len += 8u;
+#if ZPSE_LZH_PIPE_NEXT
+            p_cur = nx_cur;
+            p_h = nx_h;
+            p_c1 = nx_c;
+            p_ok = nx_ok;
+#else
+            if (pos + 1u + ZPSE_LZH_MIN_MATCH <= n) {
+                p_cur = zpse_load_u32le(in + pos + 1u);
+                p_h = lzh_hash(p_cur, hash_bits);
+                p_c1 = LZH_TAB_GET(p_h);
+                p_ok = 1;
             }
-            if (tail == 0) {
-                while (mpos + len < n && in[mpos + len] == in[mcand + len]) {
-                    len++;
+#endif
+#endif /* ZPSE_LZH_PROBE_EARLY */
+#if ZPSE_LZH_BACK_WIDE
+            while (mpos - anchor >= 8u && mcand >= 8u &&
+                   lzh_load64(in + mpos - 8u) == lzh_load64(in + mcand - 8u)) {
+                mpos -= 8u;
+                mcand -= 8u;
+            }
+#endif
+            while (mpos > anchor && mcand > 0u && in[mpos - 1u] == in[mcand - 1u]) {
+                mpos--;
+                mcand--;
+            }
+            {
+                int tail = 0;
+
+                while (mpos + len + 8u <= n) {
+                    uint64_t x = lzh_load64(in + mpos + len) ^
+                                 lzh_load64(in + mcand + len);
+
+                    if (x != 0u) {
+                        len += zpse_ctz64(x) >> 3;
+                        tail = 1;
+                        break;
+                    }
+                    len += 8u;
+                }
+                if (tail == 0) {
+                    while (mpos + len < n && in[mpos + len] == in[mcand + len]) {
+                        len++;
+                    }
                 }
             }
-        }
-        /* One-candidate lazy probe at the next position, as the fast form
-         * runs it: only when the match starts at the cursor, because a
-         * walked-back match is already the better one and stepping to
-         * mpos + 1 would move the scanning cursor backwards. */
-        if (mpos == pos && len <= 24u && mpos + 1u + ZPSE_LZH_MIN_MATCH <= n) {
-            uint32_t cur1 = zpse_load_u32le(in + mpos + 1u);
-            uint32_t h1 = lzh_hash(cur1, hash_bits);
-            uint32_t c1 = tab[h1];
-
-            if (c1 != LZH_EMPTY && c1 <= mpos &&
-                zpse_load_u32le(in + c1) == cur1 &&
-                lzh_extend(in, n, mpos + 1u, c1, ZPSE_LZH_MIN_MATCH) > len) {
+            /* One-candidate lazy probe at the next position, as the fast form
+             * runs it: only when the match starts at the cursor, because a
+             * walked-back match is already the better one and stepping to
+             * mpos + 1 would move the scanning cursor backwards. */
+#if ZPSE_LZH_PROBE_EARLY
+            if (p_ok && mpos == pos && len <= 24u &&
+                p_c1 != LZH_EMPTY && p_c1 <= mpos &&
+                zpse_load_u32le(in + p_c1) == p_cur &&
+                lzh_extend(in, n, mpos + 1u, p_c1, ZPSE_LZH_MIN_MATCH) > len) {
                 pos = mpos + 1u;
                 misses = 0u;
-                cur = cur1;
-                h = h1;
+                cur = p_cur;
+                h = p_h;
+#if ZPSE_LZH_PIPE_NEXT
+                cand = LZH_TAB_GET(h);
+#endif
                 continue;
             }
         }
-        {
-            uint32_t run = mpos - anchor;
-            uint32_t off = mpos - mcand;
-            uint32_t rem = len;
-            uint32_t lit_off = anchor;
+#else
+            if (mpos == pos && len <= 24u && mpos + 1u + ZPSE_LZH_MIN_MATCH <= n) {
+                uint32_t cur1 = zpse_load_u32le(in + mpos + 1u);
+                uint32_t h1 = lzh_hash(cur1, hash_bits);
+                uint32_t c1 = LZH_TAB_GET(h1);
 
-            /* The literal run in front of the match is chunked here as well as
-             * in the tail: one command carries at most ZPSE_LZH_MAX_LIT of
-             * them, and a longer run is several literal-only commands before
-             * the one that starts the match. */
-            while (run > ZPSE_LZH_MAX_LIT) {
-                if (!lzh_cmd(&w, in, rep, lit_off, ZPSE_LZH_MAX_LIT, 0u, 0u)) {
+                if (c1 != LZH_EMPTY && c1 <= mpos &&
+                    zpse_load_u32le(in + c1) == cur1 &&
+                    lzh_extend(in, n, mpos + 1u, c1, ZPSE_LZH_MIN_MATCH) > len) {
+                    pos = mpos + 1u;
+                    misses = 0u;
+                    cur = cur1;
+                    h = h1;
+#if ZPSE_LZH_PIPE_NEXT
+                    cand = LZH_TAB_GET(h);
+#endif
+                    continue;
+                }
+            }
+#endif
+            {
+                uint32_t run = mpos - anchor;
+                uint32_t off = mpos - mcand;
+                uint32_t rem = len;
+                uint32_t lit_off = anchor;
+
+                /* The literal run in front of the match is chunked here as well as
+                 * in the tail: one command carries at most ZPSE_LZH_MAX_LIT of
+                 * them, and a longer run is several literal-only commands before
+                 * the one that starts the match. */
+                while (run > ZPSE_LZH_MAX_LIT) {
+                    if (!lzh_cmd(&w, in, rep, lit_off, ZPSE_LZH_MAX_LIT, 0u, 0u)) {
+                        return 0u;
+                    }
+                    lit_off += ZPSE_LZH_MAX_LIT;
+                    run -= ZPSE_LZH_MAX_LIT;
+                }
+                while (rem > ZPSE_LZH_MAX_MATCH) {
+                    uint32_t take = ZPSE_LZH_MAX_MATCH;
+
+                    if (rem - take < ZPSE_LZH_MIN_MATCH) {
+                        take = rem - ZPSE_LZH_MIN_MATCH;
+                    }
+                    if (!lzh_cmd(&w, in, rep, lit_off, run, off, take)) {
+                        return 0u;
+                    }
+                    lit_off += run;
+                    run = 0u;
+                    rem -= take;
+                }
+                if (!lzh_cmd(&w, in, rep, lit_off, run, off, rem)) {
                     return 0u;
                 }
-                lit_off += ZPSE_LZH_MAX_LIT;
-                run -= ZPSE_LZH_MAX_LIT;
             }
-            while (rem > ZPSE_LZH_MAX_MATCH) {
-                uint32_t take = ZPSE_LZH_MAX_MATCH;
-
-                if (rem - take < ZPSE_LZH_MIN_MATCH) {
-                    take = rem - ZPSE_LZH_MIN_MATCH;
-                }
-                if (!lzh_cmd(&w, in, rep, lit_off, run, off, take)) {
-                    return 0u;
-                }
-                lit_off += run;
-                run = 0u;
-                rem -= take;
+            pos = mpos + len;
+            anchor = pos;
+            misses = 0u;
+            if (pos + ZPSE_LZH_MIN_MATCH > n) {
+                break;
             }
-            if (!lzh_cmd(&w, in, rep, lit_off, run, off, rem)) {
-                return 0u;
-            }
-        }
-        pos = mpos + len;
-        anchor = pos;
-        misses = 0u;
-        if (pos + ZPSE_LZH_MIN_MATCH > n) {
-            break;
-        }
-        cur = zpse_load_u32le(in + pos);
-        h = lzh_hash(cur, hash_bits);
+            cur = zpse_load_u32le(in + pos);
+            h = lzh_hash(cur, hash_bits);
+#if ZPSE_LZH_PIPE_NEXT
+            cand = LZH_TAB_GET(h);
+#endif
     }
     if (anchor < n) {
         if (!lzh_literals(&w, in, rep, anchor, n - anchor)) {
@@ -472,6 +626,33 @@ ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     zpse_store_u32le(dst, w.lit_total);
     zpse_store_u32le(dst + 4u, w.cmds);
     return w.pos;
+}
+
+ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
+                                  uint32_t cap, void *table, uint32_t hash_bits)
+{
+    return lzh_encode_impl(in, n, dst, cap, table, hash_bits, 0u);
+}
+
+/* The single hex pass for a caller that has already decided a page's form,
+ * with none of the sweep around it. It writes exactly what zpse_lzh_encode
+ * writes, so the two are interchangeable in a byte-identity build. */
+ZPSE_HOT uint32_t zpse_lzh_encode_page(const uint8_t *in, uint32_t n,
+                                       uint8_t *dst, uint32_t cap, void *table,
+                                       uint32_t hash_bits)
+{
+    return lzh_encode_impl(in, n, dst, cap, table, hash_bits, 0u);
+}
+
+/* Price a sample of sn bytes (the length passed as `n`) with the hex form:
+ * identical stream to zpse_lzh_encode, but only the slots a position in
+ * [0,sn) can hash to are cleared. */
+ZPSE_HOT uint32_t zpse_lzh_encode_sample(const uint8_t *in, uint32_t n,
+                                         uint8_t *dst, uint32_t cap,
+                                         void *table, uint32_t hash_bits,
+                                         uint32_t sn)
+{
+    return lzh_encode_impl(in, n, dst, cap, table, hash_bits, sn);
 }
 
 /* Copy one match. The fast form's shapes, and for its reason: a distance under
