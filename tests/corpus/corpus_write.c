@@ -15,6 +15,8 @@
  * class is kept out of the headline file because a zram workload's untouched
  * anonymous pages compress to nothing and would flatter any average that
  * included them; the repeat stream is what the page-dictionary harness reads.
+ * New shapes are appended: the mixed streams cycle only the original twelve
+ * content classes, so their bytes (and pinned digests) never move.
  *
  * --probe writes only `probe.bin`, one 4 KiB page per shape (see probe_fill):
  * the page shapes the price's knobs are supposed to separate, which the mixed
@@ -513,13 +515,20 @@ static void probe_fill(uint8_t *o, size_t n, uint32_t page)
 
 enum {
     PZERO = 0, PCODE, PRODATA, PHEAPP, PHEAPO, PSLAB, PBTREE, PHASH,
-    PJSON, PSTACK, PFLOAT, PBLOB, PMIXED, PKINDS
+    PJSON, PSTACK, PFLOAT, PBLOB, PMIXED, PWORDIDX, PBITMAP, PKINDS
 };
+
+/* The mixed streams (pages-nonzero, pages-all, pages-repeat) cycle exactly the
+ * original twelve content classes, PCODE..PMIXED. Appending a shape must not
+ * change their bytes: pages-nonzero.bin's digest is pinned at c9c0e860 in
+ * HISTORY.md, and the per-class tables are measured against that stream. A
+ * new shape gets its own `page-<name>.bin` and a `pages.txt` line only. */
+#define PPAGE_CYCLE PMIXED
 
 static const char *const page_names[PKINDS] = {
     "zero", "code", "rodata", "heap-pointers", "heap-objects", "slab-strings",
     "btree", "hash-table", "json-arena", "stack", "float-series", "blob",
-    "mixed-heap"
+    "mixed-heap", "wordidx", "bitmap"
 };
 
 static void put16(uint8_t *p, uint32_t v)
@@ -907,6 +916,43 @@ static void page_mixed_heap(uint8_t *o, size_t n, uint32_t page, uint32_t *s)
     if (i < n) memset(o + i, 0, n - i);
 }
 
+/* 32-bit ascending indices with a small gap every sixty-fourth entry. After a
+ * width-4 delta transpose, plane 0 is almost all +1 with a rare +4 and the
+ * three high planes are constant: the shape a dense whole-plane coder is for.
+ * The base continues from the page number so pages are not byte-identical. */
+static void page_wordidx(uint8_t *o, size_t n, uint32_t page, uint32_t *s)
+{
+    uint32_t v = page * 1024u;
+    uint32_t step = 0u;
+    size_t i = 0u;
+
+    (void)s;
+    while (i + 4u <= n) {
+        put32(o + i, v);
+        i += 4u;
+        v += 1u;
+        if ((++step & 63u) == 0u) v += 3u;   /* occasional gap */
+    }
+    if (i < n) memset(o + i, 0, n - i);
+}
+
+/* A sparse bitmap: zero bytes except a few short 0xFF runs. The runs are
+ * byte-aligned groups of set bits, so RAW_BITMAP masks cover them exactly and
+ * the rest of the page is one repeated value for the one-value token. */
+static void page_bitmap(uint8_t *o, size_t n, uint32_t page, uint32_t *s)
+{
+    size_t i;
+
+    (void)s;
+    memset(o, 0, n);
+    for (i = (size_t)(page % 13u) * 31u; i + 8u <= n; i += 223u) {
+        size_t run = 4u + ((i / 223u) & 7u);
+
+        if (i + run > n) run = n - i;
+        memset(o + i, 0xFF, run);
+    }
+}
+
 static void page_fill(uint8_t *o, size_t n, uint32_t page, int cls)
 {
     uint32_t s = 0x51ED2701u ^ (uint32_t)cls * 2654435761u ^ page * 40503u;
@@ -922,18 +968,20 @@ static void page_fill(uint8_t *o, size_t n, uint32_t page, int cls)
     case PHASH:   page_hash_table(o, n, page, &s); break;
     case PJSON:   page_json_arena(o, n, page, &s); break;
     case PSTACK:  page_stack(o, n, page, &s); break;
-    case PFLOAT:  page_float_series(o, n, page, &s); break;
-    case PBLOB:   page_blob(o, n, page, &s); break;
-    default:      page_mixed_heap(o, n, page, &s); break;
+    case PFLOAT:   page_float_series(o, n, page, &s); break;
+    case PBLOB:    page_blob(o, n, page, &s); break;
+    case PWORDIDX: page_wordidx(o, n, page, &s); break;
+    case PBITMAP:  page_bitmap(o, n, page, &s); break;
+    default:       page_mixed_heap(o, n, page, &s); break;
     }
 }
 
-/* Schedule a page number onto a class. Non-zero pages cycle all twelve
- * content classes; the all-pages file puts one zero in every eight. */
+/* Schedule a page number onto a class. Non-zero pages cycle the original
+ * twelve content classes; the all-pages file puts one zero in every eight. */
 static int page_class(uint32_t page, int include_zero)
 {
     if (include_zero && (page % 8u) == 0u) return PZERO;
-    return 1 + (int)(page % (PKINDS - 1));
+    return 1 + (int)(page % PPAGE_CYCLE);
 }
 
 static int write_page_stream(const char *dir, const char *name, size_t size,
@@ -1016,7 +1064,7 @@ static int write_page_repeat(const char *dir, size_t size)
             memcpy(all + p * PAGE, all + src * PAGE, PAGE);
         } else {
             page_fill(all + p * PAGE, PAGE, (uint32_t)p,
-                      1 + (int)(p % (PKINDS - 1)));
+                      1 + (int)(p % PPAGE_CYCLE));
             uniq[fresh++] = (uint32_t)p;
         }
     }
@@ -1041,6 +1089,20 @@ static int write_page_repeat(const char *dir, size_t size)
     }
 }
 
+/* Write the per-class files in [first, last). */
+static int write_page_classes(const char *dir, size_t size, int first, int last)
+{
+    int i;
+
+    for (i = first; i < last; i++) {
+        char name[64];
+
+        snprintf(name, sizeof name, "page-%s.bin", page_names[i]);
+        if (write_page_stream(dir, name, size, i, 0) != 0) return 1;
+    }
+    return 0;
+}
+
 static int write_page_corpus(const char *dir, size_t size)
 {
     char path[1024];
@@ -1052,18 +1114,18 @@ static int write_page_corpus(const char *dir, size_t size)
         fprintf(stderr, "SIZE must be a multiple of %u for --pages\n", PAGE);
         return 2;
     }
-    for (i = 0; i < PKINDS; i++) {
-        char name[64];
-
-        snprintf(name, sizeof name, "page-%s.bin", page_names[i]);
-        if (write_page_stream(dir, name, size, i, 0) != 0) return 1;
-    }
+    /* The original classes go first: the mixed streams below reuse the
+     * allocator state left by page-mixed-heap.bin, and their digests are
+     * pinned. Appended shapes are generated afterwards, so that state is
+     * exactly as it was before they existed. */
+    if (write_page_classes(dir, size, 0, PMIXED + 1) != 0) return 1;
     if (write_page_stream(dir, "pages-nonzero.bin", size, -1, 0) != 0)
         return 1;
     if (write_page_stream(dir, "pages-all.bin", size, -1, 1) != 0)
         return 1;
     if (write_page_repeat(dir, size) != 0)
         return 1;
+    if (write_page_classes(dir, size, PMIXED + 1, PKINDS) != 0) return 1;
 
     n = snprintf(path, sizeof path, "%s/pages.txt", dir);
     if (n <= 0 || (size_t)n >= sizeof path) {
