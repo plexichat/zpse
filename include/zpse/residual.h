@@ -1,6 +1,18 @@
 #ifndef ZPSE_RESIDUAL_H
 #define ZPSE_RESIDUAL_H
 
+/* Build knob for the 4 KiB residual fast paths (src/residual.c).
+ *
+ * Set to 0 to compile the AVX2 bulk kernels out; every mode then runs its
+ * scalar reference loop. The two forms are byte-identical, and dispatch is
+ * additionally gated at runtime on ZPSE_CPU_AVX2, so -DZPSE_FORCE_SCALAR
+ * (which reports no CPU features) and -DZPSE_AVX2_ABI_OK=0 (which cannot
+ * pass a 256-bit vector between functions) both select the scalar form.
+ * Set to 1 by default. */
+#ifndef ZPSE_RES_FAST4K
+#define ZPSE_RES_FAST4K 1
+#endif
+
 /* Residual codecs. Exclusion mapping is the shared
  * primitive; per-mode packers handle the payload layout. All decoders
  * unpack into exclusion-residual bytes exc_out[K] in [0,254] (mode 1

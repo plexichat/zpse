@@ -73,6 +73,53 @@
 #include <immintrin.h>
 #endif
 
+/* The 4 KiB page bulk paths. ZPSE_RES_HAVE_AVX2 already folds in the ABI
+ * gate (ZPSE_AVX2_ABI_OK) and the target's ability to compile the kernels,
+ * so this is the only combination the new code needs. Every kernel below
+ * processes a whole 32-byte prefix and returns how much it consumed; the
+ * caller's scalar loop finishes the tail. That is what makes the two forms
+ * byte-identical -- including on rejection, where the caller re-decides
+ * from the first unconsumed value exactly as it always did. */
+#if ZPSE_RES_FAST4K && ZPSE_RES_HAVE_AVX2
+#define ZPSE_RES_FAST4K_AVX2 1
+/* Below this the setup (a caps read plus kernel call) costs more than the
+ * scalar walk; a tile's k <= 256 still gets the narrow paths above. */
+#define ZPSE_RES_FAST4K_MIN 64u
+#else
+#define ZPSE_RES_FAST4K_AVX2 0
+#endif
+
+#if ZPSE_RES_FAST4K_AVX2
+/* None of these takes or returns a __m256i by value: see ZPSE_AVX2_ABI_OK. */
+static ZPSE_RES_AVX2 uint32_t res4k_copy(uint8_t *dst, const uint8_t *src,
+                                         uint32_t n);
+static ZPSE_RES_AVX2 int res4k_has_ff(const uint8_t *src, uint32_t n);
+static ZPSE_RES_AVX2 uint32_t res4k_copy_checked(uint8_t *dst,
+                                                 const uint8_t *src,
+                                                 uint32_t n, int *bad);
+static ZPSE_RES_AVX2 uint32_t res4k_max_u8(const uint8_t *src, uint32_t n,
+                                           uint32_t *max_out);
+static ZPSE_RES_AVX2 uint16_t res4k_pal_b2(const uint8_t *pal,
+                                           const uint8_t *src, uint16_t k,
+                                           unsigned m, uint8_t *out);
+static ZPSE_RES_AVX2 uint16_t res4k_pal_b4(const uint8_t *pal,
+                                           const uint8_t *src, uint16_t k,
+                                           unsigned m, uint8_t *out);
+static ZPSE_RES_AVX2 uint16_t res4k_pal_b4_enc(const uint8_t *idx_of,
+                                               const uint8_t *exc_in,
+                                               uint16_t k, uint8_t *dst);
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc(const uint8_t *actual,
+                                              const uint8_t *pred,
+                                              uint16_t k, int *dmin_out,
+                                              int *dmax_out, int *zero_out);
+static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b0(const uint8_t *src,
+                                                 const uint8_t *pred,
+                                                 uint16_t k, uint8_t *out);
+static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b2(const uint8_t *src,
+                                                 const uint8_t *pred,
+                                                 uint16_t k, uint8_t *out);
+#endif
+
 uint8_t zpse_base_m_group(uint8_t m)
 {
     switch (m) {
@@ -182,6 +229,19 @@ static int residual_has_ff(const uint8_t *p, uint32_t n)
 {
     uint32_t i = 0;
 
+#if ZPSE_RES_FAST4K_AVX2
+    /* One 32-byte compare and a movemask per step instead of the 8-byte
+     * load/negate/idiom below. Only the whole-vector prefix is consumed;
+     * the existing scalar loop finishes from the same aligned position,
+     * so the answer (which is all the caller asks for) is unchanged. */
+    if (n >= ZPSE_RES_FAST4K_MIN &&
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        if (res4k_has_ff(p, n)) {
+            return 1;
+        }
+        i = (n / 32u) * 32u;
+    }
+#endif
     while (i + 8u <= n) {
         uint64_t w;
 
@@ -226,6 +286,17 @@ static int residual_copy_u8_checked(uint8_t *dst, const uint8_t *src,
     uint32_t i = 0;
     int bad = 0;
 
+#if ZPSE_RES_FAST4K_AVX2
+    /* The copy and the has-FF question in one 32-byte step: a full-vector
+     * load, one unaligned store, one compare and a movemask. As in the
+     * scalar loop, a rejecting payload may leave more bytes in dst than the
+     * per-byte form wrote, which no caller can observe (the status is
+     * checked first and dst is scratch). */
+    if (n >= ZPSE_RES_FAST4K_MIN &&
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        i = res4k_copy_checked(dst, src, n, &bad);
+    }
+#endif
     while (i + 32u <= n) {
         uint64_t w0, w1, w2, w3;
 
@@ -284,6 +355,15 @@ static void residual_copy_bytes(uint8_t *dst, const uint8_t *src, uint32_t n)
 {
     uint32_t i = 0;
 
+#if ZPSE_RES_FAST4K_AVX2
+    /* RAW_ACTUAL is a pure byte copy; at page length the vector form is one
+     * load/store per 32 bytes and the scalar loop below only handles the
+     * remainder. */
+    if (n >= ZPSE_RES_FAST4K_MIN &&
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        i = res4k_copy(dst, src, n);
+    }
+#endif
     while (i + 32u <= n) {
         memcpy(dst + i, src + i, 32);
         i += 32u;
@@ -458,6 +538,24 @@ static ZPSE_RES_SSSE3 uint16_t residual_decode_mode2_simd(
     if (b == 4u && m == 16u && k >= 64u &&
         (caps & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         i = residual_decode_mode2_avx2_m16(palette, src, k, exc_out);
+    }
+#endif
+#if ZPSE_RES_FAST4K_AVX2
+    /* The other palette widths of a dense page, at 64 values per 4-bit
+     * step and 128 per 2-bit step. Both expand the index bytes with pshufb
+     * against a staged 16-entry palette (the 8-bit residual alphabet's LUT),
+     * which replaces the scalar per-value "range check, then look up
+     * payload[1+idx]" branch. Each kernel validates a whole block before
+     * storing any of it, so a rejected index is still reported at the same
+     * scalar position by the loops below. The m == 16, b == 4 case above
+     * already has its own kernel and is left to it. */
+    if (k >= ZPSE_RES_FAST4K_MIN &&
+        (caps & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        if (b == 4u && m != 16u) {
+            i = res4k_pal_b4(palette, src, k, m, exc_out);
+        } else if (b == 2u) {
+            i = res4k_pal_b2(palette, src, k, m, exc_out);
+        }
     }
 #endif
     /* A full palette needs no staging copy: sixteen entries fill the
@@ -839,6 +937,393 @@ static ZPSE_RES_AVX2 uint16_t residual_decode_mode2_avx2_m16(
 }
 
 #endif /* ZPSE_RES_HAVE_AVX2 */
+
+#if ZPSE_RES_FAST4K_AVX2
+
+/* ---- 4 KiB bulk kernels ------------------------------------------- *
+ * Each handles the whole-vector prefix of a residual stream and returns
+ * the number of units it consumed. Callers keep their original scalar loop
+ * for the tail, which is what makes the two forms byte-identical on every
+ * input (and lets a rejected block be re-decided at the right position). */
+
+static ZPSE_RES_AVX2 uint32_t res4k_copy(uint8_t *dst, const uint8_t *src,
+                                         uint32_t n)
+{
+    uint32_t i = 0u;
+
+    for (; i + 32u <= n; i += 32u) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + i));
+
+        _mm256_storeu_si256((__m256i *)(void *)(dst + i), v);
+    }
+    return i;
+}
+
+/* 0xFF is the one byte that is not a legal exclusion residual. A compare
+ * plus a movemask answers it for 32 bytes at once; the caller tests the
+ * tail. Byte order is irrelevant to an equality test. */
+static ZPSE_RES_AVX2 int res4k_has_ff(const uint8_t *src, uint32_t n)
+{
+    const __m256i ff = _mm256_set1_epi8((char)0xFF);
+    uint32_t i = 0u;
+
+    for (; i + 32u <= n; i += 32u) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + i));
+
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, ff)) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Fused form for the decoder: copy the vector we just loaded, and ask the
+ * has-FF question of the same register. */
+static ZPSE_RES_AVX2 uint32_t res4k_copy_checked(uint8_t *dst,
+                                                 const uint8_t *src,
+                                                 uint32_t n, int *bad)
+{
+    const __m256i ff = _mm256_set1_epi8((char)0xFF);
+    uint32_t i = 0u;
+    int b = 0;
+
+    for (; i + 32u <= n; i += 32u) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + i));
+
+        _mm256_storeu_si256((__m256i *)(void *)(dst + i), v);
+        b |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, ff)) != 0);
+    }
+    *bad = b;
+    return i;
+}
+
+/* VPMAXUB reduces 32 bytes per step. The 32-byte horizontal finish is one
+ * store to a stack slot and a byte loop, independent of the page length. */
+static ZPSE_RES_AVX2 uint32_t res4k_max_u8(const uint8_t *src, uint32_t n,
+                                           uint32_t *max_out)
+{
+    __m256i mx = _mm256_setzero_si256();
+    uint32_t i = 0u;
+    uint8_t t[32];
+    uint32_t m = 0u;
+    unsigned j;
+
+    for (; i + 32u <= n; i += 32u) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + i));
+
+        mx = _mm256_max_epu8(mx, v);
+    }
+    _mm256_storeu_si256((__m256i *)(void *)t, mx);
+    for (j = 0u; j < 32u; j++) {
+        if ((uint32_t)t[j] > m) {
+            m = (uint32_t)t[j];
+        }
+    }
+    *max_out = m;
+    return i;
+}
+
+/* Stage the palette once for the two 2/4-bit unpackers: the byte-shuffle is
+ * lane-local, so both 128-bit halves of the register must hold the same
+ * zero-padded 16-entry table. */
+static ZPSE_RES_AVX2 inline __m256i res4k_palv(const uint8_t *pal, unsigned m)
+{
+    uint8_t staged[16];
+    __m128i p;
+
+    if (m == 16u) {
+        p = _mm_loadu_si128((const __m128i *)(const void *)pal);
+    } else {
+        memcpy(staged, pal, (size_t)m);
+        memset(staged + m, 0, sizeof staged - (size_t)m);
+        p = _mm_loadu_si128((const __m128i *)(const void *)staged);
+    }
+    return _mm256_broadcastsi128_si256(p);
+}
+
+/* Mode 2, b == 2: 128 values per step from one 32-byte load. Four masked
+ * copies give the four 2-bit index planes; four pshufb instructions expand
+ * them through the palette LUT (the per-byte "range check, then look up"
+ * branch of the scalar form), and the unpack ladder puts them back in value
+ * order. Lane-local unpacks are combined with permute2x128 so the two
+ * 128-bit halves come out as ascending positions. */
+static ZPSE_RES_AVX2 uint16_t res4k_pal_b2(const uint8_t *pal,
+                                           const uint8_t *src, uint16_t k,
+                                           unsigned m, uint8_t *out)
+{
+    const __m256i palv = res4k_palv(pal, m);
+    const __m256i limv = _mm256_set1_epi8((char)(uint8_t)(m - 1u));
+    const __m256i low2 = _mm256_set1_epi8((char)0x03);
+    uint16_t i = 0u;
+
+    while ((uint32_t)i + 128u <= (uint32_t)k) {
+        __m256i x = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + ((uint32_t)i >> 2u)));
+        __m256i i0 = _mm256_and_si256(x, low2);
+        __m256i i1 = _mm256_and_si256(_mm256_srli_epi16(x, 2), low2);
+        __m256i i2 = _mm256_and_si256(_mm256_srli_epi16(x, 4), low2);
+        __m256i i3 = _mm256_and_si256(_mm256_srli_epi16(x, 6), low2);
+        __m256i a0, a1, a2, a3;
+        __m256i u0, u1, u2, u3;
+        __m256i w0, w1, w2, w3;
+
+        /* m == 4 fills the width, so no 2-bit index can be out of range. */
+        if (m != 4u) {
+            __m256i gt = _mm256_or_si256(
+                _mm256_or_si256(_mm256_cmpgt_epi8(i0, limv),
+                                _mm256_cmpgt_epi8(i1, limv)),
+                _mm256_or_si256(_mm256_cmpgt_epi8(i2, limv),
+                                _mm256_cmpgt_epi8(i3, limv)));
+
+            if (_mm256_movemask_epi8(gt) != 0) {
+                break;
+            }
+        }
+        a0 = _mm256_shuffle_epi8(palv, i0);
+        a1 = _mm256_shuffle_epi8(palv, i1);
+        a2 = _mm256_shuffle_epi8(palv, i2);
+        a3 = _mm256_shuffle_epi8(palv, i3);
+        u0 = _mm256_unpacklo_epi8(a0, a1);
+        u1 = _mm256_unpackhi_epi8(a0, a1);
+        u2 = _mm256_unpacklo_epi8(a2, a3);
+        u3 = _mm256_unpackhi_epi8(a2, a3);
+        w0 = _mm256_unpacklo_epi16(u0, u2);
+        w1 = _mm256_unpackhi_epi16(u0, u2);
+        w2 = _mm256_unpacklo_epi16(u1, u3);
+        w3 = _mm256_unpackhi_epi16(u1, u3);
+
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            _mm256_permute2x128_si256(w0, w1, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 32u),
+                            _mm256_permute2x128_si256(w2, w3, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 64u),
+                            _mm256_permute2x128_si256(w0, w1, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 96u),
+                            _mm256_permute2x128_si256(w2, w3, 0x31));
+        i = (uint16_t)(i + 128u);
+    }
+    return i;
+}
+
+/* Mode 2, b == 4: 64 values per step, the wide form of the existing
+ * 128-bit loop. Low nibble first, then high, matching residual_get_bits'
+ * little-endian field order; m == 16 fills the width and needs no check. */
+static ZPSE_RES_AVX2 uint16_t res4k_pal_b4(const uint8_t *pal,
+                                           const uint8_t *src, uint16_t k,
+                                           unsigned m, uint8_t *out)
+{
+    const __m256i palv = res4k_palv(pal, m);
+    const __m256i limv = _mm256_set1_epi8((char)(uint8_t)(m - 1u));
+    const __m256i low4 = _mm256_set1_epi8((char)0x0F);
+    uint16_t i = 0u;
+
+    while ((uint32_t)i + 64u <= (uint32_t)k) {
+        __m256i x = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + ((uint32_t)i >> 1u)));
+        __m256i lo = _mm256_and_si256(x, low4);
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), low4);
+        __m256i a, c, u, v;
+
+        if (m != 16u &&
+            (_mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, limv)) != 0 ||
+             _mm256_movemask_epi8(_mm256_cmpgt_epi8(hi, limv)) != 0)) {
+            break;
+        }
+        a = _mm256_shuffle_epi8(palv, lo);
+        c = _mm256_shuffle_epi8(palv, hi);
+        u = _mm256_unpacklo_epi8(a, c);
+        v = _mm256_unpackhi_epi8(a, c);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            _mm256_permute2x128_si256(u, v, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 32u),
+                            _mm256_permute2x128_si256(u, v, 0x31));
+        i = (uint16_t)(i + 64u);
+    }
+    return i;
+}
+
+/* Mode 2 encode, b == 4: the value -> index table is a 32-byte pshufb LUT
+ * (values are all below 32 on this path). maddubs folds each index pair into
+ * one payload byte, and packus widens the result to the 16 bytes written for
+ * 32 values. The caller guarantees every residual is a palette entry, so
+ * pshufb's zeroing-on-high-bit case cannot fire. */
+static ZPSE_RES_AVX2 uint16_t res4k_pal_b4_enc(const uint8_t *idx_of,
+                                               const uint8_t *exc_in,
+                                               uint16_t k, uint8_t *dst)
+{
+    __m256i tlo;
+    __m256i thi;
+    __m256i nibv = _mm256_set1_epi8((char)0x0F);
+    __m256i mult;
+    uint16_t i = 0u;
+
+    /* pshufb addresses a 16-byte table within its own 128-bit lane, so the
+     * value -> index table has to be two broadcasts selected byte-wise by
+     * the high nibble, exactly as in the 128-bit packer. pshufb only uses
+     * the low four index bits, so one 32-byte LUT cannot be addressed by a
+     * five-bit residual value. */
+    tlo = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+        (const __m128i *)(const void *)idx_of));
+    thi = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+        (const __m128i *)(const void *)(idx_of + 16)));
+    mult = _mm256_setr_epi8(1, 16, 1, 16, 1, 16, 1, 16,
+                            1, 16, 1, 16, 1, 16, 1, 16,
+                            1, 16, 1, 16, 1, 16, 1, 16,
+                            1, 16, 1, 16, 1, 16, 1, 16);
+
+    while ((uint32_t)i + 32u <= (uint32_t)k) {
+        __m256i v = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(exc_in + (uint32_t)i));
+        __m256i sel = _mm256_cmpgt_epi8(v, nibv);
+        __m256i lo = _mm256_shuffle_epi8(tlo, v);
+        __m256i hi = _mm256_shuffle_epi8(thi, v);
+        __m256i idx = _mm256_or_si256(_mm256_and_si256(sel, hi),
+                                      _mm256_andnot_si256(sel, lo));
+        __m256i merged = _mm256_maddubs_epi16(idx, mult);
+        /* maddubs and packus are lane-local: lane 0 holds the first 8
+         * payload bytes, lane 1 the next 8. Packing merged with itself
+         * would duplicate each half, so bring the halves together first. */
+        __m128i plo = _mm256_castsi256_si128(merged);
+        __m128i phi = _mm256_extracti128_si256(merged, 1);
+
+        _mm_storeu_si128((__m128i *)(void *)(dst + ((uint32_t)i >> 1u)),
+                         _mm_packus_epi16(plo, phi));
+        i = (uint16_t)((uint32_t)i + 32u);
+    }
+    return i;
+}
+
+/* Mode 4's submode selection scans every delta for zero (a rejection) and
+ * for the min/max that chooses 4, 6 or 8 bits. PADDB/SUBB reproduce the
+ * wrapping signed delta byte, so the whole scan has no per-byte branch. */
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc(const uint8_t *actual,
+                                              const uint8_t *pred,
+                                              uint16_t k, int *dmin_out,
+                                              int *dmax_out, int *zero_out)
+{
+    const __m256i c128 = _mm256_set1_epi8((char)0x80);
+    __m256i mn = _mm256_set1_epi8((char)127);
+    __m256i mx = _mm256_set1_epi8((char)(-128));
+    uint32_t i = 0u;
+    int zero = 0;
+    int8_t tb[32];
+    int lo = 127;
+    int hi = -128;
+    unsigned j;
+
+    for (; i + 32u <= (uint32_t)k; i += 32u) {
+        __m256i x = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(actual + i));
+        __m256i p = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pred + i));
+        __m256i d = _mm256_add_epi8(_mm256_sub_epi8(x, p), c128);
+        __m256i s;
+
+        /* d == 0 is exactly the wrapped byte 0x80. */
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(d, c128)) != 0) {
+            zero = 1;
+            break;
+        }
+        s = _mm256_sub_epi8(d, c128);
+        mn = _mm256_min_epi8(mn, s);
+        mx = _mm256_max_epi8(mx, s);
+    }
+    _mm256_storeu_si256((__m256i *)(void *)tb, mn);
+    for (j = 0u; j < 32u; j++) {
+        if ((int)tb[j] < lo) {
+            lo = (int)tb[j];
+        }
+    }
+    _mm256_storeu_si256((__m256i *)(void *)tb, mx);
+    for (j = 0u; j < 32u; j++) {
+        if ((int)tb[j] > hi) {
+            hi = (int)tb[j];
+        }
+    }
+    *dmin_out = lo;
+    *dmax_out = hi;
+    *zero_out = zero;
+    return i;
+}
+
+/* Common tail of the mode-4 decode kernels: x = pred + d (mod 256), then
+ * exclusion_forward(x, pred) = x - (x > pred). A non-zero delta byte d in
+ * [-128,127] never leaves x == pred, so "x <= pred" from unsigned
+ * max/compare is exactly the keep case, and the subtract mask has no
+ * per-byte branch. */
+static ZPSE_RES_AVX2 inline __m256i res4k_delta_map(__m256i x, __m256i p)
+{
+    const __m256i one = _mm256_set1_epi8(1);
+    __m256i le = _mm256_cmpeq_epi8(_mm256_max_epu8(x, p), p);
+
+    return _mm256_sub_epi8(x, _mm256_andnot_si256(le, one));
+}
+
+/* Mode 4, submode 0: 4-bit deltas, two per payload byte. The 16-byte load
+ * is broadcast to both lanes; only the low lane's 32 values are used, and
+ * (e ^ 8) - 8 maps the 4-bit signed field to its two's-complement byte. */
+static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b0(const uint8_t *src,
+                                                 const uint8_t *pred,
+                                                 uint16_t k, uint8_t *out)
+{
+    const __m256i low4 = _mm256_set1_epi8((char)0x0F);
+    const __m256i eight = _mm256_set1_epi8((char)8);
+    const __m256i zero = _mm256_setzero_si256();
+    uint16_t i = 0u;
+
+    while ((uint32_t)i + 32u <= (uint32_t)k) {
+        __m128i raw = _mm_loadu_si128(
+            (const __m128i *)(const void *)(src + ((uint32_t)i >> 1u)));
+        __m256i x = _mm256_broadcastsi128_si256(raw);
+        __m256i lo = _mm256_and_si256(x, low4);
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), low4);
+        __m256i u = _mm256_unpacklo_epi8(lo, hi);
+        __m256i v = _mm256_unpackhi_epi8(lo, hi);
+        __m256i e = _mm256_permute2x128_si256(u, v, 0x20);
+        __m256i p = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pred + i));
+        __m256i d;
+
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(e, zero)) != 0) {
+            break;
+        }
+        d = _mm256_sub_epi8(_mm256_xor_si256(e, eight), eight);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            res4k_delta_map(_mm256_add_epi8(p, d), p));
+        i = (uint16_t)(i + 32u);
+    }
+    return i;
+}
+
+/* Mode 4, submode 2: one 8-bit delta per byte. The encoded byte is already
+ * the two's-complement delta, so only the add and the exclusion map remain. */
+static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b2(const uint8_t *src,
+                                                 const uint8_t *pred,
+                                                 uint16_t k, uint8_t *out)
+{
+    const __m256i zero = _mm256_setzero_si256();
+    uint16_t i = 0u;
+
+    for (; (uint32_t)i + 32u <= (uint32_t)k; i = (uint16_t)(i + 32u)) {
+        __m256i e = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(src + i));
+        __m256i p = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pred + i));
+
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(e, zero)) != 0) {
+            break;
+        }
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            res4k_delta_map(_mm256_add_epi8(p, e), p));
+    }
+    return i;
+}
+
+#endif /* ZPSE_RES_FAST4K_AVX2 */
 
 static int residual_decode_mode2(const uint8_t *payload,
                                  uint16_t payload_len, uint16_t k,
@@ -1607,7 +2092,7 @@ static int residual_decode_mode4(const uint8_t *payload,
 {
     uint8_t sub;
     uint32_t expect;
-    uint16_t i;
+    uint16_t i = 0u;
 
     if (payload_len < 1u) {
         return ZPSE_BAD_RESIDUAL;
@@ -1635,7 +2120,13 @@ static int residual_decode_mode4(const uint8_t *payload,
                 return ZPSE_BAD_RESIDUAL;
             }
         }
-        for (i = 0; i < k; i++) {
+#if ZPSE_RES_FAST4K_AVX2
+        if (k >= ZPSE_RES_FAST4K_MIN &&
+            (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            i = res4k_delta_dec_b0(payload + 1u, pred_at_exc, k, exc_out);
+        }
+#endif
+        for (; i < k; i++) {
             uint8_t byte = payload[1u + (i >> 1u)];
             unsigned enc = ((i & 1u) == 0u) ? (byte & 0xFu) : (byte >> 4u);
             int d;
@@ -1670,7 +2161,17 @@ static int residual_decode_mode4(const uint8_t *payload,
             exc_out[i] = zpse_exclusion_forward(x, pred_at_exc[i]);
         }
     } else {
-        for (i = 0; i < k; i++) {
+#if ZPSE_RES_FAST4K_AVX2
+        /* The 8-bit submode is one byte per delta: unpack and map thirty-two
+         * values at a time. The scalar loop finishes from the first vector
+         * it could not take (including a rejected block, whose status it
+         * then reports at the same value). */
+        if (k >= ZPSE_RES_FAST4K_MIN &&
+            (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            i = res4k_delta_dec_b2(payload + 1u, pred_at_exc, k, exc_out);
+        }
+#endif
+        for (; i < k; i++) {
             uint8_t enc = payload[1u + i];
             int d;
             uint8_t x;
@@ -2093,7 +2594,17 @@ ZPSE_HOT static int residual_encode_mode2(const uint8_t *exc_in, uint16_t k,
          * retires sixteen values per step; everything it does not consume,
          * including the tail of the block, is left to the byte loop. */
         if (b == 4u && wide == 0) {
-            gi = residual_encode_mode2_simd(idx_of, exc_in, k, dst);
+#if ZPSE_RES_FAST4K_AVX2
+            /* Same value -> index pshufb as the 128-bit packer, but 32
+             * values per step (16 whole payload bytes) on a dense page. */
+            if (k >= ZPSE_RES_FAST4K_MIN &&
+                (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+                gi = res4k_pal_b4_enc(idx_of, exc_in, k, dst);
+            } else
+#endif
+            {
+                gi = residual_encode_mode2_simd(idx_of, exc_in, k, dst);
+            }
             g = (uint32_t)gi >> 1u;
         } else if (b == 1u && nu == 2u) {
             gi = residual_encode_mode2_bits(exc_in, k, pal[1], dst);
@@ -2162,9 +2673,22 @@ ZPSE_HOT static int residual_encode_mode3(const uint8_t *exc_in, uint16_t k,
         m = 3;
     } else {
         uint8_t maxv = 0;
-        uint16_t i;
+        uint16_t i = 0u;
 
-        for (i = 0; i < k; i++) {
+#if ZPSE_RES_FAST4K_AVX2
+        /* M is chosen from the max residual, so min/max over the whole page
+         * is the only data-dependent scan before the packer. VPMAXUB folds
+         * 32 bytes per step; the scalar loop below starts at the first byte
+         * the kernel did not consume, so both forms pick the same M. */
+        if (k >= ZPSE_RES_FAST4K_MIN &&
+            (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            uint32_t v = 0u;
+
+            i = (uint16_t)res4k_max_u8(exc_in, (uint32_t)k, &v);
+            maxv = (uint8_t)v;
+        }
+#endif
+        for (; i < k; i++) {
             if (exc_in[i] > maxv) {
                 maxv = exc_in[i];
             }
@@ -2276,7 +2800,7 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
     int dmax = 0;
     uint8_t sub;
     uint32_t total;
-    uint16_t i;
+    uint16_t i = 0u;
 
     if (k == 0u) {
         if (cap < 1u) {
@@ -2291,7 +2815,26 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
     if (actual_in == 0 || pred_at_exc == 0) {
         return ZPSE_BAD_ARG;
     }
-    for (i = 0; i < k; i++) {
+#if ZPSE_RES_FAST4K_AVX2
+    /* The submode decision needs the page's min and max signed delta, and
+     * d == 0 rejects the whole tile. Both come from the same 32-byte pass:
+     * PADDB/SUBB wrap is the signed delta byte, CMPEQB against zero's byte
+     * pattern detects a rejection, and PMINSB/PMAXSB fold the extrema.
+     * Nothing has been written to out yet, so the rejection status is the
+     * same even though the vector pass may look past the scalar's first
+     * zero. */
+    if (k >= ZPSE_RES_FAST4K_MIN &&
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        int zero = 0;
+
+        i = (uint16_t)res4k_delta_enc(actual_in, pred_at_exc, k,
+                                      &dmin, &dmax, &zero);
+        if (zero != 0) {
+            return ZPSE_BAD_RESIDUAL;
+        }
+    }
+#endif
+    for (; i < k; i++) {
         int d = residual_delta(actual_in[i], pred_at_exc[i]);
 
         if (d == 0) {
@@ -2421,8 +2964,24 @@ ZPSE_HOT int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
         if ((uint32_t)payload_cap < (uint32_t)k) {
             return ZPSE_OUTPUT_OVERFLOW;
         }
-        if (k > 0u)
+        if (k > 0u) {
+#if ZPSE_RES_FAST4K_AVX2
+            /* Same bulk copy as the RAW_ACTUAL decode path; the scalar
+             * memcpy remains the fallback for small k and other builds. */
+            if (k >= ZPSE_RES_FAST4K_MIN &&
+                (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+                uint32_t done = res4k_copy(payload_out, actual_in,
+                                           (uint32_t)k);
+
+                if (done < (uint32_t)k) {
+                    memcpy(payload_out + done, actual_in + done,
+                           (size_t)k - (size_t)done);
+                }
+                return (int)k;
+            }
+#endif
             memcpy(payload_out, actual_in, (size_t)k);
+        }
         return (int)k;
     }
     if (mode == ZPSE_R_EXCLUSION_U8) {
@@ -2529,9 +3088,18 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
             m = 3;
         } else {
             uint8_t maxv = 0;
-            uint16_t i;
+            uint16_t i = 0u;
 
-            for (i = 0; i < k; i++) {
+#if ZPSE_RES_FAST4K_AVX2
+            if (k >= ZPSE_RES_FAST4K_MIN &&
+                (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+                uint32_t v = 0u;
+
+                i = (uint16_t)res4k_max_u8(exc_in, (uint32_t)k, &v);
+                maxv = (uint8_t)v;
+            }
+#endif
+            for (; i < k; i++) {
                 if (exc_in[i] > maxv) {
                     maxv = exc_in[i];
                 }
