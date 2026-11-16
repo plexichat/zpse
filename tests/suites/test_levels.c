@@ -102,6 +102,64 @@ static double now_ns(void)
 #endif
 }
 
+/* 4 KiB is the one block size the ladder above does not cover (its smallest
+ * is 8 KiB). A page goes through the single FLAT page path at every level, so
+ * all nine levels must decode to the same bytes and write the same size. Pin
+ * that on two representative pages -- a low-alphabet one and a 256-symbol one
+ * -- with deterministic input so the corpus is identical on every run. */
+static void page_levels(void)
+{
+    uint32_t sizes[9];
+    uint8_t first[4096];
+    uint32_t i;
+    int b;
+
+    for (b = 0; b < 2; b++) {
+        unsigned li;
+        int have_first = 0;
+
+        for (i = 0u; i < 4096u; i++) {
+            in[i] = (b == 0) ? (uint8_t)(i & 7u)
+                             : (uint8_t)(i * 131u + 17u);
+        }
+        for (li = 0u; li < 9u; li++) {
+            uint32_t cl = 0u;
+            uint32_t ol = 0u;
+            int rc = zpse_compress_block_ex(in, 4096u, comp,
+                                            (uint32_t)sizeof comp, &cl, 0, 1,
+                                            levels[li], E);
+
+            CHECK(rc == ZPSE_OK,
+                  "4 KiB page %d: the %s level did not compress", b,
+                  names[li]);
+            if (rc != ZPSE_OK) {
+                continue;
+            }
+            sizes[li] = cl;
+            rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, D);
+            CHECK(rc == ZPSE_OK && ol == 4096u &&
+                      memcmp(out, in, 4096u) == 0,
+                  "4 KiB page %d: the %s level did not round-trip", b,
+                  names[li]);
+            if (!have_first) {
+                memcpy(first, out, 4096u);
+                have_first = 1;
+            } else {
+                CHECK(memcmp(out, first, 4096u) == 0,
+                      "4 KiB page %d: the %s level decoded differently", b,
+                      names[li]);
+            }
+        }
+        /* One page form at every level: the size cannot grow going down the
+         * ladder (here every level writes the same bytes). */
+        for (li = 1u; li < 9u; li++) {
+            CHECK(sizes[li] <= sizes[li - 1u],
+                  "4 KiB page %d: at the %s level %u bytes, the %s level %u",
+                  b, names[li], sizes[li], names[li - 1u], sizes[li - 1u]);
+        }
+    }
+}
+
 int main(void)
 {
     int kind;
@@ -188,6 +246,8 @@ int main(void)
             }
         }
     }
+
+    page_levels();
 
     /* The level field is four bits, so 10-15 are representable and must be
      * refused rather than treated as the deepest level: a caller asking for
