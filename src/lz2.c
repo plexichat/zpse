@@ -13,6 +13,11 @@
  * not a legitimate entry. */
 #define LZ2_EMPTY 0xFFFFu
 
+/* Hash slot access: one uint16_t array of caller-owned scratch, cleared per
+ * call. LZ2_EMPTY is the marker for a slot that holds no position. */
+#define LZ2_TAB_GET(h) ((tab)[(h)])
+#define LZ2_TAB_SET(h, v) do { (tab)[(h)] = (uint16_t)(v); } while (0)
+
 /* The payload header: literal total and token count. */
 #define LZ2_HDR 8u
 
@@ -365,14 +370,15 @@ static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
 #define ZPSE_LZ2_BACK_WIDE 0
 #endif
 
-/* Tagged with the rest of the hot set: this finder is the whole of the F
- * form's encode, and it was the one kernel in the tree left at the build's
- * own level. */
-ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                         uint32_t cap, void *table, uint32_t hash_bits)
+/* The one finder body behind both entry points. `sample_n == 0` is a full
+ * pass; a nonzero `sample_n` prices a sample and clears only the slots that a
+ * position in [0,sample_n) can hash to. Every decision and store is shared. */
+static uint32_t lz2_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
+                                uint32_t cap, void *table, uint32_t hash_bits,
+                                uint32_t sample_n)
 {
     uint16_t *restrict tab = (uint16_t *)table;
-    uint32_t entries = 1u << hash_bits;
+    uint32_t entries;
     uint32_t pos, anchor, misses;
     uint32_t lit_total = 0u, cmds = 0u, out = LZ2_HDR;
     uint32_t cur, h, limit;
@@ -387,11 +393,28 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < ZPSE_LZ2_MIN_PAYLOAD) {
         return 0u;
     }
+    entries = 1u << hash_bits;
     /* LZ2_EMPTY is 0xFFFF and the table is uint16_t, so all-ones bytes are
-     * exactly the empty marker. One memset beats the 16-bit fill loop, which
-     * gcc does not vectorise at -O2, for the same reason src/lz.c's clear
-     * does (see the comment there). */
-    memset(tab, 0xFF, (size_t)entries * sizeof *tab);
+     * exactly the empty marker. A full pass clears it (memset beats the
+     * 16-bit fill loop gcc does not vectorise at -O2); a sample pass clears
+     * only the slots a position in [0, sample_n) can hash to. The hash is a
+     * key hash, so those slots are found by running the same hash over each
+     * key in the sample. See src/lz.c's clear. */
+    {
+        uint32_t ce = (sample_n != 0u && sample_n < n) ? sample_n : n;
+
+        if (sample_n == 0u) {
+            memset(tab, 0xFF, (size_t)entries * sizeof *tab);
+        } else if (ce >= ZPSE_LZ2_MIN_MATCH) {
+            uint32_t p;
+
+            for (p = 0u; p + ZPSE_LZ2_MIN_MATCH <= ce; p++) {
+                uint32_t k = zpse_load_u32le(in + p);
+
+                LZ2_TAB_SET(lz2_hash_at(in, p, n, k, hash_bits), LZ2_EMPTY);
+            }
+        }
+    }
     pos = 0u;
     anchor = 0u;
     misses = 0u;
@@ -403,7 +426,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
      * miss path reads it while the candidate is being compared (see
      * ZPSE_LZ2_PIPE_NEXT), so re-reading it at the top would spend the
      * latency the lookahead just saved. */
-    uint32_t cand = tab[h];
+    uint32_t cand = LZ2_TAB_GET(h);
 #endif
 
     while (pos <= limit) {
@@ -414,7 +437,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t nx_cur = 0u, nx_h = 0u, nx_c = LZ2_EMPTY;
         int nx_ok = 0;
 #else
-        uint32_t cand = tab[h];
+        uint32_t cand = LZ2_TAB_GET(h);
         uint32_t len = ZPSE_LZ2_MIN_MATCH;
         /* The match's own start: the walk below moves these instead of the
          * scanning cursor (see there). */
@@ -422,7 +445,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t mcand = cand;
 #endif
 
-        tab[h] = (uint16_t)pos;
+        LZ2_TAB_SET(h, pos);
 #if ZPSE_LZ2_PIPE_NEXT
         /* The next position's chain, read BEFORE the candidate at the cursor
          * is tested: the word at pos + 1 is the byte the cursor is about to
@@ -434,7 +457,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             nx_cur = zpse_load_u32le(in + pos + 1u);
             nx_h = lz2_hash_at(in, pos + 1u, n, nx_cur, hash_bits);
-            nx_c = tab[nx_h];
+            nx_c = LZ2_TAB_GET(nx_h);
             nx_ok = 1;
         }
 #endif
@@ -464,7 +487,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             cur = zpse_load_u32le(in + pos);
             h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
-            cand = tab[h];
+            cand = LZ2_TAB_GET(h);
 #endif
             continue;
         }
@@ -473,7 +496,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
          * the backward walk and the extension below (see
          * ZPSE_LZ2_PROBE_EARLY). Read after the table write above, so a
          * self-hit reads exactly as it did before. */
-        uint32_t p_cur = 0u, p_h = 0u, p_c1 = LZ2_EMPTY;
+        uint32_t p_cur = 0u, p_h = 0u, p_c1 = LZ2_EMPTY, p_c1p;
         int p_ok = 0;
 
 #if ZPSE_LZ2_PIPE_NEXT
@@ -487,10 +510,11 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         if (pos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             p_cur = zpse_load_u32le(in + pos + 1u);
             p_h = lz2_hash_at(in, pos + 1u, n, p_cur, hash_bits);
-            p_c1 = tab[p_h];
+            p_c1 = LZ2_TAB_GET(p_h);
             p_ok = 1;
         }
 #endif
+        p_c1p = p_c1;
 #endif
         /* Extend backward into the pending literals: an earlier start is a
          * longer match for the same four bytes, and the run in front of it is
@@ -595,15 +619,15 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
 #if ZPSE_LZ2_PROBE_EARLY
         if (p_ok && mpos == pos && len <= (uint32_t)ZPSE_LZ2_LAZY_MAX) {
             if ((ZPSE_LZ2_PROBE_SELF != 0 || p_h != h) &&
-                p_c1 != LZ2_EMPTY && p_c1 <= mpos &&
-                zpse_load_u32le(in + p_c1) == p_cur &&
-                lz2_extend(in, n, mpos + 1u, p_c1, ZPSE_LZ2_MIN_MATCH) > len) {
+                p_c1 != LZ2_EMPTY &&
+                p_c1p <= mpos && zpse_load_u32le(in + p_c1p) == p_cur &&
+                lz2_extend(in, n, mpos + 1u, p_c1p, ZPSE_LZ2_MIN_MATCH) > len) {
                 pos = mpos + 1u;
                 misses = 0u;
                 cur = p_cur;
                 h = p_h;
 #if ZPSE_LZ2_PIPE_NEXT
-                cand = tab[h];
+                cand = LZ2_TAB_GET(h);
 #endif
                 continue;
             }
@@ -613,17 +637,18 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
             mpos + 1u + ZPSE_LZ2_MIN_MATCH <= n) {
             uint32_t cur1 = zpse_load_u32le(in + mpos + 1u);
             uint32_t h1 = lz2_hash_at(in, mpos + 1u, n, cur1, hash_bits);
-            uint32_t c1 = tab[h1];
+            uint32_t c1 = LZ2_TAB_GET(h1);
+            uint32_t c1p = c1;
 
-            if (c1 != LZ2_EMPTY && c1 <= mpos &&
-                zpse_load_u32le(in + c1) == cur1 &&
-                lz2_extend(in, n, mpos + 1u, c1, ZPSE_LZ2_MIN_MATCH) > len) {
+            if (c1 != LZ2_EMPTY && c1p <= mpos &&
+                zpse_load_u32le(in + c1p) == cur1 &&
+                lz2_extend(in, n, mpos + 1u, c1p, ZPSE_LZ2_MIN_MATCH) > len) {
                 pos = mpos + 1u;
                 misses = 0u;
                 cur = cur1;
                 h = h1;
 #if ZPSE_LZ2_PIPE_NEXT
-                cand = tab[h];
+                cand = LZ2_TAB_GET(h);
 #endif
                 continue;
             }
@@ -649,7 +674,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                 cur = zpse_load_u32le(in + pos);
                 h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
-                cand = tab[h];
+                cand = LZ2_TAB_GET(h);
 #endif
                 continue;
             }
@@ -741,7 +766,7 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         cur = zpse_load_u32le(in + pos);
         h = lz2_hash_at(in, pos, n, cur, hash_bits);
 #if ZPSE_LZ2_PIPE_NEXT
-        cand = tab[h];
+        cand = LZ2_TAB_GET(h);
 #endif
     }
     if (anchor < n) {
@@ -764,6 +789,26 @@ ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     zpse_store_u32le(dst, lit_total);
     zpse_store_u32le(dst + 4u, cmds);
     return out;
+}
+
+/* Tagged with the rest of the hot set: this finder is the whole of the F
+ * form's encode, and it was the one kernel in the tree left at the build's
+ * own level. */
+ZPSE_HOT uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
+                         uint32_t cap, void *table, uint32_t hash_bits)
+{
+    return lz2_encode_impl(in, n, dst, cap, table, hash_bits, 0u);
+}
+
+/* Price a sample of sn bytes (the length passed as `n`) with the fast form:
+ * identical stream to zpse_lz2_encode, but only the slots a position in
+ * [0,sn) can hash to are cleared. */
+ZPSE_HOT uint32_t zpse_lz2_encode_sample(const uint8_t *in, uint32_t n,
+                                         uint8_t *dst, uint32_t cap,
+                                         void *table, uint32_t hash_bits,
+                                         uint32_t sn)
+{
+    return lz2_encode_impl(in, n, dst, cap, table, hash_bits, sn);
 }
 
 /* Copy one match: sixteen bytes for a short match at a long distance, two
