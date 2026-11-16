@@ -52,7 +52,6 @@ static uint8_t tile_src[256];
 static uint8_t tile_plane[512];
 static uint8_t tile_rec[1024];
 static uint8_t tile_dec[256];
-static uint8_t tile_comb[0x2000]; /* ZPSE_*_SZ_COMB */
 static uint8_t tile_o1[8 * 256];
 /* ORDER2 state: 8 x 4096 {value, confidence} pairs, interleaved. */
 static uint8_t tile_o2[8 * 4096 * 4];
@@ -315,7 +314,7 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     zpse_tile_choose_modes(&cl, nt, &mm, &rm);
     n = zpse_tile_pack(pid, &cl, nt, tile_plane + off, mm, rm, 1, tile_rec,
-                       (uint32_t)sizeof tile_rec, tile_comb);
+                       (uint32_t)sizeof tile_rec, NULL);
     if (n < 8) {
         printf("FAIL tilesmall pack pid=%u nt=%u mask=%u res=%u n=%d\n",
                (unsigned)pid, (unsigned)nt, (unsigned)mm, (unsigned)rm, n);
@@ -332,7 +331,7 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 1, tile_plane, off,
-                          tile_dec, nt, tile_comb);
+                          tile_dec, nt, NULL);
     if (rc != (int)nt || memcmp(tile_dec, tile_plane + off, (size_t)nt) != 0) {
         printf("FAIL tilesmall round pid=%u nt=%u mask=%u res=%u n=%d "
                "rc=%d\n", (unsigned)pid, (unsigned)nt, (unsigned)mm,
@@ -422,7 +421,7 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     zpse_tile_choose_modes(&cl, nt, &mm, &rm);
     n = zpse_tile_pack(pid, &cl, nt, tile_plane + off, mm, rm, 1, tile_rec,
-                       (uint32_t)sizeof tile_rec, tile_comb);
+                       (uint32_t)sizeof tile_rec, NULL);
     if (n < 8) {
         printf("FAIL tiledeep pack pid=%u nt=%u mask=%u res=%u n=%d\n",
                (unsigned)pid, (unsigned)nt, (unsigned)mm, (unsigned)rm, n);
@@ -439,7 +438,7 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
         zpse_lane_reset(&L2, lit);
         memset(tile_dec, 0x5A, sizeof tile_dec);
         rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 1, tile_plane,
-                              off, tile_dec, nt, tile_comb);
+                              off, tile_dec, nt, NULL);
         if (rc != (int)nt ||
             memcmp(tile_dec, tile_plane + off, (size_t)nt) != 0) {
             printf("FAIL tiledeep round pid=%u nt=%u mask=%u res=%u d=%d "
@@ -459,7 +458,7 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc0 = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 0, tile_plane, off,
-                           tile_dec, nt, tile_comb);
+                           tile_dec, nt, NULL);
     if (rc0 > 0 && rc0 != (int)nt) {
         printf("FAIL tiledeep noreset pid=%u nt=%u rc=%d\n", (unsigned)pid,
                (unsigned)nt, rc0);
@@ -504,7 +503,80 @@ static void run(const char *name, uint32_t n) {
                          (uint8_t)(clen >> 16), (uint8_t)(clen >> 24) };
         mix(l, 4);
     }
-}/* Two tiles classified back to back on ONE lane state: the first with
+}
+
+/* One of four deterministic 4096-byte page shapes, chosen to reach each FLAT
+ * codec: noise -> RAW, two symbols -> BIT2, low nibble -> NIBBLE4 and a
+ * pointer-shaped lane pattern -> SUBLANE. Every one is a page, so it takes the
+ * FLAT writer at every effort level. */
+static void flat_page(int shape, uint8_t *dst)
+{
+    uint32_t i;
+    uint32_t r = 0x13579BDFu;
+
+    switch (shape) {
+    case 0:
+        for (i = 0; i < 4096u; i++) {
+            r = r * 1664525u + 1013904223u;
+            dst[i] = (uint8_t)(r >> 24);
+        }
+        break;
+    case 1:
+        for (i = 0; i < 4096u; i++) {
+            dst[i] = (i & 1u) ? 0xFFu : 0x00u;
+        }
+        break;
+    case 2:
+        for (i = 0; i < 4096u; i++) {
+            r = r * 1664525u + 1013904223u;
+            dst[i] = (uint8_t)((r >> 24) & 0x0Fu);
+        }
+        break;
+    default:
+        for (i = 0; i < 4096u; i += 4u) {
+            dst[i] = (uint8_t)(i / 4u);
+            dst[i + 1u] = 0x7Fu;
+            dst[i + 2u] = 0u;
+            dst[i + 3u] = 0u;
+        }
+        break;
+    }
+}
+
+/* Round-trip one FLAT page and fold its compressed bytes and length into the
+ * same digest as the rest of the corpus, so def/scalar/swap must agree on the
+ * new wire form too. */
+static void run_flat(const char *name, int shape)
+{
+    uint32_t clen = 0u, olen = 0u;
+    int rc;
+
+    flat_page(shape, in);
+    rc = zpse_compress_block(in, 4096u, comp, sizeof comp, &clen,
+                             (uint32_t)(100 + shape), 1u, enc_arena);
+    if (rc != 0) {
+        printf("FAIL %-22s compress rc=%d(%s)\n", name, rc,
+               zpse_status_name(rc));
+        fails++;
+        return;
+    }
+    memset(out, 0xA5, 4096u);
+    rc = zpse_decompress_block(comp, clen, out, 4096u, &olen, dec_arena);
+    if (rc < 0 || olen != 4096u || memcmp(in, out, 4096u) != 0) {
+        printf("FAIL %-22s decode rc=%d olen=%u\n", name, rc, olen);
+        fails++;
+        return;
+    }
+    printf("ok   %-22s n=%5u clen=%6u\n", name, 4096u, clen);
+    mix(comp, clen);
+    {
+        uint8_t l[4] = { (uint8_t)clen, (uint8_t)(clen >> 8),
+                         (uint8_t)(clen >> 16), (uint8_t)(clen >> 24) };
+        mix(l, 4);
+    }
+}
+
+/* Two tiles classified back to back on ONE lane state: the first with
  * tile_reset = 1 (what the encoder does for every tile, and what the
  * per-primitive sweep above does for its single tile), the second with
  * tile_reset = 0, so the second classification starts from the lane
@@ -565,7 +637,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     }
     zpse_tile_choose_modes(&clA, 256u, &mmA, &rmA);
     nA = zpse_tile_pack(pid, &clA, 256u, tile_plane, mmA, rmA, 1, tile_rec,
-                        (uint32_t)sizeof tile_rec, tile_comb);
+                        (uint32_t)sizeof tile_rec, NULL);
     if (nA < 8) {
         printf("FAIL chainpack a pid=%u n=%d\n", (unsigned)pid, nA);
         fails++;
@@ -594,7 +666,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     }
     zpse_tile_choose_modes(&clB, 256u, &mmB, &rmB);
     nB = zpse_tile_pack(pid, &clB, 256u, tile_plane + 256u, mmB, rmB, 0,
-                        tile_rec2, (uint32_t)sizeof tile_rec2, tile_comb);
+                        tile_rec2, (uint32_t)sizeof tile_rec2, NULL);
     if (nB < 8) {
         printf("FAIL chainpack b pid=%u n=%d\n", (unsigned)pid, nB);
         fails++;
@@ -641,7 +713,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)nA, lit, 1, tile_plane, 0u,
-                          tile_dec, 256u, tile_comb);
+                          tile_dec, 256u, NULL);
     if (rc != 256 || memcmp(tile_dec, tile_plane, 256u) != 0) {
         printf("FAIL chainround a pid=%u n=%d rc=%d\n", (unsigned)pid, nA,
                rc);
@@ -650,7 +722,7 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     }
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec2, (uint32_t)nB, lit, 0, tile_plane,
-                          256u, tile_dec, 256u, tile_comb);
+                          256u, tile_dec, 256u, NULL);
     if (rc != 256 || memcmp(tile_dec, tile_plane + 256u, 256u) != 0) {
         printf("FAIL chainround b pid=%u n=%d rc=%d\n", (unsigned)pid, nB,
                rc);
@@ -709,6 +781,19 @@ int main(void)
         }
         sprintf(nm, "lowentropy/%u", n);
         run(nm, n);
+    }
+
+    /* FLAT page corpus: one deterministic page per codec, folded into the
+     * digest so the three parity builds must agree on every FLAT form. */
+    {
+        static const char *const flat_names[4] = {
+            "flat_raw", "flat_bit2", "flat_nibble4", "flat_sublane"
+        };
+        int f;
+
+        for (f = 0; f < 4; f++) {
+            run_flat(flat_names[f], f);
+        }
     }
 
     /* Frame path over a multi-block payload. */
@@ -842,7 +927,7 @@ int main(void)
                                                tile_plane + off, mm, rm,
                                                (int)rst_i, tile_rec,
                                                (uint32_t)sizeof tile_rec,
-                                               tile_comb);
+                                               NULL);
                             if (n < 8) {
                                 printf("FAIL tilepack  pid=%u tile=%u "
                                        "mask=%u res=%u n=%d\n",
@@ -864,7 +949,7 @@ int main(void)
                                                   (uint32_t)n, lits[lit_i],
                                                   (int)rst_i, tile_plane,
                                                   (uint32_t)off, tile_dec,
-                                                  256u, tile_comb);
+                                                  256u, NULL);
                             if (rc != 256 ||
                                 memcmp(tile_dec, tile_plane + off,
                                        256u) != 0) {
