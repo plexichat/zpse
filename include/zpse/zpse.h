@@ -31,7 +31,6 @@
 #include "arena.h"
 #include "transform.h"
 #include "predictor.h"
-#include "combinadic.h"
 #include "mask.h"
 #include "residual.h"
 #include "tile.h"
@@ -44,5 +43,22 @@
 #include "parallel.h"
 #include "vector.h"
 #include "api.h"
+
+/* New page encoder flags (ZPSE_ENC_*). They change no wire form: every stream
+ * they select is read by the ordinary decoder. Their values live in
+ * constants.h (TURBO, HUF) and api.h (INSTANT); collected here so a caller
+ * including the umbrella sees what each one trades.
+ *
+ * ZPSE_ENC_PAGE_TURBO    Page rate profile: one cheap LZ pass behind the page
+ *                        decode-first margin, skipping the multi-candidate
+ *                        decision -- lz4-class encode rate at page size, with
+ *                        a stream the decoder reads faster than raw LZ.
+ * ZPSE_ENC_PAGE_HUF      Page entropy: allow the Huffman wrapper on a 4 KiB
+ *                        page at any LZ level, trading an extra entropy pass
+ *                        on both sides for a smaller page payload.
+ * ZPSE_ENC_PAGE_INSTANT  No-decision classifier: write a page in one shot
+ *                        from a cheap classifier, with no probe, trial or
+ *                        sweep -- the fastest page encode, paid for in ratio.
+ */
 
 #endif /* ZPSE_H */
