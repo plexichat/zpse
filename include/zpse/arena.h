@@ -31,6 +31,9 @@
 #define ZPSE_D_SZ_OUT       0x10000u
 #define ZPSE_D_SZ_ORDER1    0x00800u
 #define ZPSE_D_SZ_O2        0x20000u
+/* 8 KiB generic scratch: dense/tile exception buffers and the old
+ * combinadic rank/unrank workspace (the rank/unrank code is gone, the
+ * bytes are still needed by the dense decoder). */
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
 #define ZPSE_D_SZ_GUARD     0x0B800u
@@ -68,6 +71,7 @@
 #define ZPSE_E_SZ_BEST      0x10000u
 #define ZPSE_E_SZ_ORDER1    0x00800u
 #define ZPSE_E_SZ_O2        0x20000u
+/* 8 KiB generic scratch, as in the decoder arena (see ZPSE_D_SZ_COMB). */
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
 #define ZPSE_E_SZ_SHUF      0x01000u
@@ -82,12 +86,12 @@
 #define ZPSE_E_SZ_GUARD     0x06800u
 
 typedef struct ZpseDecoder {
-    uint8_t *arena;       /* base, 64-B aligned, 320 KiB */
+    uint8_t *arena;       /* base, 64-B aligned, 384 KiB (incl. 64 KiB lzbuf) */
     uint8_t *recon;       /* transformed reconstruction (64 KiB) */
     uint8_t *out_stage;   /* output staging (64 KiB) */
     uint8_t *order1;      /* 2 KiB */
     uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
-    uint8_t *comb;        /* 8 KiB combinadic scratch */
+    uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *shuf;        /* 4 KiB shuffle/CRC consts */
     uint8_t *lzbuf;       /* 64 KiB: unpacked body of an LZ_TILE block */
     /* The plane the last zpse_segment_decode produced was one byte value
@@ -108,7 +112,7 @@ typedef struct ZpseEncoder {
     uint8_t *best;        /* 64 KiB best staging */
     uint8_t *order1;      /* 2 KiB */
     uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
-    uint8_t *comb;        /* 8 KiB */
+    uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
     uint8_t *lz;          /* 32 KiB LZ match-finder table (2^14 max) */
@@ -159,6 +163,7 @@ typedef struct ZpseEncoder {
 
 int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len);
 int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len);
+
 int zpse_arena_is_aligned(const void *p);
 
 #endif /* ZPSE_ARENA_H */
