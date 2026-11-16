@@ -215,17 +215,14 @@ has to re-decide a match.
 Three of its choices were settled by measurement, and two of them by being
 wrong first.
 
-* Two symbols per lookup is the wrong table for this data. A 2 048-entry table
-  only packs two codes into one entry when their lengths fit inside eleven
-  bits, and an LZ command stream averages 7.41 bits per symbol, so a pair
-  needs fourteen. Measured over the page and mixed corpora, only 10.4% of
-  eleven-bit windows hold two complete codes: The first tables were
-  built that way and produced a 101% payload: 32 KiB of lookup to decode one
-  symbol per lookup. One symbol in two bytes of entry is what the payload
-  wants, and it halves the tables to 16 KiB.
-  Measured over 29.8 MB of real payloads at 7.41 bits per symbol, 10.4% of
-  windows hold two complete codes, so a pair table would remove one chain
-  step in ten, not one in two.
+* One symbol per lookup is the right table for this data. A two-symbol entry
+  only fires when both codes fit inside the ten-bit window, and an LZ command
+  stream averages about seven bits per symbol, so a pair needs fourteen and
+  almost never has both codes in ten bits. A two-symbol table was measured on
+  this corpus and produced a 101% payload: it paid for a wider table and still
+  decoded one symbol per lookup. Two bytes per entry and a 1 024-entry decode
+  table give one symbol per lookup for 8 KiB of lookups, half what the
+  16 KiB two-symbol tables took.
 
 * The decoder had to stop keeping its state in memory. A first version held
   seven values per stream -- accumulator, bits left, bit position, cursor,
@@ -269,10 +266,10 @@ bytes of the same block, so a block is still a function of its own bytes.
 
 The exact lengths then came free from the coding loop. That loop already forms
 the bit total of every five symbols it stores, so a stream's encoded length is
-what the write itself produced. When the caller's capacity can absorb eleven
+what the write itself produced. When the caller's capacity can absorb ten
 bits per symbol and the store slop, the four streams are written first and the
 twelve-byte header last, and no bit count runs at all. When it cannot -- a
-payload near the 64 KiB staging buffer, where eleven bits a symbol could not
+payload near the 64 KiB staging buffer, where ten bits a symbol could not
 be stored -- the lengths are counted first and nothing is written until the
 size is known. Both paths were checked to produce identical bytes.
 
@@ -288,8 +285,9 @@ of a percent of the output. That is what makes the sampled ranking the right
 trade -- the exact version of it costs a cycle per byte and buys nothing a
 reader can see.
 
-It costs 18 KiB of read-only tables and a pass on each side: under two percent
-of encode time at level 9 end to end, because the match finder still dominates
+It costs 10 KiB of read-only tables -- 2 KiB of codes and 8 KiB of lookups --
+and a pass on each side: under two percent of encode time at level 9 end to
+end, because the match finder still dominates
 the block, and about 1 430 MB/s of decode end to end on Silesia. Level 6 does
 not offer it: the rung below MAX is where encode time is worth more than seven
 percent of bytes. `ZPSE_ENC_HUF` asks for it at any level.
@@ -644,9 +642,9 @@ Three follow-ups were measured in one pass. Two changed the tree; one did not.
 is now 32 KiB (`ZPSE_E_SZ_LZ 0x08000`, `ZPSE_LZ_HASH_BITS_WIDE 14`) and the
 arena is 464 KiB. Every other caller of the finder keeps 13 bits, so the
 screens and the page passes are byte-for-byte untouched -- only the lazy pass
-indexes all fourteen bits. Measured per file over two rounds with
-`BLOCK=16384 bash tests/benchmarks/ab_silesia.sh 69ca55a 2 6`, the rounds
-agreeing on every byte: the twelve files go 106,180,882 -> 106,079,560 bytes,
+indexes all fourteen bits. Measured per file over two rounds at level 6 with
+`BLOCK=16384 bash tests/benchmarks/ab_silesia.sh`, the rounds agreeing on
+every byte: the twelve files go 106,180,882 -> 106,079,560 bytes,
 -101,322 (-0.095%). mozilla -58,844, nci -13,251, ooffice -12,510, osdb -9,901,
 samba -6,371, sao -217, xml -124, dickens -92, mr and x-ray unchanged, and
 reymont +25 -- the one case the wider table loses, in both rounds. At the
@@ -768,24 +766,20 @@ the parallel digest `cec73f05` are unchanged, because neither form is affected
 by the tile sweep; and the scalar/swap parity builds still produce identical
 digests.
 
-**The page table was re-measured on the tree's own corpus.** The 4 KiB rows in
-the README were taken before the page path got its wide lazy probe, so they
-were re-read from a freshly generated `pages-nonzero.bin` (16 MiB, sha256
-`c9c0e860…`, `corpus_write --pages`) with the CLI at `-b 4096`, three rounds of
-best-of-four, median reported. Packed bytes are properties of the stream and
-were identical in every round and every arm: 1.74:1, 2.40:1, 2.56:1 for levels
-1, 6 and 9, 1.52:1 for `PAGE_FAST` and 2.21:1 for `LZ_FAST`. Rates, old ->
-new: level 1 244/2514 -> 250/2506, level 6 146/1290 -> 158/1639, level 9
-124/1196 -> 128/1243, `PAGE_FAST` 807/2222 -> 888/3059, `LZ_FAST` 537/1912 ->
-591/1988. On the same stream with one zero page in eight, level 6 reads 2.67:1
-and decodes at 1954 MB/s (was 1760).
+**The 4 KiB page rows come from the tree's own corpus.** They are read from a
+generated `pages-nonzero.bin` (16 MiB, sha256 `c9c0e860…`, `corpus_write
+--pages`) with the CLI at `-b 4096`, best of five, one process, median
+reported. Packed bytes are a property of the stream: 1.74:1, 2.40:1, 2.56:1
+for levels 1, 6 and 9, 1.52:1 for `PAGE_FAST` and 2.21:1 for `LZ_FAST`. The
+rates are 296/2879 for level 1, 175/1841 for level 6, 138/1323 for level 9,
+995/3365 for `PAGE_FAST` and 624/1967 for `LZ_FAST` (encode/decode MB/s). On
+the same stream with one zero page in eight, level 6 reads 2.67:1 and decodes
+at 1954 MB/s.
 
-Two claims above the table were re-derived rather than copied: `LZ_FAST` now
-gives up 8.6% of the packed size for 3.7 times the encode rate, and level 9's
-entropy pass costs 19% of the encode rate (it was 15% when level 6 encoded at
-146 MB/s and now that level 6 encodes at 158). The per-file profile table in
-the README was regenerated with `build/blkstat` for the same reason: it reports
-the trial share, and that share is what the cap change moved.
+`LZ_FAST` gives up 8.6% of the packed size for about 3.6 times the encode rate,
+and level 9's entropy pass costs 19% of its encode. The per-file profile table
+in the README is regenerated with `build/blkstat` and reports the trial share,
+which is what the cap change moved.
 
 ## The two macro tables, re-read on the shipped scripts
 
@@ -984,15 +978,15 @@ cycles per symbol, and the table load is the head of that chain: index, load,
 shift, next index. The entry is two bytes and the tables are static read-only
 data -- there is no per-block table build to remove, which is the cost zstd's
 HUF pays and this format does not. A bit-by-bit canonical walk would replace
-one load with a loop of up to eleven shifts and compares, which is the shape
+one load with a loop of up to ten shifts and compares, which is the shape
 every Huffman decoder had before LUTs for exactly this reason.
 
-The window is already the right size. The four books have an 11-bit longest
-code, so 2^11 entries cover every code in one level; a 15-bit window, which is
-what a two-symbol entry needs (an LZ payload averages ~7 bits a symbol, so a
-pair needs ~14), is 32768 four-byte entries per book, 512 KiB for four books,
-and leaves L1. The two-symbol version was measured before the format was
-frozen: 101% payload, because the pair almost never fits.
+The window is already the right size. The four books have a ten-bit longest
+code, so 2^10 = 1 024 entries cover every code in one level; a 15-bit window,
+which is what a two-symbol entry needs (an LZ payload averages ~7 bits a
+symbol, so a pair needs ~14), is 32768 four-byte entries per book, 512 KiB for
+four books, and leaves L1. The two-symbol version was measured before the
+format was frozen: 101% payload, because the pair almost never fits.
 
 For scale, HUF is only reachable at level 9 and above (ZPSE_HUF_MIN_LEVEL) or
 with ZPSE_ENC_HUF, and at 1.6 GB/s its encode is a few percent of a level-9
@@ -1036,11 +1030,11 @@ The parked work (tagged table epochs, the greedy fast form, page headers)
 was taken apart again to answer three questions, and two of the three
 answers are "no" for a reason worth writing down.
 
-**The ASCII gate has to fire at every level.** The parked diff had narrowed
-it to the full-size block at level 6 and deeper (`ZPSE_ASCII_GATE_ON`, a
-level term) to protect the level ladder's time check. That is backwards: the
-gate does not compete with the match finder, it only decides what the TILE
-side of a block costs, and `zpse_block_lz_level` still reads the level. With
+**The ASCII gate has to fire at every level.** The parked diff had narrowed it
+to the full-size block at level 6 and deeper (a level term) to protect the
+level ladder's time check. That is backwards: the gate does not compete with
+the match finder, it only decides what the TILE side of a block costs, and
+`zpse_block_lz_level` still reads the level. With
 the narrowing, level 5 kept the sweep and wrote 116 bytes of tiles on a
 block of two runs where level 9 took the gated path and wrote 476 of LZ2 --
 a deeper rung writing a larger block, which the size ladder forbids. Every
@@ -1336,7 +1330,7 @@ table still ends ahead (7.7 against 7.3 GB/s), so the batching is worth the
 same on a page frame -- there is just less room to divide. The 64 KiB row here
 reads 4.13x where the table above says 4.01x: the same frame measured again at
 best-of-3, and this host varies about 20% run to run. Read both as 4x, and
-pages as 2.4-2.5x.
+pages as 2.3-2.5x.
 
 ### The write beside the decode
 
@@ -1356,15 +1350,193 @@ because the writer is never more than one batch behind.
 
 The pipelined run sits on the read-plus-decode floor in both cases, so what is
 left is I/O the codec cannot hide. `decode_round.sh` reproduces it end to end:
-220 ms at one worker and 147 ms at six on the same frame, best of three with
-the write included. Measuring the 202 MiB frame repeatedly
-needed pacing: without it the dirty pages back up and single runs reach a
+174 ms at one worker and 131 ms at six on the same frame, best of three with
+the write included. Measuring the 202 MiB frame repeatedly needed pacing:
+without it the dirty pages back up and single runs reach a
 second (one measured 1 107 ms, its partner 336 ms), which is writeback and not
 the decoder. The table above is paced runs in alternating order, every output
 compared with the corpus byte for byte. The pipeline is kept, and the comment
 beside it in `zpse_cli.c` records the decomposition.
 
-Everything above is regenerated by `bash tests/benchmarks/decode_round.sh`
-with a Silesia tree in `SILESIA_DIR`: the in-memory scaling tables for 64 KiB
-blocks and 4 KiB pages, the per-block decode-first table, the level 6 against
-level 6|-D frame tables, and the streaming decode with its write included.
+### The read beside the decode
+
+The write moved off the decode thread; the read is what was left. On the same
+202 MiB corpus the reader parses each block as it reads it -- a block's length
+lives in its header, so reading ahead means parsing -- and fills one of two
+batch slots while the caller decodes the other. A block is read straight into
+its place in the slot, which drops the copy the walking loop made from a stack
+buffer as well.
+
+| frame | workers | read inline | read on its own thread | read+decode floor (NUL) |
+| --- | ---: | ---: | ---: | ---: |
+| 202 MiB Silesia, 170 MB page frame | 6 | 500 ms | 421 ms | 300-317 ms |
+| 202 MiB Silesia, 170 MB page frame | 1 | 331 ms | 339 ms | -- |
+| 202 MiB Silesia, 102 MB block frame | 1 | 205 ms | 185 ms | -- |
+| 202 MiB Silesia, 102 MB block frame | 6 | 137 ms | 134 ms | 87-98 ms |
+
+Where the write is bigger than the read the change is a wash, which is the
+block frame at six workers: it already sits on its floor there, and the floor
+is write, not read. It pays where the read dominates the run. The page frame
+is the case that matters -- 170 MB of frame for 202 MiB of content, decoding at
+7.7 GB/s, so the disk is the slow side of that pipeline -- and six workers go
+from 500 to 421 ms there. Paced runs in alternating order, every output
+compared with the corpus.
+
+That frame is also what exposed a bug in the write pipeline. The streamed page
+decode came back with two adjacent batches swapped in five runs out of ten.
+The writer wrote the lowest-numbered filled slot, and
+a page decode is fast enough that the caller can release a slot and refill it
+before the writer looks for work, so the newer batch went out first. The
+reader had the same shape: it refills a just-released slot, and the caller took
+the lowest-numbered filled one, which is the newer batch when an older one is
+still waiting. Both sides now take the oldest by a sequence number stamped at
+handover. Forty-eight byte-identical runs at one and six workers on both
+frames, plus the serial build, followed; the swap only ever appeared with pages, because a 64 KiB block
+decodes slowly enough that the writer is always waiting for work. Every output
+in this document is compared with its corpus, which is why a swapped batch
+surfaced as a failed run instead of a wrong file nobody read.
+
+### The same buffer at both ends
+
+A streamed decode writes each finished block through stdio, and the default
+stdio buffer is 4 KiB. That is exactly one page, so a 4 KiB page frame leaves
+the writer as 51 743 separate writes; it is a sixteenth of a 64 KiB block, so
+the block path copies every block through the buffer on its way out. The
+encoder had already found the size that works -- 256 KiB took its output from
+107 / 93 ms to 99 / 85 on mozilla / webster at eight workers -- and the reader
+has the same shape: it asks for a 16 or 32 byte header and then the payload,
+which for a page fills the buffer exactly.
+
+Both streams in the streamed decode now carry 256 KiB. Pages are the case that
+showed it. Medians of five alternating, paced runs, every output compared with
+the corpus: the 170 MB page frame goes from 420 to 222 ms at one worker and
+from 514 to 380 ms at six, while the 102 MB block frame moves 204 to 201 and
+163 to 163 -- a wash, as it should be, since a 64 KiB write is larger than the
+old buffer and already went straight to the file. Splitting the change says
+which end did what: the output buffer alone gets pages to 297 and 431 ms, and
+the input buffer is what turns that into 224 and 360, because on the page frame
+the read is the slow side and every page was costing a read of its own.
+
+The host was visibly busy during that run -- the output-to-`NUL` floor moved
+between 300 and 460 ms -- but the direction held in every pair.
+
+The tables in this section are regenerated by
+`bash tests/benchmarks/decode_round.sh` with a Silesia tree in `SILESIA_DIR`:
+the in-memory scaling tables for 64 KiB blocks and 4 KiB pages, the per-block
+decode-first table, the level 6 against level 6|-D frame tables, and the
+streaming decode with its write included.
+
+### Why the page encode is cheaper and what is still expensive
+
+A page spends most of its encode on deciding, not on writing, so the work that
+landed here is work removed from the decision. The price probe used to pack
+every sampled tile only to count the bytes it had written; the length is
+already known exactly from the classifier's residual count and the mask mode's
+arithmetic, so the pack is gone and the stream is byte-identical. The LZ screen
+cleared a 16 KiB hash table to price a 512-byte sample, as many as four times a
+page; it now clears the slots that sample can hash to. The page candidate list
+built all ten transposes before cutting itself to one, so the flag that asks
+for one shape is now read before the list is built. On the generated page
+corpus these together buy about a quarter of FASTEST's encode and a twentieth
+of the default level's, with the packed bytes unchanged to the byte.
+
+Two other forms were tried and refused with measurements. Predictor 9 as an
+extra trial on tiles the cheap screen misses wrote about 900 fewer bytes over
+16 MiB of pages but halved the PAGE_FAST encode rate (715 to 355 MB/s), because
+a page has mostly noisy tiles and each one paid a second classify. The
+generation-stamped hash table replaced the per-page memset with an epoch
+compare and was slower still (418 against 476 MB/s at LZ_FAST): the clear is
+16 KiB that stays in L1, and the extra array costs more than it saves. Both
+knobs are left in the tree, defaulted off, with the numbers beside them.
+
+Decode lost two CRC passes on every block: the header parse already validates
+the header, and the page's single segment directory entry was read three times
+in one decode. The parallel frame path used to re-CRC the whole index for every
+block it sought, which on a page frame is tens of gigabytes of redundant CRC;
+it now resolves the index once and hands workers a block-at helper. These are
+byte-identical changes. Their effect is visible in the all-page decode column:
+FASTEST gains about a quarter and the default level is inside the host's band,
+because the remaining cost there is the inverse transform, not the envelope.
+
+A one-value page is now a 16-byte token rather than 44 bytes of dense record,
+and the page dictionary stores incompressible pages too: a repeated raw page
+was a permanent miss even though its first block was still in the store. Hit
+rate on the repeat corpus rises from about 18 to about 19.5% with the packed
+stream unchanged.
+
+The remaining gap to lz4 is not a missed micro-optimization. On this corpus
+lz4 1 writes 2.03:1 at roughly 981 MB/s and our cheapest page mode
+(`PAGE_FAST`) writes 1.52:1 at 995, while the default writes 2.40:1 at 175. A
+page's decision is still a larger bill than one greedy match pass, and beating
+lz4 on encode, ratio and decode at once needs a cheaper shape decision than
+the sweep -- not a faster version of it.
+
+## Profiles belong to the build, not the tree
+
+Profile-guided optimization is the one compiler lever that cannot be reviewed
+in the source: it changes the code emitted for decisions the encoder already
+makes, so the packed stream has to stay byte-identical and any gain has to
+come from better layout and inlining on branch-dense paths.
+`tests/benchmarks/pgo_build.sh` trains the 4 KiB path on the generated page,
+probe and mixed corpora, rebuilds with the profile, and with `--verify` checks
+the result in the default, forced-scalar and swapped-attempt-order parity
+modes. A rate table alone would not tell whether the profile had crossed from
+code generation into a decision.
+
+A profile is a build artifact, never a shipped asset. clang's `.profraw` and
+gcc's `.gcda` are not interchangeable, and even the same compiler's counters
+describe branch probabilities for the source they were taken from: a stale
+profile spends the compiler's inlining and layout budget on a shape the code
+no longer has, which is worse than no profile at all. Regenerating it from the
+checked-in generators on every run is what keeps the counters tied to the tree
+that consumes them; neither the format nor a block's bytes depend on them.
+
+The build has to keep the unity translation unit and the attributes inside it
+intact. `ZPSE_HOT` on gcc is a per-function `-O3` request whose 1.053x was
+measured on that whole-unit shape, and the AVX2 target attributes beside it
+are what let the vector kernels obey the ABI rules recorded in `hot.h`.
+Adding `-fprofile-*` to the same command changes only what the compiler knows
+about branch frequencies. Replacing the unity build with per-file objects, or
+stripping those attributes to make a profile match, would trade a measured
+gain for one nobody has measured; the parity digests are the guard that the
+profile stayed a code-generation choice.
+
+
+## The one-pass page form and why it is a fast path, not the whole path
+
+The page path grew a 16-byte FLAT block precisely because the page is where
+decode rates are hardest to lift: one finder pass cannot amortise a full sweep
+over 4 KiB, and the tile reconstruction that buys ratio on a large block costs
+more than the whole page. FLAT gives the cheap page shapes a payload that one
+SIMD pass can decode -- a token for a constant page, packed 4-bit or 2-bit
+indices for an irregular low-alphabet page, and a per-lane template for a
+pointer page. On those shapes its kernels run at roughly 9 GB/s, and a zero or
+constant page, being a 16-byte token, runs at 20-75 GB/s.
+
+The first version made FLAT the only page path. Measured on the pinned
+non-zero page corpus that collapsed the default ratio from 2.40:1 to 1.06:1:
+every content page that FLAT's four codecs could not pack became a verbatim
+RAW payload, and the 9 GB/s was the rate of a memcpy, not of compression.
+Pure FLAT also erased the level ladder on pages -- all nine levels wrote the
+same bytes. Structured low-alphabet pages made it starkest: an alternating
+page that the ladder writes in 72 bytes took 1 048 as a 2-bit FLAT payload,
+and a stride-record page grew from 1 565 to 2 080. Fixed-width packing throws
+away exactly the run and DELTA structure the ladder prices.
+
+The resolution is to treat FLAT as a fast path for the shapes it packs well
+and fall through to the ladder for the rest. The classifier's one pass already
+separates constants, low-alphabet and pointer pages from ASCII and generic
+ones; a generic or ASCII page goes to the ladder with its ratio intact, and a
+constant, low-alphabet or pointer page keeps the one-pass decode. This keeps
+the ladder monotonic on pages (705 of 768 corpus cases shrank under the new
+token and packed forms, 27 structured low-alphabet cases are re-pinned as the
+cost), and it keeps the 2.28:1 default ratio close to the old 2.40:1.
+
+The honest cost is that the mixed-corpus decode target of 5 GB/s is not met:
+because most content pages take the ladder, the stream decodes at about 1.9
+GB/s. Reaching 5 GB/s on those pages would need a compressible codec that is
+also one SIMD pass, which FLAT's four fixed-width forms are not. lz4 1 still
+has a faster mixed-corpus decode loop (3.8 GB/s). The retired `PAGE_FAST`,
+`LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags were the old way of buying page
+rate with a cruder shape decision; folding them into the level ladder removes
+four near-identical modes without changing what any level writes.
