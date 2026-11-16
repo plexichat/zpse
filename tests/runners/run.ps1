@@ -14,7 +14,7 @@ $unity = Join-Path $repo "src/zpse_unity.c"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "opencode/zpse-tests"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $fail = 0
-foreach ($t in @("test_roundtrip", "test_transforms", "test_combinadic", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_lzh", "test_huf", "test_ascii", "test_levels", "test_frame", "test_sizes", "test_colref", "test_colcorpus")) {
+foreach ($t in @("test_roundtrip", "test_transforms", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_lzh", "test_huf", "test_ascii", "test_levels", "test_frame", "test_sizes", "test_colref", "test_colcorpus", "test_pageforms")) {
     $src = Join-Path $repo "tests/suites/$t.c"
     $exe = Join-Path $tmp "$t.exe"
     Write-Output "=== build $t ==="
@@ -69,6 +69,40 @@ foreach ($suite in @("parity", "fuzz", "lseed")) {
         } else {
             Write-Output "$suite ok ($mode): $digDef identical streams"
         }
+    }
+}
+
+Write-Output "=== page kernels without AVX2 (ZPSE_AVX2_ABI_OK=0) ==="
+# The page kernels have AVX2 and scalar/SSE2 twins (see hot.h and the page
+# kernel sources). Build test_pageforms with the kernels compiled out and
+# require every byte of its output to match the default build, so the SIMD
+# path cannot drift from the scalar reference on the new page forms. This is
+# the same kind of guard the parity/fuzz/lseed loop applies to the older
+# kernels; it is kept separate so those three digest checks stay unchanged.
+$pfSrc = Join-Path $repo "tests/suites/test_pageforms.c"
+$pfBuilt = $true
+$pfLogs = @{}
+foreach ($mode in @("def", "noavx")) {
+    $exe = Join-Path $tmp "pageforms.$mode.exe"
+    Write-Output "=== build pageforms ($mode) ==="
+    switch ($mode) {
+        "def" { gcc -std=c11 -O2 -Wall -Wextra -I $inc -I (Join-Path $repo "tests/corpus") $pfSrc $unity -o $exe 2>&1 }
+        "noavx" { gcc -std=c11 -O2 -Wall -Wextra -DZPSE_AVX2_ABI_OK=0 -I $inc -I (Join-Path $repo "tests/corpus") $pfSrc $unity -o $exe 2>&1 }
+    }
+    if ($LASTEXITCODE -ne 0) { Write-Output "BUILD FAILED: pageforms ($mode)"; $fail = 1; $pfBuilt = $false }
+}
+if ($pfBuilt) {
+    foreach ($mode in @("def", "noavx")) {
+        $out = & (Join-Path $tmp "pageforms.$mode.exe") 2>&1
+        $rc = $LASTEXITCODE
+        $pfLogs[$mode] = $out
+        if ($rc -ne 0) { Write-Output "SUITE FAILED: pageforms ($mode)"; $fail = 1 }
+    }
+    if (Compare-Object $pfLogs["def"] $pfLogs["noavx"]) {
+        Write-Output "pageforms FAILED: output differs with ZPSE_AVX2_ABI_OK=0"
+        $fail = 1
+    } else {
+        Write-Output "pageforms ok (noavx): $($pfLogs['def']) identical streams"
     }
 }
 

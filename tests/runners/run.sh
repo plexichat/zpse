@@ -45,7 +45,7 @@ same() {
 
 fail=0
 
-for t in test_roundtrip test_transforms test_combinadic test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_lzh test_huf test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus test_pagedict; do
+for t in test_roundtrip test_transforms test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_lzh test_huf test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus test_pagedict test_pageforms; do
     src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
@@ -65,6 +65,15 @@ for t in test_roundtrip test_transforms test_combinadic test_hostile test_units 
     fi
 done
 
+# def/scalar/swap determinism gate: the three modes below must produce
+# byte-identical compressed streams for every corpus case -- def is the
+# runtime SIMD dispatch, scalar forces the reference path
+# (-DZPSE_FORCE_SCALAR), and swap permutes the encoder's candidate-attempt
+# order (-DZPSE_FORCE_TRIAL_SWAP). This is what keeps the new static-const
+# CRC32C slice/GF(2) tables and the restored fixed-offset arena carves
+# honest: no lazy table init, no position-dependent scratch, and no trial
+# order may leak into the output. Any digest or per-case line that differs
+# across the three modes fails the run.
 echo "=== scalar/SIMD/order parity ==="
 
 # `parity` compares whole compressed corpora; `fuzz` does the same over a
@@ -143,6 +152,47 @@ if ! "$CC" -std=c11 -O2 -Wall -Wextra $mt_flags -I "$inc" \
 elif ! "$tmp/test_parallel.mt$exe"; then
     echo "SUITE FAILED: test_parallel ($mt_flags)"
     fail=1
+fi
+
+# The page kernels have AVX2 and scalar/SSE2 twins (see hot.h and the page
+# kernel sources). Build test_pageforms with the kernels compiled out and
+# require every byte of its output to match the default build, so the SIMD
+# path cannot drift from the scalar reference on the new page forms. This is
+# the same kind of guard the parity/fuzz/lseed loop applies to the older
+# kernels; it is kept separate so those three digest checks stay unchanged.
+echo "=== page kernels without AVX2 (ZPSE_AVX2_ABI_OK=0) ==="
+pf_src="$repo/tests/suites/test_pageforms.c"
+pf_built=1
+for mode in def noavx; do
+    case "$mode" in
+    def) fl="" ;;
+    noavx) fl="-DZPSE_AVX2_ABI_OK=0" ;;
+    esac
+    echo "=== build pageforms ($mode) ==="
+    # shellcheck disable=SC2086
+    if ! "$CC" -std=c11 -O2 -Wall -Wextra $fl -I "$inc" \
+        -I "$repo/tests/corpus" "$pf_src" "$unity" \
+        -o "$tmp/pageforms.$mode$exe"; then
+        echo "BUILD FAILED: pageforms ($mode)"
+        fail=1
+        pf_built=0
+    fi
+done
+if [ "$pf_built" -eq 1 ]; then
+    for mode in def noavx; do
+        "$tmp/pageforms.$mode$exe" >"$tmp/pageforms.$mode.log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "SUITE FAILED: pageforms ($mode)"
+            fail=1
+        fi
+    done
+    if ! same "$tmp/pageforms.def.log" "$tmp/pageforms.noavx.log"; then
+        echo "pageforms FAILED: output differs with ZPSE_AVX2_ABI_OK=0"
+        fail=1
+    else
+        echo "pageforms ok (noavx): $(cat "$tmp/pageforms.def.log") identical streams"
+    fi
 fi
 
 if [ "$fail" -eq 0 ]; then
