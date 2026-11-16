@@ -422,11 +422,12 @@ static void no_match_cases(void)
     }
 }
 
-/* ZPSE_ENC_PAGE_FAST: a page gets one shape and no decision. Three things
- * are pinned here: the block it writes is the identity tile stream (no RAW,
- * no LZ form, one segment, transform 0), that block reads back, and the
- * option is ignored above a page -- where it says nothing about the block
- * and the sweep has to choose as it always did. */
+/* ZPSE_ENC_PAGE_FAST is retired: page blocks now take the one-pass FLAT
+ * fast path for the shapes it packs (constants, low-alphabet, pointer lanes)
+ * and the level ladder for the rest, regardless of this option bit. What is
+ * still pinned here is that the bit is harmless -- the page round-trips and
+ * the header parses at both the fastest and deepest level -- and that above
+ * a page the sweep still chooses as it always did. */
 static void page_fast_cases(void)
 {
     uint32_t cl = 0u;
@@ -446,13 +447,6 @@ static void page_fast_cases(void)
           cl);
     CHECK(zpse_block_header_parse(&h, comp, cl) == ZPSE_OK,
           "PAGE_FAST: the header does not parse");
-    CHECK((h.block_flags &
-           (ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) == 0u &&
-              h.segment_count == 1u && h.transform_id == 0u,
-          "PAGE_FAST: not the identity tile stream (flags 0x%02x, %u "
-          "segments, transform %u)",
-          (unsigned)h.block_flags, (unsigned)h.segment_count,
-          (unsigned)h.transform_id);
     CHECK(h.compressed_block_size == cl, "PAGE_FAST: size in header");
     CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
                   ZPSE_OK &&
@@ -477,11 +471,6 @@ static void page_fast_cases(void)
               "PAGE_FAST level 9: the page did not compress");
         CHECK(zpse_block_header_parse(&h, payload, cl6) == ZPSE_OK,
               "PAGE_FAST level 9: the header does not parse");
-        CHECK((h.block_flags &
-               (ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) == 0u &&
-                  h.segment_count == 1u && h.transform_id == 0u,
-              "PAGE_FAST level 9: not one shape (flags 0x%02x, %u segments)",
-              (unsigned)h.block_flags, (unsigned)h.segment_count);
         CHECK(zpse_decompress_block(payload, cl6, out, sizeof out, &got6,
                                     da) == ZPSE_OK &&
                   got6 == 4096u && memcmp(out, plain, 4096u) == 0,
