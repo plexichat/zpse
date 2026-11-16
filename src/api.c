@@ -16,12 +16,13 @@ const char *zpse_version_string(void)
 }
 
 /* Encoder options are ZPSE_ENC_CHECKSUM, ZPSE_ENC_LZ_FAST, ZPSE_ENC_PAGE_FAST,
- * ZPSE_ENC_LZ_HEX and one of the nine levels in bits 1-4, and an empty level
- * field means the default level.
+ * ZPSE_ENC_LZ_HEX, ZPSE_ENC_HUF, ZPSE_ENC_DECODE_FAST, ZPSE_ENC_PAGE_TURBO,
+ * ZPSE_ENC_PAGE_HUF and ZPSE_ENC_PAGE_INSTANT, plus one of the nine levels in
+ * bits 1-4 (an empty level field means the default level).
  * Anything else is a bad argument rather than a silent round to a neighbour:
  * the level is the caller's own speed/size trade, so a codec that cannot
  * honour it must say so. Bits outside those fields are refused for the same
- * reason. */
+ * reason -- notably bit 11, which stays reserved. */
 static int enc_flags_ok(uint32_t enc_flags)
 {
     uint32_t lvl;
@@ -30,7 +31,8 @@ static int enc_flags_ok(uint32_t enc_flags)
          ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK |
                      ZPSE_ENC_LZ_FAST | ZPSE_ENC_PAGE_FAST |
                      ZPSE_ENC_LZ_HEX | ZPSE_ENC_HUF |
-                     ZPSE_ENC_DECODE_FAST)) != 0u) {
+                     ZPSE_ENC_DECODE_FAST | ZPSE_ENC_PAGE_TURBO |
+                     ZPSE_ENC_PAGE_HUF | ZPSE_ENC_PAGE_INSTANT)) != 0u) {
         return 0;
     }
     lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
@@ -83,12 +85,12 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
 int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint8_t *output, uint32_t out_cap,
                           uint32_t *out_len_out,
-                          void *dec_arena_320k)
+                          void *dec_arena)
 {
     ZpseDecoder dec;
     int rc;
 
-    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
+    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena == 0) {
         return ZPSE_BAD_ARG;
     }
     /* A page's block is 16 bytes of header, so this floor is the short one:
@@ -96,7 +98,7 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
     if (in_len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
         return ZPSE_TRUNCATED;
     }
-    rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
+    rc = zpse_decoder_init(&dec, dec_arena, (size_t)ZPSE_DEC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
         return rc;
     }
@@ -189,18 +191,18 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
 
 int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
                     uint8_t *output, uint32_t out_cap, uint32_t *out_len_out,
-                    void *dec_arena_320k)
+                    void *dec_arena)
 {
     ZpseDecoder dec;
     int rc;
 
-    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
+    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena == 0) {
         return ZPSE_BAD_ARG;
     }
     if (in_len < 32u) {
         return ZPSE_TRUNCATED;
     }
-    rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
+    rc = zpse_decoder_init(&dec, dec_arena, (size_t)ZPSE_DEC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
         return rc;
     }
@@ -211,12 +213,12 @@ int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
 int zpse_decompress_frame(const uint8_t *in, size_t in_len,
                           uint8_t *output, size_t out_cap,
                           size_t *out_len_out,
-                          void *dec_arena_320k)
+                          void *dec_arena)
 {
     ZpseDecoder dec;
     int rc;
 
-    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena_320k == 0) {
+    if (in == 0 || output == 0 || out_len_out == 0 || dec_arena == 0) {
         return ZPSE_BAD_ARG;
     }
     if (in_len == 0) {
@@ -225,7 +227,7 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
     if (in_len < 32u) {
         return ZPSE_TRUNCATED;
     }
-    rc = zpse_decoder_init(&dec, dec_arena_320k, (size_t)ZPSE_DEC_ARENA_SIZE);
+    rc = zpse_decoder_init(&dec, dec_arena, (size_t)ZPSE_DEC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
         return rc;
     }

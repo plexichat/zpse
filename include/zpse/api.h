@@ -10,6 +10,12 @@
 #include "arena.h"
 #include "constants.h"
 
+/* Page-instant: the no-decision page classifier (see the umbrella header's
+ * flag notes). Guarded so this public definition and src/block.c's own agree. */
+#ifndef ZPSE_ENC_PAGE_INSTANT
+#define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,7 +57,7 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
 int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint8_t *output, uint32_t out_cap,
                           uint32_t *out_len_out,
-                          void *dec_arena_320k);
+                          void *dec_arena);
 
 /* One-shot frame calls. */
 int zpse_compress_frame(const uint8_t *in, size_t n,
@@ -70,7 +76,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
 int zpse_decompress_frame(const uint8_t *in, size_t in_len,
                           uint8_t *output, size_t out_cap,
                           size_t *out_len_out,
-                          void *dec_arena_320k);
+                          void *dec_arena);
 
 /* Same as zpse_compress_frame_ex, with the FrameIndex appended so the
  * result can be read block by block in any order (zpse_frame_seek). The
@@ -86,7 +92,7 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
  * `output` must hold one block (at most nominal_block_size, 64 KiB). */
 int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
                     uint8_t *output, uint32_t out_cap, uint32_t *out_len_out,
-                    void *dec_arena_320k);
+                    void *dec_arena);
 
 #ifdef __cplusplus
 }
