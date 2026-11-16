@@ -14,27 +14,48 @@ pages so far, so the copies are scattered rather than adjacent. That is the
 shape a content-addressed dictionary can find and a small recency cache cannot.
 
 `tests/benchmarks/bench_pagedict.c` runs the shipped API over 4,096 pages
-(16 MiB), level 6, one pinned core, best of three. Each arm hashes the page,
-serves a stored block on a hit and retags it for the new position, and
-compresses on a miss:
+(16 MiB), level 6, one pinned core, best of three. Each arm hashes the page
+(or, on one arm, tries two cheaper checks first), serves a stored block on a
+hit and retags it for the new position, and compresses on a miss:
 
 | arm | pages served | encode MB/s | packed bytes |
 | --- | ---: | ---: | ---: |
 | none | 0.00% | 151 | 6,951,106 |
-| direct 1,024 | 10.82% | 169 | 6,951,106 |
-| direct 4,096 | 15.70% | 179 | 6,951,106 |
-| direct 65,536 | 17.97% | 180 | 6,951,106 |
-| 4-way 4,096 | 17.70% | 176 | 6,951,106 |
-| 4-way 65,536 | 18.24% | 182 | 6,951,106 |
+| direct 1,024 | 11.08% | 169 | 6,951,106 |
+| direct 4,096 | 16.65% | 179 | 6,951,106 |
+| direct 65,536 | 19.48% | 180 | 6,951,106 |
+| 4-way 4,096 | 19.07% | 176 | 6,951,106 |
+| 4-way 65,536 | 19.80% | 182 | 6,951,106 |
 
 Packed bytes are identical in every arm, because a hit rewrites nothing but a
 header. That is the point of the feature: it is a rate trade with no ratio side
-at all. A 65,536-entry table serves about 18% of the stream for a fifth of the
-encode work, and a 1,024-entry table loses more than a third of those hits to
+at all. A 65,536-entry table serves about a fifth of the stream for a fifth of
+the encode work, and a 1,024-entry table loses two fifths of those hits to
 collisions.
 
 A real trace will have a different repeat distance. The rates above are a
 model, not a promise: measure the store's own pages before sizing the table.
+
+## Cheap checks before the hash
+
+The hash is paid on every lookup, including the ones whose answer is obvious.
+The `mru+zero 4096` arm puts two checks in front of it. It keeps the most
+recent page's bytes and its slot, so a `memcmp` of 4 KiB against the last page
+serves an adjacent copy without hashing at all. It also keeps one canonical
+slot for the all-zero page, found with an AVX2 all-zero scan where the host's
+ABI allows AVX2 and a scalar OR of the bytes otherwise; every zero page after
+the first is served from that slot. Both checks serve a stored block and retag
+it, so neither changes a byte of the stream.
+
+Neither check finds anything on `pages-repeat.bin`. Its copies are drawn
+uniformly from all earlier unique pages, so an adjacent repeat is rare, and
+the `--pages` corpus keeps the zero class out of the repeat stream entirely.
+The arm serves 16.65% -- the same as its direct 4,096 table -- and pays for a
+4 KiB compare and a 4 KiB scan per page. That is the trade: MRU pays off on
+short corpora, where a page and its copy are close together, and the zero slot
+pays off on a zram trace, where untouched pages are a large share of the
+stream. A store that knows its workload has either shape can add these checks;
+one that does not should measure first.
 
 ## Why it does not live in the codec
 
@@ -107,27 +128,30 @@ if (zpse_pagedict_find(&d, lo, hi, &slot) &&
     emit(blk, blen);                                 /* no arena touched     */
 } else {
     zpse_compress_block(page, 4096, blk, cap, &blen, seq, is_last, arena);
-    if (blen < 4096) {                               /* only if it compressed */
-        slot = store_write(blk, blen);
-        zpse_pagedict_insert(&d, lo, hi, slot);
-    }
+    slot = store_write(blk, blen);                  /* compressed or RAW */
+    zpse_pagedict_insert(&d, lo, hi, slot);
     emit(blk, blen);
 }
 ```
 
-Two rules the sequence encodes:
+Three rules the sequence encodes:
 
-* **Insert only what compressed.** A raw page's block is longer than the page,
-  so an entry for it costs more than the hash it saves; the next copy of those
-  bytes still pays a full encode, which is what a page store does anyway.
+* **Insert every miss, raw included.** A page is stored whatever form its block
+  took. A RAW page costs a page of slab, but the only thing that makes it worth
+  keeping is the copy that is coming; skipping it turns every repeat of an
+  incompressible page into a full encode. Budget the store for a whole block
+  per unique page, not for the compressed length.
 * **Retag, never reuse verbatim.** A block carries `seq` in its header and the
   header checksum covers it, so a stored block served for a new position
   without `zpse_block_retag` produces a stream that decodes correctly and
-  indexes itself wrongly.
+  indexes itself wrongly. This holds for a RAW block too.
+* **Keep the store grow-only.** Slots are never reused, so evicting a tag from
+  the index does not invalidate a block another entry -- or the MRU slot, or
+  the zero slot -- still points at.
 
 `tests/suites/test_pagedict.c` pins the whole loop: every served block is
 byte-identical to a fresh encode of that page at that position, in both header
-forms, and decodes to the page.
+forms and for a RAW block, and decodes to the page.
 
 ## What the tag costs on a corpus that does not repeat
 
@@ -141,25 +165,18 @@ it is not what decides the trade either.
 ## How wide the table should be
 
 Ways are worth having exactly where the table is small enough to collide, which
-is why they are an option rather than the default. On the repeat corpus:
-
-| entries | direct | 4-way |
-| ---: | ---: | ---: |
-| 1,024 | 10.82% | -- |
-| 4,096 | 15.70% / 179 MB/s | 17.70% / 176 MB/s |
-| 65,536 | 17.97% / 180 MB/s | 18.24% / 182 MB/s |
-
-At 4,096 entries four ways serve two more points of pages for the same rate,
-which is the useful middle. At 65,536 the extra tag compares buy a quarter of a
-point and nothing measurable, and a 1,024-entry table loses a third of the
-available hits to collisions. So: a store whose table is a few thousand
-entries should ask for four ways; a store at 65,536 can keep the direct mapping,
-which is what the two inits are for.
+is why they are an option rather than the default. The repeat-corpus table above
+shows the trade. At 4,096 entries four ways serve two and a half more points of
+pages for the same rate, which is the useful middle. At 65,536 the extra tag
+compares buy a third of a point and nothing measurable, and a 1,024-entry table
+loses two fifths of the available hits to collisions. So: a store whose table is
+a few thousand entries should ask for four ways; a store at 65,536 can keep the
+direct mapping, which is what the two inits are for.
 
 ## What it deliberately is not
 
 * **Not a decision cache.** Remembering only the winning shape and re-running
-  the trial on a hit skips the price on the pages that repeat -- under a fifth
+  the trial on a hit skips the price on the pages that repeat -- about a fifth
   of this corpus -- while still hashing every page. The win here comes from
   not encoding the page at all.
 * **Not a decoder feature.** No new block type, no new header field, no format
@@ -180,9 +197,10 @@ which is what the two inits are for.
 * **Where `seq` comes from.** A store that compresses before it knows a page's
   position needs the retag; one that knows the position up front can pass it to
   `zpse_compress_block` and store the block as written.
-* **Sizing.** The dictionary pays only on pages that repeat and compress. A
-  caller with a mixed workload should size it by the fraction of pages that
-  actually repeat, not by the page count of the device.
+* **Sizing.** The dictionary pays on pages that repeat, whether or not they
+  compress; the store pays a page of slab for each unique one. A caller with a
+  mixed workload should size it by the fraction of pages that actually repeat,
+  not by the page count of the device.
 * **The pages above the table.** The generated stream repeats one page in five.
   A store with a larger repeat distance needs a larger table or a second level;
   neither was measured here.
