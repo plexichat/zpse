@@ -21,6 +21,61 @@
 #include <stdio.h>
 #endif
 
+/* The FLAT page form (sync 0x50B9) is the ONE page path at every level. Its
+ * sync and codec ids come from constants.h; the decoder lives in flat.h. Do
+ * not include flat.h here: it declares the codecs as an enum while
+ * constants.h defines the same names as macros, so a TU that has both would
+ * not preprocess. The #ifndef fallbacks and the local prototype keep this
+ * file buildable on its own before either header lands; they are exactly the
+ * values/prototype those headers define. */
+#ifndef ZPSE_BLOCK_SYNC_FLAT
+#define ZPSE_BLOCK_SYNC_FLAT ((uint16_t)0x50B9)
+#endif
+#ifndef ZPSE_FLAT_RAW
+#define ZPSE_FLAT_RAW ((uint8_t)0)
+#endif
+#ifndef ZPSE_FLAT_NIBBLE4
+#define ZPSE_FLAT_NIBBLE4 ((uint8_t)1)
+#endif
+#ifndef ZPSE_FLAT_BIT2
+#define ZPSE_FLAT_BIT2 ((uint8_t)2)
+#endif
+#ifndef ZPSE_FLAT_SUBLELANE
+#define ZPSE_FLAT_SUBLELANE ((uint8_t)3)
+#endif
+int zpse_flat_decode(uint8_t codec, uint8_t param, const uint8_t *payload,
+                     uint32_t payload_len, uint8_t *out, uint32_t n);
+
+/* The classifier and its result type live in their own header so a caller can
+ * use the same classes. Keep a local copy here for a standalone build of this
+ * file made before that header lands. */
+#if defined(__has_include)
+#if __has_include("zpse/pagefast.h")
+#include "zpse/pagefast.h"
+#define ZPSE_BLOCK_HAVE_PAGEFAST 1
+#endif
+#endif
+#ifndef ZPSE_BLOCK_HAVE_PAGEFAST
+typedef enum {
+    ZPSE_PAGE_ZERO,
+    ZPSE_PAGE_ONE_VALUE,
+    ZPSE_PAGE_LOW_ALPHA,
+    ZPSE_PAGE_ASCII,
+    ZPSE_PAGE_POINTER,
+    ZPSE_PAGE_GENERIC
+} ZpsePageClass;
+typedef struct {
+    uint8_t value;
+    uint8_t alpha[16];
+    uint8_t nalpha;
+    uint16_t nzero;
+    uint32_t flags;
+    uint8_t lane_diff[32];
+    uint8_t zero_cnt[32];
+} ZpsePageInfo;
+int zpse_page_classify(const uint8_t *in, uint32_t n, ZpsePageInfo *info);
+#endif
+
 /* Capacity of the transform sweep's candidate list, and of one candidate's
  * transform metadata. The list used to hold three shapes -- RAW_BYTES,
  * DELTA8 and a single plain transpose -- so both were sized to a small
@@ -302,6 +357,38 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
     if (hdr == 0u || in_len < hdr) {
         return ZPSE_TRUNCATED;
     }
+    if (zpse_load_u16le(in) == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
+        if (in[4] != 1u || in[5] != 0u ||
+            in[8] != (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
+            in[9] != 0u) {
+            return ZPSE_BAD_HEADER;
+        }
+        if ((uint32_t)(zpse_crc32c(in, 14) & UINT32_C(0xFFFF)) !=
+            (uint32_t)zpse_load_u16le(in + 14)) {
+            return ZPSE_BAD_HEADER_CRC;
+        }
+        *compressed_size_out = (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+        *uncompressed_size_out = (uint32_t)zpse_load_u16le(in + 6);
+        return ZPSE_OK;
+    }
+    if (zpse_load_u16le(in) == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        ZpseBlockHeader fh;
+
+        rc = zpse_block_header_parse_flat(&fh, in, in_len);
+        if (rc != ZPSE_OK) {
+            return rc;
+        }
+        if (fh.compressed_block_size ==
+            (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            return ZPSE_BAD_BLOCK_SIZE;
+        }
+        if (in_len < fh.compressed_block_size) {
+            return ZPSE_TRUNCATED;
+        }
+        *compressed_size_out = fh.compressed_block_size;
+        *uncompressed_size_out = fh.uncompressed_size;
+        return ZPSE_OK;
+    }
     rc = zpse_block_header_parse(&h, in, in_len);
     if (rc != ZPSE_OK) {
         return rc;
@@ -323,6 +410,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 {
     ZpseBlockHeader h;
     ZpseTransformMeta meta;
+    ZpseSegmentHeader sh0;
     uint32_t n, c, meta_size, scount;
     uint64_t dir_end, area;
     const uint8_t *dir, *payloads;
@@ -330,6 +418,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     uint32_t body_off, body_len;
     uint32_t hdr;
     uint32_t seg_lens[16];
+    uint32_t seg_off[16], seg_sz[16];
     const uint8_t *csegs[16];
     uint32_t cum, s;
     int identity_shape;
@@ -348,19 +437,94 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if (hdr == 0u || in_len < hdr) {
         return ZPSE_TRUNCATED;
     }
+
+    /* One-value page token (v1.1): the short header with a different sync,
+     * the fill byte in transform_id, no payload, and the same 16-bit header
+     * CRC. Checked before the ordinary parse because the parse rejects a
+     * sync it does not know. Every field the token carries is validated
+     * here, and the fill is a memset at memcpy-class speed. */
+    if (zpse_load_u16le(in) == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
+        uint8_t flags = in[2];
+        uint8_t value = in[3];
+        uint32_t n_tok = (uint32_t)zpse_load_u16le(in + 6);
+        uint32_t c_tok = (uint32_t)zpse_load_u16le(in + 8);
+        uint16_t crc = zpse_load_u16le(in + 14);
+
+        if (in[4] != 1u || in[5] != 0u ||
+            (flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET)) !=
+                (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET) ||
+            (flags & (uint8_t)(ZPSE_B_CRC | ZPSE_B_HAS_META |
+                               ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                               ZPSE_B_RESERVED_MASK)) != 0u ||
+            c_tok != (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
+            n_tok < ZPSE_MIN_BLOCK_SIZE || n_tok > ZPSE_MAX_BLOCK_SIZE) {
+            return ZPSE_BAD_HEADER;
+        }
+        if ((uint32_t)(zpse_crc32c(in, 14) & UINT32_C(0xFFFF)) != crc) {
+            return ZPSE_BAD_HEADER_CRC;
+        }
+        if (out_cap < n_tok) {
+            return ZPSE_OUTPUT_OVERFLOW;
+        }
+        memset(output, value, n_tok);
+        if (out_len_out != 0) {
+            *out_len_out = n_tok;
+        }
+        return (int)n_tok;
+    }
+
+    /* The FLAT page form (sync 0x50B9): a 16-byte header naming a flat payload
+     * codec instead of a transform + segment directory. Checked before the
+     * ordinary parse for the same reason as the token -- the parse refuses a
+     * sync it does not know. The header parser validates every field (CRC,
+     * flags, reserved byte, codec, sizes); what is left here is the length
+     * arithmetic between the header, the bytes the caller handed us and the
+     * payload the flat decoder expects. */
+    if (zpse_load_u16le(in) == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        ZpseBlockHeader fh;
+        uint32_t c_flat;
+        uint32_t plen;
+        int frc;
+
+        frc = zpse_block_header_parse_flat(&fh, in, in_len);
+        if (frc != ZPSE_OK) {
+            return frc;
+        }
+        c_flat = fh.compressed_block_size;
+        plen = c_flat - (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+        if (c_flat > in_len) {
+            return ZPSE_TRUNCATED;
+        }
+        if (plen == 0u) {
+            /* Every codec writes at least one byte for n >= 1, so an empty
+             * payload is a size the encoder never produces. */
+            return ZPSE_BAD_BLOCK_SIZE;
+        }
+        if (out_cap < fh.uncompressed_size) {
+            return ZPSE_OUTPUT_OVERFLOW;
+        }
+        frc = zpse_flat_decode(fh.transform_id,
+                                (uint8_t)fh.transform_meta_size,
+                                in + ZPSE_BLOCK_HEADER_SIZE_SHORT, plen,
+                                output, fh.uncompressed_size);
+        if (frc != ZPSE_OK) {
+            return frc;
+        }
+        if (out_len_out != 0) {
+            *out_len_out = fh.uncompressed_size;
+        }
+        return (int)fh.uncompressed_size;
+    }
+
     rc = zpse_block_header_parse(&h, in, in_len);
     if (rc != ZPSE_OK) {
         return rc;
     }
-    /* Header CRC defence in depth (parse is expected to check it). */
-    if (hdr == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        if ((uint32_t)(zpse_crc32c(in, 14) & UINT32_C(0xFFFF)) !=
-            h.header_crc32c) {
-            return ZPSE_BAD_HEADER_CRC;
-        }
-    } else if (zpse_crc32c(in, 28) != h.header_crc32c) {
-        return ZPSE_BAD_HEADER_CRC;
-    }
+    /* The header CRC is validated by zpse_block_header_parse itself in both
+     * the short (types.c) and long form; recomputing it here was a second
+     * 14/28-byte CRC pass on every block, which is a measurable share of a
+     * 4 KiB page's decode. Removing it changes no refusal: a bad header CRC
+     * is returned by the parse above. */
 
     n = h.uncompressed_size;
     c = h.compressed_block_size;
@@ -638,6 +802,8 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             if (sz < (uint32_t)ZPSE_SEGMENT_HEADER_SIZE) {
                 return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
+            seg_off[s] = off;
+            seg_sz[s] = sz;
             expect = off + sz;
         }
         if ((uint64_t)expect != area) {
@@ -645,13 +811,16 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         }
     }
 
-    /* Per-segment decoded sizes from segment headers. */
+    /* Per-segment decoded sizes from segment headers. The directory entries
+     * were read and validated once above and are reused here and in PHASE3;
+     * a page has one segment, so re-reading the same eight bytes three times
+     * was three loads of the same cache line for one directory entry. */
     {
         uint64_t sum = 0;
         for (s = 0; s < scount; s++) {
             ZpseSegmentHeader sh;
-            uint32_t off = zpse_load_u32le(dir + (size_t)s * 8);
-            uint32_t sz = zpse_load_u32le(dir + (size_t)s * 8 + 4);
+            uint32_t off = seg_off[s];
+            uint32_t sz = seg_sz[s];
             rc = zpse_segment_header_parse(&sh, payloads + off, sz);
             if (rc != ZPSE_OK) {
                 return rc;
@@ -660,6 +829,11 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                 return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
             seg_lens[s] = sh.segment_decoded_size;
+            /* A page has one segment; keep its parsed header so PHASE3 can
+             * skip parsing the same eight bytes a second time. */
+            if (scount == 1u) {
+                sh0 = sh;
+            }
             sum += (uint64_t)sh.segment_decoded_size;
         }
         if (sum != (uint64_t)n) {
@@ -729,8 +903,8 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         }
         cum = 0;
         for (s = 0; s < scount; s++) {
-            uint32_t off = zpse_load_u32le(dir + (size_t)s * 8);
-            uint32_t sz = zpse_load_u32le(dir + (size_t)s * 8 + 4);
+            uint32_t off = seg_off[s];
+            uint32_t sz = seg_sz[s];
             uint8_t *plane = d->recon + cum;
             uint32_t got = 0;
 
@@ -758,8 +932,14 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             if ((uint64_t)cum + (uint64_t)seg_lens[s] > ZPSE_MAX_BLOCK_SIZE) {
                 return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
-            rc = zpse_segment_decode(d, &lanes, payloads + off, sz,
-                                     plane, seg_lens[s], &got);
+            if (scount == 1u) {
+                rc = zpse_segment_decode_preparsed(d, &lanes, &sh0,
+                                                   payloads + off, sz,
+                                                   plane, seg_lens[s], &got);
+            } else {
+                rc = zpse_segment_decode(d, &lanes, payloads + off, sz,
+                                         plane, seg_lens[s], &got);
+            }
             if (rc != ZPSE_OK) {
                 return rc;
             }
@@ -781,8 +961,11 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
      * skipped for it, which is also the only way to express it (see the
      * identity_shape comment). */
     if (identity_shape == 0) {
-        rc = zpse_transform_inverse(&meta, h.segment_count, csegs, seg_lens,
-                                    output, n);
+        /* Sizes and plane layout were already validated above, so the
+         * duplicate validation (including the O(w^2) overlap walk) is skipped
+         * here. The page path is bit-identical and activates for n <= 4096. */
+        rc = zpse_transform_inverse_trusted(&meta, h.segment_count, csegs,
+                                            seg_lens, output, n);
         if (rc != ZPSE_OK) {
             return rc;
         }
@@ -874,38 +1057,6 @@ static const uint8_t zpse_block_screen[9] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
  * about to write. The abort further requires a leading run of unpredicted
  * tiles. Returns 1 only when the whole block reads as noise at every sample
  * point. */
-/* How many tiles a PAGE_FAST page's noise probe reads. A page has sixteen
- * tiles, and the generic probe below reads all sixteen -- the whole page --
- * one tile before the trial prescreens each of them again. One sample, at the
- * page's midpoint, is worth 4.6 to 11.9% of the page rate here (dumps +4.6%,
- * mixed +11.9%, Silesia +6.6% at level 1; +5.7%, +10.6%, +6.9% at level 2,
- * medians of five paired rounds) for 0.009 to 0.013% of the packed bytes: the
- * page it can misjudge is one whose middle reads as noise and whose rest does
- * not. Two samples, an eighth of the page, bought the same 4% on the dumps and
- * lost rate on the other two. Sixteen is not byte-identical after all: three
- * rounds put it 13 332 and 15 952 bytes ahead on the dumps at levels 1 and 6,
- * 22 150 and 20 933 ahead on Silesia at levels 1 and 2, and the mixed corpus
- * identical -- a hundredth of a point across the host corpora at either level --
- * for up to 7.7% of Silesia's level-6 rate and 8.1% of its level 2, the dumps
- * inside the band. Two samples saves 11 076 and 13 357 bytes over the dumps and
- * 14 182 and 13 881 over Silesia (0.005 to 0.007 of a point) at rate inside the
- * band, and a whole point on the probe pages at level 1 (670 706 bytes) for 6%
- * of their rate. The probe corpus is where the sample is worth points instead
- * of hundredths: 3.25 at level 1 and 2.53 at level 6 for 8 and 10% of that
- * corpus's rate. A hundredth of a point is
- * not what percent of the rate is for, so the default stays one and the arm
- * stays buildable for callers whose pages look like those shapes. A
- * build that defines this 0 arms the abort with no probe at all, and five
- * paired rounds put it 2.2 to 7.4% ahead on five of the six page cells and
- * 2.0% behind on the sixth, for 0.02 to 0.08 more ratio points (mixed 81.25
- * to 81.33). So the sample stays: it is the cheaper point of the same curve,
- * and the probe-free arm is the one to revisit if the rate ever matters more
- * than the ratio it costs. The arms are measured on the page table in the
- * README. */
-#ifndef ZPSE_PAGE_NOISE_POINTS
-#define ZPSE_PAGE_NOISE_POINTS 1u
-#endif
-
 static int zpse_block_is_noise(const uint8_t *const planes[16], uint8_t sc,
                                const uint32_t lens[16], uint32_t n,
                                unsigned points)
@@ -986,9 +1137,6 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (budget_hit != 0) {
         *budget_hit = 0;
     }
-    /* Reorder the prescreen scan order by win count at every block start,
-     * so the predictor that wins most tiles runs first. */
-    seg_screen_rank();
     /* The flat abort's coverage counter and the flag that ends its run span
      * this trial's segments, so they are reset here rather than inside
      * zpse_segment_encode. */
@@ -1850,7 +1998,7 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
 {
     ZpseLaneState lanes;
 
-    if (plane == 0 || len == 0u || e->comb == 0) {
+    if (plane == 0 || len == 0u) {
         return UINT32_MAX;
     }
     if (tiles == 0u || tiles > ZPSE_DECIDE_TILES) {
@@ -2844,10 +2992,12 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * deeper screen accepted a block whose finder stream the tiles beat.
      * Keeping the token form here keeps every verdict where it was, so the
      * only thing the swap changes is the stream the finder writes. */
-    lz_s = zpse_lz_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                          lvl == 1u
-                              ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                              : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
+    lz_s = zpse_lz_encode_sample(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND,
+                                 e->lz,
+                                 lvl == 1u
+                                     ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                     : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
+                                 sn);
     if (lz_s == 0u) {
         return 1;
     }
@@ -2894,11 +3044,12 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (row->samples > 1u && have_best &&
         !zpse_block_lz_sample_can_win(lz_s, sn, n, best_total)) {
         uint32_t off = (n - sn) / 2u;
-        uint32_t lz_m = zpse_lz_encode(in + off, sn, e->cand,
-                                       (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                                       lvl == 1u
-                                           ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                           : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
+        uint32_t lz_m = zpse_lz_encode_sample(in + off, sn, e->cand,
+                                              (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                                              lvl == 1u
+                                                  ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                                  : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
+                                              sn);
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -2956,8 +3107,9 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         num = num * (uint32_t)ZPSE_LZ2_SHORT_MARGIN_NUM /
               (uint32_t)ZPSE_LZ2_SHORT_MARGIN_DEN;
     }
-    lz_s = zpse_lz2_encode(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                           (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
+    lz_s = zpse_lz2_encode_sample(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND,
+                                  e->lz,
+                                  (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS, sn);
     if (lz_s == 0u) {
         return 1;
     }
@@ -2977,9 +3129,10 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     if (row->samples > 1u && have_best) {
         uint32_t off = (n - sn) / 2u;
-        uint32_t lz_m = zpse_lz2_encode(in + off, sn, e->cand,
-                                        (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                                        (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS);
+        uint32_t lz_m = zpse_lz2_encode_sample(in + off, sn, e->cand,
+                                               (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                                               (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
+                                               sn);
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -2989,30 +3142,6 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return 1;
 }
 
-/* Whether the caller asked for decode rate over ratio (ZPSE_ENC_DECODE_FAST),
- * and how much smaller an LZ form has to be than the tile winner when it did.
- *
- * One constant for every LZ form, because they all trade the same thing: the
- * tile path reconstructs through a vectorised kernel at 5-13 GB/s and a
- * command loop decodes at 1-4 GB/s. 1/8 is the margin where the tile stream's
- * decode win is worth the bytes on the corpora this was measured on; the
- * default 1/32 is the size-only rule (see ZPSE_LZ_MIN_WIN_DIV). */
-#ifndef ZPSE_DECODE_FAST_DIV
-#define ZPSE_DECODE_FAST_DIV 8u
-#endif
-
-static int zpse_block_lz_decode_first(uint32_t enc_flags)
-{
-    return (enc_flags & (uint32_t)ZPSE_ENC_DECODE_FAST) != 0u;
-}
-
-static uint32_t zpse_block_lz_win_div(uint32_t enc_flags)
-{
-    return zpse_block_lz_decode_first(enc_flags)
-               ? (uint32_t)ZPSE_DECODE_FAST_DIV
-               : (uint32_t)ZPSE_LZ_MIN_WIN_DIV;
-}
-
 /* Is this LZ stream worth taking? Smaller than the tile winner (or the
  * sweep found nothing at all, in which case there is no tile stream to
  * compare against), inside the level's acceleration factor, and smaller by
@@ -3020,20 +3149,16 @@ static uint32_t zpse_block_lz_win_div(uint32_t enc_flags)
  * from zpse_lz_encode (its stream always ends in a command) but is kept as
  * "no evidence either way" rather than a division by zero.
  *
- * `decode_first` is ZPSE_ENC_DECODE_FAST, and it only raises the margin the
- * form has to beat the tile stream by; it can never make a stream larger than
- * it would have been with the tile form winning, because the tile form is
- * what the caller gets instead. */
+ * The margin is the format's size-only one: the nine-level table is the sole
+ * authority for a block over a page, and the page path is FLAT. */
 static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
                               int have_best, uint32_t best_total,
-                              uint32_t speed, int decode_first)
+                              uint32_t speed)
 {
-    uint32_t div = decode_first ? (uint32_t)ZPSE_DECODE_FAST_DIV
-                                : (uint32_t)ZPSE_LZ_MIN_WIN_DIV;
-
     if (have_best &&
         (lz_total >= best_total ||
-         best_total - lz_total < best_total / div + 1u)) {
+         best_total - lz_total <
+             best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u)) {
         return 0;
     }
     if (lz_cmds != 0u && n / lz_cmds < zpse_lz_min_bpc(speed)) {
@@ -3090,16 +3215,6 @@ static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
 #ifndef ZPSE_LZ_TABLE_BIG_MIN
 #define ZPSE_LZ_TABLE_BIG_MIN 16384u
 #endif
-/* The F form's table at page size, in hash bits. The 64 KiB arm is 2^16
- * entries because a 64 KiB block inserts up to 65,532 positions there -- a
- * load factor of one. A 4 KiB page inserts at most 4,092, and clearing the
- * same 128 KiB for it costs 32 bytes of store per input byte; this is the
- * table a page gets instead (see the LZ_FAST arm in zpse_block_lz_body for
- * the measurement, and ZPSE_LZ_TABLE_BIG_MIN above for the 64 KiB side). */
-#ifndef ZPSE_LZ2_PAGE_BITS
-#define ZPSE_LZ2_PAGE_BITS 13u
-#endif
-
 /* The fast LZ form's block: same header, same 'is_last' and CRC handling as
  * zpse_block_try_lz, different payload codec. */
 static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -3131,42 +3246,16 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     {
         /* Which table the finder uses depends on who asked for it.
          *
-         * The fast form is the finder and nothing else, so the 128 KiB of
-         * candidate staging (cand and best, contiguous at ZPSE_E_OFF_CAND)
-         * are untouched by it: they make a 2^16-entry table, four times the
-         * 16 KiB e->lz the arena normally carries. Measured over Silesia
-         * prose, columnar XML and the binaries, the bigger table is 9% FASTER
-         * as well as smaller (2.4% of the payload on `dickens`), because a
-         * 128 KiB table still fits L2 while 16 KiB of it does not fit L1
-         * beside a 64 KiB block streaming past -- so the smaller table was
-         * paying L2 latency for the privilege of missing more.
-         *
-         * Every other caller -- the LZ2 trial at the cheap levels and the
-         * last candidate at MAX -- is inside the sweep, where cand and best
-         * are the encoder's own staging, so those keep e->lz and the 13 bits
-         * the format has always used. Their streams are unchanged. */
+         * A caller outside the sweep that is holding the candidate staging
+         * for something else has its 64 KiB free: 2^15 entries instead of
+         * 2^13, which is both faster and smaller -- 128 KiB still fits L2
+         * while 16 KiB of it does not fit L1 beside a 64 KiB block streaming
+         * past. A caller inside the sweep keeps e->lz and the 13 bits the
+         * format has always used. */
         void *tab = e->lz;
         uint32_t hb = (uint32_t)ZPSE_LZ_HASH_BITS;
 
-        if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u) {
-            /* ... but not at a page's size. The 2^16 table above was measured
-             * on 64 KiB blocks; on a 4 KiB page it is 32 bytes of clear per
-             * input byte, and the table only ever holds 4,092 positions.
-             * ZPSE_LZ2_PAGE_BITS is the page's table: on the generated page
-             * corpus, 4 KiB blocks, level 6 with LZ_FAST, 13 bits encodes
-             * +9.6% faster on the mixed page stream (518 -> 567 MB/s) and
-             * +6.5% on the repeated-page stream (551 -> 587), for +0.073% of
-             * packed bytes there (5,528 of 7,534,944) and at most +0.19% on
-             * any class (float-series); the mixed page stream and the zero
-             * pages are byte-identical to the 16-bit arm. 12 bits, the load
-             * factor a 64 KiB block runs at, was no faster than 16 in the
-             * same alternation (510 against 518 MB/s) and cost 0.21 points
-             * more on float-series, so 13 is the arm. */
-            tab = e->cand;
-            hb = n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX
-                     ? (uint32_t)ZPSE_LZ2_PAGE_BITS
-                     : 16u;
-        } else if (dst != e->cand) {
+        if (dst != e->cand) {
             /* The caller is holding the candidate staging for something
              * else, so its 64 KiB are free: 2^15 entries instead of 2^13.
              * The bigger table is both faster and smaller -- 128 KiB still
@@ -3186,8 +3275,8 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             hb = 15u;
         }
         /* A page gets the hexadecimal encoding; anything larger keeps the fast
-         * one, and ZPSE_ENC_LZ_HEX forces the hex form at every size (the
-         * switch the measurement was taken with).
+         * one. (Pages normally take the FLAT path; this is the long-header
+         * fall-through for a checksum-requesting page.)
          *
          * The split is a measurement, not a preference. On the same finder
          * pass at 4 KiB the hex form is 2.51% smaller over the dumps and 2.10%
@@ -3663,6 +3752,286 @@ static int zpse_block_write_raw(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return (int)total;
 }
 
+/* The 16-byte one-value page token, shared by the FLAT writer below and the
+ * only path a constant page takes. No checksum flag: the short header has
+ * nowhere to carry a payload CRC, so callers that asked for one never reach
+ * this writer (zpse_block_encode leaves them on the long-header path). */
+static int zpse_block_write_token(ZpseEncoder *e, const uint8_t *in,
+                                  uint32_t n, uint32_t seq, int is_last,
+                                  uint8_t *out, uint32_t out_cap)
+{
+    uint8_t flags = (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET |
+                              (is_last ? ZPSE_B_LAST : 0u));
+
+    if (out_cap < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_OUTPUT_OVERFLOW;
+    }
+    zpse_store_u16le(out + 0, (uint16_t)ZPSE_BLOCK_SYNC_TOKEN);
+    out[2] = flags;
+    out[3] = in[0];
+    out[4] = 1u;
+    out[5] = 0u;
+    zpse_store_u16le(out + 6, (uint16_t)n);
+    zpse_store_u16le(out + 8, (uint16_t)ZPSE_BLOCK_HEADER_SIZE_SHORT);
+    zpse_store_u32le(out + 10, seq);
+    zpse_store_u16le(out + 14,
+                     (uint16_t)(zpse_crc32c(out, 14) & UINT32_C(0xFFFF)));
+    zpse_block_hist_set(e, out, ZPSE_BLOCK_HEADER_SIZE_SHORT);
+    return (int)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+}
+
+/* ---- The FLAT page writer ------------------------------------------- *
+ * One classifier call, one payload build, one self-check. There is no sweep,
+ * no candidate list and no trial: the class picks the form directly. Every
+ * compressed form is decoded back and compared with the input before it is
+ * kept, so a wire detail owned by flat.c cannot make this file emit a wrong
+ * page -- on any doubt the RAW form carries the bytes verbatim. */
+
+/* Palette index of `v`; the classifier guarantees a hit for a LOW_ALPHA page. */
+static uint8_t zpse_flat_pal_index(const uint8_t *alpha, uint8_t nalpha,
+                                    uint8_t v)
+{
+    uint8_t i;
+
+    for (i = 0u; i < nalpha; i++) {
+        if (alpha[i] == v) {
+            return i;
+        }
+    }
+    return 0u;
+}
+
+/* BIT2: 8-byte palette, then two bits per position, low pair first. */
+static uint32_t zpse_flat_build_bit2(const ZpsePageInfo *pi,
+                                     const uint8_t *in, uint32_t n,
+                                     uint8_t *dst)
+{
+    uint32_t idx_bytes = (n + 3u) >> 2;
+    uint32_t g;
+    uint8_t i;
+
+    memset(dst, 0, 8u);
+    for (i = 0u; i < pi->nalpha; i++) {
+        dst[i] = pi->alpha[i];
+    }
+    for (g = 0u; g < idx_bytes; g++) {
+        uint32_t base = g << 2;
+        uint8_t b = 0u;
+        uint32_t j;
+
+        for (j = 0u; j < 4u && base + j < n; j++) {
+            uint8_t ix = zpse_flat_pal_index(pi->alpha, pi->nalpha,
+                                              in[base + j]);
+
+            b = (uint8_t)(b | (uint8_t)((uint32_t)ix << (2u * j)));
+        }
+        dst[8u + g] = b;
+    }
+    return 8u + idx_bytes;
+}
+
+/* NIBBLE4: 16-byte palette, then four bits per position, low nibble even. */
+static uint32_t zpse_flat_build_nibble4(const ZpsePageInfo *pi,
+                                        const uint8_t *in, uint32_t n,
+                                        uint8_t *dst)
+{
+    uint32_t idx_bytes = (n + 1u) >> 1;
+    uint32_t g;
+    uint8_t i;
+
+    memset(dst, 0, 16u);
+    for (i = 0u; i < pi->nalpha; i++) {
+        dst[i] = pi->alpha[i];
+    }
+    for (g = 0u; g < idx_bytes; g++) {
+        uint32_t base = g << 1;
+        uint8_t b = 0u;
+
+        if (base < n) {
+            b = zpse_flat_pal_index(pi->alpha, pi->nalpha, in[base]);
+        }
+        if (base + 1u < n) {
+            b = (uint8_t)(b | (uint8_t)((uint32_t)zpse_flat_pal_index(
+                pi->alpha, pi->nalpha, in[base + 1u]) << 4));
+        }
+        dst[16u + g] = b;
+    }
+    return 16u + idx_bytes;
+}
+
+/* SUBLANE: [period][keepmask][templ[8]][sub[k*groups]][4 pad].
+ *
+ * A period position is written from the constant template when every lane
+ * that shares it is constant (lane_diff == 0); otherwise a per-group byte is
+ * stored in `sub`. zero_cnt confirms an all-zero lane, whose template byte
+ * must be zero. Periods are tried from 8 down to 1 and the first payload that
+ * decodes back to the input is kept; a mismatch moves on to the next period
+ * and ultimately to RAW. */
+static uint32_t zpse_flat_build_sublane(const uint8_t *in, uint32_t n,
+                                        const ZpsePageInfo *pi,
+                                        uint8_t *dst, uint8_t *scratch)
+{
+    static const uint32_t periods[4] = { 8u, 4u, 2u, 1u };
+    uint32_t t;
+
+    for (t = 0u; t < 4u; t++) {
+        uint32_t period = periods[t];
+        uint32_t groups = (n + period - 1u) / period;
+        uint8_t keepmask = 0u;
+        uint8_t templ[8];
+        uint32_t rank[8];
+        uint32_t k = 0u;
+        uint32_t j, g;
+        uint32_t len;
+
+        memset(templ, 0, sizeof templ);
+        for (j = 0u; j < period; j++) {
+            uint32_t l;
+            int constant = 1;
+            int all_zero = 1;
+
+            for (l = j; l < 32u; l += period) {
+                if (pi->lane_diff[l] != 0u) {
+                    constant = 0;
+                    break;
+                }
+            }
+            /* A constant position's template byte is its first byte; when
+             * every lane in it is all zero (zero_cnt == lane length) that
+             * byte is zero, which is the same value in a correct classifier. */
+            for (l = j; constant != 0 && l < 32u; l += period) {
+                uint32_t lane_len = (n + 31u - l) / 32u;
+
+                if (pi->zero_cnt[l] != lane_len) {
+                    all_zero = 0;
+                }
+            }
+            templ[j] = (constant != 0 && all_zero != 0) ? 0u : in[j];
+            rank[j] = (uint8_t)k;
+            if (constant == 0) {
+                keepmask = (uint8_t)(keepmask | (uint8_t)(1u << j));
+                k++;
+            }
+        }
+        len = 14u + k * groups;
+        if (len >= n) {
+            continue; /* RAW payload is smaller: no point keeping this form */
+        }
+        /* sub[] is indexed per group and, inside a group, by keep-bit rank. */
+        for (g = 0u; g < groups; g++) {
+            for (j = 0u; j < period; j++) {
+                uint32_t at = g * period + j;
+
+                if ((keepmask & (uint8_t)(1u << j)) != 0u && at < n) {
+                    dst[10u + g * k + rank[j]] = in[at];
+                }
+            }
+        }
+        memset(dst + 10u + k * groups, 0, 4u);
+        dst[0] = (uint8_t)period;
+        dst[1] = keepmask;
+        memcpy(dst + 2u, templ, 8u);
+
+        if (zpse_flat_decode((uint8_t)ZPSE_FLAT_SUBLELANE, 0u, dst, len,
+                             scratch, n) == ZPSE_OK &&
+            memcmp(scratch, in, n) == 0) {
+            return len;
+        }
+    }
+    return 0u;
+}
+
+/* The one page path. A checksum request never reaches here: the 16-byte
+ * FLAT/token headers have no field for a payload CRC, so those callers stay
+ * on the long-header path in zpse_block_encode. */
+static int zpse_block_write_flat(ZpseEncoder *e, const uint8_t *in, uint32_t n,
+                                 uint32_t seq, int is_last,
+                                 uint8_t *out, uint32_t out_cap)
+{
+    ZpsePageInfo pi = { 0 };
+    ZpseBlockHeader h;
+    uint8_t scratch[ZPSE_BLOCK_SHORT_MAX];
+    /* Build the payload off-buffer first. The builders can emit up to n
+     * bytes before we know the chosen form's length, so writing them into
+     * `out + 16` would smash a caller buffer whose out_cap is in [16, 16+n).
+     * The public one-shot API passes out_cap straight through, so that case
+     * is reachable; stage here and copy only after the capacity check. */
+    uint8_t payload[ZPSE_BLOCK_SHORT_MAX];
+    uint8_t codec = (uint8_t)ZPSE_FLAT_RAW;
+    uint8_t param = 0u;
+    uint32_t plen = n;
+    uint32_t total;
+    int cls;
+
+    if (out_cap < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_OUTPUT_OVERFLOW;
+    }
+    cls = zpse_page_classify(in, n, &pi);
+    if ((cls == (int)ZPSE_PAGE_ZERO || cls == (int)ZPSE_PAGE_ONE_VALUE) &&
+        zpse_segment_plane_is_const(in, n)) {
+        return zpse_block_write_token(e, in, n, seq, is_last, out, out_cap);
+    }
+    if (cls == (int)ZPSE_PAGE_LOW_ALPHA && pi.nalpha != 0u) {
+        uint32_t p;
+
+        if (pi.nalpha <= 4u) {
+            p = zpse_flat_build_bit2(&pi, in, n, payload);
+            if (p < n &&
+                zpse_flat_decode((uint8_t)ZPSE_FLAT_BIT2,
+                                 (uint8_t)(pi.nalpha - 1u), payload, p,
+                                 scratch, n) == ZPSE_OK &&
+                memcmp(scratch, in, n) == 0) {
+                codec = (uint8_t)ZPSE_FLAT_BIT2;
+                param = (uint8_t)(pi.nalpha - 1u);
+                plen = p;
+            }
+        } else if (pi.nalpha <= 16u) {
+            p = zpse_flat_build_nibble4(&pi, in, n, payload);
+            if (p < n &&
+                zpse_flat_decode((uint8_t)ZPSE_FLAT_NIBBLE4,
+                                 (uint8_t)(pi.nalpha - 1u), payload, p,
+                                 scratch, n) == ZPSE_OK &&
+                memcmp(scratch, in, n) == 0) {
+                codec = (uint8_t)ZPSE_FLAT_NIBBLE4;
+                param = (uint8_t)(pi.nalpha - 1u);
+                plen = p;
+            }
+        }
+    } else if (cls == (int)ZPSE_PAGE_POINTER) {
+        uint32_t p = zpse_flat_build_sublane(in, n, &pi, payload, scratch);
+
+        if (p != 0u) {
+            codec = (uint8_t)ZPSE_FLAT_SUBLELANE;
+            plen = p;
+        }
+    }
+    if (codec == (uint8_t)ZPSE_FLAT_RAW) {
+        /* FLAT's four codecs cover constant, low-alpha and pointer pages.
+         * An ASCII or generic page is often richly compressible by the LZ /
+         * transform / tile ladder, which a raw FLAT envelope would throw
+         * away (a text page drops from ~2.4:1 to 1.0:1). Return 0 to let
+         * zpse_block_encode run that ladder instead. Only pages FLAT can
+         * actually pack get the one-pass SIMD decode. */
+        return 0;
+    }
+    total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT + plen;
+    if (total > out_cap) {
+        return ZPSE_OUTPUT_OVERFLOW;
+    }
+    memcpy(out + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT, payload, plen);
+    memset(&h, 0, sizeof h);
+    h.sync = ZPSE_BLOCK_SYNC_FLAT;
+    h.block_flags = (uint8_t)(ZPSE_B_RESET | (is_last ? ZPSE_B_LAST : 0u));
+    h.uncompressed_size = n;
+    h.compressed_block_size = total;
+    h.transform_id = codec;
+    h.transform_meta_size = param;
+    h.block_sequence_number = seq;
+    zpse_block_header_serialize_flat(out, &h);
+    zpse_block_hist_set(e, out, total);
+    return (int)total;
+}
+
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                       uint32_t seq, int is_last,
                       uint8_t *out, uint32_t out_cap)
@@ -3704,16 +4073,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 
     /* ZPSE_ENC_LZ_FAST: the whole decision is the match finder. One pass
      * writes the fast LZ form, and a block that pass cannot beat a verbatim
-     * copy on goes RAW. No probe, no candidate list, no trial -- which is the
-     * point: this is the option that exists to spend a block's encode budget
-     * on one LZ parse instead of on choosing a shape. */
+     * copy on goes RAW. No probe, no candidate list, no trial -- the point
+     * is to spend the block's encode budget on one LZ parse. */
     if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u && e->lz != 0) {
-        /* The decoded CRC is only read by a decoder that sees the block's
-         * CRC flag, which is the checksum option. Computing it regardless
-         * was a whole extra pass over every 64 KiB block -- a quarter of
-         * this form's encode -- to fill a field nothing would look at. The
-         * general path below has always left it 0 in this case; this one
-         * now does the same. */
         uint32_t f_crc = ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
                              ? zpse_crc32c(in, n)
                              : 0u;
@@ -3758,6 +4120,23 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
 
+    /* FLAT is a one-pass SIMD fast path for the page shapes it can pack:
+     * constants (a 16-byte token), low-alphabet pages (NIBBLE4/BIT2) and
+     * pointer lanes (SUBLANE). The writer returns 0 for an ASCII or generic
+     * page it cannot pack better than RAW; those fall through to the full
+     * ladder below, which keeps their ratio (a raw FLAT envelope would
+     * throw away most of a text page's compression). A checksum request
+     * has nowhere to live in a 16-byte FLAT/token header, so it also uses
+     * the ladder. None of the old page-option bits affects FLAT. */
+    if (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+        (e->enc_flags & ZPSE_ENC_CHECKSUM) == 0u) {
+        int frc = zpse_block_write_flat(e, in, n, seq, is_last, out, out_cap);
+
+        if (frc != 0) {
+            return frc;
+        }
+    }
+
     /* Trial-level noise probe threshold: a trial whose only way to win is
      * the RAW envelope is abandoned once it has covered this many input
      * bytes without one tile paying for itself (zpse_segment_encode,
@@ -3765,20 +4144,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * only for blocks big enough for either to be worth measuring -- the
      * same 8 KiB gate the prescreen proxy uses -- so small blocks keep
      * exactly the trial structure they have always had. */
-    /* A page under ZPSE_ENC_PAGE_FAST has one trial and no sweep behind it,
-     * so this is the only thing that can stop that trial on a page that is
-     * noise: without it, a 4 KiB page that ends RAW pays all sixteen noise
-     * tiles (about 5.9 us) to learn what the first four already said. The
-     * abort is armed only while beating the RAW envelope is the trial's only
-     * way to win, and a page that aborts goes RAW exactly as it would have
-     * at the end, so it can only remove work -- unless a page that is noise
-     * at the front compresses later, which is why this is measured rather
-     * than assumed (see the PAGE_FAST table's bytes). */
-    flat_min = (n >= 8192u ||
-                ((e->enc_flags & ZPSE_ENC_PAGE_FAST) != 0u &&
-                 n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX))
-                   ? (n / ZPSE_FLAT_MIN_DIV)
-                   : 0u;
+    flat_min = (n >= 8192u) ? (n / ZPSE_FLAT_MIN_DIV) : 0u;
     if (flat_min != 0u && flat_min < 1024u)
         flat_min = 1024u;
 
@@ -4148,36 +4514,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_FLAT_PRICE
 #define ZPSE_FLAT_PRICE 1
 #endif
-    /* ZPSE_ENC_PAGE_FAST: one shape, no decision.
-     *
-     * The list above is the sweep's menu; this option asks for its first line
-     * and nothing else. The identity is entry 0 and is always built, so
-     * cutting the list to one skips the pricing pass outright (it needs
-     * ncand > 1), and with it the attempt-order sample, the compaction and
-     * the trial cap -- every decision the encoder makes about a page, for the
-     * one shape a cheap rung writes anyway. Over the dump corpus at 4 KiB,
-     * levels 1 and 2 write no LZ form at all (0.0% of their bytes) and the
-     * pricing pass is 68% of their cycles, so paying it to choose between
-     * tile shapes is the trade a caller who wants the rate should not make.
-     *
-     * Nothing about the format changes: the identity is a shape the sweep
-     * could have chosen, so the header and the decoder are the same, and a
-     * page the identity cannot beat a verbatim copy on still goes RAW. What
-     * it gives up is the predictors -- on the Python heap's pages a width-16
-     * transpose is 16.2% of the bytes at level 1 -- which is why it is an
-     * option and not a level.
-     *
-     * The four LZ stages further down are decisions as well, so they too are
-     * declined for a page under this flag (page_fast_page below). Without
-     * that, levels 5 to 9 still offered the token and fast LZ forms and wrote
-     * a different page than the cheap rungs did -- 75,218,131 bytes against
-     * 104,827,267 on the library dump -- while claiming one shape. */    int page_fast_page = 0;
-
-    if ((e->enc_flags & ZPSE_ENC_PAGE_FAST) != 0u &&
-        n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
-        ncand = 1;
-        page_fast_page = 1;
-    }
     if (ncand > 1 && n >= ZPSE_PRICE_MIN_N) {
         uint32_t ex[ZPSE_MAX_CAND];
         uint32_t pc[ZPSE_MAX_CAND];
@@ -4880,7 +5216,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * the trial was going to produce -- not a guess. A block whose trial
      * could deviate from zpse_block_ascii_total never reaches this code
      * (the gate clears, or it is not the identity-only shape). */
-    if (!page_fast_page && e->ascii_gate != 0u && ncand == 1) {
+    if (e->ascii_gate != 0u && ncand == 1) {
         uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
         uint32_t atotal = zpse_block_ascii_total(n);
         uint32_t lz_floor = (uint32_t)ZPSE_BLOCK_HEADER_SIZE +
@@ -4926,9 +5262,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 }
                 if (rc == ZPSE_OK &&
                     zpse_block_lz_wins(n, lz_cmds, lz_total, 1, atotal,
-                                       lz_speed,
-                                       zpse_block_lz_decode_first(
-                                           e->enc_flags))) {
+                                       lz_speed)) {
                     /* ---- The gate's total is arithmetic, so the trial is
                      * not needed to settle it ---------------------------
                      *
@@ -5059,7 +5393,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * this was accepted under (no case may grow by more than 1/64 of its
      * input) rather than the absolute "no case grows" it used to. */
     if (!direct_out && !lz_done && e->lz != 0 && ncand > 0 &&
-        !zpse_block_lz_decode_first(e->enc_flags) &&
         n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
@@ -5102,8 +5435,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (lrc == ZPSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
             lz_total <= out_cap && lz_total >= n / 64u &&
             zpse_block_lz_wins(n, lz_cmds, lz_total, 0, 0u,
-                               e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
-                               zpse_block_lz_decode_first(e->enc_flags))) {
+                               e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
             memcpy(out, e->cand, lz_total);
             lz_total = zpse_block_shrink_page(out, n, lz_total);
             zpse_block_hist_set(e, out, lz_total);
@@ -5169,19 +5501,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                     meta_lens[i], is_last, seq, tdst, tcap,
                                     &t, &budget_hit, have_best, best_total,
-                                    flat_min,
-                                    page_fast_page
-                                        ? (unsigned)ZPSE_PAGE_NOISE_POINTS
-                                        : 16u);
+                                    flat_min, 16u);
             zpse_block_trial_cycles += blk_rdtsc() - t_cycle;
         }
 #else
         rc = zpse_block_try_one(e, in, n, in_crc, tids[i], scounts[i], mb,
                                 meta_lens[i], is_last, seq, tdst, tcap, &t,
                                 &budget_hit, have_best, best_total, flat_min,
-                                page_fast_page
-                                    ? (unsigned)ZPSE_PAGE_NOISE_POINTS
-                                    : 16u);
+                                16u);
 #endif
 #if defined(ZPSE_TRACE_TRIALS)
         fprintf(stderr, "  trial oi=%d tid=%u rc=%d t=%u haven=%d bt=%u\n",
@@ -5414,7 +5741,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * text), and what they will trade for it is the level's acceleration
      * factor (see ZPSE_LZ_ACCEL_*): the match finder is a full pass over the
      * block, so it is the most expensive candidate in the sweep. */
-    if (!page_fast_page && !lz_done &&
+    if (!lz_done &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         e->lz != 0) {
@@ -5522,9 +5849,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * came from. */
             if (rc == ZPSE_OK &&
                 zpse_block_lz_wins(n, lz_cmds, lz_total, have_best,
-                                   best_total, lz_speed,
-                                   zpse_block_lz_decode_first(
-                                       e->enc_flags))) {
+                                   best_total, lz_speed)) {
                 if (direct_out) {
                     /* In direct_out mode, `out` is the caller's buffer with
                      * capacity `tcap` (= out_cap). `lz_total` can be up to
@@ -5569,7 +5894,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * points -- a full point of ratio -- for 2% of encode, which a build that
      * changes nothing also spends. The body it compresses is already a tile
      * stream, so the finder is fast on it and there is no pass to save. */
-    if (!page_fast_page && !direct_out && have_best && e->lz != 0 &&
+    if (!direct_out && have_best && e->lz != 0 &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u + 64u) &&
@@ -5605,19 +5930,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #endif
             uint32_t tot = (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u) + pl;
 
-            /* Same decode-first rule as the pure LZ forms: the tile body is
-             * read through a match finder before the reconstruction, so a
-             * decode-first caller wants it only when it pays well. Pricing
-             * the pass by the payload's share of the block instead was tried
-             * (`pl <= n / 8`): it refused wraps that save a third of a block
-             * and cost 1.8-3.1% of the frame on nci, xml and dickens for no
-             * decode time this host could measure, so the margin stayed. See
-             * docs/HISTORY.md. */
-            uint32_t tdiv = zpse_block_lz_decode_first(e->enc_flags)
-                                ? (uint32_t)ZPSE_DECODE_FAST_DIV
-                                : (uint32_t)ZPSE_LZ_TILE_DIV;
-
-            if (pl != 0u && tot + tot / tdiv <= best_total &&
+            /* The tile body is read through a match finder before the
+             * reconstruction, so a wrap has to pay for the pass: 1/32 of the
+             * tile stream. Pricing it by the payload's share of the block
+             * instead was tried (`pl <= n / 8`): it refused wraps that save a
+             * third of a block and cost 1.8-3.1% of the frame on nci, xml and
+             * dickens for no decode time this host could measure, so the
+             * margin stayed. See docs/HISTORY.md. */
+            if (pl != 0u && tot + tot / (uint32_t)ZPSE_LZ_TILE_DIV <=
+                                best_total &&
                 tot <= out_cap) {
                 wh.block_flags = (uint8_t)((wh.block_flags &
                                             ~(uint8_t)(ZPSE_B_RAW |
@@ -5721,7 +6042,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #ifndef ZPSE_LZ2_MIN_LEVEL
 #define ZPSE_LZ2_MIN_LEVEL ZPSE_ENC_SPEED_LZ_MIN
 #endif
-    if (!page_fast_page && have_best && e->lz != 0 &&
+    if (have_best && e->lz != 0 &&
         zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
             (uint32_t)ZPSE_LZ2_MIN_LEVEL &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
@@ -5761,9 +6082,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                (uint32_t)ZPSE_E_SZ_CAND, &t2, &cmds2) ==
                 ZPSE_OK &&
             t2 < best_total &&
-            (!zpse_block_lz_decode_first(e->enc_flags) ||
-             best_total - t2 >=
-                 best_total / zpse_block_lz_win_div(e->enc_flags) + 1u) &&
             (!direct_out || t2 <= out_cap)) {
             if (direct_out) {
                 memcpy(out, e->cand, t2);
@@ -5798,9 +6116,7 @@ lz2_done:
      * has nowhere to put them. The RAW form is not wrapped either: it is the
      * fallback for bytes that did not compress, and coding it would make a
      * block that had already lost try again with a pass that cannot win. */
-    if (!page_fast_page && have_best &&
-        !zpse_block_lz_decode_first(e->enc_flags) &&
-        zpse_block_huf_level(e->enc_flags) &&
+    if (have_best && zpse_block_huf_level(e->enc_flags) &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + ZPSE_HUF_MIN_PAYLOAD)) {
         uint8_t *win = direct_out ? out : e->best;
         ZpseBlockHeader wh;
@@ -6151,6 +6467,59 @@ int zpse_block_retag(uint8_t *block, uint32_t block_len,
     }
     if (block_len < hsz) {
         return ZPSE_TRUNCATED;
+    }
+    if (zpse_load_u16le(block) == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
+        /* A one-value token is all header, and the seq/last bits live at the
+         * same offsets as a page's short header. Retag in place and refresh
+         * the 16-bit CRC over the first 14 bytes, exactly as the short form
+         * serialiser does. */
+        uint8_t flags = block[2];
+
+        if (block[4] != 1u || block[5] != 0u || hsz != 16u ||
+            zpse_load_u16le(block + 8) != 16u) {
+            return ZPSE_BAD_HEADER;
+        }
+        if ((uint32_t)(zpse_crc32c(block, 14) & UINT32_C(0xFFFF)) !=
+            (uint32_t)zpse_load_u16le(block + 14)) {
+            return ZPSE_BAD_HEADER_CRC;
+        }
+        if ((zpse_load_u32le(block + 10) == seq) &&
+            (((flags & ZPSE_B_LAST) != 0u) ? 1 : 0) == (is_last ? 1 : 0)) {
+            return ZPSE_OK;
+        }
+        zpse_store_u32le(block + 10, seq);
+        block[2] = (uint8_t)(is_last ? (flags | ZPSE_B_LAST)
+                                     : (flags & ~ZPSE_B_LAST));
+        zpse_store_u16le(block + 14,
+                         (uint16_t)(zpse_crc32c(block, 14) & UINT32_C(0xFFFF)));
+        return ZPSE_OK;
+    }
+    if (zpse_load_u16le(block) == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        ZpseBlockHeader fh;
+        uint8_t flags;
+        int last;
+        int frc;
+
+        frc = zpse_block_header_parse_flat(&fh, block, block_len);
+        if (frc != ZPSE_OK) {
+            return frc;
+        }
+        if (fh.compressed_block_size != block_len) {
+            return ZPSE_BAD_HEADER;
+        }
+        flags = fh.block_flags;
+        last = (is_last != 0) ? 1 : 0;
+        if (fh.block_sequence_number == seq &&
+            (((flags & ZPSE_B_LAST) != 0u) ? 1 : 0) == last) {
+            return ZPSE_OK;
+        }
+        fh.block_sequence_number = seq;
+        fh.block_flags = (uint8_t)(last != 0 ? (flags | ZPSE_B_LAST)
+                                             : (flags & ~ZPSE_B_LAST));
+        /* The flat serialiser writes seq and LAST and recomputes the 16-bit
+         * CRC over the first 14 bytes; the codec, param and sizes stay. */
+        zpse_block_header_serialize_flat(block, &fh);
+        return ZPSE_OK;
     }
     /* The parser is the validator: magic/version/flags/size/transform checks
      * and the header CRC, so a block that has been corrupted, or that is not a
