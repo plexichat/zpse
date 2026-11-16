@@ -1,4 +1,5 @@
 #include "zpse/vector.h"
+#include "zpse/hot.h"     /* ZPSE_AVX2_ABI_OK */
 #include "zpse/status.h"
 
 /* MSVC spells the cache access path out in vector.h without atomics (it
@@ -44,19 +45,24 @@
 #if defined(__GNUC__) && ZPSE_HAVE_X86 && !defined(_MSC_VER)
 #define ZPSE_TARGET_SSE2 __attribute__((target("sse2")))
 #define ZPSE_TARGET_SSSE3 __attribute__((target("ssse3")))
+#define ZPSE_TARGET_AVX2 __attribute__((target("avx2")))
 #else
 #define ZPSE_TARGET_SSE2
 #define ZPSE_TARGET_SSSE3
+#define ZPSE_TARGET_AVX2
 #endif
 
+/* A nibble table replaces the eight-step bit loop: two lookups and an add,
+ * with no data-dependent branch. Pure C11 so the portable/SCALAR builds get
+ * the same answer as the SIMD paths. */
 static unsigned zpse_popcount8(uint8_t v)
 {
-    unsigned n = 0;
-    while (v != 0) {
-        n += (unsigned)(v & 1u);
-        v = (uint8_t)(v >> 1);
-    }
-    return n;
+    static const uint8_t bits[16] = {
+        0u, 1u, 1u, 2u, 1u, 2u, 2u, 3u,
+        1u, 2u, 2u, 3u, 2u, 3u, 3u, 4u
+    };
+
+    return (unsigned)bits[v & 0x0Fu] + (unsigned)bits[v >> 4u];
 }
 
 #if ZPSE_HAVE_X86 && !defined(_MSC_VER) && !defined(ZPSE_FORCE_SCALAR)
@@ -423,23 +429,26 @@ static int zpse_compact8_scalar(uint8_t *dst, const uint8_t data[8],
 
 #if ZPSE_HAVE_X86
 /* pshufb LUT path: 8-B entry at lut + mask*8; 0x80 entries zero the
- * corresponding output byte, of which only the first popcount(mask)
- * bytes are stored, so padding is ignored per scalar semantics. */
+ * corresponding output byte, so the first popcount(mask) bytes are the
+ * compacted data and the padding behind them is zero. */
 static ZPSE_TARGET_SSSE3 int zpse_compact8_pshufb(
     uint8_t *dst, const uint8_t data[8], uint8_t mask8, const uint8_t *lut_2k)
 {
     __m128i d;
     __m128i sh;
     __m128i r;
-    uint8_t tmp[16];
     int n;
     d = _mm_loadl_epi64((const __m128i *)(const void *)data);
     sh = _mm_loadl_epi64(
         (const __m128i *)(const void *)(lut_2k + (size_t)mask8 * 8u));
     r = _mm_shuffle_epi8(d, sh);
-    _mm_storeu_si128((__m128i *)(void *)tmp, r);
+    /* The LUT puts the compacted bytes at output positions 0..n-1 and zeros
+     * the rest, so the low 64 bits of the shuffled result are exactly the n
+     * bytes the scalar path writes. Store them straight to dst: no 16-byte
+     * temporary and no memcpy. At n < 8 the trailing bytes written here are
+     * zeros that the caller's length (n) excludes. */
+    _mm_storel_epi64((__m128i *)(void *)dst, r);
     n = (int)zpse_popcount8(mask8);
-    memcpy(dst, tmp, (size_t)n);
     return n;
 }
 #endif
