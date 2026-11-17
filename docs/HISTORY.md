@@ -1540,3 +1540,37 @@ has a faster mixed-corpus decode loop (3.8 GB/s). The retired `PAGE_FAST`,
 `LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags were the old way of buying page
 rate with a cruder shape decision; folding them into the level ladder removes
 four near-identical modes without changing what any level writes.
+
+
+## What a wave of small speedups bought on the ladder
+
+A broad audit of the encoder hot paths produced a long list of individually
+sound, byte-identical changes: precomputed suffix minima and pricing floors in
+the trial sweep, a palette LUT in the FLAT low-alpha packers, `restrict` and
+branch hints in the LZ finders, AVX2 match extension there, staged deltas in
+the mode-4 residual packer, precomputed Huffman code tables, a cheaper CRC tail,
+a single header parse in the frame loop, and deterministic static block
+assignment in the multithreaded encoder. Every change kept the compressed
+stream identical -- the def/scalar/swap digests and the no-growth size gate
+all still pass.
+
+Measured together on the pinned non-zero page corpus, they did **not** move
+the rate: level-6 encode and decode stayed within the roughly 10% run-to-run
+noise of the harness (median 164 -> 162 MB/s encode, 1558 -> 1568 MB/s
+decode). This is the honest result, and it settles the question of where the
+remaining speed has to come from: the cost is not repeated small work in the
+decision loop, it is the match finder's dependent hash chain on text and the
+ladder's mandatory full passes on content pages. Micro-optimizing the wiring
+around those paths is dominated by the noise floor.
+
+The one lever that did move a number is a build-time experiment,
+`ZPSE_LZ_SCREEN_TEXT_GATE`, which is off by default. Enabling it lengthens the
+LZ decision sample to 4 KiB on ASCII-gated 64 KiB blocks. That sample was
+measured earlier at +0.13 ratio points on Silesia but was rejected because it
+hurt columnar data; the ASCII gate now separates the two. With the gate on,
+Silesia level 6 goes from 2.08:1 to 2.14:1 (dickens 1.19 -> 1.63, webster 2.10
+-> 2.13), ladder monotonicity still holds and no size-gate case grows. The
+cost is encode rate: 408 -> 294 MB/s on Silesia, because more blocks reach the
+finder. It stays off by default because the shipped posture favours encode
+rate; it is available for a caller whose workload is text and whose budget is
+decode or storage rather than encode.
