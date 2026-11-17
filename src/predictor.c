@@ -38,21 +38,9 @@ void zpse_lane_reset_hist(ZpseLaneState *s, uint8_t initial_literal)
 /* The tables one predictor reads, in the reset state: the same values
  * zpse_lane_reset_for writes for that predictor, and nothing for the
  * predictors that read no table at all. */
-/* An ORDER2 entry is {value, confidence, generation}: the three bytes
- * a prediction needs, in one cache line (two tables meant two misses a
- * byte, one of them to a line that held nothing the other wanted). */
-static inline int zpse_o2_learned(const uint8_t *tab, size_t off,
-                                   uint16_t gen)
-{
-    return (uint16_t)tab[off + 2u] == (uint16_t)(gen & 0xFFu) &&
-           (uint16_t)tab[off + 3u] == (uint16_t)(gen >> 8);
-}
-
-static inline void zpse_o2_stamp(uint8_t *tab, size_t off, uint16_t gen)
-{
-    tab[off + 2u] = (uint8_t)(gen & 0xFFu);
-    tab[off + 3u] = (uint8_t)(gen >> 8);
-}
+/* The ORDER2 {value, confidence, generation} helpers that used to sit here
+ * died with zpse_predict_block/zpse_predict_update (no callers). The entry
+ * layout they encoded is documented in predictor.h on ZpseLaneState::o2. */
 
 void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
                           uint8_t predictor_id)
@@ -87,197 +75,32 @@ void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal)
 ZPSE_HOT void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
                            uint8_t predictor_id)
 {
-    zpse_lane_reset_hist(s, initial_literal);
-    zpse_lane_seed_table(s, initial_literal, predictor_id);
-}
-
-static uint32_t zpse_stride_of(uint8_t predictor_id)
-{
-    switch (predictor_id) {
-    case ZPSE_P_STRIDE_1:
-        return 1u;
-    case ZPSE_P_STRIDE_2:
-        return 2u;
-    case ZPSE_P_STRIDE_3:
-        return 3u;
-    case ZPSE_P_STRIDE_4:
-        return 4u;
-    default:
-        return 8u;
-    }
-}
-
-int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
-                       uint8_t constant_C, const uint8_t *seg_base,
-                       uint32_t seg_pos, uint8_t initial_literal,
-                       uint8_t *pred_out, uint16_t nt)
-{
-    uint16_t p;
-
-    if (s == NULL || pred_out == NULL) {
-        return ZPSE_BAD_ARG;
-    }
-    if (nt == 0u || nt > 256u) {
-        return ZPSE_BAD_ARG;
-    }
-    if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3) {
-        return ZPSE_BAD_PREDICTOR;
-    }
-
-    switch (predictor_id) {
-    case ZPSE_P_CONST_ZERO: /* 0 */
-        for (p = 0; p < nt; p++) {
-            pred_out[p] = 0u;
-        }
-        break;
-
-    case ZPSE_P_LANE_PREVIOUS: /* 1 */
-        for (p = 0; p < nt; p++) {
-            pred_out[p] = s->last[(size_t)p & 7u];
-        }
-        break;
-
-    case ZPSE_P_LANE_DELTA: /* 2 */
-        for (p = 0; p < nt; p++) {
-            unsigned last = s->last[(size_t)p & 7u];
-            unsigned prev = s->second_last[(size_t)p & 7u];
-            pred_out[p] = (uint8_t)((2u * last - prev) & 0xFFu);
-        }
-        break;
-
-    case ZPSE_P_ORDER1: /* 3 */
-        if (s->order1 == NULL) {
-            return ZPSE_BAD_ARG;
-        }
-        for (p = 0; p < nt; p++) {
-            size_t lane = (size_t)p & 7u;
-            pred_out[p] = s->order1[lane * 256u + (size_t)s->last[lane]];
-        }
-        break;
-
-    case ZPSE_P_ORDER2: /* 4 */
-        if (s->o2 == NULL) {
-            return ZPSE_BAD_ARG;
-        }
-        /* Predicting O2 prepares the table (memset + generation bump) so
-         * the lane state must be mutable. The caller passes a non-const
-         * lane for this predictor family. */
-        zpse_lane_o2_use(s);
-        for (p = 0; p < nt; p++) {
-            size_t lane = (size_t)p & 7u;
-            uint16_t idx = zpse_order2_index(s->second_last[lane],
-                                            s->last[lane]);
-            size_t off = (lane * 4096u + (size_t)idx) * 4u;
-
-            /* An entry nobody has learned predicts the initial literal.
-             * "Learned" means written by this tile: the generation says
-             * so. */
-            pred_out[p] = zpse_o2_learned(s->o2, off, s->gen)
-                              ? s->o2[off]
-                              : initial_literal;
-        }
-        break;
-
-    case ZPSE_P_STRIDE_1: /* 5 */
-    case ZPSE_P_STRIDE_2: /* 6 */
-    case ZPSE_P_STRIDE_4: /* 7 */
-    case ZPSE_P_STRIDE_8: /* 8 */
-    case ZPSE_P_STRIDE_3: /* 11 */
-        {
-            uint32_t stride = zpse_stride_of(predictor_id);
-            if (seg_pos + (uint32_t)nt > stride && seg_base == NULL) {
-                return ZPSE_BAD_ARG;
-            }
-            for (p = 0; p < nt; p++) {
-                /* Segment-absolute addressing: the stream
-                 * is segment-scoped, so the guard is on seg_pos + p.
-                 * NOTE: batch form is still only exact for stateless
-                 * predictors; tile reconstruction uses the online loop
-                 * in tile.c. */
-                uint32_t abs_pos = seg_pos + (uint32_t)p;
-                if (abs_pos < stride) {
-                    pred_out[p] = initial_literal;
-                } else {
-                    uint32_t idx = abs_pos - stride;
-                    pred_out[p] = seg_base[idx];
-                }
-            }
-        }
-        break;
-
-    case ZPSE_P_TILE_CONSTANT: /* 9 */
-        for (p = 0; p < nt; p++) {
-            pred_out[p] = constant_C;
-        }
-        break;
-
-    default: /* 10 LANE_AVERAGE */
-        for (p = 0; p < nt; p++) {
-            unsigned last = s->last[(size_t)p & 7u];
-            unsigned prev = s->second_last[(size_t)p & 7u];
-            pred_out[p] = (uint8_t)((last + prev + 1u) >> 1);
-        }
-        break;
-    }
-
-    return ZPSE_OK;
-}
-
-ZPSE_HOT void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,
-                         const uint8_t *actual, const uint8_t *pred,
-                         uint16_t nt)
-{
-    uint16_t p;
-
-    if (s == NULL || actual == NULL || nt == 0u || nt > 256u) {
+    if (s == NULL) {
         return;
     }
-
-    for (p = 0; p < nt; p++) {
-        size_t lane = (size_t)p & 7u;
-        uint8_t old_last = s->last[lane];
-        uint8_t old_second = s->second_last[lane];
-        uint8_t x = actual[p];
-
-        /* History update applies to every predictor, in position order. */
-        s->second_last[lane] = old_last;
-        s->last[lane] = x;
-
-        if (predictor_id == ZPSE_P_ORDER1) { /* 3 */
-            if (s->order1 != NULL) {
-                s->order1[lane * 256u + (size_t)old_last] = x;
-            }
-        } else if (predictor_id == ZPSE_P_ORDER2) { /* 4 */
-            uint16_t idx;
-
-            zpse_lane_o2_use(s);
-            idx = zpse_order2_index(old_second, old_last);
-            size_t off = (lane * 4096u + (size_t)idx) * 4u;
-            uint8_t *val;
-            uint8_t *conf;
-
-            if (s->o2 == NULL) {
-                /* No table to learn into: the caller has the
-                 * predictions and nothing else to update. */
-                (void)pred;
-                continue;
-            }
-            val = &s->o2[off];
-            conf = &s->o2[off + 1u];
-            if (!zpse_o2_learned(s->o2, off, s->gen)) {
-                /* Nobody has learned this entry, so its prediction was
-                 * the initial literal; whether the byte matched it or
-                 * not, the value now learned is the byte. */
-                *val = x;
-                *conf = 1u;
-                zpse_o2_stamp(s->o2, off, s->gen);
-            } else if (x == *val) {
-                if (*conf < 255u) {
-                    (*conf)++;
-                }
-            } else {
-                (*conf)--;
-            }
-        }
+    /* last[] and second_last[] are adjacent in ZpseLaneState, so one
+     * 16-byte memset writes the whole entry state. Inlined from
+     * zpse_lane_reset_hist: that is a plain O2 function and this one is
+     * ZPSE_HOT/O3, so gcc will not inline across the mismatch and every
+     * classify was paying the call. */
+    memset(s->last, initial_literal, 16u);
+    /* Only ORDER1 (id 3) seeds a table; for every other id
+     * zpse_lane_seed_table is a no-op. The nine ids the encoder classifies
+     * (0,1,2,5,6,7,8,10,11 -- seg_screen_pred[]) read no table at all, so
+     * this guard keeps their path call-free. The decoder can still pass 3
+     * (ORDER1 from the stream), which is why the call is guarded, not gone. */
+    if (predictor_id == (uint8_t)ZPSE_P_ORDER1) {
+        zpse_lane_seed_table(s, initial_literal, predictor_id);
     }
 }
+
+/* zpse_stride_of died with zpse_predict_block below (no callers). */
+
+/* zpse_predict_block removed: grep across src/ and tests/ found no callers.
+ * It was the scalar batch (snapshot-semantics) reference generator; tile
+ * reconstruction uses the online loop in tile.c and bit-exact SIMD formulas
+ * live in vector.h. */
+
+/* zpse_predict_update removed: grep across src/ and tests/ found no callers.
+ * It was the ORDER1/ORDER2 table learner for the batch generator; the live
+ * online update loop is in tile.c. */

@@ -99,27 +99,9 @@ static inline uint16_t zpse_order2_index(uint8_t second_last, uint8_t last) {
                        (uint16_t)((uint16_t)last * 17u)) & 0xFFFu);
 }
 
-/* Generate Nt predictions into pred_out (scalar reference). seg_base /
- * seg_pos_backing support STRIDE predictors: seg_base points at the
- * decoded transformed stream for this segment, seg_pos = count of bytes
- * already decoded in this segment before this tile. For non-stride
- * predictors these may be NULL/0. constant_C used iff predictor == 9.
- *
- * Snapshot semantics: predictions for all p in [0,Nt) derive from the
- * ENTRY state (no intra-tile chaining). Exact only for stateless
- * predictors (CONST_ZERO, TILE_CONSTANT, and STRIDE when its backing
- * bytes are already final). Stateful predictors (1-4, 10) require the
- * online predict/update loop in tile.c for tile reconstruction; do NOT
- * use this as a tile reference generator for those IDs. */
-int zpse_predict_block(ZpseLaneState *s, uint8_t predictor_id,
-                       uint8_t constant_C, const uint8_t *seg_base,
-                       uint32_t seg_pos, uint8_t initial_literal,
-                       uint8_t *pred_out, uint16_t nt);
-
-/* Advance histories + ORDER1/ORDER2 tables in position order given the
- * actual transformed bytes and their predictions. */
-void zpse_predict_update(ZpseLaneState *s, uint8_t predictor_id,
-                         const uint8_t *actual, const uint8_t *pred,
-                         uint16_t nt);
+/* zpse_predict_block and zpse_predict_update were removed: no callers in
+ * src/ or tests/. The snapshot-semantics note worth keeping is that
+ * stateful predictors (1-4, 10) require the online predict/update loop in
+ * tile.c for tile reconstruction; bit-exact SIMD formulas live in vector.h. */
 
 #endif /* ZPSE_PREDICTOR_H */
