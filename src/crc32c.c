@@ -737,7 +737,7 @@ static uint32_t zpse_crc32c_shift_bytes(uint32_t c, uint64_t len)
 
 #if ZPSE_CRC32C_HAVE_HW
 
-/* One 64-bit chain, 8 bytes per step then a byte tail.  Returns the
+/* One 64-bit chain, 8 bytes per step then a 4/2/1-byte tail. Returns the
  * running (pre-xorout) value, exactly as the hardware path always has.
  * Inlined into its (same-target) callers: a page's 14-byte header CRC used
  * to pay for a second sse4.2-tagged call on top of the dispatch call, which
@@ -753,6 +753,26 @@ zpse_crc32c_hw_chain(uint32_t crc, const uint8_t *p, size_t len)
                                       (unsigned long long)v);
         p += 8;
         len -= 8u;
+    }
+    /* Reflected CRC32-C consumes a word's bytes least-significant first,
+     * so on little-endian x86-64 a u32/u16 load stepped through crc32_u32/
+     * crc32_u16 is the same byte order as the equivalent run of crc32_u8
+     * steps -- just fewer serial chain steps. A 14-byte header becomes
+     * u64 + u32 + u16 instead of u64 + six u8. Unaligned loads go through
+     * memcpy, as in the u64 loop above. */
+    while (len >= 4u) {
+        uint32_t v;
+        memcpy(&v, p, 4);
+        crc = _mm_crc32_u32(crc, v);
+        p += 4;
+        len -= 4u;
+    }
+    if (len >= 2u) {
+        uint16_t v;
+        memcpy(&v, p, 2);
+        crc = _mm_crc32_u16(crc, v);
+        p += 2;
+        len -= 2u;
     }
     while (len != 0u) {
         crc = _mm_crc32_u8(crc, *p++);
@@ -917,13 +937,64 @@ static ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_copy_hw(uint8_t *dst,
         d += 16;
         len -= 16u;
     }
+    /* Sub-16-byte tail. Run the chain here instead of calling the generic
+     * zpse_crc32c_hw(): len is already below the split threshold, so that
+     * dispatch test and the call buy nothing. u64/u32/u16 then a u8 tail
+     * consumes the same bytes in the same little-endian order as before. */
     if (len != 0u) {
         memcpy(d, s, len);
-        crc = zpse_crc32c_hw(crc, s, len);
+        while (len >= 8u) {
+            uint64_t v;
+            memcpy(&v, s, 8);
+            crc = (uint32_t)_mm_crc32_u64((unsigned long long)crc,
+                                          (unsigned long long)v);
+            s += 8;
+            len -= 8u;
+        }
+        while (len >= 4u) {
+            uint32_t v;
+            memcpy(&v, s, 4);
+            crc = _mm_crc32_u32(crc, v);
+            s += 4;
+            len -= 4u;
+        }
+        if (len >= 2u) {
+            uint16_t v;
+            memcpy(&v, s, 2);
+            crc = _mm_crc32_u16(crc, v);
+            s += 2;
+            len -= 2u;
+        }
+        while (len != 0u) {
+            crc = _mm_crc32_u8(crc, *s++);
+            len--;
+        }
     }
     return crc ^ 0xFFFFFFFFu;
 }
 #endif /* ZPSE_CRC32C_HAVE_HW */
+
+/* Dedicated 14-byte page-header CRC -- the frame encoder's hot path.
+ * Reads the cached SSE4.2 flag once and runs the chain directly, skipping
+ * the generic update() dispatch. Returns the FULL finished CRC; callers
+ * truncate to 16 bits. Bit-identical to zpse_crc32c(buf, 14) on both
+ * backends. */
+#if ZPSE_CRC32C_HAVE_HW
+/* Same target attribute as the chain it calls: the crc32 intrinsics are
+ * only legal inside an sse4.2-tagged function. */
+ZPSE_CRC32C_TARGET uint32_t zpse_crc32c_hdr14(const uint8_t *buf)
+{
+    if (zpse_crc32c_hw_present()) {
+        return zpse_crc32c_hw_chain(0xFFFFFFFFu, buf, 14u) ^ 0xFFFFFFFFu;
+    }
+    return zpse_crc32c(buf, 14u);
+}
+#else
+uint32_t zpse_crc32c_hdr14(const uint8_t *buf)
+{
+    return zpse_crc32c(buf, 14u);
+}
+#endif
 
 uint32_t zpse_crc32c_init(void)
 {

@@ -19,6 +19,11 @@ uint32_t zpse_crc32c_finish(uint32_t crc); /* xorout */
 uint32_t zpse_crc32c_update(uint32_t crc, const uint8_t *data, size_t len);
 uint32_t zpse_crc32c(const uint8_t *data, size_t len);
 
+/* Dedicated 14-byte page-header CRC (frame-encoder hot path). Returns the
+ * FULL finished CRC; callers mask to 16 bits. Bit-identical to
+ * zpse_crc32c(buf, 14) on both the hardware and software backends. */
+uint32_t zpse_crc32c_hdr14(const uint8_t *buf);
+
 /* CRC32-C of `len` copies of the byte `b`, in O(log len) matrix applies
  * instead of a pass over the data. Bit-identical to
  * zpse_crc32c() on a buffer of that shape. The decoder uses it when a
