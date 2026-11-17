@@ -1113,19 +1113,20 @@ static const uint8_t seg_pred_rank[12] = {
  *
  * `best` is the smallest miss count, and on a tie the lowest priority;
  * `second` is the same rule over the remaining eight, i.e. exactly what a
- * second scan skipping `best` would return. Both are independent of
- * seg_screen_pred's current order, so the candidate list is the same list
- * the static order produced. `second` is 0xFF only when there is no
- * screened id left, which cannot happen while seg_screen_pred has nine.
+ * second scan skipping `best` would return. `second` is 0xFF only when
+ * there is no screened id left, which cannot happen while
+ * seg_screen_pred has nine.
  *
  * One pass, not two, because the pair is the whole point: every tile the
  * encoder searches asks for both (the runner-up is the second trial) and
  * the old form walked the nine candidates twice, with a data-dependent
- * branch per candidate in each walk. The ordering here is a single
- * comparison on a packed key -- miss count above, priority below, the
- * lower key wins -- which is the same decision the two-term test made, and
- * the three ids the encoder never screens carry rank 0xFF and a 0xFFFF
- * miss count, so their keys can only lose. */
+ * branch per candidate in each walk. For the nine screened ids
+ * seg_pred_rank[seg_screen_pred[i]] == i, so priority is exactly the scan
+ * index: ordering by (miss count, priority) collapses to ordering by the
+ * miss count with ties to the lower index, which a strict `<` on ks[]
+ * already gives as i ascends. The old form packed (ks << 4) | rank into
+ * one key for the same decision without relying on that identity; while
+ * it holds, the shift and the rank load are dead work. */
 static void seg_scan_two(const uint16_t ks[12], uint8_t *best,
                          uint8_t *second)
 {
@@ -1137,15 +1138,17 @@ static void seg_scan_two(const uint16_t ks[12], uint8_t *best,
 
     for (i = 0u; i < 9u; i++) {
         uint8_t p = seg_screen_pred[i];
-        uint32_t key = ((uint32_t)ks[p] << 4) | (uint32_t)seg_pred_rank[p];
+        uint32_t k = ks[p];
 
-        if (key < k0) {
+        /* rank[seg_screen_pred[i]] == i, so a strict < on the count with
+         * ties to the lower scan index is the old packed-key decision. */
+        if (k < k0) {
             k1 = k0;
             p1 = p0;
-            k0 = key;
+            k0 = k;
             p0 = p;
-        } else if (key < k1) {
-            k1 = key;
+        } else if (k < k1) {
+            k1 = k;
             p1 = p;
         }
     }
@@ -1849,17 +1852,22 @@ static int seg_pred_miss_within(const uint8_t *a, uint16_t nt, uint8_t pred,
 
 #if ZPSE_PS_HAVE_AVX2
 /* One prediction pass over the tile for the shifted families, checking that
- * every position matches. The staging buffer is the tile.c one (16 head
- * bytes + tile + 32 pad), so each prediction is a constant-offset load:
+ * every position matches. Once sixteen plane bytes precede the tile
+ * (seg_pos >= 16; STRIDE needs them and the caller guarantees it), every
+ * operand is a constant-offset load from pb = a - 16 with no copy:
  *
- *   LANE_DELTA    2*stg[8+p] - stg[p]      (head = the entry lane state)
- *   LANE_AVERAGE  avg(stg[8+p], stg[p])
- *   STRIDE_s      stg[16+p-s]              (head = real plane bytes)
+ *   LANE_DELTA    2*a[p-8] - a[p-16]
+ *   LANE_AVERAGE  avg(a[p-8], a[p-16])
+ *   STRIDE_s      a[p-s]
  *
  * The first chunk blends its first 8 / 16 lanes with `literal`, which is
- * what the lane state holds at p < 8 / p < 16 after the per-tile reset.
- * STRIDE needs real bytes before the tile, so the caller only takes this
- * path when seg_pos >= 16. */
+ * what the lane state holds at p < 8 / p < 16 after the per-tile reset;
+ * those are exactly the lanes that would otherwise read before the tile,
+ * so using real plane bytes there instead of a literal-filled head is
+ * invisible to the verdict. A partial tile (or the segment's first tile,
+ * which has no plane bytes before it) keeps the original staging: the tail
+ * branch reads the staged tile and zero pad so bytes past the tile end
+ * cannot match. Only full tiles past the first take the copy-free path. */
 static ZPSE_PS_AVX2 int seg_shift_all_hit_avx2(const uint8_t *a, uint16_t nt,
                                                uint8_t pred, uint8_t literal,
                                                uint32_t seg_pos,
@@ -1881,29 +1889,44 @@ static ZPSE_PS_AVX2 int seg_shift_all_hit_avx2(const uint8_t *a, uint16_t nt,
                      ? 0u
                      : seg_stride_of(pred);
     uint32_t p = 0u;
+    const uint8_t *pb;
 
-    if (s != 0u) {
-        /* Real preceding plane bytes (the caller guarantees seg_pos >= 16). */
-        memcpy(stg, plane + seg_pos - 16u, 16);
+    /* pb is the base every operand load is relative to. seg_pos is a tile
+     * index times 256, so seg_pos >= 16 means a == plane + seg_pos has
+     * sixteen real plane bytes before it. A full 256-byte tile then never
+     * reaches the tail branch, so pb = a - 16 reads every full chunk straight
+     * from the plane with no per-tile copy. A partial tile still needs the
+     * staged tile and zero pad for the tail branch (and the first tile has
+     * no plane bytes before it at all), so those keep the original staging
+     * and pb = stg. */
+    if (seg_pos >= 16u && (uint32_t)nt == 256u) {
+        pb = a - 16u;
     } else {
-        memset(stg, literal, 16);
+        if (s != 0u) {
+            /* Real preceding plane bytes. */
+            memcpy(stg, plane + seg_pos - 16u, 16);
+        } else {
+            /* The encoder resets the lanes to `literal`. */
+            memset(stg, literal, 16);
+        }
+        memcpy(stg + 16, a, nt);
+        memset(stg + 16 + nt, 0, 32);
+        pb = stg;
     }
-    memcpy(stg + 16, a, nt);
-    memset(stg + 16 + nt, 0, 32);
 
     while (p + 32u <= (uint32_t)nt) {
         __m256i v = _mm256_loadu_si256(
-            (const __m256i *)(const void *)(stg + 16u + p));
+            (const __m256i *)(const void *)(pb + 16u + p));
         __m256i pv;
 
         if (s != 0u) {
             pv = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(stg + 16u + p - s));
+                (const __m256i *)(const void *)(pb + 16u + p - s));
         } else {
             __m256i h8 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(stg + 8u + p));
+                (const __m256i *)(const void *)(pb + 8u + p));
             __m256i h16 = _mm256_loadu_si256(
-                (const __m256i *)(const void *)(stg + p));
+                (const __m256i *)(const void *)(pb + p));
 
             if (p == 0u) {
                 h8 = _mm256_blendv_epi8(h8, initv, m8);
