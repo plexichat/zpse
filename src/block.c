@@ -1315,7 +1315,6 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_fill_header(&h, flags, n, total, tid, sc, meta_len, seq,
                            in_crc);
     zpse_block_header_serialize(dst, &h);
-    zpse_block_fix_header_crc(dst);
     *total_out = total;
     return ZPSE_OK;
 }
@@ -2889,6 +2888,19 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
 #ifndef ZPSE_LZ_SCREEN_PAGE_BYTES
 #define ZPSE_LZ_SCREEN_PAGE_BYTES 512u
 #endif
+/* Gated experiment: a longer LZ screen sample on ASCII text only.
+ *
+ * A 4 KiB sample took Silesia from 2.03:1 to 2.16:1 but hurt the columnar
+ * corpus (see the ZPSE_LZ_SCREEN_BYTES note above), so it is offered behind
+ * ZPSE_LZ_SCREEN_TEXT_GATE and applied only to blocks the ASCII gate accepted.
+ * OFF by default: with the flag at 0 every screen -- and every output byte --
+ * is exactly as before. */
+#ifndef ZPSE_LZ_SCREEN_TEXT_GATE
+#define ZPSE_LZ_SCREEN_TEXT_GATE 0
+#endif
+#ifndef ZPSE_LZ_SCREEN_TEXT_BYTES
+#define ZPSE_LZ_SCREEN_TEXT_BYTES 4096u
+#endif
 #ifndef ZPSE_LZ_SCREEN_DEN
 #define ZPSE_LZ_SCREEN_DEN 16u
 #endif
@@ -2961,12 +2973,25 @@ static int zpse_block_lz_sample_can_win(uint32_t lz_s, uint32_t sn,
 static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                 uint8_t tid, uint8_t sc, const uint8_t *mb,
                                 uint16_t meta_len, uint32_t speed,
-                                int have_best, uint32_t best_total)
+                                int have_best, uint32_t best_total,
+                                uint32_t cache[2])
 {
     uint32_t lvl = zpse_enc_speed(speed);
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
                       ? n
                       : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
+#if ZPSE_LZ_SCREEN_TEXT_GATE
+    /* Gated experiment (ZPSE_LZ_SCREEN_TEXT_GATE): the 4 KiB sample on text
+     * only. e->ascii_gate is set before the LZ screens run; the n >= MAX test
+     * keeps this to full blocks, so the page branch below (short blocks) and
+     * the ordinary corpus are untouched. With the flag off this whole arm is
+     * compiled out and the sample is exactly as before. */
+    if (e->ascii_gate != 0u && n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+        sn = n < (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES
+                 ? n
+                 : (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES;
+    }
+#endif
     const ZpseLevel *row = zpse_level_row(lvl);
     uint32_t num = (uint32_t)row->screen_num;
     uint32_t lz_s;
@@ -2979,6 +3004,15 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         sn = n < pb ? n : pb;
     }
 #endif
+    /* The head sample and its tile price are a pure function of (in, n, tid,
+     * sc, mb, meta_len, speed): a sample LZ encode clears every hash slot it
+     * can touch and reinitializes its output state, and the tile price is the
+     * encoder's own cost model over the same window. The full-size screen at
+     * the top of the sweep asks that exact question about slot 0 with no
+     * winner; cache[2] carries its answer here so this screen only re-asks the
+     * part that depends on the real best_total. Sentinel {0, UINT32_MAX} means
+     * no earlier screen computed it. */
+    int use_cache = (cache != 0 && cache[0] != 0u && cache[1] != UINT32_MAX);
     if (sn < ZPSE_LZ_MIN_MATCH + 1u) {
         return 1;
     }
@@ -2992,40 +3026,52 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * deeper screen accepted a block whose finder stream the tiles beat.
      * Keeping the token form here keeps every verdict where it was, so the
      * only thing the swap changes is the stream the finder writes. */
-    lz_s = zpse_lz_encode_sample(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND,
-                                 e->lz,
-                                 lvl == 1u
-                                     ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                     : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
-                                 sn);
-    if (lz_s == 0u) {
-        return 1;
-    }
-    /* The shape is priced on its head windows, so a multi-plane one is
-     * priced from the transform prefix rather than by staging the sample:
-     * the screen runs before anything else on every block, and its answer
-     * only costs a candidate's price when the block is one LZ might win. */
-    {
-        int prefix_ok = 1;
+    if (use_cache) {
+        /* The full-size screen already measured this same slot-0 shape on
+         * the same head sample. Only the second-sample question below depends
+         * on this screen's best_total, so re-ask just that part. */
+        lz_s = cache[0];
+        tile_s = cache[1];
+    } else {
+        lz_s = zpse_lz_encode_sample(in, sn, e->cand,
+                                     (uint32_t)ZPSE_E_SZ_CAND, e->lz,
+                                     lvl == 1u
+                                         ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
+                                         : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
+                                     sn);
+        if (lz_s == 0u) {
+            return 1;
+        }
+        /* The shape is priced on its head windows, so a multi-plane one is
+         * priced from the transform prefix rather than by staging the sample:
+         * the screen runs before anything else on every block, and its answer
+         * only costs a candidate's price when the block is one LZ might win. */
+        {
+            int prefix_ok = 1;
 
-        /* Priced on slot 0 of the list, which is the identity unless the
-         * head sample swapped DELTA8 ahead of it. The two prices coincide on
-         * the text this decides, and pricing both of them and taking the
-         * smaller -- which is what a larger sample would need to stay
-         * order-neutral -- costs the columnar corpus 0.06 of ratio at every
-         * level from 5 up (5.06 -> 5.00, 5.13 -> 5.07), because a tighter
-         * estimate of the tile side refuses the finder on blocks where its
-         * full stream is the smaller one. The suite's swap build still
-         * writes the same streams at this sample size, so the tolerance is
-         * measured rather than assumed: if a future change to the sample
-         * makes this line order-sensitive, tests/runners/run.sh says so
-         * before this comment can be wrong about it quietly. */
-        tile_s = zpse_block_proxy_exact(e, in, sn, n, tid, sc, mb, meta_len,
-                                        ZPSE_DECIDE_TILES, UINT32_MAX, 1,
-                                        &prefix_ok);
-    }
-    if (tile_s == UINT32_MAX) {
-        return 1;
+            /* Priced on slot 0 of the list, which is the identity unless the
+             * head sample swapped DELTA8 ahead of it. The two prices coincide on
+             * the text this decides, and pricing both of them and taking the
+             * smaller -- which is what a larger sample would need to stay
+             * order-neutral -- costs the columnar corpus 0.06 of ratio at every
+             * level from 5 up (5.06 -> 5.00, 5.13 -> 5.07), because a tighter
+             * estimate of the tile side refuses the finder on blocks where its
+             * full stream is the smaller one. The suite's swap build still
+             * writes the same streams at this sample size, so the tolerance is
+             * measured rather than assumed: if a future change to the sample
+             * makes this line order-sensitive, tests/runners/run.sh says so
+             * before this comment can be wrong about it quietly. */
+            tile_s = zpse_block_proxy_exact(e, in, sn, n, tid, sc, mb, meta_len,
+                                            ZPSE_DECIDE_TILES, UINT32_MAX, 1,
+                                            &prefix_ok);
+        }
+        if (tile_s == UINT32_MAX) {
+            return 1;
+        }
+        if (cache != 0) {
+            cache[0] = lz_s;
+            cache[1] = tile_s;
+        }
     }
     if ((uint64_t)tile_s * (uint64_t)ZPSE_LZ_SCREEN_DEN <
         (uint64_t)lz_s * (uint64_t)num) {
@@ -3086,6 +3132,18 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
                       ? n
                       : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
+#if ZPSE_LZ_SCREEN_TEXT_GATE
+    /* Gated experiment (ZPSE_LZ_SCREEN_TEXT_GATE): the 4 KiB sample on text
+     * only. e->ascii_gate is set before the LZ screens run; the n >= MAX test
+     * keeps this to full blocks, so the page branch below (short blocks) and
+     * the ordinary corpus are untouched. With the flag off this whole arm is
+     * compiled out and the sample is exactly as before. */
+    if (e->ascii_gate != 0u && n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+        sn = n < (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES
+                 ? n
+                 : (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES;
+    }
+#endif
     const ZpseLevel *row = zpse_level_row(lvl);
     uint32_t num = (uint32_t)row->screen_num;
     uint32_t lz_s;
@@ -3316,7 +3374,6 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     zpse_block_fill_header(&h, flags, n, total, 0u, 1u, 0u, seq, in_crc);
     zpse_block_header_serialize(dst, &h);
-    zpse_block_fix_header_crc(dst);
     *total_out = total;
     return ZPSE_OK;
 }
@@ -3432,7 +3489,6 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     zpse_block_fill_header(&h, flags, n, total, 0u, 1u, 0u, seq, in_crc);
     zpse_block_header_serialize(dst, &h);
-    zpse_block_fix_header_crc(dst);
     *total_out = total;
     return ZPSE_OK;
 }
@@ -3740,7 +3796,6 @@ static int zpse_block_write_raw(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     zpse_block_fill_header(&h, flags, n, total, 0, 1, 0, seq, in_crc);
     zpse_block_header_serialize(out, &h);
-    zpse_block_fix_header_crc(out);
     memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
     total = zpse_block_shrink_page(out, n, total);
     zpse_block_hist_set(e, out, total);
@@ -3787,24 +3842,19 @@ static int zpse_block_write_token(ZpseEncoder *e, const uint8_t *in,
  * kept, so a wire detail owned by flat.c cannot make this file emit a wrong
  * page -- on any doubt the RAW form carries the bytes verbatim. */
 
-/* Palette index of `v`; the classifier guarantees a hit for a LOW_ALPHA page. */
-static uint8_t zpse_flat_pal_index(const uint8_t *alpha, uint8_t nalpha,
-                                    uint8_t v)
+/* Palette index of `v` via a 256-byte LUT built once per page. LUT[v] is the
+ * index in the classifier's first-appearance palette (0xFF on a miss, which
+ * cannot occur for a LOW_ALPHA page the classifier accepted). This replaces
+ * a linear scan of up to 16 bytes per input byte. */
+static uint8_t zpse_flat_pal_index(const uint8_t lut[256], uint8_t v)
 {
-    uint8_t i;
-
-    for (i = 0u; i < nalpha; i++) {
-        if (alpha[i] == v) {
-            return i;
-        }
-    }
-    return 0u;
+    return lut[v];
 }
 
 /* BIT2: 8-byte palette, then two bits per position, low pair first. */
 static uint32_t zpse_flat_build_bit2(const ZpsePageInfo *pi,
                                      const uint8_t *in, uint32_t n,
-                                     uint8_t *dst)
+                                     const uint8_t lut[256], uint8_t *dst)
 {
     uint32_t idx_bytes = (n + 3u) >> 2;
     uint32_t g;
@@ -3820,8 +3870,7 @@ static uint32_t zpse_flat_build_bit2(const ZpsePageInfo *pi,
         uint32_t j;
 
         for (j = 0u; j < 4u && base + j < n; j++) {
-            uint8_t ix = zpse_flat_pal_index(pi->alpha, pi->nalpha,
-                                              in[base + j]);
+            uint8_t ix = zpse_flat_pal_index(lut, in[base + j]);
 
             b = (uint8_t)(b | (uint8_t)((uint32_t)ix << (2u * j)));
         }
@@ -3833,7 +3882,7 @@ static uint32_t zpse_flat_build_bit2(const ZpsePageInfo *pi,
 /* NIBBLE4: 16-byte palette, then four bits per position, low nibble even. */
 static uint32_t zpse_flat_build_nibble4(const ZpsePageInfo *pi,
                                         const uint8_t *in, uint32_t n,
-                                        uint8_t *dst)
+                                        const uint8_t lut[256], uint8_t *dst)
 {
     uint32_t idx_bytes = (n + 1u) >> 1;
     uint32_t g;
@@ -3848,11 +3897,11 @@ static uint32_t zpse_flat_build_nibble4(const ZpsePageInfo *pi,
         uint8_t b = 0u;
 
         if (base < n) {
-            b = zpse_flat_pal_index(pi->alpha, pi->nalpha, in[base]);
+            b = zpse_flat_pal_index(lut, in[base]);
         }
         if (base + 1u < n) {
             b = (uint8_t)(b | (uint8_t)((uint32_t)zpse_flat_pal_index(
-                pi->alpha, pi->nalpha, in[base + 1u]) << 4));
+                lut, in[base + 1u]) << 4));
         }
         dst[16u + g] = b;
     }
@@ -3957,6 +4006,11 @@ static int zpse_block_write_flat(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * The public one-shot API passes out_cap straight through, so that case
      * is reachable; stage here and copy only after the capacity check. */
     uint8_t payload[ZPSE_BLOCK_SHORT_MAX];
+    /* 256-byte value→palette-index LUT, built once for LOW_ALPHA pages so the
+     * bit/nibble builders do a single load per byte instead of a ≤16 linear
+     * scan. Byte-identical: the classifier guarantees every byte is in the
+     * palette, so the 0xFF miss sentinel is never used. */
+    uint8_t pal_lut[256];
     uint8_t codec = (uint8_t)ZPSE_FLAT_RAW;
     uint8_t param = 0u;
     uint32_t plen = n;
@@ -3974,8 +4028,9 @@ static int zpse_block_write_flat(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (cls == (int)ZPSE_PAGE_LOW_ALPHA && pi.nalpha != 0u) {
         uint32_t p;
 
+        zpse_pf_make_pal_lut(pi.alpha, pi.nalpha, pal_lut);
         if (pi.nalpha <= 4u) {
-            p = zpse_flat_build_bit2(&pi, in, n, payload);
+            p = zpse_flat_build_bit2(&pi, in, n, pal_lut, payload);
             if (p < n &&
                 zpse_flat_decode((uint8_t)ZPSE_FLAT_BIT2,
                                  (uint8_t)(pi.nalpha - 1u), payload, p,
@@ -3986,7 +4041,7 @@ static int zpse_block_write_flat(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 plen = p;
             }
         } else if (pi.nalpha <= 16u) {
-            p = zpse_flat_build_nibble4(&pi, in, n, payload);
+            p = zpse_flat_build_nibble4(&pi, in, n, pal_lut, payload);
             if (p < n &&
                 zpse_flat_decode((uint8_t)ZPSE_FLAT_NIBBLE4,
                                  (uint8_t)(pi.nalpha - 1u), payload, p,
@@ -4076,7 +4131,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * copy on goes RAW. No probe, no candidate list, no trial -- the point
      * is to spend the block's encode budget on one LZ parse. */
     if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u && e->lz != 0) {
-        uint32_t f_crc = ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
+        uint32_t f_crc = ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u &&
+                          n > (uint32_t)ZPSE_BLOCK_SHORT_MAX)
                              ? zpse_crc32c(in, n)
                              : 0u;
         uint32_t f_total = 0u;
@@ -4112,7 +4168,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             zpse_block_fill_header(&h, flags, n, rtotal, 0u, 1u, 0u, seq,
                                    f_crc);
             zpse_block_header_serialize(out, &h);
-            zpse_block_fix_header_crc(out);
             memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
             rtotal = zpse_block_shrink_page(out, n, rtotal);
             zpse_block_hist_set(e, out, rtotal);
@@ -4263,7 +4318,12 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * at the first differing byte, so a block that is not constant pays one
      * compare and writes no pointer. */
     e->const_plane = 0;
-    if ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u) {
+    /* A short page is always rewritten by zpse_block_shrink_page, which
+     * unconditionally drops ZPSE_B_CRC and zeroes the field. Its payload CRC
+     * is never emitted, so do not pay crc32c over the whole block here: leave
+     * in_crc at 0 for short pages, exactly as a no-checksum request does. */
+    if ((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u &&
+        n > (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
         if (zpse_segment_plane_is_const(in, n)) {
             in_crc = zpse_crc32c_repeat(in[0], (size_t)n);
             e->const_plane = in;
@@ -4604,12 +4664,24 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t cfloor;
         /* The identity priced at raw at both windows: cut the list. */
         int flat_head = 0;
+        /* The tail-window price of the identity, computed once in the sweep
+         * below. When the identity turns out to be the winner, the raw-fallback
+         * test prices that same 12 KiB window a second time with the very same
+         * arguments; reuse this value instead. */
+        uint32_t flat_head_tail_tp = UINT32_MAX;
+        int have_flat_head_tail_tp = 0;
         /* Candidates the sweep has priced on this block, and the ones the page
          * cap (ZPSE_PAGE_CAND_CAP) left unpriced. Unpriced-by-the-cap is not
          * the same as unpriced: the sweep must never drop a candidate it could
          * not price, only one it chose not to. */
         int np = 0;
         uint8_t cap_skip[ZPSE_MAX_CAND];
+        /* The head-window floor of each candidate, filled once before the
+         * sweep. zpse_block_floor is a pure function of (pn, tid, sc,
+         * meta_len) and none of those change while the candidates are priced,
+         * so the per-candidate call in the lim != UINT32_MAX branch below is
+         * answered from here instead of recomputed every time. */
+        uint32_t pf[ZPSE_MAX_CAND];
         int ci;
         int k;
 
@@ -4645,6 +4717,15 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * may change. Same value, same comparison, ten fewer calls on a
          * full candidate list. */
         cfloor = zpse_block_cand_floor(pn);
+        {
+            uint32_t seg_price = zpse_segment_price(e->enc_flags);
+            int fi;
+
+            for (fi = 0; fi < ncand; fi++) {
+                pf[fi] = zpse_block_floor(pn, tids[fi], scounts[fi],
+                                          meta_lens[fi], seg_price);
+            }
+        }
         for (k = 0; k < nord; k++) {
             const uint8_t *mb;
             uint32_t lim = UINT32_MAX;
@@ -4708,9 +4789,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * is kept on purpose: the sweep must never drop something it
              * could not price). */
             if (lim != UINT32_MAX) {
-                uint32_t fl = zpse_block_floor(
-                    pn, tids[ci], scounts[ci], meta_lens[ci],
-                    zpse_segment_price(e->enc_flags));
+                uint32_t fl = pf[ci];
 
                 if (fl != UINT32_MAX && fl > lim) {
                     ex[ci] = fl;
@@ -4739,6 +4818,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                              UINT32_MAX, every_plane, 0)
                     : ex[ci];
 
+                flat_head_tail_tp = tp;
+                have_flat_head_tail_tp = 1;
                 if (tp == UINT32_MAX ||
                     tp >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
                     /* The width-4 pair, plain and delta: the stride shapes. */
@@ -4921,11 +5002,24 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * tell that apart from a block that is noise everywhere -- and
              * only the winner is priced, not the whole list. */
             if (sample_flat && n > pn) {
-                const uint8_t *wmb = meta_lens[pick] > 0 ? meta_bufs[pick] : in;
-                uint32_t tp = zpse_block_proxy_exact(
-                    e, in + (n - pn), pn, n, tids[pick], scounts[pick], wmb,
-                    meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX,
-                    every_plane, 0);
+                uint32_t tp;
+
+                if (have_flat_head_tail_tp && idx[pick] == 0u &&
+                    scounts[pick] == 1u && tids[pick] == 0u &&
+                    meta_lens[pick] == 0u) {
+                    /* The identity won and its head priced at raw, so the
+                     * sweep already priced this exact window with these exact
+                     * arguments. */
+                    tp = flat_head_tail_tp;
+                } else {
+                    const uint8_t *wmb = meta_lens[pick] > 0
+                                             ? meta_bufs[pick] : in;
+
+                    tp = zpse_block_proxy_exact(
+                        e, in + (n - pn), pn, n, tids[pick], scounts[pick], wmb,
+                        meta_lens[pick], ZPSE_DECIDE_TILES, UINT32_MAX,
+                        every_plane, 0);
+                }
 
                 if (tp == UINT32_MAX ||
                     tp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + pn) {
@@ -5187,10 +5281,22 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     /* Set once the match finder has run, wherever it ran (see the early
      * pass below); the candidate block after the trials then skips it. */
     int lz_done = 0;
+    /* Head sample and tile price measured by the full-size screen near the
+     * top of the sweep, for slot 0's shape. {0, UINT32_MAX} means that screen
+     * did not run or did not reach a price; the late screen then measures it
+     * itself. When it did, the late screen reuses these for the identical
+     * first-sample part and only re-asks the best_total-dependent part. */
+    uint32_t lz_cache[2] = {0u, UINT32_MAX};
     uint8_t *tdst = e->cand;
     uint32_t tcap = (uint32_t)ZPSE_E_SZ_CAND;
     /* Per-slot floor, filled once before the trial loop (see there). */
     uint32_t fl[ZPSE_MAX_CAND];
+    /* Suffix minima of fl[]/idx[] over the remaining candidate slots. The
+     * post-trial scan needs the minimum floor and "is an earlier-indexed
+     * candidate left" over oi+1..ncand-1; both are answered in O(1) from
+     * these, with sentinels at [ncand] for an empty tail. */
+    uint32_t suf_fl[ZPSE_MAX_CAND + 1];
+    uint8_t suf_idx[ZPSE_MAX_CAND + 1];
 
     /* ---- The match finder before the trial, on a gated block -------- *
      *
@@ -5241,7 +5347,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             lz_done = 1;
             if (zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
                                      meta_lens[0] > 0 ? meta_bufs[0] : in,
-                                     meta_lens[0], lz_speed, 1, atotal)) {
+                                     meta_lens[0], lz_speed, 1, atotal, 0)) {
                 if (atotal < (uint32_t)ZPSE_E_SZ_CAND && atotal > win) {
                     lz_cap = atotal - win;
                 }
@@ -5347,6 +5453,19 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                      zpse_segment_price(e->enc_flags));
         }
     }
+    /* Suffix minima over the same fixed slot order. idx[] values are the
+     * original list indices (0..ZPSE_MAX_CAND), so UINT8_MAX is a sentinel
+     * no real index can reach; UINT32_MAX does the same for the floors. */
+    {
+        int fi;
+
+        suf_fl[ncand] = UINT32_MAX;
+        suf_idx[ncand] = UINT8_MAX;
+        for (fi = ncand - 1; fi >= 0; fi--) {
+            suf_fl[fi] = fl[fi] < suf_fl[fi + 1] ? fl[fi] : suf_fl[fi + 1];
+            suf_idx[fi] = idx[fi] < suf_idx[fi + 1] ? idx[fi] : suf_idx[fi + 1];
+        }
+    }
 
     /* ---- The match finder first, when the screen convicts --------------
      *
@@ -5400,7 +5519,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              meta_lens[0] > 0 ? meta_bufs[0] : in,
                              meta_lens[0],
                              e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK, 0,
-                             0u)) {
+                             0u, lz_cache)) {
         uint32_t lz_total = 0u;
         uint32_t lz_cmds = 0u;
         int lrc;
@@ -5676,27 +5795,16 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * constant/ramp blocks the sweep ends here after one trial while a
          * ramp whose winner is DELTA8 still gets its second trial. */
         {
-            uint32_t min_floor = UINT32_MAX;
-            int earlier_left = 0;
-            int oj;
+            /* A candidate earlier in the list than the winner cannot
+             * produce a smaller total, but it can produce the same one and
+             * win the tie on order, so the bound does not cover it and the
+             * sweep does not end while one is left. suf_idx[k] < best_idx is
+             * exactly that condition over the remaining slots, and when it
+             * is false every remaining slot contributes to suf_fl[k], which
+             * is therefore the same minimum the scan computed. */
+            int earlier_left = (suf_idx[oi + 1] < best_idx);
+            uint32_t min_floor = suf_fl[oi + 1];
 
-            for (oj = oi + 1; oj < ncand; oj++) {
-                int j = oj;
-                uint32_t f;
-
-                /* A candidate earlier in the list than the winner cannot
-                 * produce a smaller total, but it can produce the same one
-                 * and win the tie on order, so the bound does not cover it
-                 * and the sweep does not end while one is left. */
-                if ((uint32_t)idx[j] < best_idx) {
-                    earlier_left = 1;
-                    continue;
-                }
-                f = fl[j];
-                if (f < min_floor) {
-                    min_floor = f;
-                }
-            }
             if (have_best && !earlier_left && best_total <= min_floor) {
                 break;
             }
@@ -5764,7 +5872,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                  meta_lens[0],
                                  e->enc_flags &
                                      (uint32_t)ZPSE_ENC_SPEED_MASK,
-                                 have_best, best_total)) {
+                                 have_best, best_total, lz_cache)) {
             uint32_t lz_total = 0u;
             uint32_t lz_cmds = 0u;
             uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
@@ -5947,7 +6055,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                            ZPSE_B_LZ_TILE);
                 wh.compressed_block_size = tot;
                 zpse_block_header_serialize(out, &wh);
-                zpse_block_fix_header_crc(out);
                 zpse_store_u32le(out + ZPSE_BLOCK_HEADER_SIZE, blen);
                 memcpy(out + ZPSE_BLOCK_HEADER_SIZE + 4u, e->tstage, pl);
                 best_total = tot;
@@ -6157,7 +6264,6 @@ lz2_done:
                     wh.compressed_block_size =
                         (uint32_t)ZPSE_BLOCK_HEADER_SIZE + hl;
                     zpse_block_header_serialize(nh, &wh);
-                    zpse_block_fix_header_crc(nh);
                     if (direct_out) {
                         memcpy(out, nh, sizeof nh);
                         memcpy(out + ZPSE_BLOCK_HEADER_SIZE, e->tstage, hl);
