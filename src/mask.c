@@ -463,12 +463,6 @@ static int zpse_mask_runs_scalar(uint32_t words[8], const uint8_t *payload,
  * zpse_mask_decode for the other builds and CPUs. */
 #if ZPSE_MASK_HAVE_AVX2
 
-/* The clear at the top of every mask decode: eight scalar stores -> one. */
-static ZPSE_MASK_AVX2 void zpse_mask_clear_avx2(uint32_t words[8])
-{
-    _mm256_storeu_si256((__m256i *)(void *)words, _mm256_setzero_si256());
-}
-
 /* ALL_EXCEPTION: words = bits [0, nt). words[] is already zero. One masked
  * store writes whole words for the 32-position blocks below nt; only the
  * partial final word needs a scalar AND. */
@@ -601,10 +595,17 @@ static ZPSE_MASK_AVX2 int zpse_mask_runs_avx2(
         if (pos[7] > (uint32_t)nt || mp[7] > (uint32_t)k)
             goto reject;
 
-        for (i = 0u; i < 8u; i++) {
+        /* Only the miss runs write bits: (r + i) is odd exactly when i has
+         * the parity opposite to r, so start at that i and step by two. This
+         * visits the same indices, in the same order, as testing every i
+         * against the old ((r + i) & 1u) branch -- r is a multiple of 8 here
+         * so the first miss run is i = 1 and `from` is the chunk-local
+         * pos[i - 1] (the `(i == 0) ? base` guard is kept for the general
+         * case). Byte-identical set_range calls, four instead of eight. */
+        for (i = (r & 1u) ^ 1u; i < 8u; i += 2u) {
             uint32_t from = (i == 0u) ? base : pos[i - 1u];
 
-            if (((r + i) & 1u) != 0u && pos[i] > from)
+            if (pos[i] > from)
                 zpse_mask_set_range(words, from, pos[i] - from);
         }
         base = pos[7];
@@ -647,21 +648,10 @@ int zpse_mask_decode(uint8_t mask_mode, const uint8_t *payload,
 
     if (words == 0)
         return ZPSE_BAD_ARG;
-#if ZPSE_MASK_HAVE_AVX2
-    if (have_avx2) {
-        zpse_mask_clear_avx2(words);
-    } else {
-        int i;
-        for (i = 0; i < 8; i++)
-            words[i] = 0;
-    }
-#else
-    {
-        int i;
-        for (i = 0; i < 8; i++)
-            words[i] = 0;
-    }
-#endif
+    /* words[] is zeroed by the caller (see the mask.h contract); every
+     * success path below ORs into those zero words, so no clear is needed
+     * here. The AVX2 reject paths clear before their scalar replay and keep
+     * doing so -- that reset is not redundant. */
     if (!zpse_mask_nt_ok(nt))
         return ZPSE_BAD_MASK;
     if (payload_len > 0 && payload == 0)
