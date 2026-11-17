@@ -376,6 +376,17 @@ static ZPSE_T_AVX2 void kernel_name(const uint8_t *src, uint8_t *dst,        \
                                             (size_t)b * 32u));              \
             __m256i nb;                                                     \
                                                                             \
+            /* A chunk of zeros leaves the scan exactly where it was: the  \
+             * prefix is zero in either algebra, so the plane is the carry  \
+             * broadcast and the carry stands. This is the same testz the   \
+             * merge kernels make (see zpse_chain_add32v); one testz, no    \
+             * vector port, against five ladder steps plus the broadcasts. */ \
+            if (_mm256_testz_si256(x, x)) {                                 \
+                _mm256_storeu_si256((__m256i *)(void *)(dst + (size_t)j +   \
+                                                       (size_t)b * 32u), c); \
+                continue;                                                   \
+            }                                                               \
+                                                                            \
             x = OPV(x, _mm256_slli_si256(x, 1));                            \
             x = OPV(x, _mm256_slli_si256(x, 2));                            \
             x = OPV(x, _mm256_slli_si256(x, 4));                            \
@@ -855,7 +866,41 @@ static ZPSE_T_AVX2 void zpse_plane_chain32(uint8_t *p, uint32_t n,
     __m256i inc = _mm256_castsi128_si256(_mm_cvtsi32_si128((int)seed));
     uint32_t q;
 
-    for (q = 0; (size_t)q + 32u <= (size_t)n; q += 32u) {
+    /* Two 32-byte chunks per carry link. The first chunk's byte 31 is the
+     * second one's incoming byte; it is taken from the loaded vector before
+     * either store, so the only serial edge between the two chunks is that
+     * one-byte carry -- both loads, both lane bridges and both ladders issue
+     * independently. The 32-byte loop below is the same arithmetic one chunk
+     * at a time, for n that is not a multiple of 64. */
+    for (q = 0; (size_t)q + 64u <= (size_t)n; q += 64u) {
+        __m256i x0 = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(p + q));
+        __m256i x1 = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(p + q + 32u));
+        __m256i top0 = _mm256_srli_si256(
+            _mm256_permute2x128_si256(x0, x0, 0x00), 15);
+        __m256i top1 = _mm256_srli_si256(
+            _mm256_permute2x128_si256(x1, x1, 0x00), 15);
+        __m256i prv0 = _mm256_or_si256(_mm256_slli_si256(x0, 1),
+                                       _mm256_blend_epi32(inc, top0, 0xF0));
+        /* Byte 31 of the first chunk, which is lane 1's byte 15, is the
+         * second chunk's incoming byte. */
+        __m256i inc1 = _mm256_castsi128_si256(
+            _mm_srli_si128(_mm256_extracti128_si256(x0, 1), 15));
+        __m256i prv1 = _mm256_or_si256(_mm256_slli_si256(x1, 1),
+                                       _mm256_blend_epi32(inc1, top1, 0xF0));
+
+        _mm256_storeu_si256((__m256i *)(void *)(p + q),
+                            delta ? _mm256_sub_epi8(x0, prv0)
+                                  : _mm256_xor_si256(x0, prv0));
+        _mm256_storeu_si256((__m256i *)(void *)(p + q + 32u),
+                            delta ? _mm256_sub_epi8(x1, prv1)
+                                  : _mm256_xor_si256(x1, prv1));
+        /* Byte 63 of the pair becomes the next pair's incoming byte. */
+        inc = _mm256_castsi128_si256(
+            _mm_srli_si128(_mm256_extracti128_si256(x1, 1), 15));
+    }
+    for (; (size_t)q + 32u <= (size_t)n; q += 32u) {
         __m256i x = _mm256_loadu_si256(
             (const __m256i *)(const void *)(p + q));
         __m256i top = _mm256_srli_si256(
@@ -2408,13 +2453,11 @@ static void zpse_transform_inverse_page(const ZpseTransformMeta *meta,
                 }
             }
         } else {
-            if (w == 2u) {
-                zpse_pf_merge2(out, segs, full, 0, 0);
-            } else if (w == 4u) {
-                zpse_pf_merge4(out, segs, full, 0, 0);
-            } else {
-                zpse_pf_merge8(out, segs, full, 0, 0);
-            }
+            /* The auto-selecting wrapper runs the byte-identical AVX2 32-row
+             * merges where they apply and the same SSE2 network as
+             * zpse_pf_merge* for the leftover 16 rows, so the ragged tail
+             * below is the only part left scalar. */
+            zpse_merge_narrow(out, segs, full, w, 0, 0);
             for (s = 0; s < w; s++) {
                 uint32_t len = seg_lens[s];
                 uint32_t r2;
@@ -2454,13 +2497,11 @@ static void zpse_transform_inverse_page(const ZpseTransformMeta *meta,
                 }
             }
         } else {
-            if (w == 2u) {
-                zpse_pf_merge2(out, segs, full, carry, delta);
-            } else if (w == 4u) {
-                zpse_pf_merge4(out, segs, full, carry, delta);
-            } else {
-                zpse_pf_merge8(out, segs, full, carry, delta);
-            }
+            /* Same wrapper as the plain branch: the AVX2 chain forms keep
+             * each plane's carry in a vector register and write all w bytes
+             * back once, after `full` rows, which is exactly the carry the
+             * scalar ragged tail continues from. */
+            zpse_merge_narrow(out, segs, full, w, carry, delta);
             for (s = 0; s < w; s++) {
                 uint32_t len = seg_lens[s];
                 uint8_t p = carry[s];
