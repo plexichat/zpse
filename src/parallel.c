@@ -116,11 +116,7 @@ typedef struct ZpseMtJob {
     size_t stride;      /* reserved slot size per block */
     uint32_t block;     /* nominal block size */
     uint32_t enc_flags;
-    /* The next block index no worker has claimed. A worker that finds it
-     * past the end is finished; the counter is only ever incremented, so
-     * no worker can be handed another's block. Volatile because on the
-     * Win32 path it is the operand of an interlocked increment. */
-    volatile long next;
+    unsigned workers;   /* static worker->block stride (see zpse_mt_worker) */
     /* First failure, advisory: it stops the other workers early, and the
      * caller reads it after every thread has joined. */
     volatile int failed;
@@ -129,6 +125,7 @@ typedef struct ZpseMtJob {
 typedef struct ZpseMtArg {
     ZpseMtJob *job;
     void *arena;
+    unsigned worker;
 } ZpseMtArg;
 
 /* The next unclaimed block index, or SIZE_MAX when there is none left.
@@ -149,6 +146,29 @@ static size_t zpse_mt_claim(volatile long *next, size_t nblocks)
     return (size_t)v;
 }
 
+/* Decode workers take a run of blocks per claim instead of one at a time. A
+ * decoded block is independent and lands at its own offset in `out`, so the
+ * run size cannot change a byte -- it only trades atomic operations for a
+ * little less load balance at the tail. Eight keeps the atomic off the hot
+ * path without letting one slow block stall a whole worker's worth of work. */
+#define ZPSE_MT_DEC_CHUNK 8u
+
+static size_t zpse_mt_claim_chunk(volatile long *next, size_t nblocks,
+                                  unsigned chunk)
+{
+    long v;
+
+#if defined(_WIN32)
+    v = InterlockedExchangeAdd((volatile LONG *)next, (LONG)chunk);
+#else
+    v = __atomic_fetch_add(next, (long)chunk, __ATOMIC_RELAXED);
+#endif
+    if (v < 0 || (size_t)v >= nblocks) {
+        return SIZE_MAX;
+    }
+    return (size_t)v;
+}
+
 static void zpse_mt_fail(ZpseMtJob *j, int rc)
 {
     if (j->failed == 0) {
@@ -156,9 +176,18 @@ static void zpse_mt_fail(ZpseMtJob *j, int rc)
     }
 }
 
-static void zpse_mt_worker(ZpseMtJob *j, void *arena)
+/* Worker w owns blocks w, w + workers, w + 2*workers, ... in that order --
+ * the same static assignment the streamed encode uses. It has to be static:
+ * with a shared claim counter the block -> worker pairing is decided by
+ * timing, so the per-worker encoder history follows a timing-dependent
+ * sequence -- and a history-confident stop (ZPSE_HIST_STOP_STREAK > 0) would
+ * then let that timing change the bytes. Here a worker's blocks and their
+ * order are fixed, and a block is a pure function of its own bytes at the
+ * current defaults, so the frame is the same at every worker count. */
+static void zpse_mt_worker(ZpseMtJob *j, void *arena, unsigned w)
 {
     ZpseEncoder enc;
+    unsigned g = 0u;
     int rc;
 
     rc = zpse_encoder_init(&enc, arena, (size_t)ZPSE_ENC_ARENA_SIZE);
@@ -176,10 +205,11 @@ static void zpse_mt_worker(ZpseMtJob *j, void *arena)
         if (j->failed != 0) {
             return;
         }
-        i = zpse_mt_claim(&j->next, j->nblocks);
-        if (i == SIZE_MAX) {
+        i = (size_t)w + (size_t)g * (size_t)j->workers;
+        if (i >= j->nblocks) {
             return;
         }
+        g++;
         off = i * (size_t)j->block;
         if (off >= j->n) {
             zpse_mt_fail(j, ZPSE_BAD_HEADER);
@@ -208,7 +238,7 @@ static DWORD WINAPI zpse_mt_entry(LPVOID p)
 {
     ZpseMtArg *a = (ZpseMtArg *)p;
 
-    zpse_mt_worker(a->job, a->arena);
+    zpse_mt_worker(a->job, a->arena, a->worker);
     return 0;
 }
 #else
@@ -216,7 +246,7 @@ static void *zpse_mt_entry(void *p)
 {
     ZpseMtArg *a = (ZpseMtArg *)p;
 
-    zpse_mt_worker(a->job, a->arena);
+    zpse_mt_worker(a->job, a->arena, a->worker);
     return 0;
 }
 #endif
@@ -782,6 +812,11 @@ typedef struct ZpseMtDecJob {
     size_t nblocks;
     volatile long next;
     volatile int failed;
+    /* Decoded length of the last block, published by the single worker that
+     * decodes it (see zpse_mt_dec_worker) and read after every thread joins.
+     * The caller needs it to size a frame that carries no content size, and
+     * decoding that block a second time is pure duplication. */
+    volatile uint32_t last_got;
 } ZpseMtDecJob;
 
 typedef struct ZpseMtDecArg {
@@ -808,51 +843,69 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena)
     }
     for (;;) {
         size_t i;
-        size_t out_off;
-        size_t room;
-        uint32_t blk_off;
-        uint32_t blk_size;
-        uint32_t got = 0u;
+        size_t end;
 
         if (j->failed != 0) {
             return;
         }
-        i = zpse_mt_claim(&j->next, j->nblocks);
+        i = zpse_mt_claim_chunk(&j->next, j->nblocks, ZPSE_MT_DEC_CHUNK);
         if (i == SIZE_MAX) {
             return;
         }
-        out_off = i * j->nominal;
-        if (out_off > j->out_cap) {
-            zpse_mt_dec_fail(j, ZPSE_OUTPUT_OVERFLOW);
-            return;
+        end = i + (size_t)ZPSE_MT_DEC_CHUNK;
+        if (end > j->nblocks) {
+            end = j->nblocks;
         }
-        /* Decoded straight into its final place: the block writes its own
-         * bytes and nothing else, so its room is exactly the room the
-         * caller's buffer has left at this position. */
-        room = j->out_cap - out_off;
-        if (room > j->nominal) {
-            room = j->nominal;
-        }
-        /* The index was validated once by the caller; read this block's
-         * entry and let zpse_block_at do the per-entry checks and decode. */
-        blk_off = zpse_load_u32le(j->entries +
-                                  i * (size_t)ZPSE_INDEX_ENTRY_SIZE);
-        blk_size = zpse_load_u32le(j->entries +
-                                   i * (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
-        rc = zpse_block_at(&d, j->in, j->in_len, blk_off, blk_size,
-                           (uint32_t)i, j->out + out_off, (uint32_t)room,
-                           &got);
-        if (rc != ZPSE_OK) {
-            zpse_mt_dec_fail(j, rc);
-            return;
-        }
-        if (i + 1u < j->nblocks && (size_t)got != j->nominal) {
-            zpse_mt_dec_fail(j, ZPSE_BAD_HEADER);
-            return;
-        }
-        if ((size_t)got > j->out_cap - out_off) {
-            zpse_mt_dec_fail(j, ZPSE_OUTPUT_OVERFLOW);
-            return;
+        for (; i < end; i++) {
+            size_t out_off;
+            size_t room;
+            uint32_t blk_off;
+            uint32_t blk_size;
+            uint32_t got = 0u;
+
+            if (j->failed != 0) {
+                return;
+            }
+            out_off = i * j->nominal;
+            if (out_off > j->out_cap) {
+                zpse_mt_dec_fail(j, ZPSE_OUTPUT_OVERFLOW);
+                return;
+            }
+            /* Decoded straight into its final place: the block writes its own
+             * bytes and nothing else, so its room is exactly the room the
+             * caller's buffer has left at this position. */
+            room = j->out_cap - out_off;
+            if (room > j->nominal) {
+                room = j->nominal;
+            }
+            /* The index was validated once by the caller; read this block's
+             * entry and let zpse_block_at do the per-entry checks and decode. */
+            blk_off = zpse_load_u32le(j->entries +
+                                      i * (size_t)ZPSE_INDEX_ENTRY_SIZE);
+            blk_size = zpse_load_u32le(j->entries +
+                                       i * (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
+            rc = zpse_block_at(&d, j->in, j->in_len, blk_off, blk_size,
+                               (uint32_t)i, j->out + out_off, (uint32_t)room,
+                               &got);
+            if (rc != ZPSE_OK) {
+                zpse_mt_dec_fail(j, rc);
+                return;
+            }
+            if (i + 1u < j->nblocks && (size_t)got != j->nominal) {
+                zpse_mt_dec_fail(j, ZPSE_BAD_HEADER);
+                return;
+            }
+            if ((size_t)got > j->out_cap - out_off) {
+                zpse_mt_dec_fail(j, ZPSE_OUTPUT_OVERFLOW);
+                return;
+            }
+            /* Only the worker that gets the last block writes this slot and
+             * the caller reads it after join. Room here is capped at
+             * `nominal`, which is >= the block's own length, so `got` is the
+             * same length a second decode would report. */
+            if (i + 1u == j->nblocks) {
+                j->last_got = got;
+            }
         }
     }
 }
@@ -878,7 +931,7 @@ static void *zpse_mt_dec_entry(void *p)
 static int zpse_mt_dec_run(const uint8_t *in, size_t in_len,
                            const uint8_t *entries, uint8_t *out,
                            size_t out_cap, size_t nblocks, size_t nominal,
-                           size_t last_len, unsigned threads,
+                           size_t *last_len_out, unsigned threads,
                            void *const arenas[])
 {
     ZpseMtDecJob job;
@@ -900,6 +953,7 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len,
     job.nblocks = nblocks;
     job.next = 0;
     job.failed = 0;
+    job.last_got = 0u;
 
     for (w = 1u; w < threads; w++) {
         args[w].job = &job;
@@ -925,7 +979,7 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len,
         pthread_join(handles[w], NULL);
 #endif
     }
-    (void)last_len;
+    *last_len_out = (size_t)job.last_got;
     if (job.failed != 0) {
         return job.failed;
     }
@@ -956,15 +1010,18 @@ static int zpse_mt_run(const uint8_t *in, size_t n, uint8_t *out,
     job.enc_flags = enc_flags;
     job.nblocks = n / (size_t)block + ((n % (size_t)block) != 0u ? 1u : 0u);
     job.stride = (size_t)block + zpse_mt_slot_overhead(block);
-    job.next = 0;
+    job.workers = threads;
     job.failed = 0;
 
-    /* The calling thread is worker 0; the rest are spawned. A thread that
-     * will not start leaves its share to the others rather than failing
-     * the encode -- the work queue does not care how many join in. */
+    /* The calling thread is worker 0; the rest are spawned. The assignment is
+     * static (worker w owns w, w + threads, ...), so unlike a shared work
+     * queue a worker that never starts leaves its blocks unencoded: rather
+     * than close a frame with holes in it, hand the whole input to the serial
+     * encoder once the threads that did start have been joined. */
     for (w = 1u; w < threads; w++) {
         args[w].job = &job;
         args[w].arena = arenas[w];
+        args[w].worker = w;
 #if defined(_WIN32)
         handles[w] = CreateThread(NULL, 0, zpse_mt_entry, &args[w], 0, NULL);
         if (handles[w] == NULL) {
@@ -977,7 +1034,19 @@ static int zpse_mt_run(const uint8_t *in, size_t n, uint8_t *out,
 #endif
         started++;
     }
-    zpse_mt_worker(&job, arenas[0]);
+    if (started + 1u < threads) {
+        job.failed = 1; /* stop the workers that did start */
+        for (w = 1u; w <= started; w++) {
+#if defined(_WIN32)
+            WaitForSingleObject(handles[w], INFINITE);
+            CloseHandle(handles[w]);
+#else
+            pthread_join(handles[w], NULL);
+#endif
+        }
+        return 1; /* caller runs the serial encoder over the same buffer */
+    }
+    zpse_mt_worker(&job, arenas[0], 0u);
     for (w = 1u; w <= started; w++) {
 #if defined(_WIN32)
         WaitForSingleObject(handles[w], INFINITE);
@@ -1069,6 +1138,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
         if (t > 1u) {
             size_t last_off = ((size_t)count - 1u) * nominal;
             size_t total;
+            size_t last_len = 0u;
 
             if (out_cap < last_off) {
                 return ZPSE_OUTPUT_OVERFLOW;
@@ -1079,7 +1149,8 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                 return ZPSE_OUTPUT_OVERFLOW;
             }
             rc = zpse_mt_dec_run(in, in_len, entries, output, out_cap,
-                                 (size_t)count, nominal, 0u, t, dec_arenas);
+                                 (size_t)count, nominal, &last_len, t,
+                                 dec_arenas);
             if (rc != ZPSE_OK) {
                 return rc;
             }
@@ -1087,38 +1158,13 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                 fh.content_size != UINT64_MAX) {
                 total = (size_t)fh.content_size;
             } else {
-                /* No content size in the header: the last block's own
-                 * length is the only thing left to ask, and it is the one
-                 * block that may be short. */
-                ZpseDecoder d;
-                size_t room = out_cap - last_off;
-                uint32_t got = 0u;
-                uint32_t last_blk_off;
-                uint32_t last_blk_size;
-
-                rc = zpse_decoder_init(&d, dec_arenas[0],
-                                       (size_t)ZPSE_DEC_ARENA_SIZE);
-                if (rc != ZPSE_OK) {
-                    return rc;
-                }
-                /* Reuse the entry table already validated at the top of this
-                 * call instead of re-seeking (and re-checking the whole
-                 * index) for the last block. */
-                last_blk_off = zpse_load_u32le(entries +
-                              (size_t)(count - 1u) * ZPSE_INDEX_ENTRY_SIZE);
-                last_blk_size = zpse_load_u32le(entries +
-                              (size_t)(count - 1u) * ZPSE_INDEX_ENTRY_SIZE +
-                              4u);
-                rc = zpse_block_at(&d, in, in_len, last_blk_off, last_blk_size,
-                                   count - 1u, output + last_off,
-                                   room > (size_t)UINT32_MAX
-                                       ? UINT32_MAX
-                                       : (uint32_t)room,
-                                   &got);
-                if (rc != ZPSE_OK) {
-                    return rc;
-                }
-                total = last_off + (size_t)got;
+                /* No content size in the header: the last block's length is
+                 * the only thing left to ask, and it is the one block that
+                 * may be short. The worker that decoded it published its
+                 * length, so there is no need to decode the block a second
+                 * time; that worker's room was capped at `nominal`, which is
+                 * >= the block's own length, so the length is the same. */
+                total = last_off + last_len;
             }
             *out_len_out = total;
             return ZPSE_OK;
@@ -1187,9 +1233,15 @@ int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
             threads = (unsigned)(nblocks / 4u);
         }
         if (threads > 1u) {
-            return zpse_mt_run(in, n, out, out_cap, out_len_out,
-                               nominal_block_size, enc_flags, with_index,
-                               threads, enc_arenas);
+            int rc = zpse_mt_run(in, n, out, out_cap, out_len_out,
+                                 nominal_block_size, enc_flags, with_index,
+                                 threads, enc_arenas);
+
+            if (rc != 1) {
+                return rc;
+            }
+            /* A worker could not be started; the serial encoder below writes
+             * the same frame into the same buffer. */
         }
     }
 #else
