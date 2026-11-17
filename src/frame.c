@@ -83,6 +83,46 @@ static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
     *dec_crc_out = bh.decoded_crc32c;
     return ZPSE_OK;
 }
+
+/* Read a long-form (32-byte) block header once for the framing loop. This is
+ * the 64 KiB block case. zpse_block_probe would call zpse_block_header_size
+ * (32 for this sync), refuse avail < 32 as TRUNCATED, call
+ * zpse_block_header_parse, refuse compressed_block_size < 32 as BAD_BLOCK_SIZE
+ * (which the parse already does) and avail < compressed_block_size as
+ * TRUNCATED; the loop would then call zpse_block_header_parse a second time
+ * for the LAST flag and the decoded CRC. One parse here supplies all of them.
+ *
+ * The caller has established `in` starts with a ZPSE_BLOCK_SYNC sync and that
+ * avail covers at least a short header. Every check and status is the one
+ * zpse_block_probe plus its header parse would return, in the same order. */
+static int zpse_frame_long_header(const uint8_t *in, uint32_t avail,
+                                  uint32_t *comp_out, uint32_t *uncomp_out,
+                                  uint8_t *flags_out, uint32_t *dec_crc_out)
+{
+    ZpseBlockHeader bh;
+    int rc;
+
+    /* zpse_block_probe refuses in_len < hdr (32) with TRUNCATED before it
+     * parses. This subsumes its earlier in_len < 16 check for this sync. */
+    if (avail < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+        return ZPSE_TRUNCATED;
+    }
+    rc = zpse_block_header_parse(&bh, in, avail);
+    if (rc != ZPSE_OK) {
+        return rc;
+    }
+    /* The probe's comp < hdr -> BAD_BLOCK_SIZE is already enforced inside
+     * zpse_block_header_parse (comp < ZPSE_BLOCK_HEADER_SIZE). What remains
+     * is the probe's in_len < comp length bound, in the same position. */
+    if (avail < bh.compressed_block_size) {
+        return ZPSE_TRUNCATED;
+    }
+    *comp_out = bh.compressed_block_size;
+    *uncomp_out = bh.uncompressed_size;
+    *flags_out = bh.block_flags;
+    *dec_crc_out = bh.decoded_crc32c;
+    return ZPSE_OK;
+}
 #endif /* ZPSE_FRAME_PAGE_FAST */
 
 static void zpse_frame_pack28(uint8_t out[32], const ZpseFrameHeader *h)
@@ -243,27 +283,34 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         int page_fast = 0;
 
 #if ZPSE_FRAME_PAGE_FAST
-        /* A page frame's blocks carry the 16-byte header, so one short parse
-         * supplies the sizes, the LAST flag and the CRC the loop needs. A
-         * long-form block is still legal in such a frame (a header that could
-         * not be shrunk), so fall back to the original path when the sync is
-         * the long one. */
-        if (fh.nominal_block_size <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
-            avail >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        /* Read each block's header once here. A page frame's blocks carry the
+         * 16-byte header (short/token/FLAT); a 64 KiB block carries the 32-byte
+         * long header. One parse supplies the sizes, the LAST flag and the
+         * decoded CRC the loop needs, rather than the probe plus the second
+         * parse the original path paid. An unrecognised sync still falls
+         * through to zpse_block_probe unchanged. */
+        if (avail >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             uint16_t sync = zpse_load_u16le(in + pos);
 
-            if (sync == (uint16_t)ZPSE_BLOCK_SYNC_SHORT ||
-                sync == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN ||
-                sync == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+            if (fh.nominal_block_size <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
+                (sync == (uint16_t)ZPSE_BLOCK_SYNC_SHORT ||
+                 sync == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN ||
+                 sync == (uint16_t)ZPSE_BLOCK_SYNC_FLAT)) {
                 rc = zpse_frame_short_header(in + pos, avail, &comp_sz,
                                              &uncomp_sz, &blk_flags, &dec_crc);
                 if (rc != ZPSE_OK) {
                     return rc;
                 }
                 page_fast = 1;
+            } else if (sync == (uint16_t)ZPSE_BLOCK_SYNC) {
+                rc = zpse_frame_long_header(in + pos, avail, &comp_sz,
+                                            &uncomp_sz, &blk_flags, &dec_crc);
+                if (rc != ZPSE_OK) {
+                    return rc;
+                }
+                page_fast = 1;
             }
-            /* A long or unrecognised sync falls through to the original
-             * probe path unchanged. */
+            /* An unrecognised sync falls through to the original probe path. */
         }
 #endif
         if (!page_fast) {
