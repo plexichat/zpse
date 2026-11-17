@@ -12,9 +12,9 @@
 # its two siblings.
 #
 # Stage 1 compiles the unity source and tests/tools/zpse_cli.c with profile
-# instrumentation, trains `zpse_cli bench -q -b 4096 -l 6` on the generated 4
-# KiB page corpus (headline, all-pages, repeat and code classes), the probe
-# corpus and the mixed corpus, and keeps the counters. Stage 2 recompiles the
+# instrumentation, trains `zpse_cli bench -q` on the 4 KiB page, probe and mixed
+# corpora at `-b 4096 -l 6` and on the byte-pattern and columnar corpora at
+# `-b 65536`, levels 1, 6 and 9, and keeps the counters. Stage 2 recompiles the
 # SAME sources to the SAME relative object paths with -fprofile-use, which is
 # what makes gcc's .gcda names resolve; clang needs llvm-profdata to merge its
 # .profraw files first; automatic selection falls back to gcc without it.
@@ -156,7 +156,8 @@ build_suite() {
 (cd "$work" &&
     ./corpus_write$exe corpus "$size" --pages &&
     ./corpus_write$exe corpus "$size" --probe &&
-    ./corpus_write$exe corpus "$size" --mixed) ||
+    ./corpus_write$exe corpus "$size" --mixed &&
+    ./corpus_write$exe corpus "$size") ||
     die "corpus generation failed"
 if command -v sha256sum >/dev/null 2>&1; then
     for f in pages-nonzero.bin probe.bin mixed.bin; do
@@ -171,10 +172,29 @@ build_cli pg "cli.pg$exe" "${gen[@]}" || die "instrumented CLI build failed"
 
 train=(corpus/pages-nonzero.bin corpus/pages-all.bin corpus/pages-repeat.bin
        corpus/page-code.bin corpus/probe.bin corpus/mixed.bin)
-echo "pgo_build: training over ${#train[@]} corpora (${size} B/class)" >&2
+# The default corpus_write output: the ten byte patterns (one 64 KiB block of
+# each per file) and the seven columnar classes. Trained at the headline block
+# size so size-gated code is covered: the >=8 KiB trial caps, the big LZ table
+# and the wide backward walk, plus the level 1 and level 9 branches.
+train64=(corpus/zeros.bin corpus/incr.bin corpus/random.bin corpus/sparse.bin
+         corpus/strided.bin corpus/const5A.bin corpus/alt00FF.bin
+         corpus/sawtooth.bin corpus/lowentropy.bin corpus/sparse2.bin
+         corpus/ts_seq.bin corpus/ts_ns.bin corpus/float_sparse.bin
+         corpus/var_string.bin corpus/sparse_mix.bin corpus/geo_point.bin
+         corpus/struct_offsets.bin)
+echo "pgo_build: training over ${#train[@]} 4 KiB and ${#train64[@]} 64 KiB corpora (${size} B/class)" >&2
 if [ "$kind" = clang ]; then
     (cd "$work" && LLVM_PROFILE_FILE="prof/pgo-%p.profraw" \
         "./cli.pg$exe" bench -q -b 4096 -l 6 "${train[@]}" >/dev/null) ||
+        die "PGO training run failed"
+    (cd "$work" && LLVM_PROFILE_FILE="prof/pgo-%p.profraw" \
+        "./cli.pg$exe" bench -q -b 65536 -l 1 "${train64[@]}" >/dev/null) ||
+        die "PGO training run failed"
+    (cd "$work" && LLVM_PROFILE_FILE="prof/pgo-%p.profraw" \
+        "./cli.pg$exe" bench -q -b 65536 -l 6 "${train64[@]}" >/dev/null) ||
+        die "PGO training run failed"
+    (cd "$work" && LLVM_PROFILE_FILE="prof/pgo-%p.profraw" \
+        "./cli.pg$exe" bench -q -b 65536 -l 9 "${train64[@]}" >/dev/null) ||
         die "PGO training run failed"
     shopt -s nullglob
     raw=("$work"/prof/*.profraw)
@@ -184,6 +204,12 @@ if [ "$kind" = clang ]; then
         die "llvm-profdata merge failed"
 else
     (cd "$work" && "./cli.pg$exe" bench -q -b 4096 -l 6 "${train[@]}" >/dev/null) ||
+        die "PGO training run failed"
+    (cd "$work" && "./cli.pg$exe" bench -q -b 65536 -l 1 "${train64[@]}" >/dev/null) ||
+        die "PGO training run failed"
+    (cd "$work" && "./cli.pg$exe" bench -q -b 65536 -l 6 "${train64[@]}" >/dev/null) ||
+        die "PGO training run failed"
+    (cd "$work" && "./cli.pg$exe" bench -q -b 65536 -l 9 "${train64[@]}" >/dev/null) ||
         die "PGO training run failed"
     got="$(find "$work/prof" -name '*.gcda' -print -quit)"
     [ -n "$got" ] || die "training produced no .gcda files"
