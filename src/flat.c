@@ -199,8 +199,9 @@ static ZPSE_FLAT_AVX2_TARGET void flat_sublane_avx2(const uint8_t *sub,
 
 /* ---- scalar, bit-exact fallbacks ------------------------------------- */
 
-static void flat_nibble4_scalar(const uint8_t *pal, const uint8_t *src,
-                                uint8_t *dst, uint32_t n)
+static void flat_nibble4_scalar(const uint8_t *restrict pal,
+                                const uint8_t *restrict src,
+                                uint8_t *restrict dst, uint32_t n)
 {
     uint32_t i;
 
@@ -209,8 +210,9 @@ static void flat_nibble4_scalar(const uint8_t *pal, const uint8_t *src,
     }
 }
 
-static void flat_bit2_scalar(const uint8_t *pal, const uint8_t *src,
-                             uint8_t *dst, uint32_t n)
+static void flat_bit2_scalar(const uint8_t *restrict pal,
+                             const uint8_t *restrict src,
+                             uint8_t *restrict dst, uint32_t n)
 {
     uint32_t i;
 
@@ -219,7 +221,8 @@ static void flat_bit2_scalar(const uint8_t *pal, const uint8_t *src,
     }
 }
 
-static void flat_sublane_scalar(const uint8_t *sub, uint8_t *dst, uint32_t n,
+static void flat_sublane_scalar(const uint8_t *restrict sub,
+                                uint8_t *restrict dst, uint32_t n,
                                 uint32_t period, uint32_t k,
                                 const uint8_t keep[8], const uint8_t rank[8],
                                 const uint8_t templ[8])

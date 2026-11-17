@@ -73,6 +73,16 @@
 #define ZPSE_LIKELY(X) (X)
 #endif
 
+/* The counterpart to ZPSE_LIKELY, for branches that are not the iteration:
+ * error, validation and other cold exits. Like ZPSE_LIKELY it is only a
+ * layout instruction -- it cannot change which inputs are accepted -- and
+ * it compiles to nothing where the builtin is unknown. */
+#if defined(__GNUC__) || defined(__clang__)
+#define ZPSE_UNLIKELY(X) __builtin_expect(!!(X), 0)
+#else
+#define ZPSE_UNLIKELY(X) (X)
+#endif
+
 /* Whether this toolchain can be handed the 256-bit kernels at all.
  *
  * A `__m256i` stack slot has to be 32-byte aligned, because that is what
