@@ -386,3 +386,19 @@ int zpse_page_classify(const uint8_t *in, uint32_t n, ZpsePageInfo *info)
     }
     return pf_finish(&a, n, info);
 }
+
+/* See pagefast.h for the contract. memset seeds the "absent" sentinel; the
+ * ascending stores then write each present value's palette index (first match
+ * wins -- the classifier's palette holds distinct values, so the first match
+ * is the only match). The i < 16u guard keeps this in bounds even if a caller
+ * passes a malformed nalpha; valid classifier output always has nalpha <= 16. */
+void zpse_pf_make_pal_lut(const uint8_t alpha[16], uint8_t nalpha,
+                          uint8_t lut[256])
+{
+    uint8_t i;
+
+    memset(lut, 0xFF, 256u);
+    for (i = 0u; i < nalpha && i < 16u; i++) {
+        lut[alpha[i]] = i;
+    }
+}

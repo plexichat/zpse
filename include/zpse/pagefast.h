@@ -68,4 +68,23 @@ typedef struct ZpsePageInfo {
 /* Returns one of the ZpsePageClass values. in may be unaligned. */
 int zpse_page_classify(const uint8_t *in, uint32_t n, ZpsePageInfo *info);
 
+/* Build a 256-byte value -> palette-index LUT for a FLAT low-alpha page.
+ *
+ * For every byte value v, lut[v] is the palette index of v: the smallest i
+ * with alpha[i] == v (FIRST MATCH WINS), or 0xFF when v is absent from the
+ * palette. The classifier's alpha holds distinct values in first-appearance
+ * order, so the first match is also the only match and the mapping is
+ * unambiguous. Every byte of a LOW_ALPHA page is in its palette, so the
+ * 0xFF sentinel is never returned for input the classifier accepted; it is
+ * only a safe default for values outside the palette.
+ *
+ * This is byte-identical to the linear first-match scan of alpha[0..nalpha-1]
+ * for all values that can occur on a LOW_ALPHA page, but turns each lookup
+ * into a single load instead of up to 16 compares.
+ *
+ * alpha must point to at least nalpha (<= 16) readable bytes and lut to 256
+ * writable bytes. No allocation or retained state. */
+void zpse_pf_make_pal_lut(const uint8_t alpha[16], uint8_t nalpha,
+                          uint8_t lut[256]);
+
 #endif /* ZPSE_PAGEFAST_H */
