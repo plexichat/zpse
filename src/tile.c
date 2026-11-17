@@ -2550,6 +2550,16 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
     }
     if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
         c = cl->constant_C;
+    /* A CONST tile predicts c at every exception: 0 for CONST_ZERO,
+     * constant_C for TILE_CONSTANT. The dense at_pred array holds exactly
+     * cl->k such predictions in ascending position order, and the staging
+     * buffer is unread for this family. Skip both the 304-byte stage and
+     * the vector/scalar prediction walk -- a memset of k bytes is the
+     * whole job, byte-identically. */
+    if (fam == TILE_FAM_CONST) {
+        memset(cl->at_pred, c, cl->k);
+        return ZPSE_OK;
+    }
 
 #if ZPSE_TILE_HAVE_AVX2
     if (nt >= 32u && tile_fam_is_vectorisable(fam) &&
@@ -2651,15 +2661,35 @@ static uint16_t tile_res_len(uint8_t res_mode, const ZpseTileClass *cl,
         return (uint16_t)(1u + m + (((uint32_t)k * b + 7u) / 8u));
     }
     case ZPSE_R_PACKED_BASE_M: {
-        uint8_t m;
-        uint8_t g;
+        /* One load of the base-M group for this residual max, then division
+         * by a compile-time constant in each arm (multiply-shift, no runtime
+         * hardware divide). g_of_rmax[r] is
+         * zpse_base_m_group(zpse_residual_mode3_pick_m(r)); a zero entry
+         * means no allowed M covers r, which the caller reports as 0xFFFF.
+         * The g set is {7,8,9,10,11,13,20} (residual.c); every allowed M
+         * maps to one of those, so g == 0 only for the "no M" case. */
+        static const uint8_t g_of_rmax[256] = {
+            [0] = 20, [1] = 20, [2] = 20, [3] = 13, [4] = 13, [5] = 11,
+            [6] = 10, [7] = 9, [8] = 9, [9] = 9, [10] = 8, [11] = 8,
+            [12] = 8, [13] = 7, [14] = 7
+        };
+        uint8_t g = g_of_rmax[cl->rmax];
+        uint16_t q;
+
         if (k == 0u)
             return 1u;
-        m = zpse_residual_mode3_pick_m(cl->rmax);
-        if (m == 0u)
+        if (g == 0u)
             return 0xFFFFu;
-        g = zpse_base_m_group(m);
-        return (uint16_t)(1u + (((uint32_t)k + g - 1u) / g) * 4u);
+        switch (g) {
+        case 7:  q = (uint16_t)(((uint32_t)k + 6u) / 7u);  break;
+        case 8:  q = (uint16_t)(((uint32_t)k + 7u) / 8u);  break;
+        case 9:  q = (uint16_t)(((uint32_t)k + 8u) / 9u);  break;
+        case 10: q = (uint16_t)(((uint32_t)k + 9u) / 10u); break;
+        case 11: q = (uint16_t)(((uint32_t)k + 10u) / 11u); break;
+        case 13: q = (uint16_t)(((uint32_t)k + 12u) / 13u); break;
+        default: /* 20 */ q = (uint16_t)(((uint32_t)k + 19u) / 20u); break;
+        }
+        return (uint16_t)(1u + (uint32_t)q * 4u);
     }
     default: { /* SIGNED_DELTA */
         int dmin = (int)cl->dmin - 128;
@@ -2946,26 +2976,30 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
                         (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT
                              ? 1u : 0u);
         uint32_t total = base + (uint32_t)k;
-        uint16_t i;
+        int rrc;
 
         if (total > record_cap)
             return ZPSE_OUTPUT_OVERFLOW;
-        if (zpse_mask_count_bits(words, nt) != (int)nt)
-            return ZPSE_BAD_MASK;
-        for (i = 0; i < k; i++) {
-            uint8_t v = cl->res_at_exc[i];
-
-            if (v > 254u)
-                return ZPSE_BAD_RESIDUAL;
-            record_out[base + i] = v;
-        }
+        /* Same exclusion packer as the generic path: it rejects a 0xFF
+         * residual (residual_has_ff) and copies cl->res_at_exc verbatim,
+         * so the v > 254 check is kept. The ALL_EXCEPTION mask has every
+         * bit set by construction (k == nt), so the popcount re-check the
+         * generic path implies is redundant here and is dropped. The packer
+         * returns exactly k, i.e. rrc == 0 is impossible for k == nt > 0. */
+        rrc = zpse_residual_encode_hint(ZPSE_R_EXCLUSION_U8,
+                                        cl->res_at_exc, 0, cl->at_pred, k,
+                                        record_out + base,
+                                        tile_cap16(record_cap - base),
+                                        cl->nu, cl->seen);
+        if (rrc < 0)
+            return rrc;
         record_out[0] = zpse_tile_flags_make(mask_mode, res_mode,
                                              tile_reset ? 1 : 0);
         record_out[1] = predictor_id;
         record_out[2] = (uint8_t)(nt - (uint16_t)1);
         record_out[3] = 0u;
         zpse_store_u16le(record_out + 4, 0u);
-        zpse_store_u16le(record_out + 6, (uint16_t)k);
+        zpse_store_u16le(record_out + 6, (uint16_t)rrc);
         if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
             record_out[ZPSE_TILE_HEADER_SIZE] = cl->constant_C;
         return (int)total;
