@@ -2107,8 +2107,8 @@ static int cmd_bench(int argc, char **argv)
     int failures = 0;
     unsigned long long tot_in = 0u;
     unsigned long long tot_out = 0u;
-    /* Bytes fed through each codec, counting every repetition: the
-     * per-file rates are n*reps/time, so the totals must be too. */
+    /* One rep's worth of bytes per file: the per-file rates are n/best_time,
+     * so the totals sum n over files and divide by the sum of best times. */
     unsigned long long tot_passed = 0u;
     double tot_enc_ns = 0.0;
     double tot_dec_ns = 0.0;
@@ -2241,6 +2241,17 @@ static int cmd_bench(int argc, char **argv)
         free_arenas(dec_arenas, threads);
         return 1;
     }
+    /* Pre-fault each worker's arena before any clock starts. The first write
+     * into a fresh arena is a page fault every 4 KiB, which is the caller's
+     * allocation cost, not the codec's work. The reps below reuse these
+     * arenas, so touch them once here and keep that cost out of every rep. */
+    {
+        unsigned a;
+        for (a = 0; a < threads; a++) {
+            memset(enc_arenas[a], 0, ZPSE_ENC_ARENA_SIZE);
+            memset(dec_arenas[a], 0, ZPSE_DEC_ARENA_SIZE);
+        }
+    }
     if (!quiet) {
         printf("level %s%s%s, block %u, %s, %u thread%s\n",
                level_name(enc_flags),
@@ -2264,6 +2275,7 @@ static int cmd_bench(int argc, char **argv)
         long reps;
         long r;
         double t0;
+        double dt;
         double enc_ns;
         double dec_ns;
         int ok = 1;
@@ -2318,8 +2330,11 @@ static int cmd_bench(int argc, char **argv)
                 reps = 20;
             }
         }
-        t0 = now_ns();
+        /* Best of N: time every rep on its own and keep the fastest. With
+         * enough reps the first is a warmup and never enters the minimum. */
+        enc_ns = 0.0;
         for (r = 0; r < reps; r++) {
+            t0 = now_ns();
             if (compress_mem(in, n, comp, comp_cap, &comp_len, block,
                              enc_flags, indexed, enc_arenas, threads) != 0) {
                 fprintf(stderr, "zpse_cli: compress failed on %s (n=%lu)\n",
@@ -2327,8 +2342,14 @@ static int cmd_bench(int argc, char **argv)
                 ok = 0;
                 break;
             }
+            if (reps >= 3 && r == 0) {
+                continue;
+            }
+            dt = now_ns() - t0;
+            if (enc_ns == 0.0 || dt < enc_ns) {
+                enc_ns = dt;
+            }
         }
-        enc_ns = now_ns() - t0;
         if (!ok) {
             free(in);
             free(comp);
@@ -2344,8 +2365,9 @@ static int cmd_bench(int argc, char **argv)
             failures++;
             continue;
         }
-        t0 = now_ns();
+        dec_ns = 0.0;
         for (r = 0; r < reps; r++) {
+            t0 = now_ns();
             if (zpse_decompress_frame_parallel(comp, comp_len, out, n,
                                                &out_len, threads, dec_arenas,
                                                threads) != 0) {
@@ -2353,8 +2375,14 @@ static int cmd_bench(int argc, char **argv)
                 ok = 0;
                 break;
             }
+            if (reps >= 3 && r == 0) {
+                continue;
+            }
+            dt = now_ns() - t0;
+            if (dec_ns == 0.0 || dt < dec_ns) {
+                dec_ns = dt;
+            }
         }
-        dec_ns = now_ns() - t0;
         if (ok) {
             /* Untimed verification pass: one decode, compared whole. */
             if (out_len != n || memcmp(out, in, n) != 0) {
@@ -2366,8 +2394,8 @@ static int cmd_bench(int argc, char **argv)
             printf("%-14s %11lu %11lu %7.2f %10.1f %10.1f %8.1f%s\n", path,
                    (unsigned long)n, (unsigned long)comp_len,
                    comp_len ? (double)n / (double)comp_len : 0.0,
-                   enc_ns > 0.0 ? (double)n * (double)reps / enc_ns * 1e3 : 0.0,
-                   dec_ns > 0.0 ? (double)n * (double)reps / dec_ns * 1e3 : 0.0,
+                   enc_ns > 0.0 ? (double)n / enc_ns * 1e3 : 0.0,
+                   dec_ns > 0.0 ? (double)n / dec_ns * 1e3 : 0.0,
                    (enc_ns + dec_ns) / 1e6, ok ? "" : "  FAIL");
         }
         if (!ok) {
@@ -2375,7 +2403,7 @@ static int cmd_bench(int argc, char **argv)
         }
         tot_in += (unsigned long long)n;
         tot_out += (unsigned long long)comp_len;
-        tot_passed += (unsigned long long)n * (unsigned long long)reps;
+        tot_passed += (unsigned long long)n;
         tot_enc_ns += enc_ns;
         tot_dec_ns += dec_ns;
         free(in);

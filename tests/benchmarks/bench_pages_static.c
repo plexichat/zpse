@@ -72,13 +72,15 @@ static int mode_wanted(const char *key)
     return 0;
 }
 
-static int run_codec(const char *name, const unsigned char *in, size_t npages,
+static int run_codec(const char *name, const unsigned char *in,
+                     const unsigned char *skip, size_t npages,
                      int kind, int param, int reps);
 
 static void emit(const char *key, const char *name, const unsigned char *in,
-                 size_t npages, int kind, int param, int reps)
+                 const unsigned char *skip, size_t npages,
+                 int kind, int param, int reps)
 {
-    if (mode_wanted(key)) run_codec(name, in, npages, kind, param, reps);
+    if (mode_wanted(key)) run_codec(name, in, skip, npages, kind, param, reps);
 }
 
 static double now_ns(void)
@@ -110,7 +112,8 @@ static int all_zero(const unsigned char *p)
 /* kind: 0 zpse level, 9 zpse FLAT (default level flags, no flag bit),
  * 1 zpse PAGE_FAST, 5 zpse LZ_FAST, 6 zpse LZ_HEX, 7 zpse PAGE_TURBO,
  * 8 zpse PAGE_INSTANT, 3 lz4hc, 4 lz4 default. */
-static int run_codec(const char *name, const unsigned char *in, size_t npages,
+static int run_codec(const char *name, const unsigned char *in,
+                     const unsigned char *skip, size_t npages,
                      int kind, int param, int reps)
 {
     unsigned char *packed = (unsigned char *)malloc(npages * COMP_CAP);
@@ -133,7 +136,7 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
         uint32_t cl = 0;
         int dl;
 
-        if (exclude_zero && all_zero(src)) continue;
+        if (skip[p]) continue;
         switch (kind) {
         case 0:
         case 9:  /* FLAT: default level flags; the encoder emits FLAT itself. */
@@ -207,7 +210,7 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
         for (p = 0; p < npages; p++) {
             const unsigned char *src = in + p * PAGE;
             uint32_t cl = 0;
-            if (exclude_zero && all_zero(src)) continue;
+            if (skip[p]) continue;
             switch (kind) {
             case 0:
             case 9:
@@ -257,7 +260,7 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
         {
             size_t off = 0;
             for (p = 0; p < npages; p++) {
-                if (exclude_zero && all_zero(in + p * PAGE)) continue;
+                if (skip[p]) continue;
                 if ((kind == 3 || kind == 4)) {
                     int stored = (int)lens[p] - 2;
                     LZ4_decompress_safe((const char *)packed + off, (char *)out,
@@ -277,7 +280,7 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
     {
         size_t measured = 0;
         for (p = 0; p < npages; p++)
-            if (!(exclude_zero && all_zero(in + p * PAGE))) measured++;
+            if (!skip[p]) measured++;
         if (measured == 0u) {
             printf("| %-24s | (no pages) | | |\n", name);
         } else {
@@ -296,6 +299,7 @@ int main(int argc, char **argv)
     FILE *f;
     long sz;
     unsigned char *in;
+    unsigned char *skip;
     size_t npages, p;
     int i, start = 1, reps = 3, rc = 0;
     const char *base;
@@ -343,7 +347,16 @@ int main(int argc, char **argv)
         }
         fclose(f);
         npages = (size_t)sz / PAGE;
-        for (p = 0; p < npages; p++) (void)all_zero(in + p * PAGE);
+        /* One untimed pass decides which pages each codec must skip. Doing
+         * it here, once per file, keeps a full 4 KiB all_zero scan out of the
+         * timed encode/decode loops, where it was pure harness overhead. */
+        skip = (unsigned char *)malloc(npages);
+        if (skip == NULL) {
+            fprintf(stderr, "bench_pages_static: out of memory (skip)\n");
+            free(in); return 1;
+        }
+        for (p = 0; p < npages; p++)
+            skip[p] = (unsigned char)(exclude_zero && all_zero(in + p * PAGE));
 
         base = strrchr(argv[i], '/');
         if (!base) base = strrchr(argv[i], '\\');
@@ -354,20 +367,21 @@ int main(int argc, char **argv)
         printf("\n");
         printf("| codec | ratio | encode MB/s | decode MB/s |\n");
         printf("| --- | ---: | ---: | ---: |\n");
-        emit("level1",  "zpse 1 FASTEST",     in, npages, 0, 1, reps);
-        emit("level6",  "zpse 6 (default)",   in, npages, 0, 6, reps);
-        emit("level9",  "zpse 9 MAX",         in, npages, 0, 9, reps);
-        emit("flat",    "zpse FLAT (default)", in, npages, 9, 6, reps);
-        emit("fast",    "zpse 6 PAGE_FAST",   in, npages, 1, 6, reps);
-        emit("lzf",     "zpse 6 LZ_FAST",     in, npages, 5, 6, reps);
-        emit("lzh",     "zpse 6 LZ_HEX",      in, npages, 6, 6, reps);
-        emit("turbo",   "zpse 6 TURBO",       in, npages, 7, 6, reps);
-        emit("instant", "zpse 6 PAGE_INSTANT", in, npages, 8, 6, reps);
-        emit("lz4",     "lz4 1",              in, npages, 4, 1, reps);
-        emit("hc4",     "lz4hc 4",            in, npages, 3, 4, reps);
-        emit("hc9",     "lz4hc 9",            in, npages, 3, 9, reps);
-        emit("hc12",    "lz4hc 12",           in, npages, 3, 12, reps);
+        emit("level1",  "zpse 1 FASTEST",     in, skip, npages, 0, 1, reps);
+        emit("level6",  "zpse 6 (default)",   in, skip, npages, 0, 6, reps);
+        emit("level9",  "zpse 9 MAX",         in, skip, npages, 0, 9, reps);
+        emit("flat",    "zpse FLAT (default)", in, skip, npages, 9, 6, reps);
+        emit("fast",    "zpse 6 PAGE_FAST",   in, skip, npages, 1, 6, reps);
+        emit("lzf",     "zpse 6 LZ_FAST",     in, skip, npages, 5, 6, reps);
+        emit("lzh",     "zpse 6 LZ_HEX",      in, skip, npages, 6, 6, reps);
+        emit("turbo",   "zpse 6 TURBO",       in, skip, npages, 7, 6, reps);
+        emit("instant", "zpse 6 PAGE_INSTANT", in, skip, npages, 8, 6, reps);
+        emit("lz4",     "lz4 1",              in, skip, npages, 4, 1, reps);
+        emit("hc4",     "lz4hc 4",            in, skip, npages, 3, 4, reps);
+        emit("hc9",     "lz4hc 9",            in, skip, npages, 3, 9, reps);
+        emit("hc12",    "lz4hc 12",           in, skip, npages, 3, 12, reps);
         printf("\n");
+        free(skip);
         free(in);
     }
     return rc;

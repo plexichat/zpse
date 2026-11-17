@@ -65,9 +65,12 @@ if [ "$digest_upper" != "$expected" ]; then
     exit 1
 fi
 
+pin=""
+command -v taskset >/dev/null 2>&1 && pin="taskset -c 0"
+
 echo "## table: page corpus, non-zero pages"
 echo
-"$work/bench_pages_static" --exclude-zero --reps="$REPS" "$work/pages/pages-nonzero.bin"
+$pin "$work/bench_pages_static" --exclude-zero --reps="$REPS" "$work/pages/pages-nonzero.bin"
 echo "Corpus: \`pages-nonzero.bin\`, $SIZE bytes, sha256 \`${digest:0:16}…\`."
 echo "Every page is one independent block; lz4 is called once per 4 KiB page."
 echo "Packed bytes include each codec's framing (two length bytes are charged"
@@ -76,18 +79,18 @@ echo
 
 echo "## table: page corpus, all pages including zero"
 echo
-"$work/bench_pages_static" --reps="$REPS" "$work/pages/pages-all.bin"
+$pin "$work/bench_pages_static" --reps="$REPS" "$work/pages/pages-all.bin"
 echo
 
 echo "## table: page corpus, per class"
 echo
-echo "Decode MB/s (best of 3) per corpus class:"
+echo "Decode MB/s (best of $REPS) per corpus class:"
 echo
 echo "| class | zpse 6 | zpse FLAT | zpse 6 INSTANT | lz4 1 | lz4hc 12 |"
 echo "| --- | ---: | ---: | ---: | ---: | ---: |"
 for f in "$work"/pages/page-*.bin; do
     name=$(basename "$f" .bin); name=${name#page-}
-    out=$("$work/bench_pages_static" --reps=3 "$f")
+    out=$($pin "$work/bench_pages_static" --reps="$REPS" "$f")
     zp=$(printf '%s\n' "$out" | awk -F'|' '/zpse 6 \(default\)/ {gsub(/ /,"",$5); print $5}')
     zf=$(printf '%s\n' "$out" | awk -F'|' '/zpse FLAT \(default\)/ {gsub(/ /,"",$5); print $5}')
     zi=$(printf '%s\n' "$out" | awk -F'|' '/zpse 6 PAGE_INSTANT/ {gsub(/ /,"",$5); print $5}')
