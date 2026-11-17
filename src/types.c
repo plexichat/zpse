@@ -336,7 +336,6 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     uint32_t seq;
     uint32_t dec_crc;
     uint32_t stored_crc, calc_crc;
-    uint32_t hsz;
     int has_meta;
 
     if (out == 0 || buf == 0) {
@@ -345,23 +344,36 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     if (len < 2u) {
         return ZPSE_TRUNCATED;
     }
-    hsz = zpse_block_header_size(buf, len);
-    if (hsz == 0u) {
+
+    /* One sync load selects the header form and its length. Caching it here
+     * avoids re-reading the first two bytes through the size helper and the
+     * chain of form tests; the per-form parsers below are unchanged. */
+    sync = zpse_load_u16le(buf + 0);
+    switch (sync) {
+    case ZPSE_BLOCK_SYNC_TOKEN:
+        if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            return ZPSE_TRUNCATED;
+        }
+        return zpse_block_token_build(out, buf, len);
+    case ZPSE_BLOCK_SYNC_FLAT:
+        if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            return ZPSE_TRUNCATED;
+        }
+        return zpse_block_header_parse_flat(out, buf, len);
+    case ZPSE_BLOCK_SYNC_SHORT:
+        if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            return ZPSE_TRUNCATED;
+        }
+        return zpse_block_header_parse_short(out, buf);
+    case ZPSE_BLOCK_SYNC:
+        if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE) {
+            return ZPSE_TRUNCATED;
+        }
+        break; /* the long header is parsed below */
+    default:
         return ZPSE_BAD_HEADER;
     }
-    if (len < hsz) {
-        return ZPSE_TRUNCATED;
-    }
-    if (zpse_load_u16le(buf) == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN) {
-        return zpse_block_token_build(out, buf, len);
-    }
-    if (zpse_load_u16le(buf) == (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
-        return zpse_block_header_parse_flat(out, buf, len);
-    }
-    if (hsz == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
-        return zpse_block_header_parse_short(out, buf);
-    }
-    sync = zpse_load_u16le(buf + 0);
+
     ver = buf[2];
     flags = buf[3];
     uncomp = zpse_load_u32le(buf + 4);
