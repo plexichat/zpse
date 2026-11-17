@@ -72,15 +72,14 @@ lz_extend_avx2(const uint8_t *in, uint32_t pos, uint32_t cand, uint32_t len,
     while (pos + len + 32u <= n && cand + len + 32u <= n) {
         __m256i a = _mm256_loadu_si256((const __m256i *)(in + pos + len));
         __m256i b = _mm256_loadu_si256((const __m256i *)(in + cand + len));
+        uint32_t eq = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
 
-        if ((uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) !=
-            0xFFFFFFFFu) {
-            uint32_t k = 0u;
-
-            while (in[pos + len + k] == in[cand + len + k]) {
-                k++;
-            }
-            return len + k;
+        if (eq != 0xFFFFFFFFu) {
+            /* Bit k of `eq` is set when byte k compared equal. The lowest
+             * clear bit is the first mismatching byte, so ctz of the
+             * complement is the offset a byte loop would have counted one
+             * byte at a time -- the same `len`. */
+            return len + (uint32_t)zpse_ctz64(~(uint64_t)eq);
         }
         len += 32u;
     }
@@ -418,7 +417,7 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
                                uint32_t cap, void *table, uint32_t hash_bits,
                                uint32_t lazy_max, uint32_t sample_n)
 {
-    uint16_t *tab = (uint16_t *)table;
+    uint16_t *restrict tab = (uint16_t *)table;
     LzOut o;
     uint32_t pos, anchor, misses;
     uint32_t cur, h, cand;
@@ -518,6 +517,12 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
         uint32_t nxt_ok = 0u, nxt_cur = 0u, nxt_h = 0u;
         uint16_t nxt_cand = LZ_EMPTY;
 #endif
+#if ZPSE_LZ_PIPE_NEXT && (ZPSE_LZ_LAZY_LEN > 0)
+        /* The position the lookahead below was computed for. The lazy
+         * probe reuses that lookahead only when the backward walk has not
+         * moved the cursor off it. */
+        uint32_t probe_base;
+#endif
 
         LZ_TAB_SET(h, pos);
 #if ZPSE_LZ_PIPE_NEXT
@@ -571,8 +576,8 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
  * round-trip status, and only above a page because the lazy pass stops at
  * ZPSE_LZ_LAZY_MAX.  One compare, on the probe that already loads the word
  * at the candidate. */
-        if (cand == LZ_EMPTY || (uint32_t)cand >= pos ||
-            zpse_load_u32le(in + cand) != cur) {
+        if (ZPSE_LIKELY(cand == LZ_EMPTY || (uint32_t)cand >= pos ||
+                        zpse_load_u32le(in + cand) != cur)) {
 #if ZPSE_LZ_PIPE_NEXT
             /* The ordinary case: the cursor advances by one, which is every
              * miss until thirty-two in a row make it accelerate, and the
@@ -673,6 +678,11 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
          * longer match for the same four bytes. It can never cross the
          * last match's end, so the decoder's view of the stream does not
          * change. */
+#if ZPSE_LZ_PIPE_NEXT && (ZPSE_LZ_LAZY_LEN > 0)
+        /* Remember the cursor the pos+1 lookahead was read for; the probe
+         * below may reuse it if this walk does not move the cursor. */
+        probe_base = pos;
+#endif
 #if ZPSE_LZ_BACK_WIDE
         while (pos - anchor >= 8u && cand >= 8u &&
                lz_load64(in + pos - 8u) == lz_load64(in + cand - 8u)) {
@@ -735,9 +745,27 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
         }
 #if (ZPSE_LZ_LAZY_LEN > 0)
         if (lazy_max != 0u && n <= lazy_max && pos + len + 1u < n) {
-            uint32_t v1 = zpse_load_u32le(in + pos + 1u);
-            uint32_t h1 = lz_hash(v1, hb);
-            uint32_t cand1 = LZ_TAB_GET(h1);
+            uint32_t v1, h1, cand1;
+
+#if ZPSE_LZ_PIPE_NEXT
+            /* The probe asks about pos + 1, which is exactly what the
+             * lookahead at the top read. When the backward walk did not
+             * move the cursor (probe_base == pos), those three values are
+             * already in hand and no table slot was written in between, so
+             * reusing them gives the same key, hash and candidate the old
+             * three loads produced -- the decision and the stream are
+             * unchanged. This is src/lz2.c's ZPSE_LZ2_PROBE_EARLY. */
+            if (nxt_ok != 0u && pos == probe_base) {
+                v1 = nxt_cur;
+                h1 = nxt_h;
+                cand1 = nxt_cand;
+            } else
+#endif
+            {
+                v1 = zpse_load_u32le(in + pos + 1u);
+                h1 = lz_hash(v1, hb);
+                cand1 = LZ_TAB_GET(h1);
+            }
 
             if (cand1 != LZ_EMPTY && cand1 < pos + 1u && cand1 + 4u <= n &&
                 zpse_load_u32le(in + cand1) == v1) {
@@ -757,6 +785,14 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
 #else
                 {
                     uint32_t l1 = ZPSE_LZ_MIN_MATCH;
+                    /* The decision below is `l1 > len + 1`, i.e. whether the
+                     * first `len + 2` bytes match. Bytes past that cannot
+                     * change it: if a mismatch is found first, ctz gives its
+                     * exact offset, and if the walk reaches the cap every
+                     * byte before it matched so the test is already true.
+                     * Capping the walk saves measuring long matches at
+                     * pos + 1 to their full end. */
+                    uint32_t l1_max = len + 2u;
 
 #if ZPSE_LZ_LAZY_WIDE
                     /* The 8-byte arm of this lazy probe cannot start with
@@ -769,7 +805,7 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
                         /* Only the larger cursor needs the bound: cand1 is
                          * below pos + 1, so eight readable bytes at
                          * pos + 1 + l1 are eight at cand1 + l1 as well. */
-                        while (pos + 1u + l1 + 8u <= n) {
+                        while (l1 < l1_max && pos + 1u + l1 + 8u <= n) {
                             uint64_t x = lz_load64(in + pos + 1u + l1) ^
                                          lz_load64(in + cand1 + l1);
 
@@ -784,7 +820,8 @@ static uint32_t lz_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
                     /* The tail, and with the wide loop off the whole of it:
                      * it exits at once after a mismatch the wide loop found,
                      * because that is the byte it stopped on. */
-                    while (pos + 1u + l1 < n && cand1 + l1 < n &&
+                    while (l1 < l1_max && pos + 1u + l1 < n &&
+                           cand1 + l1 < n &&
                            in[pos + 1u + l1] == in[cand1 + l1]) {
                         l1++;
                     }

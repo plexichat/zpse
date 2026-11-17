@@ -3,6 +3,7 @@
 #include "zpse/bits.h"
 #include "zpse/hot.h"
 #include "zpse/status.h"
+#include "zpse/vector.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -145,6 +146,48 @@ static uint64_t lz2_load64(const uint8_t *p)
     return v;
 }
 
+/* AVX2 forward extension for the main match, ported from src/lz.c's
+ * lz_extend_avx2. Same guard and per-file macro names: the unity build puts
+ * lz.c and this file in one translation unit. The first mismatching byte is
+ * the lowest clear bit of the equality mask, which is exactly the offset the
+ * eight-byte xor loop below finds with ctz on the xor -- so the resulting
+ * length is bit-for-bit the scalar one. */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_LZ2_AVX2 __attribute__((target("avx2")))
+#define ZPSE_LZ2_HAVE_AVX2 ZPSE_AVX2_ABI_OK
+#elif defined(__AVX2__)
+#define ZPSE_LZ2_AVX2
+#define ZPSE_LZ2_HAVE_AVX2 ZPSE_AVX2_ABI_OK
+#else
+#define ZPSE_LZ2_HAVE_AVX2 0
+#endif
+#else
+#define ZPSE_LZ2_HAVE_AVX2 0
+#endif
+
+#if ZPSE_LZ2_HAVE_AVX2
+#include <immintrin.h>
+
+static ZPSE_LZ2_AVX2 uint32_t
+lz2_extend_avx2(const uint8_t *in, uint32_t a, uint32_t b, uint32_t len,
+                uint32_t n)
+{
+    while (a + len + 32u <= n && b + len + 32u <= n) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(in + a + len));
+        __m256i y = _mm256_loadu_si256((const __m256i *)(in + b + len));
+        uint32_t eq = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y));
+
+        if (eq != 0xFFFFFFFFu) {
+            return len + (uint32_t)zpse_ctz64(~(uint64_t)eq);
+        }
+        len += 32u;
+    }
+    return len;
+}
+#endif /* ZPSE_LZ2_HAVE_AVX2 */
+
 /* The four most recent distances, most recent first.
  *
  * A repeat is coded as ONE byte -- 0xFC plus the slot -- instead of the two a
@@ -281,11 +324,14 @@ static int lz2_put(uint8_t *dst, uint32_t cap, uint32_t *out,
 /* Forward extension for the lazy probe only: the main loop's copy is inline
  * because it runs at every match, and this one runs once per candidate the
  * probe asks about. Same shape, so a length means the same thing on both
- * sides of the decision. */
+ * sides of the decision. `max_len` caps the walk: the caller only asks
+ * whether the match is strictly longer than the one in hand, so bytes past
+ * the cap cannot change the answer -- a mismatch is reported at its exact
+ * offset by ctz, and reaching the cap means every byte before it matched. */
 static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
-                           uint32_t b, uint32_t len)
+                           uint32_t b, uint32_t len, uint32_t max_len)
 {
-    while (a + len + 8u <= n) {
+    while (len < max_len && a + len + 8u <= n) {
         uint64_t x = lz2_load64(in + a + len) ^ lz2_load64(in + b + len);
 
         if (x != 0u) {
@@ -293,7 +339,7 @@ static uint32_t lz2_extend(const uint8_t *in, uint32_t n, uint32_t a,
         }
         len += 8u;
     }
-    while (a + len < n && in[a + len] == in[b + len]) {
+    while (len < max_len && a + len < n && in[a + len] == in[b + len]) {
         len++;
     }
     return len;
@@ -383,6 +429,13 @@ static uint32_t lz2_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
     uint32_t lit_total = 0u, cmds = 0u, out = LZ2_HDR;
     uint32_t cur, h, limit;
     uint32_t rep[4] = { 1u, 1u, 1u, 1u };
+    /* The extension width is a property of the machine, not of the
+     * position: ask once per call, as src/lz.c does. A constant 0 where the
+     * kernel is compiled out keeps the scalar branch the only one taken. */
+    int have_avx2 = 0;
+#if ZPSE_LZ2_HAVE_AVX2
+    have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+#endif
 
     if (in == 0 || dst == 0 || tab == 0) {
         return 0u;
@@ -570,16 +623,26 @@ static uint32_t lz2_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
         {
             int tail = 0;
 
-            while (mpos + len + 8u <= n) {
-                uint64_t x = lz2_load64(in + mpos + len) ^
-                             lz2_load64(in + mcand + len);
+            if (have_avx2) {
+#if ZPSE_LZ2_HAVE_AVX2
+                /* 32 bytes at a time where both cursors have the room (see
+                 * ZPSE_LZ2_AVX2). The kernel stops at the first mismatch and
+                 * the byte loop below resolves the byte it stopped on --
+                 * the same length the eight-byte loop finds with ctz. */
+                len = lz2_extend_avx2(in, mpos, mcand, len, n);
+#endif
+            } else {
+                while (mpos + len + 8u <= n) {
+                    uint64_t x = lz2_load64(in + mpos + len) ^
+                                 lz2_load64(in + mcand + len);
 
-                if (x != 0u) {
-                    len += zpse_ctz64(x) >> 3;
-                    tail = 1;
-                    break;
+                    if (x != 0u) {
+                        len += zpse_ctz64(x) >> 3;
+                        tail = 1;
+                        break;
+                    }
+                    len += 8u;
                 }
-                len += 8u;
             }
             /* Only the end of the block reaches this: eight bytes are not
              * readable there and the length has to be counted one at a
@@ -621,7 +684,8 @@ static uint32_t lz2_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
             if ((ZPSE_LZ2_PROBE_SELF != 0 || p_h != h) &&
                 p_c1 != LZ2_EMPTY &&
                 p_c1p <= mpos && zpse_load_u32le(in + p_c1p) == p_cur &&
-                lz2_extend(in, n, mpos + 1u, p_c1p, ZPSE_LZ2_MIN_MATCH) > len) {
+                lz2_extend(in, n, mpos + 1u, p_c1p, ZPSE_LZ2_MIN_MATCH,
+                           len + 1u) > len) {
                 pos = mpos + 1u;
                 misses = 0u;
                 cur = p_cur;
@@ -642,7 +706,8 @@ static uint32_t lz2_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
 
             if (c1 != LZ2_EMPTY && c1p <= mpos &&
                 zpse_load_u32le(in + c1p) == cur1 &&
-                lz2_extend(in, n, mpos + 1u, c1p, ZPSE_LZ2_MIN_MATCH) > len) {
+                lz2_extend(in, n, mpos + 1u, c1p, ZPSE_LZ2_MIN_MATCH,
+                           len + 1u) > len) {
                 pos = mpos + 1u;
                 misses = 0u;
                 cur = cur1;

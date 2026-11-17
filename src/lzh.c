@@ -3,6 +3,7 @@
 #include "zpse/bits.h"
 #include "zpse/hot.h"
 #include "zpse/status.h"
+#include "zpse/vector.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -63,6 +64,48 @@ static uint64_t lzh_load64(const uint8_t *p)
     memcpy(&v, p, 8u);
     return v;
 }
+
+/* AVX2 forward extension for the main match, ported from src/lz.c's
+ * lz_extend_avx2 (see src/lz2.c). Per-file macro and function names keep the
+ * unity build's single translation unit free of collisions. The kernel stops
+ * at the first mismatching byte -- the lowest clear bit of the equality mask,
+ * the same offset the eight-byte xor loop finds with ctz -- so the length is
+ * bit-for-bit the scalar one. */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#define ZPSE_LZH_AVX2 __attribute__((target("avx2")))
+#define ZPSE_LZH_HAVE_AVX2 ZPSE_AVX2_ABI_OK
+#elif defined(__AVX2__)
+#define ZPSE_LZH_AVX2
+#define ZPSE_LZH_HAVE_AVX2 ZPSE_AVX2_ABI_OK
+#else
+#define ZPSE_LZH_HAVE_AVX2 0
+#endif
+#else
+#define ZPSE_LZH_HAVE_AVX2 0
+#endif
+
+#if ZPSE_LZH_HAVE_AVX2
+#include <immintrin.h>
+
+static ZPSE_LZH_AVX2 uint32_t
+lzh_extend_avx2(const uint8_t *in, uint32_t a, uint32_t b, uint32_t len,
+                uint32_t n)
+{
+    while (a + len + 32u <= n && b + len + 32u <= n) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(in + a + len));
+        __m256i y = _mm256_loadu_si256((const __m256i *)(in + b + len));
+        uint32_t eq = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y));
+
+        if (eq != 0xFFFFFFFFu) {
+            return len + (uint32_t)zpse_ctz64(~(uint64_t)eq);
+        }
+        len += 32u;
+    }
+    return len;
+}
+#endif /* ZPSE_LZH_HAVE_AVX2 */
 
 /* Which of the four recent distances `off` is, or 4 when it is a fresh one. */
 static uint32_t lzh_rep_index(const uint32_t *rep, uint32_t off)
@@ -277,11 +320,15 @@ static int lzh_cmd(LzhWr *w, const uint8_t *in, uint32_t *rep,
     return lzh_pair(w, in, &c);
 }
 
-/* Lazy probe helper, the fast form's: the length of the match at (a, b). */
+/* Lazy probe helper, the fast form's: the length of the match at (a, b).
+ * `max_len` caps the walk: the caller only asks whether this match is
+ * strictly longer than the one in hand, so bytes past the cap cannot change
+ * the answer -- a mismatch is reported at its exact offset by ctz, and
+ * reaching the cap means every byte before it matched. */
 static uint32_t lzh_extend(const uint8_t *in, uint32_t n, uint32_t a,
-                           uint32_t b, uint32_t len)
+                           uint32_t b, uint32_t len, uint32_t max_len)
 {
-    while (a + len + 8u <= n) {
+    while (len < max_len && a + len + 8u <= n) {
         uint64_t x = lzh_load64(in + a + len) ^ lzh_load64(in + b + len);
 
         if (x != 0u) {
@@ -289,7 +336,7 @@ static uint32_t lzh_extend(const uint8_t *in, uint32_t n, uint32_t a,
         }
         len += 8u;
     }
-    while (a + len < n && in[a + len] == in[b + len]) {
+    while (len < max_len && a + len < n && in[a + len] == in[b + len]) {
         len++;
     }
     return len;
@@ -350,12 +397,19 @@ static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
                                 uint32_t cap, void *table, uint32_t hash_bits,
                                 uint32_t sample_n)
 {
-    uint16_t *tab = (uint16_t *)table;
+    uint16_t *restrict tab = (uint16_t *)table;
     uint32_t entries;
     uint32_t pos, anchor, misses;
     uint32_t cur, h, limit;
     uint32_t rep[4] = { 1u, 1u, 1u, 1u };
     LzhWr w;
+    /* Ask for the extension width once per call, as src/lz.c and src/lz2.c
+     * do; a constant 0 where the kernel is compiled out leaves the scalar
+     * branch the only one taken. */
+    int have_avx2 = 0;
+#if ZPSE_LZH_HAVE_AVX2
+    have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
+#endif
     entries = 1u << hash_bits;
 
     if (in == 0 || dst == 0 || tab == 0) {
@@ -502,16 +556,26 @@ static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
             {
                 int tail = 0;
 
-                while (mpos + len + 8u <= n) {
-                    uint64_t x = lzh_load64(in + mpos + len) ^
-                                 lzh_load64(in + mcand + len);
+                if (have_avx2) {
+#if ZPSE_LZH_HAVE_AVX2
+                    /* 32 bytes at a time where both cursors have the room
+                     * (see ZPSE_LZH_AVX2). The kernel stops at the first
+                     * mismatch and the byte loop below resolves the byte it
+                     * stopped on -- the same length the xor loop finds. */
+                    len = lzh_extend_avx2(in, mpos, mcand, len, n);
+#endif
+                } else {
+                    while (mpos + len + 8u <= n) {
+                        uint64_t x = lzh_load64(in + mpos + len) ^
+                                     lzh_load64(in + mcand + len);
 
-                    if (x != 0u) {
-                        len += zpse_ctz64(x) >> 3;
-                        tail = 1;
-                        break;
+                        if (x != 0u) {
+                            len += zpse_ctz64(x) >> 3;
+                            tail = 1;
+                            break;
+                        }
+                        len += 8u;
                     }
-                    len += 8u;
                 }
                 if (tail == 0) {
                     while (mpos + len < n && in[mpos + len] == in[mcand + len]) {
@@ -527,7 +591,8 @@ static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
             if (p_ok && mpos == pos && len <= 24u &&
                 p_c1 != LZH_EMPTY && p_c1 <= mpos &&
                 zpse_load_u32le(in + p_c1) == p_cur &&
-                lzh_extend(in, n, mpos + 1u, p_c1, ZPSE_LZH_MIN_MATCH) > len) {
+                lzh_extend(in, n, mpos + 1u, p_c1, ZPSE_LZH_MIN_MATCH,
+                           len + 1u) > len) {
                 pos = mpos + 1u;
                 misses = 0u;
                 cur = p_cur;
@@ -546,7 +611,8 @@ static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
 
                 if (c1 != LZH_EMPTY && c1 <= mpos &&
                     zpse_load_u32le(in + c1) == cur1 &&
-                    lzh_extend(in, n, mpos + 1u, c1, ZPSE_LZH_MIN_MATCH) > len) {
+                    lzh_extend(in, n, mpos + 1u, c1, ZPSE_LZH_MIN_MATCH,
+                               len + 1u) > len) {
                     pos = mpos + 1u;
                     misses = 0u;
                     cur = cur1;
