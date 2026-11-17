@@ -110,9 +110,19 @@ static ZPSE_RES_AVX2 uint16_t res4k_pal_b4_enc(const uint8_t *idx_of,
                                                uint16_t k, uint8_t *dst);
 static ZPSE_RES_AVX2 uint32_t res4k_delta_enc(const uint8_t *actual,
                                               const uint8_t *pred,
-                                              uint16_t k, int *dmin_out,
+                                              uint16_t k, uint8_t *deltas,
+                                              int *dmin_out,
                                               int *dmax_out, int *zero_out);
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc_b0(const uint8_t *deltas,
+                                                 uint32_t n, uint8_t *dst);
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc_b1(const uint8_t *deltas,
+                                                 uint32_t n, uint8_t *dst);
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc_b2(const uint8_t *deltas,
+                                                 uint32_t n, uint8_t *dst);
 static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b0(const uint8_t *src,
+                                                 const uint8_t *pred,
+                                                 uint16_t k, uint8_t *out);
+static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b1(const uint8_t *src,
                                                  const uint8_t *pred,
                                                  uint16_t k, uint8_t *out);
 static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b2(const uint8_t *src,
@@ -292,6 +302,82 @@ static int residual_copy_u8_checked(uint8_t *dst, const uint8_t *src,
      * scalar loop, a rejecting payload may leave more bytes in dst than the
      * per-byte form wrote, which no caller can observe (the status is
      * checked first and dst is scratch). */
+    if (n >= ZPSE_RES_FAST4K_MIN &&
+        (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+        i = res4k_copy_checked(dst, src, n, &bad);
+    }
+#endif
+    while (i + 32u <= n) {
+        uint64_t w0, w1, w2, w3;
+
+        memcpy(&w0, src + i, sizeof w0);
+        memcpy(&w1, src + i + 8u, sizeof w1);
+        memcpy(&w2, src + i + 16u, sizeof w2);
+        memcpy(&w3, src + i + 24u, sizeof w3);
+        memcpy(dst + i, &w0, sizeof w0);
+        memcpy(dst + i + 8u, &w1, sizeof w1);
+        memcpy(dst + i + 16u, &w2, sizeof w2);
+        memcpy(dst + i + 24u, &w3, sizeof w3);
+        w0 = ~w0;
+        w1 = ~w1;
+        w2 = ~w2;
+        w3 = ~w3;
+        bad |= (int)(((w0 - UINT64_C(0x0101010101010101)) & ~w0 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        bad |= (int)(((w1 - UINT64_C(0x0101010101010101)) & ~w1 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        bad |= (int)(((w2 - UINT64_C(0x0101010101010101)) & ~w2 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        bad |= (int)(((w3 - UINT64_C(0x0101010101010101)) & ~w3 &
+                      UINT64_C(0x8080808080808080)) != 0u);
+        i += 32u;
+    }
+    for (; i + 8u <= n; i += 8u) {
+        uint64_t w;
+
+        memcpy(&w, src + i, sizeof w);
+        memcpy(dst + i, &w, sizeof w);
+        w = ~w;
+        bad |= (int)(((w - UINT64_C(0x0101010101010101)) & ~w &
+                      UINT64_C(0x8080808080808080)) != 0u);
+    }
+    for (; i < n; i++) {
+        uint8_t v = src[i];
+
+        dst[i] = v;
+        bad |= (v == 255u) ? 1 : 0;
+    }
+    return bad;
+}
+
+/* The encoder's mirror of residual_copy_u8_checked above. EXCLUSION_U8's
+ * payload is the exclusion residuals themselves: the encoder asks the same
+ * two questions of the same k bytes -- "is any of them 0xFF" (which an
+ * exclusion residual cannot be) and "copy them into the record" -- and used
+ * to walk them twice (residual_has_ff, then memcpy). One step that stores
+ * the word it just loaded and applies the same has-a-zero-byte idiom to its
+ * complement asks both questions at once, so the loads happen once instead
+ * of twice.
+ *
+ * The answer is the has-FF one, so the status is unchanged, and on success
+ * the k copied bytes are exactly the ones memcpy wrote. A rejecting payload
+ * can leave more bytes in dst than the per-byte loop had written before it
+ * stopped; no caller can observe that. Every caller discards the record
+ * immediately on a non-OK status: zpse_tile_pack returns rrc before reading
+ * the record again, segment.c's sweep repacks its fallback into the same
+ * scratch and only commits a successful record, and the tests return on a
+ * negative length. */
+static int residual_copy_u8_checked_encode(uint8_t *dst, const uint8_t *src,
+                                           uint32_t n)
+{
+    uint32_t i = 0;
+    int bad = 0;
+
+#if ZPSE_RES_FAST4K_AVX2
+    /* The 32-byte form of the same fused step, gated exactly like the
+     * decoder's: a full-vector load, one store, one compare and a movemask.
+     * The rejection argument above applies unchanged -- the caller discards
+     * the record, so stores past the failing byte are unobservable. */
     if (n >= ZPSE_RES_FAST4K_MIN &&
         (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         i = res4k_copy_checked(dst, src, n, &bad);
@@ -1199,10 +1285,23 @@ static ZPSE_RES_AVX2 uint16_t res4k_pal_b4_enc(const uint8_t *idx_of,
 
 /* Mode 4's submode selection scans every delta for zero (a rejection) and
  * for the min/max that chooses 4, 6 or 8 bits. PADDB/SUBB reproduce the
- * wrapping signed delta byte, so the whole scan has no per-byte branch. */
+ * wrapping signed delta byte, so the whole scan has no per-byte branch.
+ *
+ * The scan also stages the biased delta (x - pred + 128) in `deltas`, one
+ * byte per consumed value, so the three packers below can pack from that
+ * scratch instead of re-reading actual/pred and recomputing a per-byte
+ * delta. All three encodings are functions of this one byte: submode 2
+ * stores it minus 0x80 (the raw wrapping difference), and submodes 0 and 1
+ * take its low 4 and low 6 bits (0x80's low bits are zero, so those equal
+ * the signed delta's low bits the scalar packers use). Only accepted
+ * blocks are staged, and the caller's scalar tail starts at the first
+ * value this scan did not consume, so the two forms pick the same submode
+ * and write the same payload. k <= 256 (a tile holds at most 256
+ * exceptions), so the caller's 256-byte scratch covers every block. */
 static ZPSE_RES_AVX2 uint32_t res4k_delta_enc(const uint8_t *actual,
                                               const uint8_t *pred,
-                                              uint16_t k, int *dmin_out,
+                                              uint16_t k, uint8_t *deltas,
+                                              int *dmin_out,
                                               int *dmax_out, int *zero_out)
 {
     const __m256i c128 = _mm256_set1_epi8((char)0x80);
@@ -1228,6 +1327,8 @@ static ZPSE_RES_AVX2 uint32_t res4k_delta_enc(const uint8_t *actual,
             zero = 1;
             break;
         }
+        /* Stage the accepted block's biased deltas for the packers. */
+        _mm256_storeu_si256((__m256i *)(void *)(deltas + i), d);
         s = _mm256_sub_epi8(d, c128);
         mn = _mm256_min_epi8(mn, s);
         mx = _mm256_max_epi8(mx, s);
@@ -1247,6 +1348,100 @@ static ZPSE_RES_AVX2 uint32_t res4k_delta_enc(const uint8_t *actual,
     *dmin_out = lo;
     *dmax_out = hi;
     *zero_out = zero;
+    return i;
+}
+
+/* Mode-4 submode 0 encode, 4-bit deltas. Mirror of res4k_pal_b4_enc: the
+ * staged biased delta's low nibble is the field the scalar packer writes
+ * (0x80 has a zero low nibble). maddubs folds each adjacent pair into one
+ * payload byte and packus narrows the sixteen words into the sixteen bytes
+ * written for 32 values; the lane-local halves are brought together first. */
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc_b0(const uint8_t *deltas,
+                                                  uint32_t n, uint8_t *dst)
+{
+    const __m256i mult = _mm256_setr_epi8(1, 16, 1, 16, 1, 16, 1, 16,
+                                          1, 16, 1, 16, 1, 16, 1, 16,
+                                          1, 16, 1, 16, 1, 16, 1, 16,
+                                          1, 16, 1, 16, 1, 16, 1, 16);
+    const __m256i low4 = _mm256_set1_epi8((char)0x0F);
+    uint32_t i = 0u;
+
+    while (i + 32u <= n) {
+        __m256i d = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(deltas + i));
+        __m256i idx = _mm256_and_si256(d, low4);
+        __m256i merged = _mm256_maddubs_epi16(idx, mult);
+        __m128i plo = _mm256_castsi256_si128(merged);
+        __m128i phi = _mm256_extracti128_si256(merged, 1);
+
+        _mm_storeu_si128((__m128i *)(void *)(dst + (i >> 1u)),
+                         _mm_packus_epi16(plo, phi));
+        i += 32u;
+    }
+    return i;
+}
+
+/* Mode-4 submode 1 encode, 6-bit deltas. The staged biased delta's low six
+ * bits are the field the scalar packer writes. Four consecutive fields are
+ * spread across one 32-bit lane as four bytes (e0 | e1<<8 | e2<<16 |
+ * e3<<24); vpshufb then gathers, skipping each lane's high byte, into the
+ * three payload bytes e0 | e1<<6, e1>>2 | e2<<4 and e2>>4 | e3<<2. */
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc_b1(const uint8_t *deltas,
+                                                  uint32_t n, uint8_t *dst)
+{
+    const __m256i low6 = _mm256_set1_epi8((char)0x3F);
+    const __m256i ff = _mm256_set1_epi32((int)0xFFu);
+    const __m128i shuf = _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10,
+                                       12, 13, 14, -1, -1, -1, -1);
+    uint32_t i = 0u;
+
+    while (i + 32u <= n) {
+        __m256i d = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(deltas + i));
+        __m256i e = _mm256_and_si256(d, low6);
+        __m256i e0 = _mm256_and_si256(e, ff);
+        __m256i e1 = _mm256_and_si256(_mm256_srli_epi32(e, 8), ff);
+        __m256i e2 = _mm256_and_si256(_mm256_srli_epi32(e, 16), ff);
+        __m256i e3 = _mm256_srli_epi32(e, 24);
+        __m256i r = _mm256_or_si256(
+            e0, _mm256_or_si256(
+                    _mm256_slli_epi32(e1, 6),
+                    _mm256_or_si256(_mm256_slli_epi32(e2, 12),
+                                    _mm256_slli_epi32(e3, 18))));
+        __m128i lo = _mm_shuffle_epi8(_mm256_castsi256_si128(r), shuf);
+        __m128i hi = _mm_shuffle_epi8(_mm256_extracti128_si256(r, 1), shuf);
+        uint32_t off = ((uint32_t)i * 3u) / 4u;
+
+        /* Each half holds four groups' three bytes in its low twelve bytes;
+         * store them in value order as 8+4 bytes per half, 24 bytes total. */
+        _mm_storel_epi64((__m128i *)(void *)(dst + off), lo);
+        zpse_store_u32le(dst + off + 8u,
+                         (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(lo, 8)));
+        _mm_storel_epi64((__m128i *)(void *)(dst + off + 12u), hi);
+        zpse_store_u32le(dst + off + 20u,
+                         (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(hi, 8)));
+        i += 32u;
+    }
+    return i;
+}
+
+/* Mode-4 submode 2 encode, 8-bit deltas. The encoded byte is the raw
+ * wrapping difference x - pred, i.e. the staged biased delta minus 0x80;
+ * one subtract per 32-byte block replaces the scalar per-byte pass. */
+static ZPSE_RES_AVX2 uint32_t res4k_delta_enc_b2(const uint8_t *deltas,
+                                                  uint32_t n, uint8_t *dst)
+{
+    const __m256i c128 = _mm256_set1_epi8((char)0x80);
+    uint32_t i = 0u;
+
+    while (i + 32u <= n) {
+        __m256i d = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(deltas + i));
+
+        _mm256_storeu_si256((__m256i *)(void *)(dst + i),
+                            _mm256_sub_epi8(d, c128));
+        i += 32u;
+    }
     return i;
 }
 
@@ -1295,6 +1490,80 @@ static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b0(const uint8_t *src,
         _mm256_storeu_si256((__m256i *)(void *)(out + i),
                             res4k_delta_map(_mm256_add_epi8(p, d), p));
         i = (uint16_t)(i + 32u);
+    }
+    return i;
+}
+
+/* Expand 24 bytes of 6-bit fields into 32 field bytes, in ascending value
+ * order. Four 6-bit fields tile three bytes; source bytes 3k..3k+2 become
+ * output bytes 4k..4k+3 via four 32-bit-lane shifts, after a vpshufb gathers
+ * each triple into the low three bytes of one lane. The gather's indices are
+ * lane-local, so lane 1 draws from a dword window shifted one group along
+ * (dwords 3,4,5,6 of the load instead of 0,1,2,3); both halves then use the
+ * same shuffle control. Exactly 24 bytes are read. */
+static ZPSE_RES_AVX2 inline __m256i res4k_expand6(const uint8_t *src)
+{
+    const __m256i win = _mm256_setr_epi32(0, 1, 2, 3, 3, 4, 5, 6);
+    /* Each output dword's low three bytes are one group: source 0-2, 3-5,
+     * 6-8, 9-11 in lane 0 and the same stride in lane 1 (which the `win`
+     * permute shifted to start at source byte 12). */
+    const __m256i shuf = _mm256_setr_epi8(
+        0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1,
+        0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
+    const __m256i m3 = _mm256_set1_epi32((int)0x00FFFFFFu);
+    const __m256i low6 = _mm256_set1_epi8((char)0x3F);
+    __m128i lo = _mm_loadu_si128((const __m128i *)(const void *)src);
+    __m128i hi = _mm_loadl_epi64(
+        (const __m128i *)(const void *)(src + 16u));
+    __m256i x = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+    __m256i g = _mm256_and_si256(
+        _mm256_shuffle_epi8(_mm256_permutevar8x32_epi32(x, win), shuf), m3);
+    __m256i f0 = _mm256_and_si256(g, low6);
+    __m256i f1 = _mm256_and_si256(_mm256_srli_epi32(g, 6), low6);
+    __m256i f2 = _mm256_and_si256(_mm256_srli_epi32(g, 12), low6);
+    __m256i f3 = _mm256_and_si256(_mm256_srli_epi32(g, 18), low6);
+
+    return _mm256_or_si256(
+        f0, _mm256_or_si256(
+                _mm256_slli_epi32(f1, 8),
+                _mm256_or_si256(_mm256_slli_epi32(f2, 16),
+                                _mm256_slli_epi32(f3, 24))));
+}
+
+/* Mode 4, submode 1: six bits per delta. Two 24-byte reads give the 64
+ * fields a step; each 32-byte block is validated before any of it is stored,
+ * so a rejected field is reported at the same scalar position by the loop in
+ * the caller. (e ^ 32) - 32 maps the 6-bit field to its signed delta byte,
+ * as (e ^ 8) - 8 does for the 4-bit form. */
+static ZPSE_RES_AVX2 uint16_t res4k_delta_dec_b1(const uint8_t *src,
+                                                  const uint8_t *pred,
+                                                  uint16_t k, uint8_t *out)
+{
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i c32 = _mm256_set1_epi8((char)32);
+    uint16_t i = 0u;
+
+    while ((uint32_t)i + 64u <= (uint32_t)k) {
+        uint32_t off = ((uint32_t)i * 3u) / 4u;
+        __m256i e0 = res4k_expand6(src + off);
+        __m256i e1 = res4k_expand6(src + off + 24u);
+        __m256i p0, p1, d0, d1;
+
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(e0, zero)) != 0 ||
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(e1, zero)) != 0) {
+            break;
+        }
+        d0 = _mm256_sub_epi8(_mm256_xor_si256(e0, c32), c32);
+        d1 = _mm256_sub_epi8(_mm256_xor_si256(e1, c32), c32);
+        p0 = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pred + i));
+        p1 = _mm256_loadu_si256(
+            (const __m256i *)(const void *)(pred + i + 32u));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i),
+                            res4k_delta_map(_mm256_add_epi8(p0, d0), p0));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 32u),
+                            res4k_delta_map(_mm256_add_epi8(p1, d1), p1));
+        i = (uint16_t)(i + 64u);
     }
     return i;
 }
@@ -2148,7 +2417,17 @@ static int residual_decode_mode4(const uint8_t *payload,
                 return ZPSE_BAD_RESIDUAL;
             }
         }
-        for (i = 0; i < k; i++) {
+#if ZPSE_RES_FAST4K_AVX2
+        /* The 6-bit submode is the last dense path without a vector kernel:
+         * expand and map 64 deltas per step. The scalar loop finishes from
+         * the first value the kernel could not take, including a rejected
+         * block, whose status it then reports at the same value. */
+        if (k >= ZPSE_RES_FAST4K_MIN &&
+            (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
+            i = res4k_delta_dec_b1(payload + 1u, pred_at_exc, k, exc_out);
+        }
+#endif
+        for (; i < k; i++) {
             unsigned enc = residual_get_bits(s, (uint32_t)i * 6u, 6u);
             int d;
             uint8_t x;
@@ -2801,6 +3080,14 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
     uint8_t sub;
     uint32_t total;
     uint16_t i = 0u;
+#if ZPSE_RES_FAST4K_AVX2
+    /* `deltas` holds the biased deltas staged by the submode scan for the
+     * one [0, scan_end) prefix the three packers below consume; the scalar
+     * packs finish from the first value the scan did not stage. k <= 256,
+     * so this covers every possible block. */
+    uint8_t deltas[256];
+    uint16_t scan_end = 0u;
+#endif
 
     if (k == 0u) {
         if (cap < 1u) {
@@ -2827,11 +3114,12 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
         (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
         int zero = 0;
 
-        i = (uint16_t)res4k_delta_enc(actual_in, pred_at_exc, k,
+        i = (uint16_t)res4k_delta_enc(actual_in, pred_at_exc, k, deltas,
                                       &dmin, &dmax, &zero);
         if (zero != 0) {
             return ZPSE_BAD_RESIDUAL;
         }
+        scan_end = i;
     }
 #endif
     for (; i < k; i++) {
@@ -2872,15 +3160,25 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
     if (sub == 0u) {
         uint32_t packed = ((uint32_t)k + 1u) / 2u;
         uint32_t g = 0u;
-        uint16_t gi;
+        uint16_t gi = 0u;
 
         memset(out + 1u, 0, (size_t)packed);
+#if ZPSE_RES_FAST4K_AVX2
+        /* The vector scan staged the biased deltas for the first scan_end
+         * values. Pack 32 at a time from that scratch, then let the group
+         * loop below finish from the first value it did not consume; the
+         * whole-byte stores it makes are later bytes of the same payload. */
+        if (scan_end != 0u) {
+            gi = (uint16_t)res4k_delta_enc_b0(deltas, scan_end, out + 1u);
+            g = (uint32_t)gi >> 1u;
+        }
+#endif
         /* Four-bit fields. Eight of them are exactly four bytes and a
          * group always starts on a byte boundary, so one little-endian
          * store of sum(enc_i << (4*i)) is what the nibble form below
          * wrote: value 2j in the low nibble of byte j, value 2j+1 in the
          * high one, which is the same bit positions. */
-        for (gi = 0u; (uint32_t)gi + 8u <= (uint32_t)k;
+        for (; (uint32_t)gi + 8u <= (uint32_t)k;
              gi = (uint16_t)(gi + 8u)) {
             uint32_t w = 0u;
             unsigned j;
@@ -2909,14 +3207,23 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
     } else if (sub == 1u) {
         uint32_t packed = (6u * (uint32_t)k + 7u) / 8u;
         uint32_t g = 0u;
-        uint16_t gi;
+        uint16_t gi = 0u;
 
         memset(out + 1u, 0, (size_t)packed);
+#if ZPSE_RES_FAST4K_AVX2
+        /* The staged prefix is packed 32 values at a time into 24 bytes;
+         * gi is a multiple of 32 there, so gi*6/8 is a whole byte and the
+         * group loop below resumes on a byte boundary as it always did. */
+        if (scan_end != 0u) {
+            gi = (uint16_t)res4k_delta_enc_b1(deltas, scan_end, out + 1u);
+            g = ((uint32_t)gi * 3u) / 4u;
+        }
+#endif
         /* Six-bit fields. Eight are 48 bits, again a whole number of bytes
          * per group, so a group is one 64-bit little-endian store and the
          * tail keeps the bit form (which also starts on a byte boundary,
          * because the groups consumed whole bytes). */
-        for (gi = 0u; (uint32_t)gi + 8u <= (uint32_t)k;
+        for (; (uint32_t)gi + 8u <= (uint32_t)k;
              gi = (uint16_t)(gi + 8u)) {
             uint64_t w = 0u;
             unsigned j;
@@ -2939,7 +3246,16 @@ ZPSE_HOT static int residual_encode_mode4(const uint8_t *actual_in,
                               (unsigned)(d & 0x3F));
         }
     } else {
-        for (i = 0; i < k; i++) {
+        i = 0u;
+#if ZPSE_RES_FAST4K_AVX2
+        /* One raw difference per byte: the staged biased delta minus 0x80,
+         * 32 at a time, with the scalar loop finishing the tail from the
+         * first value the scan did not consume. */
+        if (scan_end != 0u) {
+            i = (uint16_t)res4k_delta_enc_b2(deltas, scan_end, out + 1u);
+        }
+#endif
+        for (; i < k; i++) {
             int d = residual_delta(actual_in[i], pred_at_exc[i]);
 
             out[1u + i] = (uint8_t)(d & 0xFF);
@@ -2992,11 +3308,15 @@ ZPSE_HOT int zpse_residual_encode_hint(uint8_t mode, const uint8_t *exc_in,
             return ZPSE_OUTPUT_OVERFLOW;
         }
         if (k > 0u) {
-            /* `> 254` on a byte is `== 255`; test eight at a time, then copy. */
-            if (residual_has_ff(exc_in, (uint32_t)k)) {
+            /* `> 254` on a byte is `== 255`. The test and the copy are asked
+             * of the payload in one walk (residual_copy_u8_checked_encode);
+             * the status and the k bytes copied on success are exactly what
+             * the old scan-then-memcpy produced, and a rejected record's
+             * extra writes are unobservable -- every caller discards it. */
+            if (residual_copy_u8_checked_encode(payload_out, exc_in,
+                                                (uint32_t)k)) {
                 return ZPSE_BAD_RESIDUAL;
             }
-            memcpy(payload_out, exc_in, (size_t)k);
         }
         return (int)k;
     }
