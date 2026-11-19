@@ -157,16 +157,15 @@
 #endif
 
 /* zpse_huf_ctab[t][s] = (code << 4) | nbits, code bit-reversed, nbits 0 only
- * if the table has no code for the symbol (it always does). */
-#define ZPSE_HUF_CTAB_BYTES (ZPSE_HUF_TABLES * ZPSE_HUF_SYMBOLS * 2u)
-/* zpse_huf_dtab[t][i] = (nbBits << 8) | symbol: exactly one symbol per
+ * if the table has no code for the symbol (it always does).
+ *
+ * zpse_huf_dtab[t][i] = (nbBits << 8) | symbol: exactly one symbol per
  * lookup. A two-symbol entry needs both codes inside the ten-bit window,
  * which an LZ payload (about seven bits per symbol) almost never has, so it
- * was measured and dropped -- see src/huf.c. */
-#define ZPSE_HUF_DTAB_BYTES (ZPSE_HUF_TABLES * ZPSE_HUF_TABLE_SIZE * 2u)
-/* What the tables add to the binary: 2 KiB of codes and 8 KiB of lookups,
+ * was measured and dropped -- see src/huf.c.
+ *
+ * Together the tables add 2 KiB of codes and 8 KiB of lookups to the binary,
  * as read-only data. */
-#define ZPSE_HUF_TABLE_BYTES (ZPSE_HUF_CTAB_BYTES + ZPSE_HUF_DTAB_BYTES)
 
 /* Code a payload of n bytes into dst[0..cap). Returns the payload length, or
  * 0 when the arguments are unusable, n is outside

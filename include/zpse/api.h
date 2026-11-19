@@ -10,8 +10,10 @@
 #include "arena.h"
 #include "constants.h"
 
-/* Page-instant: the no-decision page classifier (see the umbrella header's
- * flag notes). Guarded so this public definition and src/block.c's own agree. */
+/* Retired: PAGE_INSTANT was the no-decision page classifier (see the umbrella
+ * header's flag notes). The define stays for source compatibility; the flag no
+ * longer changes which page form is written. Guarded so this public definition
+ * and src/block.c's own agree. */
 #ifndef ZPSE_ENC_PAGE_INSTANT
 #define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
 #endif
@@ -59,6 +61,12 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint32_t *out_len_out,
                           void *dec_arena);
 
+/* The one-shot frame calls below always emit a normal PSE1 frame; they never
+ * emit FLAT7 ("F7P1" magic), including the indexed form. FLAT7 frames are
+ * produced only by the CLI's fast path for whole-ASCII inputs or by explicit
+ * zpse_flat7_encode calls. zpse_decompress_frame decodes both normal and
+ * FLAT7 frames transparently. zpse_seek_frame returns ZPSE_UNSUPPORTED_FEATURE
+ * for FLAT7, which has no block index. */
 /* One-shot frame calls. */
 int zpse_compress_frame(const uint8_t *in, size_t n,
                         uint8_t *out, size_t out_cap,

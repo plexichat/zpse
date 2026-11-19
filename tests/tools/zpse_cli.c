@@ -20,6 +20,15 @@
  *   -l LEVEL   balanced (default) | faster | fastest | max
  *   -F         write the fast LZ form only (one match-finder pass, no
  *              shape decision); see ZPSE_ENC_LZ_FAST
+ *   -F7, -7    bench only: run an in-memory FLAT7 arm (fused gate, ASCII scan
+ *              and 7-bit pack) beside the normal block arm on eligible input,
+ *              and print both rates and ratios with the flat7/block speedup
+ *   -R         bench: run an in-memory whole-frame REPACK arm (fixed-width
+ *              ASCII symbol repack, magic ZRPK) beside the normal block arm on
+ *              eligible input, with both rates, ratios and the
+ *              repack/block speedup. Replaces the -F7 A/B arm when both are
+ *              given. c: try a ZRPK frame first, normal codec on decline;
+ *              d: sniff ZRPK and call the repack decoder.
  *   -P         a page (block <= 4096) gets the identity tile stream and no
  *              shape decision; ignored above a page. See ZPSE_ENC_PAGE_FAST
  *   -c         emit the per-block payload CRC32-C (verified on decode)
@@ -78,8 +87,12 @@
 
 #include "zpse/zpse.h"
 #include "zpse/block.h"
+#include "zpse/flat7.h"
 #include "zpse/frame.h"
 #include "zpse/parallel.h"
+#include "zpse/repack.h"
+#include "zpse/rlefast.h"
+#include "zpse/tile.h"
 
 /* The persistent encode pool is an addition to parallel.h. Detect it by the
  * size macro it ships, so this file still builds against a parallel.h that
@@ -881,8 +894,8 @@ static void reader_fill(ZpseCliReader *r, ZpseCliInBatch *b)
             return;
         }
         /* The sync says which header this is: a page's 16-byte form (short,
-         * token or FLAT) is accepted here too, everything else the 32 the
-         * format has always had, so the short read above is enough to tell
+         * token, FLAT or TEXT) is accepted here too, everything else the 32
+         * the format has always had, so the short read above is enough to tell
          * and the rest is read here. */
         hdr_sz = zpse_block_header_size(slot, (uint32_t)got);
         if (got < (size_t)ZPSE_BLOCK_HEADER_SIZE_SHORT && ferror(r->fi) != 0) {
@@ -1016,30 +1029,13 @@ static int reader_start(ZpseCliReader *r, FILE *fi, const char *in_path,
                         uint64_t declared, int has_count, int async)
 {
     unsigned i;
-    uint32_t hdr =
-        (nominal <= (uint32_t)ZPSE_BLOCK_SHORT_MAX)
-            ? (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT
-            : (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
-
-    /* Robust fallback for a page-nominal frame whose blocks actually carry
-     * the long 32-byte header (a variable-size block the 16-byte form cannot
-     * express, e.g. one whose metadata does not fit). Size the slots from the
-     * first block's sync, not from nominal alone: a normal page frame peeks
-     * 16 and keeps the small stride, one that uses long headers gets room for
-     * them. Seek back so the reader sees the first block again. */
-    {
-        uint8_t peek[ZPSE_BLOCK_HEADER_SIZE_SHORT];
-        size_t pn = fread(peek, 1u, sizeof peek, fi);
-
-        if (pn == sizeof peek) {
-            uint32_t phs = zpse_block_header_size(peek, (uint32_t)pn);
-
-            if (phs != 0u) {
-                hdr = phs;
-            }
-        }
-        (void)fseek(fi, (long)ZPSE_FRAME_HEADER_SIZE, SEEK_SET);
-    }
+    /* Slots must hold the LARGEST header any block in the frame may carry,
+     * not the first block's. A frame can mix forms: level-1 Silesia starts
+     * with a 16-byte TEXT page and later has 32-byte raw blocks, so taking the
+     * stride from block 0 gives 16 + nominal and refuses the first long-header
+     * block (comp = 32 + nominal > stride). Sixteen bytes a page slot might
+     * save are not worth a frame that will not decode. */
+    uint32_t hdr = (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
 
     memset(r, 0, sizeof *r);
     r->fi = fi;
@@ -1508,6 +1504,72 @@ static int stream_emit(void *ctx, uint32_t seq, const uint8_t *blk, size_t len)
     return 0;
 }
 
+/* Cheap ratio-safety gate for the CLI's FLAT7 emit path. FLAT7 packs 7-bit
+ * ASCII at a fixed ~1.143:1 and never runs the LZ/TEXT finder, so feeding it
+ * redundant ASCII is a catastrophic ratio regression: 64 KiB of repeated
+ * lines shrinks only to ~57 KiB where the normal frame reaches tens-to-one.
+ * The API auto-gate was removed for determinism, so this decision has to be
+ * made here, from the bytes alone.
+ *
+ * Sample three 4 KiB windows (front/middle/back) and count repeated 4-byte
+ * grams in a 1024-entry direct-mapped cache that stores the full 32-bit key.
+ * A repeat is counted only when the exact key returns to the same slot, so
+ * collisions between different grams -- inevitable with 12 KiB of input in
+ * 1024 slots -- are overwritten, not miscounted as repeats. Random printable
+ * ASCII has ~95^4 possible grams and almost never repeats; redundant ASCII
+ * repeats constantly. The probe reads at most 12 KiB, is a pure function of
+ * the input bytes, and needs no floating point.
+ *
+ * Measured on this tree with this exact probe (repeat rate over the three
+ * windows, 1024 slots):
+ *   random printable 100 KiB     0.000  -> allow, 1.143:1 is the best there is
+ *   random alphanumeric 100 KiB  0.000  -> allow
+ *   webster (LZ 2.10:1)          0.339  -> decline
+ *   nci     (LZ 5.43:1)          0.870  -> decline
+ *   64 KiB repeated ASCII lines  0.901  -> decline
+ *   English-like prose           0.789  -> decline
+ * The 10% cutoff below sits ~3.4x under the least-redundant real case
+ * (webster) and infinitely above every random case, so it separates them
+ * cleanly. It is deliberately conservative about emitting FLAT7: a false
+ * decline costs one normal frame, a false emit costs a ratio blowup.
+ * Limitation, stated honestly: a file whose three sampled windows look
+ * random but whose body is redundant can slip through -- no 12 KiB probe can
+ * rule that out without the full match-finder pass this gate exists to skip.
+ */
+static int cli_flat7_ratio_gate(const uint8_t *in, size_t n)
+{
+    enum { WIN = 4096u, SLOTS = 1024u };
+    uint32_t cache[SLOTS];
+    uint8_t seen[SLOTS];
+    size_t off[3], len[3], nwin, s, i, grams = 0u, reps = 0u;
+
+    memset(seen, 0, sizeof seen);
+    if (n >= 3u * WIN) {
+        off[0] = 0u;                  len[0] = WIN;
+        off[1] = n / 2u - WIN / 2u;   len[1] = WIN;
+        off[2] = n - WIN;             len[2] = WIN;
+        nwin = 3u;
+    } else {
+        off[0] = 0u; len[0] = n; nwin = 1u; /* short input: all of it */
+    }
+    for (s = 0u; s < nwin; s++) {
+        for (i = 0u; i + 4u <= len[s]; i++) {
+            const uint8_t *p = in + off[s] + i;
+            uint32_t k = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            uint32_t h = (k * 0x9E3779B1u) >> 22u; /* top 10 bits -> 0..1023 */
+            if (seen[h] && cache[h] == k) {
+                reps++;
+            }
+            cache[h] = k;
+            seen[h] = 1u;
+            grams++;
+        }
+    }
+    /* Decline above a 10% repeat rate; grams <= 3*4096, so no overflow. */
+    return grams == 0u || reps * 10u <= grams;
+}
+
 static int encode_stream(const char *in_path, const char *out_path,
                          uint32_t block, uint32_t enc_flags, int indexed,
                          unsigned threads, void *const arenas[])
@@ -1635,6 +1697,89 @@ static int encode_stream(const char *in_path, const char *out_path,
 #endif
     if (in_map == NULL) {
         in_buf = (uint8_t *)malloc((size_t)slab_blocks * (size_t)block);
+    }
+    /* FLAT7 is a one-shot whole-input ASCII codec with no block index, so it
+     * bypasses the slab writer entirely. Decline -x (nothing to append an
+     * index to) and -c (no per-block CRC field). Only the packed form (~7/8
+     * of n) plus its header is written, straight to `fo`. */
+    if (!indexed && (enc_flags & ZPSE_ENC_CHECKSUM) == 0u) {
+        const uint8_t *flat_in = in_map;
+        uint8_t *flat_owned = NULL;
+        size_t flat_cap = n + 256u; /* packed form < n; slack for the header */
+        uint8_t *flat_out = NULL;
+        size_t flat_len = 0u;
+        int frc;
+
+        if (flat_in == NULL) {
+            /* No mmap here: stage the whole input, since this codec needs it
+             * contiguous rather than a slab at a time. */
+            flat_owned = (uint8_t *)malloc(n);
+            if (flat_owned == NULL || fseek(fi, 0, SEEK_SET) != 0 ||
+                fread(flat_owned, 1u, n, fi) != n) {
+                fprintf(stderr, "zpse_cli: cannot stage input for FLAT7\n");
+                free(flat_owned);
+                goto done;
+            }
+            flat_in = flat_owned;
+        }
+        /* Cheap redundancy probe first: a decline skips the fused encoder's
+         * whole-input pass entirely. */
+        if (cli_flat7_ratio_gate(flat_in, n)) {
+            flat_out = (uint8_t *)malloc(flat_cap);
+            if (flat_out == NULL) {
+                fprintf(stderr, "zpse_cli: out of memory\n");
+                free(flat_owned);
+                goto done;
+            }
+            /* ASCII check + redundancy gate + 7-bit pack in one pass over the
+             * staged input. The 40-byte frame is committed only if every gate
+             * passes; 0 is a normal decline and takes the block path below. */
+            frc = zpse_flat7_encode_stream(flat_in, n, flat_out, flat_cap,
+                                           &flat_len);
+            if (frc > 0) {
+                if (fwrite(flat_out, 1u, flat_len, fo) != flat_len) {
+                    fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+                    free(flat_out);
+                    free(flat_owned);
+                    goto done; /* done: closes fo */
+                }
+                if (fclose(fo) != 0) {
+                    fo = NULL;
+                    fprintf(stderr, "zpse_cli: close failed on %s\n", out_path);
+                    free(flat_out);
+                    free(flat_owned);
+                    goto done;
+                }
+                fo = NULL;
+                free(flat_out);
+                free(flat_owned);
+                rc = 0;
+                goto done;
+            }
+            if (frc < 0) {
+                fprintf(stderr, "zpse_cli: FLAT7 encode failed rc=%d\n", frc);
+                free(flat_out);
+                free(flat_owned);
+                goto done;
+            }
+            /* frc == 0: declined -- drop the scratch and take the normal path. */
+            free(flat_out);
+        }
+        /* Not a FLAT7 frame: the slab writer below reads `fi` from offset 0.
+         * Where there is no mmap (Windows) the staging fread above left the
+         * file at EOF, so put it back before the first slab is read -- otherwise
+         * the first fread returns 0 and the loop reports "short read" after
+         * emitting only the 32-byte frame header. On the mmap path the file
+         * position was never advanced, and rewinding there is harmless, so
+         * both paths end up identical here. clearerr() also drops the EOF flag
+         * a full-length staging read can leave set. */
+        clearerr(fi);
+        if (fseek(fi, 0, SEEK_SET) != 0) {
+            fprintf(stderr, "zpse_cli: cannot rewind input after FLAT7 probe\n");
+            free(flat_owned);
+            goto done;
+        }
+        free(flat_owned);
     }
     slot_mem = (uint8_t *)malloc(slot_cap);
     ready = (int *)malloc(sizeof(int) * ctl);
@@ -1818,6 +1963,126 @@ done:
     return rc;
 }
 
+/* Decode a FLAT7 frame to a file without holding the decoded frame resident.
+ * The packed payload is a plain ASCII stream (ceil(7n/8) bytes), so it can be
+ * expanded in chunks: 28672 packed bytes -> 32768 decoded bytes. `n` comes
+ * from the frame header and bounds the output. */
+static int decode_flat7(const char *in_path, const char *out_path)
+{
+    enum { PACK_CHUNK = 28672u, OUT_CHUNK = 32768u };
+    FILE *fi, *fo = NULL;
+    uint8_t head[256];
+    uint8_t *whole = NULL;
+    const uint8_t *hdr;
+    size_t got, f_len, n = 0u, payload_off = 0u, packed_pos = 0u;
+    size_t consumed = 0u;
+    long end;
+    uint8_t *pchunk = NULL, *ochunk = NULL;
+    int raw, rc = 1;
+
+    fi = fopen(in_path, "rb");
+    if (fi == NULL) {
+        fprintf(stderr, "zpse_cli: cannot open %s\n", in_path);
+        return 1;
+    }
+    if (fseek(fi, 0, SEEK_END) != 0 || (end = ftell(fi)) < 0 ||
+        fseek(fi, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "zpse_cli: cannot size %s\n", in_path);
+        goto done;
+    }
+    f_len = (size_t)end;
+    got = fread(head, 1u, sizeof head, fi);
+    if (got < 4u || !zpse_flat7_is_frame(head, got)) {
+        rc = -1; /* not FLAT7: let the caller report its usual error */
+        goto done;
+    }
+    hdr = head;
+    if (zpse_flat7_header_check(hdr, f_len, &n, &payload_off) != ZPSE_OK) {
+        /* Header larger than the peek buffer: stage the packed frame and
+         * retry. n <= UINT32_MAX, so this stays bounded. */
+        whole = (uint8_t *)malloc(f_len);
+        if (whole == NULL || fseek(fi, 0, SEEK_SET) != 0 ||
+            fread(whole, 1u, f_len, fi) != f_len) {
+            fprintf(stderr, "zpse_cli: cannot read %s\n", in_path);
+            goto done;
+        }
+        hdr = whole;
+        if (zpse_flat7_header_check(hdr, f_len, &n, &payload_off) != ZPSE_OK) {
+            fprintf(stderr, "zpse_cli: bad FLAT7 header in %s\n", in_path);
+            goto done;
+        }
+    }
+    if (n == 0u || n > (size_t)UINT32_MAX || payload_off > f_len) {
+        fprintf(stderr, "zpse_cli: implausible FLAT7 header in %s\n", in_path);
+        goto done;
+    }
+    /* Region type sits at byte 20 (region base) + 12 (type field). The
+     * encoder always writes ASCII7; RAW is a forward-compat form the header
+     * check also accepts, carrying the bytes verbatim rather than packed. */
+    raw = (head[20 + 12] == ZPSE_FLAT7_REGION_RAW);
+    fo = fopen(out_path, "wb");
+    if (fo == NULL) {
+        fprintf(stderr, "zpse_cli: cannot write %s\n", out_path);
+        goto done;
+    }
+    pchunk = (uint8_t *)malloc(PACK_CHUNK);
+    /* The unpack kernels may store a few bytes past out_n; leave slack. */
+    ochunk = (uint8_t *)malloc(OUT_CHUNK + 8u);
+    if (pchunk == NULL || ochunk == NULL) {
+        fprintf(stderr, "zpse_cli: out of memory\n");
+        goto done;
+    }
+    if (whole == NULL && fseek(fi, (long)payload_off, SEEK_SET) != 0) {
+        fprintf(stderr, "zpse_cli: cannot seek %s\n", in_path);
+        goto done;
+    }
+    while (consumed < n) {
+        size_t left = n - consumed;
+        uint32_t want_out = left > (size_t)OUT_CHUNK
+                                ? (uint32_t)OUT_CHUNK : (uint32_t)left;
+        uint32_t want_packed = raw ? want_out : zpse_ascii_len(want_out);
+        size_t got_p;
+
+        if (whole != NULL) {
+            memcpy(pchunk, whole + payload_off + packed_pos, want_packed);
+            got_p = want_packed;
+        } else {
+            got_p = fread(pchunk, 1u, want_packed, fi);
+        }
+        if (got_p != want_packed) {
+            fprintf(stderr, "zpse_cli: short read on %s\n", in_path);
+            goto done;
+        }
+        if (raw) {
+            memcpy(ochunk, pchunk, want_out);
+        } else {
+            zpse_ascii_unpack_stream(pchunk, want_packed, ochunk, want_out);
+        }
+        if (fwrite(ochunk, 1u, want_out, fo) != want_out) {
+            fprintf(stderr, "zpse_cli: short write on %s\n", out_path);
+            goto done;
+        }
+        packed_pos += want_packed;
+        consumed += want_out;
+    }
+    if (fclose(fo) != 0) {
+        fo = NULL;
+        fprintf(stderr, "zpse_cli: close failed on %s\n", out_path);
+        goto done;
+    }
+    fo = NULL;
+    rc = 0;
+done:
+    free(pchunk);
+    free(ochunk);
+    free(whole);
+    if (fo != NULL) {
+        fclose(fo);
+    }
+    fclose(fi);
+    return rc;
+}
+
 static int cmd_codec(int argc, char **argv)
 {
     int compress = (argv[1][0] == 'c');
@@ -1829,6 +2094,7 @@ static int cmd_codec(int argc, char **argv)
     uint32_t enc_flags = 0u;
     uint32_t block = ZPSE_MAX_BLOCK_SIZE;
     int indexed = 0;
+    int repack_opt = 0;
     unsigned threads = 1u;
     const char *in_path;
     const char *out_path;
@@ -1853,6 +2119,12 @@ static int cmd_codec(int argc, char **argv)
              * block, no shape decision. The stream is the one MAX offers as
              * its last candidate, so any decoder reads it. */
             enc_flags |= ZPSE_ENC_LZ_FAST;
+            break;
+        case 'R':
+            /* Whole-frame repack: try a ZRPK frame before the normal codec
+             * on compress. On decompress the magic is sniffed from the
+             * header below, so -R is not needed to read a ZRPK frame. */
+            repack_opt = 1;
             break;
         case 'P':
             /* One shape per page: the identity tile stream, compared with a
@@ -1933,6 +2205,41 @@ static int cmd_codec(int argc, char **argv)
      * input or the frame, which is what a whole-file encode spends a quarter
      * of its time on. */
     if (compress) {
+        /* REPACK whole-frame form. One in-memory attempt (not a timed loop):
+         * on commit the ZRPK frame is the whole output file and no block
+         * stream is built; on decline fall through to the ordinary streamed
+         * codec below. -x (index) and -c (per-block CRC) do not apply to a
+         * ZRPK frame, so with either of those set we take the normal path. */
+        if (repack_opt && !indexed && (enc_flags & ZPSE_ENC_CHECKSUM) == 0u) {
+            uint8_t *rin;
+            uint8_t *rout;
+            size_t rn = 0u;
+            size_t rlen = 0u;
+            size_t rcap;
+
+            rin = read_file(in_path, &rn);
+            if (rin == NULL) {
+                return 1;
+            }
+            rcap = zpse_repack_bound(rn);
+            rout = (uint8_t *)malloc(rcap + 1u);
+            if (rout == NULL) {
+                fprintf(stderr, "zpse_cli: out of memory (REPACK)\n");
+                free(rin);
+                return 1;
+            }
+            if (zpse_repack_encode(rin, rn, rout, rcap, &rlen) == 1) {
+                rc = write_file(out_path, rout, rlen);
+                free(rout);
+                free(rin);
+                return rc;
+            }
+            /* 0: declined (non-ASCII or too many distinct symbols) -- free
+             * the probe and take the normal path. encode_stream reopens the
+             * input; this one-shot CLI read is not part of any timing. */
+            free(rout);
+            free(rin);
+        }
         /* A worker count does not change the path: this one takes it too, as
          * it always could. The buffered worker call it used to take for -t
          * reserves a slot per block in the caller's buffer and compacts the
@@ -1967,13 +2274,144 @@ static int cmd_codec(int argc, char **argv)
          * whole frame and the whole output resident, so webster's 41 MiB
          * frame cost 382 ms through it against 122 ms from the file. */
         ZpseFrameHeader ph;
-        uint8_t head[ZPSE_FRAME_HEADER_SIZE];
+        /* A FLAT7 header is 40 bytes, longer than a frame header, so peek
+         * enough to sniff its magic as well as read the ordinary header. */
+        uint8_t head[64];
         int peek = 0;
         int indexed = 0;
         FILE *pf = fopen(in_path, "rb");
 
         if (pf != NULL) {
-            if (fread(head, 1u, sizeof head, pf) == sizeof head &&
+            size_t got = fread(head, 1u, sizeof head, pf);
+
+            /* FLAT7 has its own magic and no block framing; the ordinary
+             * header read below would reject it. Expand it to the output
+             * file in chunks instead of buffering the decoded frame. */
+            if (got >= 40u && zpse_flat7_is_frame(head, got)) {
+                int frc;
+
+                fclose(pf);
+                frc = decode_flat7(in_path, out_path);
+                if (frc < 0) {
+                    fprintf(stderr,
+                            "zpse_cli: not a zpse frame with a content size\n");
+                    return 1;
+                }
+                return frc;
+            }
+            /* ZRPK is a self-delimiting whole-frame form with its own magic
+             * and no block framing: [0..4) is "ZRPK", [8..16) is the original
+             * length n (little-endian u64). The ordinary header read below
+             * would reject it, so expand it with the repack decoder. Like
+             * FLAT7 it needs the whole frame in memory; unlike a block frame
+             * it carries its own content size, so it needs no frame header. */
+            if (got >= 44u && head[0] == 'Z' && head[1] == 'R' &&
+                head[2] == 'P' && head[3] == 'K') {
+                uint8_t *frame;
+                uint8_t *dec;
+                size_t frame_len = 0u;
+                size_t dn;
+                uint64_t dn64 = 0u;
+                unsigned b;
+
+                fclose(pf);
+                frame = read_file(in_path, &frame_len);
+                if (frame == NULL) {
+                    return 1;
+                }
+                if (frame_len < 44u) {
+                    fprintf(stderr, "zpse_cli: truncated ZRPK frame\n");
+                    free(frame);
+                    return 1;
+                }
+                for (b = 0u; b < 8u; b++) {
+                    dn64 |= (uint64_t)frame[8u + b] << (8u * b);
+                }
+                if (dn64 > (uint64_t)(size_t)-1) {
+                    fprintf(stderr, "zpse_cli: ZRPK content size too large\n");
+                    free(frame);
+                    return 1;
+                }
+                dn = (size_t)dn64;
+                /* A packed byte expands to at most 8 symbols (w >= 1) and the
+                 * smallest ZRPK header is 44 bytes, so a frame cannot decode
+                 * to more than this many bytes. Refuse a header that claims
+                 * more before it can drive a huge malloc. */
+                if (dn > (frame_len - 44u) * 8u) {
+                    fprintf(stderr,
+                            "zpse_cli: ZRPK content size exceeds frame data\n");
+                    free(frame);
+                    return 1;
+                }
+                dec = dn > 0u ? (uint8_t *)malloc(dn) : NULL;
+                if (dn > 0u && dec == NULL) {
+                    fprintf(stderr, "zpse_cli: out of memory (REPACK decode)\n");
+                    free(frame);
+                    return 1;
+                }
+                rc = zpse_repack_decode(frame, frame_len, dec, dn) == 1
+                         ? write_file(out_path, dec, dn)
+                         : 1;
+                if (rc != 0) {
+                    fprintf(stderr, "zpse_cli: ZRPK decode failed\n");
+                }
+                free(dec);
+                free(frame);
+                return rc;
+            }
+            /* RLE1 is another self-delimiting whole-frame form: [0..4) is
+             * "RLE1", [4..8) is the original length n (u32 LE), [8..12) a
+             * header CRC. Like ZRPK it carries its own content size and needs
+             * the whole frame in memory, so expand it with rlefast. */
+            if (got >= 12u && head[0] == 'R' && head[1] == 'L' &&
+                head[2] == 'E' && head[3] == '1') {
+                uint8_t *frame;
+                uint8_t *dec;
+                size_t frame_len = 0u;
+                uint32_t n = 0u;
+                unsigned b;
+
+                fclose(pf);
+                frame = read_file(in_path, &frame_len);
+                if (frame == NULL) {
+                    return 1;
+                }
+                if (frame_len < 12u) {
+                    fprintf(stderr, "zpse_cli: truncated RLE1 frame\n");
+                    free(frame);
+                    return 1;
+                }
+                for (b = 0u; b < 4u; b++) {
+                    n |= (uint32_t)frame[4u + b] << (8u * b);
+                }
+                /* Each (value, run-1) pair costs 2 bytes and expands to at
+                 * most 256 bytes, so the payload bounds the claimed length.
+                 * A uint64 comparison keeps the multiply from wrapping. */
+                if ((uint64_t)n > (uint64_t)(frame_len - 12u) * 256u) {
+                    fprintf(stderr,
+                            "zpse_cli: RLE1 content size exceeds frame data\n");
+                    free(frame);
+                    return 1;
+                }
+                dec = n > 0u ? (uint8_t *)malloc(n) : NULL;
+                if (n > 0u && dec == NULL) {
+                    fprintf(stderr, "zpse_cli: out of memory (RLE1 decode)\n");
+                    free(frame);
+                    return 1;
+                }
+                rc = frame_len <= (size_t)UINT32_MAX &&
+                             zpse_rlefast_decode(frame, (uint32_t)frame_len,
+                                                 dec, n) == 0
+                         ? write_file(out_path, dec, n)
+                         : 1;
+                if (rc != 0) {
+                    fprintf(stderr, "zpse_cli: RLE1 decode failed\n");
+                }
+                free(dec);
+                free(frame);
+                return rc;
+            }
+            if (got >= (size_t)ZPSE_FRAME_HEADER_SIZE &&
                 zpse_frame_header_read(&ph, head) == ZPSE_OK &&
                 (ph.frame_flags & (uint16_t)ZPSE_F_CONTENT_SIZE) != 0u &&
                 ph.content_size != UINT64_MAX &&
@@ -2087,6 +2525,20 @@ static int check_seek(const uint8_t *frame, size_t frame_len,
     return 1;
 }
 
+/* The A/B table's workload column names the file, not its directory: bench
+ * paths are often whole corpus paths and would overrun the column. */
+static const char *bench_label(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    const char *bs = strrchr(path, '\\');
+    const char *last = slash;
+
+    if (bs != NULL && (last == NULL || bs > last)) {
+        last = bs;
+    }
+    return last != NULL ? last + 1 : path;
+}
+
 static int cmd_bench(int argc, char **argv)
 {
     /* No level bits: the library's own default applies. This used to
@@ -2098,6 +2550,8 @@ static int cmd_bench(int argc, char **argv)
     uint32_t block = ZPSE_MAX_BLOCK_SIZE;
     int indexed = 0;
     int quiet = 0;
+    int flat7_bench = 0;
+    int repack_bench = 0;
     long reps_arg = 0;
     long bytes_cap = 0;
     unsigned threads = 1u;
@@ -2112,6 +2566,23 @@ static int cmd_bench(int argc, char **argv)
     unsigned long long tot_passed = 0u;
     double tot_enc_ns = 0.0;
     double tot_dec_ns = 0.0;
+    /* FLAT7 A/B totals: the flat7 side covers only eligible files, so the
+     * block side used for its speedup covers exactly those same files. */
+    unsigned long long tot_f_in = 0u;
+    unsigned long long tot_f_out = 0u;
+    double tot_f_enc_ns = 0.0;
+    double tot_f_dec_ns = 0.0;
+    unsigned long long tot_b_in = 0u;
+    unsigned long long tot_b_out = 0u;
+    double tot_b_enc_ns = 0.0;
+    double tot_b_dec_ns = 0.0;
+    /* REPACK A/B totals, same shape as the FLAT7 ones: the repack side
+     * covers only eligible files, and tot_b_* is the block side over exactly
+     * those same files. */
+    unsigned long long tot_r_in = 0u;
+    unsigned long long tot_r_out = 0u;
+    double tot_r_enc_ns = 0.0;
+    double tot_r_dec_ns = 0.0;
     void **enc_arenas;
     void **dec_arenas;
 
@@ -2123,10 +2594,15 @@ static int cmd_bench(int argc, char **argv)
             }
             break;
         case 'F':
-            /* The fast LZ form and nothing else: one match-finder pass per
-             * block, no shape decision. The stream is the one MAX offers as
-             * its last candidate, so any decoder reads it. */
-            enc_flags |= ZPSE_ENC_LZ_FAST;
+            /* -F7 is the FLAT7 A/B arm, not the fast LZ form: it selects a
+             * second codec path for this bench and leaves the level bits (and
+             * therefore the normal block arm) untouched. Every other -F still
+             * means ZPSE_ENC_LZ_FAST, as in `c`. */
+            if (argv[i][2] == '7' && argv[i][3] == '\0') {
+                flat7_bench = 1;
+            } else {
+                enc_flags |= ZPSE_ENC_LZ_FAST;
+            }
             break;
         case 'P':
             /* One shape per page: the identity tile stream, compared with a
@@ -2217,10 +2693,23 @@ static int cmd_bench(int argc, char **argv)
         case 'q':
             quiet = 1;
             break;
+        case '7':
+            /* Alias for -F7: select the in-memory FLAT7 arm. */
+            flat7_bench = 1;
+            break;
+        case 'R':
+            /* Select the in-memory whole-frame REPACK A/B arm. */
+            repack_bench = 1;
+            break;
         default:
             fprintf(stderr, "zpse_cli: unknown option '%s'\n", argv[i]);
             return 2;
         }
+    }
+    /* -R and -F7 are both two-row A/B arms that share one table; keep only
+     * one active, with REPACK taking precedence when both are requested. */
+    if (repack_bench) {
+        flat7_bench = 0;
     }
     /* The parallel decoder finds a block through the index, so a threaded
      * bench measures an indexed frame. It costs 8 bytes per block in the
@@ -2230,7 +2719,15 @@ static int cmd_bench(int argc, char **argv)
     }
     files = argc - i;
     if (files < 1) {
-        fprintf(stderr, "usage: zpse_cli bench [opts] FILE...\n");
+        fprintf(stderr, "usage: zpse_cli bench [-l LEVEL] [-F7|-7|-R] [-F] [-P] "
+                        "[-D] [-T] [-H] [-c] [-b N] [-r N] [-t N] [-n N] "
+                        "[-x] [-q] FILE...\n"
+                        "  -F7  add a FLAT7 arm beside the block arm on "
+                        "eligible whole-ASCII input and print both rates,\n"
+                        "       ratios and the flat7/block encode speedup\n"
+                        "  -R   add a REPACK (ZRPK) arm beside the block arm "
+                        "on eligible ASCII input and print both rates,\n"
+                        "       ratios and the repack/block encode speedup\n");
         return 2;
     }
     enc_arenas = alloc_arenas(threads, ZPSE_ENC_ARENA_SIZE);
@@ -2253,14 +2750,27 @@ static int cmd_bench(int argc, char **argv)
         }
     }
     if (!quiet) {
-        printf("level %s%s%s, block %u, %s, %u thread%s\n",
+        printf("level %s%s%s, block %u, %s, %u thread%s%s\n",
                level_name(enc_flags),
                (enc_flags & ZPSE_ENC_CHECKSUM) ? ", crc" : "",
                (enc_flags & ZPSE_ENC_PAGE_FAST) ? ", page-fast" : "",
                (unsigned)block, indexed ? "indexed" : "no index",
-               threads, threads == 1u ? "" : "s");
-        printf("%-14s %11s %11s %7s %10s %10s %8s\n", "file", "bytes",
-               "packed", "ratio", "enc MB/s", "dec MB/s", "ms");
+               threads, threads == 1u ? "" : "s",
+               repack_bench
+                    ? ", REPACK A/B (REPACK arm single-threaded)"
+                    : (flat7_bench ? ", FLAT7 A/B (FLAT7 arm single-threaded)"
+                                   : ""));
+        if (repack_bench || flat7_bench) {
+            printf("%-22s %-6s %10s %10s %10s %12s\n", "workload", "mode",
+                   "enc MB/s", "dec MB/s", "ratio",
+                   repack_bench ? "repack/block" : "flat7/block");
+            printf("%-22s %-6s %10s %10s %10s %12s\n", "----------------------",
+                   "------", "----------", "----------", "----------",
+                   "------------");
+        } else {
+            printf("%-14s %11s %11s %7s %10s %10s %8s\n", "file", "bytes",
+                   "packed", "ratio", "enc MB/s", "dec MB/s", "ms");
+        }
     }
 
     for (f = 0; f < files; f++) {
@@ -2268,16 +2778,32 @@ static int cmd_bench(int argc, char **argv)
         uint8_t *in;
         uint8_t *comp;
         uint8_t *out;
+        uint8_t *flat = NULL;
+        uint8_t *repack = NULL;
         size_t n = 0u;
         size_t comp_cap;
         size_t comp_len = 0u;
         size_t out_len = 0u;
+        size_t flat_cap = 0u;
+        size_t flat_len = 0u;
+        size_t f_out_len = 0u;
+        size_t repack_cap = 0u;
+        size_t repack_len = 0u;
         long reps;
         long r;
         double t0;
         double dt;
         double enc_ns;
         double dec_ns;
+        double f_enc_ns = 0.0;
+        double f_dec_ns = 0.0;
+        double r_enc_ns = 0.0;
+        double r_dec_ns = 0.0;
+        int flat7_eligible = 0;
+        int f_ok = 0;
+        int repack_eligible = 0;
+        int r_ok = 0;
+        int repack_canary_ok = 1;
         int ok = 1;
 
         in = read_file(path, &n);
@@ -2318,6 +2844,76 @@ static int cmd_bench(int argc, char **argv)
          * repetitions below reuse these two, which is exactly that shape. */
         memset(out, 0, n);
         memset(comp, 0, comp_cap);
+        /* FLAT7 A/B arm. A separate frame buffer keeps the block arm's `comp`
+         * untouched, so the block row below is exactly the ordinary bench row
+         * this file already produced. n + 256 leaves room for the 40-byte
+         * header and the packer's trailing 8-byte scratch. The eligibility
+         * call is untimed -- the timed encode below calls the same gate again,
+         * so the FLAT7 number really is `zpse_flat7_should` + encode, not the
+         * bare 8-to-7 kernel. */
+        if (flat7_bench) {
+            flat_cap = n + 256u;
+            flat = (uint8_t *)malloc(flat_cap + 1u);
+            if (flat == NULL) {
+                fprintf(stderr, "zpse_cli: out of memory on %s (FLAT7)\n", path);
+                free(in);
+                free(comp);
+                free(out);
+                failures++;
+                continue;
+            }
+            memset(flat, 0, flat_cap);
+            flat7_eligible =
+                zpse_flat7_should(in, n, enc_flags, indexed, flat_cap) != 0;
+            if (!flat7_eligible) {
+                fprintf(stderr,
+                        "zpse_cli: bench -F7: %s: FLAT7 declined by "
+                        "zpse_flat7_should (non-ASCII, redundant, indexed, "
+                        "crc, or too small); skipping FLAT7 arm\n", path);
+            }
+        }
+        /* REPACK A/B arm. A separate frame buffer keeps the block arm's
+         * `comp` untouched, so the block row below stays exactly the ordinary
+         * bench row. zpse_repack_bound sizes the whole ZRPK frame. There is no
+         * separate `should` predicate in the API, so eligibility is settled
+         * by one untimed probe encode here -- which also round-trips and
+         * compares the whole input before any clock starts. The timed encode
+         * below runs the same gate; a decline is reported and the arm skipped,
+         * matching the -F7 arm. */
+        if (repack_bench) {
+            size_t probe_len = 0u;
+
+            repack_cap = zpse_repack_bound(n);
+            repack = (uint8_t *)malloc(repack_cap + 1u);
+            if (repack == NULL) {
+                fprintf(stderr, "zpse_cli: out of memory on %s (REPACK)\n",
+                        path);
+                free(in);
+                free(comp);
+                free(out);
+                failures++;
+                continue;
+            }
+            memset(repack, 0, repack_cap);
+            /* The extra byte repack_cap is a canary: encode is bounded by
+             * repack_cap and must never touch it. */
+            repack[repack_cap] = 0xA5u;
+            if (zpse_repack_encode(in, n, repack, repack_cap, &probe_len) == 1 &&
+                zpse_repack_decode(repack, probe_len, out, n) == 1 &&
+                memcmp(out, in, n) == 0) {
+                repack_eligible = 1;
+                repack_len = probe_len;
+            } else if (probe_len != 0u) {
+                fprintf(stderr, "zpse_cli: bench -R: %s: REPACK round trip "
+                                "MISMATCH; skipping REPACK arm\n", path);
+            }
+            if (!repack_eligible) {
+                fprintf(stderr,
+                        "zpse_cli: bench -R: %s: REPACK declined (non-ASCII "
+                        "or too many distinct symbols); skipping REPACK "
+                        "arm\n", path);
+            }
+        }
         /* Enough repetitions for a 64 MiB sample per file, capped so the
          * big corpus members do not dominate the run. */
         reps = reps_arg;
@@ -2390,7 +2986,196 @@ static int cmd_bench(int argc, char **argv)
                 ok = 0;
             }
         }
-        if (!quiet || !ok) {
+        /* The FLAT7 arm, in memory. zpse_flat7_encode_stream is the fused
+         * single-pass path: ASCII scan + both redundancy predicates + the
+         * 7-bit pack, committing the header only if every gate passes. Timing
+         * the bare pack would report the kernel's 17-26 GB/s and manufacture
+         * a speedup the caller never sees. Best-of-reps matches the block arm. */
+        if (flat7_bench && ok && flat7_eligible) {
+            f_ok = 1;
+            for (r = 0; r < reps; r++) {
+                size_t fl = 0u;
+                int frc;
+
+                t0 = now_ns();
+                frc = zpse_flat7_encode_stream(in, n, flat, flat_cap, &fl);
+                if (frc <= 0) {
+                    fprintf(stderr,
+                            "zpse_cli: FLAT7 encode declined/failed on %s "
+                            "(rc=%d)\n", path, frc);
+                    f_ok = 0;
+                    break;
+                }
+                dt = now_ns() - t0;
+                if (reps >= 3 && r == 0) {
+                    continue;
+                }
+                if (f_enc_ns == 0.0 || dt < f_enc_ns) {
+                    f_enc_ns = dt;
+                }
+                flat_len = fl;
+            }
+            if (f_ok) {
+                /* Untimed verification: header check, decode, whole compare. */
+                size_t ck_n = 0u;
+                size_t ck_off = 0u;
+
+                if (zpse_flat7_header_check(flat, flat_len, &ck_n, &ck_off) !=
+                        ZPSE_OK ||
+                    ck_n != n ||
+                    zpse_flat7_decode(flat, flat_len, out, n, &f_out_len) !=
+                        ZPSE_OK ||
+                    f_out_len != n || memcmp(out, in, n) != 0) {
+                    fprintf(stderr,
+                            "zpse_cli: %s: FLAT7 round trip MISMATCH\n", path);
+                    f_ok = 0;
+                }
+            }
+            /* zpse_flat7_decode validates the 40-byte header (magic, version,
+             * CRC and lengths) before it unpacks, so the decode row already
+             * includes the header check. It is single-threaded by design. */
+            f_dec_ns = 0.0;
+            if (f_ok) {
+                for (r = 0; r < reps; r++) {
+                    t0 = now_ns();
+                    if (zpse_flat7_decode(flat, flat_len, out, n, &f_out_len) !=
+                        ZPSE_OK) {
+                        fprintf(stderr, "zpse_cli: FLAT7 decode failed on %s\n",
+                                path);
+                        f_ok = 0;
+                        break;
+                    }
+                    dt = now_ns() - t0;
+                    if (reps >= 3 && r == 0) {
+                        continue;
+                    }
+                    if (f_dec_ns == 0.0 || dt < f_dec_ns) {
+                        f_dec_ns = dt;
+                    }
+                }
+            }
+        }
+        /* The REPACK arm, in memory: zpse_repack_encode writes a whole ZRPK
+         * frame and zpse_repack_decode expands it, both over the same input
+         * with no file I/O and no clock inside the setup. Best-of-reps matches
+         * the block arm; the decode validates the frame (magic, version, CRC,
+         * lengths) on every call, like FLAT7's decode. */
+        if (repack_bench && ok && repack_eligible) {
+            r_ok = 1;
+            for (r = 0; r < reps; r++) {
+                size_t rl = 0u;
+                int rrc;
+
+                t0 = now_ns();
+                rrc = zpse_repack_encode(in, n, repack, repack_cap, &rl);
+                if (rrc <= 0) {
+                    fprintf(stderr,
+                            "zpse_cli: REPACK encode declined/failed on %s "
+                            "(rc=%d)\n", path, rrc);
+                    r_ok = 0;
+                    break;
+                }
+                dt = now_ns() - t0;
+                if (reps >= 3 && r == 0) {
+                    continue;
+                }
+                if (r_enc_ns == 0.0 || dt < r_enc_ns) {
+                    r_enc_ns = dt;
+                }
+                repack_len = rl;
+            }
+            r_dec_ns = 0.0;
+            if (r_ok) {
+                for (r = 0; r < reps; r++) {
+                    t0 = now_ns();
+                    if (zpse_repack_decode(repack, repack_len, out, n) != 1) {
+                        fprintf(stderr, "zpse_cli: REPACK decode failed on %s\n",
+                                path);
+                        r_ok = 0;
+                        break;
+                    }
+                    dt = now_ns() - t0;
+                    if (reps >= 3 && r == 0) {
+                        continue;
+                    }
+                    if (r_dec_ns == 0.0 || dt < r_dec_ns) {
+                        r_dec_ns = dt;
+                    }
+                }
+            }
+            if (r_ok) {
+                /* One more untimed whole compare after the timed reps. */
+                if (zpse_repack_decode(repack, repack_len, out, n) != 1 ||
+                    memcmp(out, in, n) != 0) {
+                    fprintf(stderr, "zpse_cli: %s: REPACK round trip "
+                                    "MISMATCH\n", path);
+                    r_ok = 0;
+                }
+            }
+        }
+        if (repack_bench && repack != NULL &&
+            repack[repack_cap] != 0xA5u) {
+            fprintf(stderr, "zpse_cli: bench -R: %s: REPACK encode wrote "
+                            "past repack_cap\n", path);
+            repack_canary_ok = 0;
+        }
+        if (!ok || (flat7_eligible && !f_ok) ||
+            (repack_eligible && !r_ok) || !repack_canary_ok) {
+            failures++;
+        }
+        if (repack_bench) {
+            if (!quiet) {
+                double be = enc_ns > 0.0 ? (double)n / enc_ns * 1e3 : 0.0;
+                double bd = dec_ns > 0.0 ? (double)n / dec_ns * 1e3 : 0.0;
+
+                if (repack_eligible) {
+                    double re = r_enc_ns > 0.0 ? (double)n / r_enc_ns * 1e3
+                                               : 0.0;
+                    double rd = r_dec_ns > 0.0 ? (double)n / r_dec_ns * 1e3
+                                               : 0.0;
+
+                    printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %11.2fx%s\n",
+                           bench_label(path), "repack", re, rd,
+                           repack_len ? (double)n / (double)repack_len : 0.0,
+                           be > 0.0 ? re / be : 0.0,
+                           r_ok ? "" : "  FAIL");
+                } else {
+                    printf("%-22s %-6s %10s %10s %10s %12s\n",
+                           bench_label(path), "repack", "-", "-", "-",
+                           "declined");
+                }
+                printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %12s%s\n",
+                       bench_label(path), "block", be, bd,
+                       comp_len ? (double)n / (double)comp_len : 0.0, "",
+                       ok ? "" : "  FAIL");
+            }
+        } else if (flat7_bench) {
+            if (!quiet) {
+                double be = enc_ns > 0.0 ? (double)n / enc_ns * 1e3 : 0.0;
+                double bd = dec_ns > 0.0 ? (double)n / dec_ns * 1e3 : 0.0;
+
+                if (flat7_eligible) {
+                    double fe = f_enc_ns > 0.0 ? (double)n / f_enc_ns * 1e3
+                                               : 0.0;
+                    double fd = f_dec_ns > 0.0 ? (double)n / f_dec_ns * 1e3
+                                               : 0.0;
+
+                    printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %11.2fx%s\n",
+                           bench_label(path), "flat7", fe, fd,
+                           flat_len ? (double)n / (double)flat_len : 0.0,
+                           be > 0.0 ? fe / be : 0.0,
+                           f_ok ? "" : "  FAIL");
+                } else {
+                    printf("%-22s %-6s %10s %10s %10s %12s\n",
+                           bench_label(path), "flat7", "-", "-", "-",
+                           "declined");
+                }
+                printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %12s%s\n",
+                       bench_label(path), "block", be, bd,
+                       comp_len ? (double)n / (double)comp_len : 0.0, "",
+                       ok ? "" : "  FAIL");
+            }
+        } else if (!quiet || !ok) {
             printf("%-14s %11lu %11lu %7.2f %10.1f %10.1f %8.1f%s\n", path,
                    (unsigned long)n, (unsigned long)comp_len,
                    comp_len ? (double)n / (double)comp_len : 0.0,
@@ -2398,19 +3183,68 @@ static int cmd_bench(int argc, char **argv)
                    dec_ns > 0.0 ? (double)n / dec_ns * 1e3 : 0.0,
                    (enc_ns + dec_ns) / 1e6, ok ? "" : "  FAIL");
         }
-        if (!ok) {
-            failures++;
-        }
         tot_in += (unsigned long long)n;
         tot_out += (unsigned long long)comp_len;
         tot_passed += (unsigned long long)n;
         tot_enc_ns += enc_ns;
         tot_dec_ns += dec_ns;
+        /* The A/B totals cover only eligible files, on both sides, so the
+         * flat7/block column stays an honest speedup over the same bytes. */
+        if (flat7_bench && flat7_eligible && f_ok && ok) {
+            tot_f_in += (unsigned long long)n;
+            tot_f_out += (unsigned long long)flat_len;
+            tot_f_enc_ns += f_enc_ns;
+            tot_f_dec_ns += f_dec_ns;
+            tot_b_in += (unsigned long long)n;
+            tot_b_out += (unsigned long long)comp_len;
+            tot_b_enc_ns += enc_ns;
+            tot_b_dec_ns += dec_ns;
+        }
+        if (repack_bench && repack_eligible && r_ok && ok) {
+            tot_r_in += (unsigned long long)n;
+            tot_r_out += (unsigned long long)repack_len;
+            tot_r_enc_ns += r_enc_ns;
+            tot_r_dec_ns += r_dec_ns;
+            tot_b_in += (unsigned long long)n;
+            tot_b_out += (unsigned long long)comp_len;
+            tot_b_enc_ns += enc_ns;
+            tot_b_dec_ns += dec_ns;
+        }
         free(in);
         free(comp);
         free(out);
+        free(flat);
+        free(repack);
     }
-    if (tot_in > 0u) {
+    if (repack_bench) {
+        if (tot_r_in > 0u) {
+            double rbe = (double)tot_r_in / tot_r_enc_ns * 1e3;
+            double rbd = (double)tot_r_in / tot_r_dec_ns * 1e3;
+            double bbe = (double)tot_b_in / tot_b_enc_ns * 1e3;
+            double bbd = (double)tot_b_in / tot_b_dec_ns * 1e3;
+
+            printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %11.2fx\n", "TOTAL",
+                   "repack", rbe, rbd, (double)tot_r_in / (double)tot_r_out,
+                   bbe > 0.0 ? rbe / bbe : 0.0);
+            printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %12s\n", "TOTAL",
+                   "block", bbe, bbd, (double)tot_b_in / (double)tot_b_out,
+                   "");
+        }
+    } else if (flat7_bench) {
+        if (tot_f_in > 0u) {
+            double fbe = (double)tot_f_in / tot_f_enc_ns * 1e3;
+            double fbd = (double)tot_f_in / tot_f_dec_ns * 1e3;
+            double bbe = (double)tot_b_in / tot_b_enc_ns * 1e3;
+            double bbd = (double)tot_b_in / tot_b_dec_ns * 1e3;
+
+            printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %11.2fx\n", "TOTAL",
+                   "flat7", fbe, fbd, (double)tot_f_in / (double)tot_f_out,
+                   bbe > 0.0 ? fbe / bbe : 0.0);
+            printf("%-22s %-6s %10.1f %10.1f %8.2f:1 %12s\n", "TOTAL",
+                   "block", bbe, bbd, (double)tot_b_in / (double)tot_b_out,
+                   "");
+        }
+    } else if (tot_in > 0u) {
         printf("%-14s %11llu %11llu %7.2f %10.1f %10.1f %8.1f\n", "TOTAL",
                tot_in, tot_out, (double)tot_in / (double)tot_out,
                (double)tot_passed / tot_enc_ns * 1e3,
@@ -3405,6 +4239,11 @@ static int cmd_dir(int argc, char **argv)
     if (in == NULL) {
         return 1;
     }
+    if (zpse_flat7_is_frame(in, in_len)) {
+        fprintf(stderr, "zpse_cli: FLAT7 has no frame index\n");
+        free(in);
+        return 1;
+    }
     rc = zpse_frame_index_count(in, in_len, &count);
     if (rc != ZPSE_OK) {
         fprintf(stderr, "zpse_cli: %s carries no usable index (rc=%d); "
@@ -3469,6 +4308,11 @@ static int cmd_seek(int argc, char **argv)
     }
     in = read_file(argv[2], &in_len);
     if (in == NULL) {
+        return 1;
+    }
+    if (zpse_flat7_is_frame(in, in_len)) {
+        fprintf(stderr, "zpse_cli: FLAT7 has no frame index\n");
+        free(in);
         return 1;
     }
     out = (uint8_t *)malloc(ZPSE_MAX_BLOCK_SIZE);

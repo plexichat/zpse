@@ -48,6 +48,17 @@ static void zpse_mask_set_range(uint32_t words[8], uint32_t from,
     if (len == 0u) {
         return;
     }
+    /* words[] holds 8 x 32 = 256 bits, so wi must stay <= 7. Valid callers
+     * keep from+len <= nt <= 256 and never reach this clamp, but a cheap
+     * range check makes the helper self-contained: a stray range that runs
+     * past bit 255 is cut at 256 instead of walking wi to 8 and writing past
+     * the array. */
+    if (from >= 256u) {
+        return;
+    }
+    if (len > 256u - from) {
+        len = 256u - from;
+    }
     if (fi != 0u) {
         bits = 32u - fi;
         if (bits > len) {

@@ -24,6 +24,7 @@
 #include "zpse/arena.h"
 #include "zpse/block.h"
 #include "zpse/constants.h"
+#include "zpse/flat7.h"
 #include "zpse/frame.h"
 #include "zpse/status.h"
 #include "zpse/types.h"
@@ -1102,6 +1103,12 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
         return ZPSE_TRUNCATED;
     }
     *out_len_out = 0;
+    /* FLAT7 has no block index, which is the only way a worker can find a
+     * block to decode. Decline it here rather than letting the index resolve
+     * below read its magic as a frame and report BAD_MAGIC. */
+    if (zpse_flat7_is_frame(in, in_len)) {
+        return ZPSE_UNSUPPORTED_FEATURE;
+    }
     /* The index is the whole reason a block can be found: a header carries
      * its size, not its offset. Validate header and index once here and hand
      * the workers the validated entries, rather than re-reading the header

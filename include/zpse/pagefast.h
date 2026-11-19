@@ -18,7 +18,8 @@
  * definitive fill only for ZERO and ONE_VALUE. info->alpha/nalpha are filled
  * whenever at most 16 distinct values were found, regardless of class, and
  * are zeroed when the alphabet overflowed 16. info->nzero is the exact count
- * of zero bytes. info->flags is reserved and is always 0.
+ * of zero bytes (uint32_t, so it does not wrap for n up to 65536).
+ * info->flags is reserved and is always 0.
  *
  * info->lane_diff and info->zero_cnt expose the classifier's per-lane byte
  * statistics so a FLAT/SUBLANE encoder can build a 32-byte template from the
@@ -28,8 +29,9 @@
  *                  some byte in the lane differed from the lane's first byte
  *                  in[j] in bit k; lane_diff[j] == 0 means position j held
  *                  the same byte in every period (a constant template byte).
- *   zero_cnt[j]  = number of zero bytes in that lane, in 0..128 for a 4 KiB
- *                  page (one byte per 32-byte period).
+ *   zero_cnt[j]  = number of zero bytes in that lane, in 0..n/32 (at most 128
+ *                  for a 4 KiB page, one per 32-byte period). Stored as
+ *                  uint16_t so the count does not wrap for larger n.
  * Both arrays are filled for every class and are bit-identical between the
  * scalar and AVX2 paths; for n == 0 they are all zero.
  *
@@ -59,10 +61,10 @@ typedef struct ZpsePageInfo {
     uint8_t  value;         /* ONE_VALUE / ZERO */
     uint8_t  alpha[16];     /* LOW_ALPHA, first-appearance order */
     uint8_t  nalpha;        /* entries in alpha, 0 if > 16 distinct */
-    uint16_t nzero;         /* count of zero bytes in the page */
+    uint32_t nzero;         /* count of zero bytes in the page */
     uint32_t flags;         /* reserved, always 0 */
     uint8_t  lane_diff[32]; /* per-lane OR of (byte ^ lane's first byte) */
-    uint8_t  zero_cnt[32];  /* per-lane number of zero bytes */
+    uint16_t zero_cnt[32];  /* per-lane number of zero bytes, 0..n/32 */
 } ZpsePageInfo;
 
 /* Returns one of the ZpsePageClass values. in may be unaligned. */

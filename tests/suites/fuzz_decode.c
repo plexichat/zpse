@@ -136,6 +136,71 @@ static void fuzz_flat_seeds(void)
     fuzz_decode_block(sub, sizeof sub - 1u); /* truncated payload */
 }
 
+/* Deterministic TEXT seeds (sync 0x50BA). Arbitrary fuzz bytes almost never
+ * form a valid TEXT header, so these hand-built blocks keep the decoder's
+ * 7-bit-packed TEXT path in every invocation's corpus. Each is a legal packed
+ * stream: the 16-byte header names n, and the payload is n - n/8 bytes, so
+ * the block decodes exactly. */
+static void text_seed(uint8_t *b, uint32_t n, uint8_t flags, uint32_t seq,
+                      const uint8_t *payload, uint32_t plen)
+{
+    uint32_t i;
+
+    memset(b, 0, 16u + plen);
+    zpse_store_u16le(b + 0, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+    b[2] = flags;
+    b[3] = 0u; b[4] = 0u; b[5] = 0u; /* reserved */
+    zpse_store_u16le(b + 6, (uint16_t)n);
+    zpse_store_u16le(b + 8, (uint16_t)(16u + plen));
+    zpse_store_u32le(b + 10, seq);
+    for (i = 0u; i < plen; i++) {
+        b[16u + i] = payload[i];
+    }
+    zpse_store_u16le(b + 14, (uint16_t)(zpse_crc32c(b, 14u) & 0xFFFFu));
+}
+
+static void fuzz_text_seeds(void)
+{
+    static uint8_t t0[16u + 7u];   /* n=8:  8  - 8/8  = 7 packed bytes */
+    static uint8_t t1[16u + 14u];  /* n=16: 16 - 16/8 = 14 */
+    static uint8_t t2[16u + 28u];  /* n=32: 32 - 32/8 = 28 */
+    uint8_t payload[32];
+    uint32_t i;
+
+    /* Three valid 7-bit packed streams of increasing size. Every bit pattern
+     * is legal payload, so these vary while keeping the exact packed length
+     * the decoder requires (n - n/8). */
+    for (i = 0u; i < 8u; i++) {
+        payload[i] = (uint8_t)(0x41u + i);
+    }
+    text_seed(t0, 8u, (uint8_t)(ZPSE_B_RESET | ZPSE_B_LAST), 11u, payload, 7u);
+
+    for (i = 0u; i < 16u; i++) {
+        payload[i] = (uint8_t)(0x61u + (i & 7u));
+    }
+    text_seed(t1, 16u, (uint8_t)(ZPSE_B_RESET | ZPSE_B_LAST), 12u, payload, 14u);
+
+    for (i = 0u; i < 32u; i++) {
+        payload[i] = (uint8_t)(0x20u + (i % 5u));
+    }
+    text_seed(t2, 32u, (uint8_t)(ZPSE_B_RESET | ZPSE_B_LAST), 13u, payload, 28u);
+
+    fuzz_decode_block(t0, sizeof t0);
+    fuzz_decode_block(t1, sizeof t1);
+    fuzz_decode_block(t2, sizeof t2);
+
+    /* Corrupt TEXT streams: every payload bit pattern is legal under the
+     * 7-bit pack, so malformed means a bad header CRC, a truncated header,
+     * or a payload shorter than the header's compressed-size claim. Each
+     * must be rejected cleanly, never crash. */
+    fuzz_decode_block(t0, sizeof t0 - 1u); /* payload short of c_text */
+    t1[14] ^= 0x01u;                       /* CRC16 low byte */
+    fuzz_decode_block(t1, sizeof t1);
+    t2[15] ^= 0xFFu;                       /* CRC16 high byte */
+    fuzz_decode_block(t2, sizeof t2);
+    fuzz_decode_block(t2, 15u);            /* truncated TEXT header */
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     /* Split the input: first half as a block, second half as a frame,
@@ -143,6 +208,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     size_t half = size / 2u;
 
     fuzz_flat_seeds();
+    fuzz_text_seeds();
 
     fuzz_decode_block(data, size);
     if (half > 0u) {

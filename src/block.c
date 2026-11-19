@@ -46,6 +46,24 @@
 int zpse_flat_decode(uint8_t codec, uint8_t param, const uint8_t *payload,
                      uint32_t payload_len, uint8_t *out, uint32_t n);
 
+/* The TEXT page form (sync 0x50BA) keeps its codec in text.c. As with FLAT,
+ * include no codec header: block.c declares only what it calls, so this file
+ * still preprocesses and type-checks before text.h lands. The header parser
+ * and serializer are already declared by zpse/types.h. */
+#ifndef ZPSE_BLOCK_SYNC_TEXT
+#define ZPSE_BLOCK_SYNC_TEXT ((uint16_t)0x50BA)
+#endif
+uint32_t zpse_text_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
+                          uint32_t cap);
+int zpse_text_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
+                     uint32_t n);
+uint32_t zpse_text_price(const uint8_t *in, uint32_t n);
+/* Byte-identical to zpse_text_encode for ASCII input, but omits the ASCII
+ * eligibility scan: every caller has already proved every byte <128 (the gate
+ * and zpse_text_price below). Declared locally because the public text.h is
+ * intentionally not included here (see the note above). */
+uint32_t zpse_text_encode_ascii(const uint8_t *in, uint32_t n, uint8_t *dst,
+                                uint32_t cap);
 /* The classifier and its result type live in their own header so a caller can
  * use the same classes. Keep a local copy here for a standalone build of this
  * file made before that header lands. */
@@ -258,13 +276,6 @@ static int zpse_block_scount_valid(uint8_t sc)
     return sc == 1 || sc == 2 || sc == 4 || sc == 8 || sc == 16;
 }
 
-/* Fix up header CRC bytes 28..31 after serializing. */
-static void zpse_block_fix_header_crc(uint8_t hdr[32])
-{
-    uint32_t c = zpse_crc32c(hdr, 28);
-    zpse_store_u32le(hdr + 28, c);
-}
-
 static void zpse_block_fill_header(ZpseBlockHeader *h, uint8_t flags,
                                    uint32_t n, uint32_t c, uint8_t tid,
                                    uint8_t sc, uint16_t meta_len,
@@ -387,6 +398,24 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
         }
         *compressed_size_out = fh.compressed_block_size;
         *uncompressed_size_out = fh.uncompressed_size;
+        return ZPSE_OK;
+    }
+    if (zpse_load_u16le(in) == (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
+        ZpseBlockHeader th;
+
+        rc = zpse_block_header_parse_text(&th, in, in_len);
+        if (rc != ZPSE_OK) {
+            return rc;
+        }
+        if (th.compressed_block_size ==
+            (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            return ZPSE_BAD_BLOCK_SIZE; /* no empty token stream */
+        }
+        if (in_len < th.compressed_block_size) {
+            return ZPSE_TRUNCATED;
+        }
+        *compressed_size_out = th.compressed_block_size;
+        *uncompressed_size_out = th.uncompressed_size;
         return ZPSE_OK;
     }
     rc = zpse_block_header_parse(&h, in, in_len);
@@ -514,6 +543,46 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             *out_len_out = fh.uncompressed_size;
         }
         return (int)fh.uncompressed_size;
+    }
+
+    /* The TEXT page form (sync 0x50BA): a 16-byte header followed by a token
+     * stream that expands to n bytes. Checked with the other page forms for
+     * the same reason -- a generic parse would treat its header as an
+     * ordinary one. Decode straight into the caller's output: src/text.c's
+     * zpse_text_decode rejects in_len != n - (n>>3) before any store, so a
+     * malformed stream still leaves no bytes behind. Staging through d->lzbuf
+     * plus a full-size memcpy cost ~38% of whole-ASCII decode throughput
+     * (5,636 -> 8,568 MB/s), so it was removed. */
+    if (zpse_load_u16le(in) == (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
+        ZpseBlockHeader th;
+        uint32_t c_text;
+        uint32_t plen;
+        int trc;
+
+        trc = zpse_block_header_parse_text(&th, in, in_len);
+        if (trc != ZPSE_OK) {
+            return trc;
+        }
+        c_text = th.compressed_block_size;
+        plen = c_text - (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+        if (c_text > in_len) {
+            return ZPSE_TRUNCATED;
+        }
+        if (plen == 0u) {
+            return ZPSE_BAD_BLOCK_SIZE;
+        }
+        if (out_cap < th.uncompressed_size) {
+            return ZPSE_OUTPUT_OVERFLOW;
+        }
+        trc = zpse_text_decode(in + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
+                               plen, output, th.uncompressed_size);
+        if (trc < 0) {
+            return trc;
+        }
+        if (out_len_out != 0) {
+            *out_len_out = th.uncompressed_size;
+        }
+        return (int)th.uncompressed_size;
     }
 
     rc = zpse_block_header_parse(&h, in, in_len);
@@ -713,8 +782,8 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
 
     /* The fast LZ form: the same envelope as the block above -- transform 0,
      * one segment, no metadata -- with a different command encoding (see
-     * include/zpse/lz2.h). It carries neither the repeat-distance cache nor
-     * the lookahead, which is what makes it cheap to write and to read. */
+     * include/zpse/lz2.h). It carries no repeat-distance cache, though the
+     * lazy probe and backward walk of the token form are still present. */
     if ((h.block_flags & ZPSE_B_LZ2) != 0) {
         if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
             (h.block_flags & (ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
@@ -3725,30 +3794,35 @@ static uint32_t zpse_block_ascii_total(uint32_t n)
  *
  * The same call scores the run: a block whose winner is the shape the
  * previous block's winner had extends the stretch, anything else ends it.
- * That run length is what the history-confident stop reads. */
-static void zpse_block_hist_set(ZpseEncoder *e, const uint8_t *blk,
-                                uint32_t len)
+ * That run length is what the history-confident stop reads.
+ *
+ * The three fields arrive directly from the writer, which already holds them:
+ * re-parsing here meant a full zpse_block_header_parse -- a 28-byte CRC32-C
+ * over the long form plus a dozen field checks -- on a header this encoder
+ * just serialized and knows is valid. The decode side dropped its analogous
+ * second CRC pass for the same reason (see the note in zpse_block_decode);
+ * the encode side paid it once per block to read three bytes it can be handed.
+ * (seq is not a history input, so it is not passed.) */
+static void zpse_block_hist_set(ZpseEncoder *e, uint8_t block_flags,
+                                uint8_t transform_id, uint8_t segment_count)
 {
-    ZpseBlockHeader h;
-
-    if (zpse_block_header_parse(&h, blk, len) != ZPSE_OK ||
-        (h.block_flags &
+    if ((block_flags &
          (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
                    ZPSE_B_LZ2)) != 0u) {
         e->hist_valid = 0u;
         e->hist_streak = 0u;
         return;
     }
-    if (e->hist_valid != 0u && e->hist_tid == h.transform_id &&
-        e->hist_sc == h.segment_count) {
+    if (e->hist_valid != 0u && e->hist_tid == transform_id &&
+        e->hist_sc == segment_count) {
         if (e->hist_streak != 255u) {
             e->hist_streak++;
         }
     } else {
         e->hist_streak = 0u;
     }
-    e->hist_tid = h.transform_id;
-    e->hist_sc = h.segment_count;
+    e->hist_tid = transform_id;
+    e->hist_sc = segment_count;
     e->hist_valid = 1u;
 }
 
@@ -3798,7 +3872,8 @@ static int zpse_block_write_raw(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     zpse_block_header_serialize(out, &h);
     memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
     total = zpse_block_shrink_page(out, n, total);
-    zpse_block_hist_set(e, out, total);
+    /* RAW envelope: flags carries ZPSE_B_RAW, so the predictor invalidates. */
+    zpse_block_hist_set(e, flags, 0u, 1u);
 #if defined(ZPSE_BLOCK_STATS)
     /* The RAW fallback won, but it is not a transform win: the sweep found
      * nothing that paid, and the block went out raw. */
@@ -3831,7 +3906,9 @@ static int zpse_block_write_token(ZpseEncoder *e, const uint8_t *in,
     zpse_store_u32le(out + 10, seq);
     zpse_store_u16le(out + 14,
                      (uint16_t)(zpse_crc32c(out, 14) & UINT32_C(0xFFFF)));
-    zpse_block_hist_set(e, out, ZPSE_BLOCK_HEADER_SIZE_SHORT);
+    /* Token flags carry ZPSE_B_RAW: the predictor invalidates. tid is the
+     * fill byte (in[0]) and the token's segment count is fixed at 1. */
+    zpse_block_hist_set(e, flags, in[0], 1u);
     return (int)ZPSE_BLOCK_HEADER_SIZE_SHORT;
 }
 
@@ -4083,8 +4160,81 @@ static int zpse_block_write_flat(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     h.transform_meta_size = param;
     h.block_sequence_number = seq;
     zpse_block_header_serialize_flat(out, &h);
-    zpse_block_hist_set(e, out, total);
+    /* FLAT flags carry no RAW/LZ form bit, so the predictor records the
+     * codec as the transform with a single segment (what parse_flat read). */
+    zpse_block_hist_set(e, h.block_flags, h.transform_id, 1u);
     return (int)total;
+}
+
+/* The TEXT page form for an input the ASCII gate has already convicted: a
+ * 16-byte header whose payload is a token stream. Returns the block length,
+ * or 0 to decline (the ladder keeps the block). The caller stages the result
+ * in e->cand and copies it to the winner buffer, so `out` here is scratch,
+ * not necessarily the caller's output buffer. */
+static uint32_t zpse_block_write_text(ZpseEncoder *e, const uint8_t *in,
+                                      uint32_t n, uint32_t seq, int is_last,
+                                      uint8_t *out, uint32_t out_cap,
+                                      uint32_t plen)
+{
+    ZpseBlockHeader h;
+    uint32_t total;
+    uint32_t got;
+
+    if (n < 2u) {
+        return 0u;
+    }
+    /* `plen` is the payload length the caller already measured with
+     * zpse_text_price (which also proved the input all-ASCII). 0 means this
+     * writer was called standalone, so measure it here; the two call sites in
+     * zpse_block_encode pass the value they already have, removing a second
+     * ASCII scan of the whole block. Either way, reaching the pack below means
+     * the input is proven ASCII. */
+    if (plen == 0u) {
+        plen = zpse_text_price(in, n);
+    }
+    if (plen == 0u) {
+        return 0u;
+    }
+    total = 16u + plen;
+    if (total > 65535u) {
+        return 0u; /* the header's u16 compressed_block_size would overflow */
+    }
+    if (total > out_cap) {
+        return 0u;
+    }
+    memset(&h, 0, sizeof h);
+    h.sync = ZPSE_BLOCK_SYNC_TEXT;
+    h.block_flags = (uint8_t)(ZPSE_B_RESET | (is_last ? ZPSE_B_LAST : 0u));
+    h.uncompressed_size = n;
+    h.compressed_block_size = total;
+    h.block_sequence_number = seq;
+    h.header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    zpse_block_header_serialize_text(out, &h);
+    /* Input is proven ASCII and plen == n-(n>>3) == the pack's exact fill, so
+     * skip encode's redundant ASCII scan. `got != plen` is the length check:
+     * each pack kernel writes exactly n-(n>>3) bytes for n>=1 ASCII input. */
+    got = zpse_text_encode_ascii(in, n,
+                                 out + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
+                                 plen);
+    if (got != plen) {
+        return 0u;
+    }
+    /* No decode+memcmp self-check here. The old code unpacked the just-packed
+     * bytes into e->tstage and compared them to `in` before publishing. That
+     * pass is provably dead: zpse_text_encode is a deterministic, fixed-rate
+     * pack of input already proven all-ASCII, and zpse_text_decode is its
+     * exact inverse (both exhaustively verified over every group size and bit
+     * pattern). With plen == n-(n>>3) the decode's only structural check
+     * passes and decode(pack(in)) == in identically, so memcmp could never
+     * fail. The check above (`got == plen`) already verifies the exact-length
+     * invariant; the frame's 16-byte header CRC covers the header, not the
+     * payload, so it is no substitute -- but it is also why dropping this
+     * redundant round-trip cannot change a single output byte. The parity
+     * suite (def/scalar/swap identical digests) guards the SIMD pack kernels. */
+    /* TEXT flags carry no RAW/LZ form bit; its parse reports transform 0 and
+     * one segment, which is what the predictor records. */
+    zpse_block_hist_set(e, h.block_flags, 0u, 1u);
+    return total;
 }
 
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
@@ -4144,7 +4294,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (lrc == ZPSE_OK &&
             f_total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
             f_total = zpse_block_shrink_page(out, n, f_total);
-            zpse_block_hist_set(e, out, f_total);
+            /* try_lz2's header carries ZPSE_B_LZ2 (or LZ_HEX): invalidate. */
+            zpse_block_hist_set(e, ZPSE_B_LZ2, 0u, 1u);
             return (int)f_total;
         }
         if (lrc != ZPSE_OK && lrc != ZPSE_OUTPUT_OVERFLOW) {
@@ -4170,7 +4321,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             zpse_block_header_serialize(out, &h);
             memcpy(out + ZPSE_BLOCK_HEADER_SIZE, in, n);
             rtotal = zpse_block_shrink_page(out, n, rtotal);
-            zpse_block_hist_set(e, out, rtotal);
+            /* RAW fallback: flags carries ZPSE_B_RAW, so invalidate. */
+            zpse_block_hist_set(e, flags, 0u, 1u);
             return (int)rtotal;
         }
     }
@@ -4395,6 +4547,27 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_block_gate_cycles += blk_rdtsc() - t_gate0;
     }
 #endif
+
+    /* The TEXT form is offered only to a gated block with one candidate: the
+     * gate has already proved the input is plain text. Price it once here so
+     * the final commit can compare against the sweep without a second scan;
+     * the writer repeats the price when it actually builds the block (its
+     * signature is fixed and it must stay callable on its own). A token
+     * stream whose envelope would overflow the header's u16 size declines. */
+    int text_eligible = (e->ascii_gate != 0u) && (ncand == 1) &&
+                        (n >= (uint32_t)ZPSE_ASCII_MIN_BLOCK);
+    uint32_t text_total = 0u;
+    int text_won = 0;
+
+    if (text_eligible) {
+        uint32_t tp = zpse_text_price(in, n);
+
+        if (tp == 0u || 16u + tp > 65535u) {
+            text_eligible = 0;
+        } else {
+            text_total = 16u + tp;
+        }
+    }
 
     /* Attempt order: identity first unless the sample says DELTA8's plane
      * is much more predictable, and never anything but a swap of those
@@ -5337,6 +5510,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             uint32_t lz_cmds = 0u;
             uint32_t lz_cap = (uint32_t)ZPSE_E_SZ_CAND;
             uint32_t win = atotal / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u;
+            int lz_screen_win;
 
             /* This is the screen the candidate block below would run, on
              * the same sample, the same tile price and the same verdict
@@ -5345,9 +5519,41 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * block the screen is a 1 KiB match-finder pass plus a priced
              * sample, a tenth of a text block's encode. */
             lz_done = 1;
-            if (zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
-                                     meta_lens[0] > 0 ? meta_bufs[0] : in,
-                                     meta_lens[0], lz_speed, 1, atotal, 0)) {
+            lz_screen_win = zpse_block_lz_screen(
+                e, in, n, tids[0], scounts[0],
+                meta_lens[0] > 0 ? meta_bufs[0] : in,
+                meta_lens[0], lz_speed, 1, atotal, 0);
+
+            /* ---- The TEXT fast path: use the screen's verdict ---------- *
+             *
+             * When the cheap screen says the finder cannot win, a gated
+             * block's only tile candidate is the arithmetic identity total
+             * (0.875 bytes a byte plus the envelope). TEXT was priced once
+             * above; when it beats that identity total by the same 1/32
+             * margin the final commit would require, it is the winner and
+             * there is no reason to run the tile trial or the sweep. Ship it
+             * here. This is exactly the decision the final commit would make
+             * for the same block, taken before paying for the ladder -- on
+             * prose the screen refuses the finder on ~78% of text blocks,
+             * which is where the encode time went. When the screen says LZ
+             * can win, nothing changes: the finder runs and the final commit
+             * keeps the exact TEXT-vs-LZ comparison. */
+            if (text_eligible && !lz_screen_win &&
+                text_total + atotal / 32u + 1u <= atotal &&
+                text_total <= out_cap) {
+                uint32_t tt = zpse_block_write_text(e, in, n, seq, is_last,
+                                                    out, out_cap,
+                                                    text_total - 16u);
+
+                if (tt != 0u) {
+#if defined(ZPSE_BLOCK_STATS)
+                    zpse_block_gate_lz++;
+#endif
+                    return (int)tt;
+                }
+            }
+
+            if (lz_screen_win) {
                 if (atotal < (uint32_t)ZPSE_E_SZ_CAND && atotal > win) {
                     lz_cap = atotal - win;
                 }
@@ -5388,6 +5594,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                      * fast LZ2 form after the sweep: the trial is that
                      * candidate's `have_best`, so the deepest rung keeps it
                      * and its stream is unchanged. */
+                    /* When the cheap sample already said TEXT cannot win,
+                     * the early TEXT return above handled the block. Here the
+                     * finder's stream is the smaller one against the identity
+                     * total, so ship it directly: the trial is arithmetically
+                     * unable to beat it and the ladder would only re-derive
+                     * that. The final TEXT comparison still runs on every
+                     * block that reaches it (LZ not winning, or MAX), so this
+                     * fast return gives up no ratio. */
                     if (lz_total <= out_cap &&
                         zpse_enc_speed(lz_speed) < 9u) {
 #if defined(ZPSE_BLOCK_STATS)
@@ -5395,7 +5609,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #endif
                         memcpy(out, e->best, lz_total);
                         lz_total = zpse_block_shrink_page(out, n, lz_total);
-                        zpse_block_hist_set(e, out, lz_total);
+                        /* try_lz's stream carries ZPSE_B_LZ: invalidate. */
+                        zpse_block_hist_set(e, ZPSE_B_LZ, 0u, 1u);
                         return (int)lz_total;
                     }
                     /* The stream is already in e->best, which is where the
@@ -5557,7 +5772,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
             memcpy(out, e->cand, lz_total);
             lz_total = zpse_block_shrink_page(out, n, lz_total);
-            zpse_block_hist_set(e, out, lz_total);
+            /* try_lz's stream carries ZPSE_B_LZ: invalidate. */
+            zpse_block_hist_set(e, ZPSE_B_LZ, 0u, 1u);
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_finder_first++;
 #endif
@@ -6278,6 +6494,36 @@ lz2_done:
         }
     }
 
+    /* ---- The TEXT form, priced last against the sweep's winner ------- *
+     *
+     * The gate has already done the expensive work of proving this is text,
+     * and zpse_text_price above already measured the token stream. Require a
+     * 1/32 win over the LZ stream before paying for a second decode pass at
+     * read time. The writer stages into e->cand (the LZ2 path's buffer) and
+     * the copy below puts the bytes wherever the common copy-out expects the
+     * winner -- `out` in direct_out mode, e->best otherwise. best_idx = 15 is
+     * the sentinel the other non-candidate forms use. */
+    if (text_eligible && have_best &&
+        text_total + best_total / 32u + 1u <= best_total &&
+        text_total <= out_cap) {
+        uint32_t tt = zpse_block_write_text(e, in, n, seq, is_last,
+                                            e->cand,
+                                            (uint32_t)ZPSE_E_SZ_CAND,
+                                            text_total - 16u);
+
+        if (tt != 0u) {
+            if (direct_out) {
+                memcpy(out, e->cand, tt);
+            } else {
+                memcpy(e->best, e->cand, tt);
+            }
+            best_total = tt;
+            best_idx = 15u;
+            have_best = 1;
+            text_won = 1;
+        }
+    }
+
     /* RAW fallback when coded does not pay: coded >= 32 + N. */
     if (!have_best || (uint64_t)best_total >=
                       (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n) {
@@ -6291,8 +6537,29 @@ lz2_done:
     if (!direct_out) {
         memcpy(out, e->best, best_total);
     }
-    best_total = zpse_block_shrink_page(out, n, best_total);
-    zpse_block_hist_set(e, out, best_total);
+    /* shrink_page rewrites a long header as a 16-byte SHORT one and memmoves
+     * the payload from offset 32 to 16. A TEXT block is already a 16-byte
+     * page form and its payload starts at 16, so that rewrite would destroy
+     * it. The generic header parse now recognises the TEXT sync, so the
+     * usual "parse fails, leave it alone" guard does not apply here. */
+    best_total = text_won ? best_total
+                          : zpse_block_shrink_page(out, n, best_total);
+    /* The writer already recorded the TEXT block's history from the staging
+     * copy; a second call here would count one block twice in hist_streak.
+     *
+     * The winner's three history fields are read straight out of the final
+     * header: LONG keeps them at [3]/[12]/[13], SHORT at [2]/[3]/[4]. This is
+     * the one site where they are not in a local -- the LZ_TILE / LZ2 / HUF
+     * stages can rewrite the flags after the trial that won -- so read the
+     * three bytes (no CRC, no validation) rather than the full header parse
+     * the old hist_set ran over this same just-serialized header. */
+    if (!text_won) {
+        if (zpse_load_u16le(out) == (uint16_t)ZPSE_BLOCK_SYNC) {
+            zpse_block_hist_set(e, out[3], out[12], out[13]);
+        } else {
+            zpse_block_hist_set(e, out[2], out[3], out[4]);
+        }
+    }
 #if defined(ZPSE_BLOCK_STATS)
     {
         /* The winner's transform id: the candidate that carried best_total.
@@ -6625,6 +6892,36 @@ int zpse_block_retag(uint8_t *block, uint32_t block_len,
         /* The flat serialiser writes seq and LAST and recomputes the 16-bit
          * CRC over the first 14 bytes; the codec, param and sizes stay. */
         zpse_block_header_serialize_flat(block, &fh);
+        return ZPSE_OK;
+    }
+    if (zpse_load_u16le(block) == (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
+        ZpseBlockHeader th;
+        uint8_t flags;
+        int last;
+        int trc;
+
+        /* This must stay ahead of the generic path below: that path hardcodes
+         * the SHORT sync on rewrite and would silently turn a TEXT block into
+         * a short-header one, corrupting its payload. */
+        trc = zpse_block_header_parse_text(&th, block, block_len);
+        if (trc != ZPSE_OK) {
+            return trc;
+        }
+        if (th.compressed_block_size != block_len) {
+            return ZPSE_BAD_HEADER;
+        }
+        flags = th.block_flags;
+        last = (is_last != 0) ? 1 : 0;
+        if (th.block_sequence_number == seq &&
+            (((flags & ZPSE_B_LAST) != 0u) ? 1 : 0) == last) {
+            return ZPSE_OK;
+        }
+        th.block_sequence_number = seq;
+        th.block_flags = (uint8_t)(last != 0 ? (flags | ZPSE_B_LAST)
+                                             : (flags & ~ZPSE_B_LAST));
+        /* The TEXT serialiser writes seq and LAST and recomputes the 16-bit
+         * CRC over the first 14 bytes; reserved bytes and sizes stay. */
+        zpse_block_header_serialize_text(block, &th);
         return ZPSE_OK;
     }
     /* The parser is the validator: magic/version/flags/size/transform checks

@@ -116,12 +116,6 @@ typedef struct ZpseLzhCode {
 uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                          uint32_t cap, void *table, uint32_t hash_bits);
 
-/* One hex pass for a block whose form a caller has already decided -- the
- * page encode with no sweep, screen or trial around it. The table requirement
- * is the same as zpse_lzh_encode's, and the two write the same stream. */
-uint32_t zpse_lzh_encode_page(const uint8_t *in, uint32_t n, uint8_t *dst,
-                              uint32_t cap, void *table, uint32_t hash_bits);
-
 /* Price a small sample without clearing the whole hash table. `sn` is the
  * sample length (the `n` this call encodes); only the slots a position in
  * [0,sn) can hash to are cleared. The stream is byte-identical to the one

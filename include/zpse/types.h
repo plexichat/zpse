@@ -90,8 +90,6 @@ typedef struct ZpseTransformMeta {
 } ZpseTransformMeta;
 
 /* Parse/serialize entry points (implemented in .c, bounds-checked). */
-int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t len);
-void zpse_frame_header_serialize(uint8_t out[32], const ZpseFrameHeader *h);
 int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len);
 void zpse_block_header_serialize(uint8_t out[32], const ZpseBlockHeader *h);
 /* 32, 16, or 0 when `buf` does not start with a recognised block sync. Only
@@ -137,9 +135,17 @@ void zpse_block_header_serialize_token(uint8_t out[16], const ZpseBlockHeader *h
 int zpse_block_header_parse_flat(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len);
 void zpse_block_header_serialize_flat(uint8_t out[16], const ZpseBlockHeader *h);
 
+/* The TEXT page form (sync ZPSE_BLOCK_SYNC_TEXT): a 16-byte header with no
+ * codec fields, reserved bytes at [3..6) and n at [6..8) where 0 means 65536.
+ * zpse_block_header_parse_text validates the CRC, reserved bytes, flags and
+ * sizes and fills `out`; the block parser dispatches here on the TEXT sync.
+ * zpse_block_header_serialize_text writes the fixed envelope from an
+ * already-validated `h` and recomputes the CRC. */
+int zpse_block_header_parse_text(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len);
+void zpse_block_header_serialize_text(uint8_t out[16], const ZpseBlockHeader *h);
+
 int zpse_segment_header_parse(ZpseSegmentHeader *out, const uint8_t *buf, uint32_t len);
 void zpse_segment_header_serialize(uint8_t out[8], const ZpseSegmentHeader *h);
-int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len);
 int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
                               const uint8_t *buf, uint16_t len,
                               uint8_t segment_count);

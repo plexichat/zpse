@@ -72,10 +72,6 @@ int zpse_segment_plane_is_const(const uint8_t *p, uint32_t n);
  * framing and a predictor search per 256 bytes to do). The dense records
  * reconstruct exactly the plane they replace, tile_count is 1, and every
  * other plane's bytes are unchanged. */
-/* Prescreen-only size estimate of one transformed plane, used to rank (and
- * prune) transform candidates before any of them is priced exactly. */
-uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len);
-
 /* Smallest size one transformed plane can be written in, whole: its tile
  * records (sampled), or one of the two dense forms when that is smaller.
  * Includes the 8-byte segment header; UINT32_MAX when it cannot be

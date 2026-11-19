@@ -3,29 +3,22 @@
 
 /* Intra-block LZ, fast form (block flag ZPSE_B_LZ2).
  *
- * A second LZ codec, not a new version of the first one. src/lz.c spends its
- * per-position budget on three things a plain LZ finder does not need: a lazy
- * probe one byte ahead, a backward extension into the pending literals, and a
- * four-entry repeat-distance cache that turns a repeat into a one-byte
- * distance. They are worth size on structured data and they are paid for on
- * every position, and on prose they are most of the gap to lz4: the finder
- * runs at 256 MB/s on `dickens` against lz4's 429 on the same blocks, for a
- * payload within 2.6%.
+ * A second LZ codec, not a new version of the first one. It spends its
+ * per-position budget on the same things src/lz.c does -- a lazy probe one
+ * byte ahead and a backward extension into the pending literals -- but codes
+ * a match with a fixed two-byte little-endian distance instead of a
+ * repeat-distance code. The finder takes one candidate per hash entry, so a
+ * command is a token, its inline literals and a distance; the decoder's only
+ * distance work is one 16-bit load, which is the shape lz4 writes.
  *
- * This form keeps two of them: a four-slot repeat cache, because a repeat is
- * a byte of distance where the token form spends one on its own code, and one
- * candidate per hash entry with no lookahead and no backward walk. A command
- * is a token, its literals and a distance that is one byte when it repeats
- * and a fixed little-endian 16-bit field otherwise, which is what lz4 writes
- * and why its decoder is a tight loop.
- *
- * The repeat code was added here after the varint that first tried it cost
- * this decoder a third of its rate: the four codes sit at the top of the
- * first distance byte, so the test is one compare against 0xFC and there is
- * no loop to run. That is the size the token form's cache buys, for a branch
- * instead of a parse -- and this form writes the blocks whose head it codes
- * smaller than the token form does (see zpse_lz_pick_fast in src/block.c),
- * so on prose its decode rate is the default level's decode rate.
+ * A four-slot repeat-distance cache used to turn a repeat into a one-byte
+ * distance (0xFC | slot). Removing it measured +26.5% decode (2.31 -> 2.93
+ * GB/s), +12.8% encode and +1.366% compressed size over twelve 64 KiB Silesia
+ * blocks; seven of the twelve were within 0.2% of their old size. The rep
+ * branch and the escape a match whose low distance byte was 0xFC..0xFF needed
+ * are both gone, so the full 1..65535 range is usable. The size cost sits in
+ * the spike-pattern cases (mozilla +4.02%, nci +3.89%), where a recent
+ * distance is named often enough to be worth a byte.
  *
  * Payload layout, after the 32-byte block header:
  *
@@ -38,13 +31,12 @@
  *   token       high nibble: literal bytes before the match, 0..14 or 15 for
  *               "more follows"; low nibble: match length minus four, same
  *               escape rule
- *   escapes     one byte per escaped field: 255-chained, every 0xFF adds 255
- *               and the first byte below 255 ends the run
+ *   lit escape  one byte when the literal nibble is 15: 255-chained, every
+ *               0xFF adds 255 and the first byte below 255 ends the run
  *   literals    the run the token names, inline
- *   distance    one byte 0xFC..0xFF for the first to fourth most recent
- *               distance (the four-slot cache, seeded at 1), else u16 little
- *               endian on whose low byte 0xFC..0xFF never appear; 0 means no
- *               match and literals only
+ *   distance    fixed u16 little endian, 1..65535; zero means no match and
+ *               the command is literals only (no escape, no repeat code)
+ *   len escape  one byte when the match-length nibble is 15, same 255-chain
  *
  * The streams are self-checking the same way src/lz.c's are: the decode stops
  * when the output is full and then requires that the literal total, the

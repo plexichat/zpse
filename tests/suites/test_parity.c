@@ -576,6 +576,70 @@ static void run_flat(const char *name, int shape)
     }
 }
 
+/* Deterministic ASCII prose: lowercase words and spaces, every byte < 0x80,
+ * so the block is eligible for the TEXT (sync 0x50BA) form. The suite LCG is
+ * reseeded per shape and size, so the page is reproducible in any call order. */
+static void text_page(uint32_t shape, uint8_t *dst, uint32_t n)
+{
+    static const char *const words[] = {
+        "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy",
+        "dog", "pack", "my", "box", "with", "five", "dozen", "liquor",
+        "jugs", "hello", "world", "compression", "text", "ascii",
+        "byte", "stream", "deterministic", "prose"
+    };
+    const uint32_t nw = (uint32_t)(sizeof words / sizeof words[0]);
+    uint32_t i = 0u;
+
+    rng_state = 0x7E57A11Cu + shape * 2654435761u + n;
+    while (i < n) {
+        const char *w = words[rnd() % nw];
+        uint32_t wl = (uint32_t)strlen(w);
+        uint32_t j;
+
+        for (j = 0u; j < wl && i < n; j++, i++) {
+            dst[i] = (uint8_t)w[j];
+        }
+        if (i < n) {
+            dst[i++] = (uint8_t)' ';
+        }
+    }
+}
+
+/* Round-trip one TEXT-eligible ASCII page at a given size and effort level,
+ * folding its compressed bytes and length into the same digest as run_flat,
+ * so the def/scalar/swap builds must agree on every TEXT stream too. */
+static void run_text(const char *name, uint32_t shape, uint32_t n,
+                     uint32_t enc_flags)
+{
+    uint32_t clen = 0u, olen = 0u;
+    int rc;
+
+    text_page(shape, in, n);
+    rc = zpse_compress_block_ex(in, n, comp, sizeof comp, &clen,
+                                (uint32_t)(200u + shape), 1, enc_flags,
+                                enc_arena);
+    if (rc != 0) {
+        printf("FAIL %-22s n=%u compress rc=%d(%s)\n", name, n, rc,
+               zpse_status_name(rc));
+        fails++;
+        return;
+    }
+    memset(out, 0xA5, n);
+    rc = zpse_decompress_block(comp, clen, out, n, &olen, dec_arena);
+    if (rc < 0 || olen != n || memcmp(in, out, n) != 0) {
+        printf("FAIL %-22s n=%u decode rc=%d olen=%u\n", name, n, rc, olen);
+        fails++;
+        return;
+    }
+    printf("ok   %-22s n=%5u clen=%6u\n", name, n, clen);
+    mix(comp, clen);
+    {
+        uint8_t l[4] = { (uint8_t)clen, (uint8_t)(clen >> 8),
+                         (uint8_t)(clen >> 16), (uint8_t)(clen >> 24) };
+        mix(l, 4);
+    }
+}
+
 /* Two tiles classified back to back on ONE lane state: the first with
  * tile_reset = 1 (what the encoder does for every tile, and what the
  * per-primitive sweep above does for its single tile), the second with
@@ -793,6 +857,27 @@ int main(void)
 
         for (f = 0; f < 4; f++) {
             run_flat(flat_names[f], f);
+        }
+    }
+
+    /* TEXT page corpus: deterministic ASCII prose at three block sizes and
+     * three effort levels, folded into the digest so the parity builds agree
+     * byte for byte on every stream the TEXT form produces (and on the form
+     * selection itself, since the whole compressed block enters the digest). */
+    {
+        static const uint32_t tsz[3] = { 4096u, 16384u, 65536u };
+        static const uint32_t tlvl[3] = { 1u, 6u, 9u };
+        char nm[64];
+        uint32_t si;
+        uint32_t li;
+
+        for (si = 0u; si < 3u; si++) {
+            for (li = 0u; li < 3u; li++) {
+                uint32_t enc_flags = tlvl[li] << ZPSE_ENC_SPEED_SHIFT;
+
+                sprintf(nm, "text/%u/L%u", tsz[si], tlvl[li]);
+                run_text(nm, (si * 3u + li) & 3u, tsz[si], enc_flags);
+            }
         }
     }
 

@@ -589,7 +589,11 @@ static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
              * mpos + 1 would move the scanning cursor backwards. */
 #if ZPSE_LZH_PROBE_EARLY
             if (p_ok && mpos == pos && len <= 24u &&
-                p_c1 != LZH_EMPTY && p_c1 <= mpos &&
+                /* Skip re-testing this match's own source one byte on: it is
+                 * a byte shorter and so can never win. mpos == pos here, so
+                 * cand == mcand and the skip cannot change a decision --
+                 * measured byte-identical over the 12-file Silesia corpus. */
+                p_c1 != LZH_EMPTY && p_c1 <= mpos && p_c1 != cand &&
                 zpse_load_u32le(in + p_c1) == p_cur &&
                 lzh_extend(in, n, mpos + 1u, p_c1, ZPSE_LZH_MIN_MATCH,
                            len + 1u) > len) {
@@ -696,16 +700,6 @@ static uint32_t lzh_encode_impl(const uint8_t *in, uint32_t n, uint8_t *dst,
 
 ZPSE_HOT uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
                                   uint32_t cap, void *table, uint32_t hash_bits)
-{
-    return lzh_encode_impl(in, n, dst, cap, table, hash_bits, 0u);
-}
-
-/* The single hex pass for a caller that has already decided a page's form,
- * with none of the sweep around it. It writes exactly what zpse_lzh_encode
- * writes, so the two are interchangeable in a byte-identity build. */
-ZPSE_HOT uint32_t zpse_lzh_encode_page(const uint8_t *in, uint32_t n,
-                                       uint8_t *dst, uint32_t cap, void *table,
-                                       uint32_t hash_bits)
 {
     return lzh_encode_impl(in, n, dst, cap, table, hash_bits, 0u);
 }

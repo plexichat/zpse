@@ -66,10 +66,4 @@ int zpse_transform_inverse_trusted(const ZpseTransformMeta *meta,
                                    const uint32_t seg_lens[16], uint8_t *out,
                                    uint32_t n);
 
-/* Delta8 / Xor8 per-segment helpers (with explicit seed). */
-void zpse_delta8_encode(const uint8_t *in, uint8_t *enc, uint32_t n, uint8_t seed);
-void zpse_delta8_decode(const uint8_t *enc, uint8_t *out, uint32_t n, uint8_t seed);
-void zpse_xor8_encode(const uint8_t *in, uint8_t *enc, uint32_t n, uint8_t seed);
-void zpse_xor8_decode(const uint8_t *enc, uint8_t *out, uint32_t n, uint8_t seed);
-
 #endif /* ZPSE_TRANSFORM_H */

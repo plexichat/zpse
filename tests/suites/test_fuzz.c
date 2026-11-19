@@ -125,12 +125,13 @@ static void region_fill(uint8_t *dst, uint32_t len, uint32_t kind,
     }
 }
 
-#define SHAPE_N 18
+#define SHAPE_N 19
 
 static const char *const shape_name[SHAPE_N] = {
     "zeros", "const5A", "constFF", "ramp", "ramp251", "inter2",
     "inter8", "inter16", "alt00FF", "sparse97", "sparse251", "lownib",
-    "random", "walk", "walknoise", "regimes", "concat", "shifted"
+    "random", "walk", "walknoise", "regimes", "concat", "shifted",
+    "prose"
 };
 
 static void fill(uint32_t shape, uint32_t n)
@@ -257,6 +258,33 @@ static void fill(uint32_t shape, uint32_t n)
         }
         break;
     }
+    case 18: { /* deterministic English-like prose: lowercase words + spaces.
+                * Every byte is < 0x80, so this shape is eligible for the TEXT
+                * (sync 0x50BA) page form on the blocks where it is smaller. */
+        static const char *const words[] = {
+            "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy",
+            "dog", "pack", "my", "box", "with", "five", "dozen", "liquor",
+            "jugs", "hello", "world", "compression", "text", "ascii",
+            "byte", "stream", "deterministic", "prose"
+        };
+        const uint32_t nw = (uint32_t)(sizeof words / sizeof words[0]);
+        uint32_t p = 0u;
+
+        rs = 0x4B1D5A2Eu + n; /* fixed per length: reproducible in any order */
+        while (p < n) {
+            const char *w = words[nr32() % nw];
+            uint32_t wl = (uint32_t)strlen(w);
+            uint32_t j;
+
+            for (j = 0u; j < wl && p < n; j++, p++) {
+                in[p] = (uint8_t)w[j];
+            }
+            if (p < n) {
+                in[p++] = (uint8_t)' ';
+            }
+        }
+        break;
+    }
     default: { /* the smooth walk, shifted one byte along */
         uint8_t prev = 0u;
 
@@ -274,6 +302,226 @@ static void fill(uint32_t shape, uint32_t n)
         }
         break;
     }
+    }
+}
+
+/* ---- Hand-built TEXT block streams ----------------------------------- *
+ * The block decoder dispatches the TEXT sync (0x50BA) before the generic
+ * 32-byte-header path: a 16-byte header, then a fixed-rate 7-bit pack whose
+ * length is n - (n>>3) for a decoded size of n. We build the header and the
+ * packed payload here rather than going through the encoder, so a wrong
+ * header, CRC, length or out-of-bounds decode cannot hide behind a matching
+ * writer. Two generator modes:
+ *
+ *   mode 0 -- generate n printable ASCII bytes, pack them with an independent
+ *             8->7 model, and check the exact decoded bytes;
+ *   mode 1 -- generate arbitrary packed bytes (bits 7 are legal in this form)
+ *             for the same fixed rate, then check the exact bytes predicted by
+ *             the independent 7->8 model as well as the reject/accept safety
+ *             contract.
+ *
+ * Both feed the public zpse_decompress_block entry point with an output
+ * canary, exactly like the hostile-suite reject helpers. */
+
+#define TEXT_TOK_MAX 256u               /* largest decoded n used here */
+#define TEXT_PACK_MAX (TEXT_TOK_MAX - (TEXT_TOK_MAX >> 3)) /* 224 */
+
+/* Write a 16-byte TEXT header. n is stored literally (our n < 65536), c is
+ * the total block size, and the CRC is the low 16 bits of CRC32-C over the
+ * first 14 bytes -- the same check the parser recomputes. */
+static void text_block_header(uint8_t h[16], uint32_t n, uint32_t c,
+                               uint32_t seq)
+{
+    uint32_t crc;
+
+    memset(h, 0, 16u);
+    zpse_store_u16le(h + 0, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+    h[2] = (uint8_t)(ZPSE_B_RESET | ZPSE_B_LAST);
+    /* h[3..6) reserved, left zero */
+    zpse_store_u16le(h + 6, (uint16_t)n);
+    zpse_store_u16le(h + 8, (uint16_t)c);
+    zpse_store_u32le(h + 10, seq);
+    crc = zpse_crc32c(h, 14u) & UINT32_C(0xFFFF);
+    zpse_store_u16le(h + 14, (uint16_t)crc);
+}
+
+/* Decoded length n whose canonical packed length is exactly plen. A multiple
+ * of seven lands on a full 8-byte group (plen=7 -> n=8, plen=14 -> n=16);
+ * otherwise the final group holds the remaining 1..6 bytes. */
+static uint32_t text_len_for_packed(uint32_t plen)
+{
+    if (plen == 0u) {
+        return 0u;
+    }
+    if ((plen % 7u) == 0u) {
+        return (plen / 7u) * 8u;
+    }
+    return plen + (plen - 1u) / 7u;
+}
+
+/* Independent 8->7 pack: bit 7*i+k of each group is bit k of byte i. */
+static uint32_t text_pack_model(const uint8_t *ascii, uint32_t n,
+                                uint8_t *packed)
+{
+    uint32_t ip = 0u, op = 0u;
+
+    while (ip < n) {
+        uint32_t r = n - ip, i, k, nb;
+        uint64_t v = 0u;
+
+        if (r > 8u) {
+            r = 8u;
+        }
+        for (i = 0u; i < r; i++) {
+            for (k = 0u; k < 7u; k++) {
+                if (((ascii[ip + i] >> k) & 1u) != 0u) {
+                    v |= UINT64_C(1) << (7u * i + k);
+                }
+            }
+        }
+        nb = (7u * r + 7u) >> 3;
+        for (k = 0u; k < nb; k++) {
+            packed[op + k] = (uint8_t)(v >> (8u * k));
+        }
+        ip += r;
+        op += nb;
+    }
+    return op;
+}
+
+/* Independent 7->8 unpack. Used for mode 1, where the packed bytes are
+ * arbitrary bit patterns rather than the output of our own packer. */
+static void text_unpack_model(const uint8_t *packed, uint32_t n,
+                              uint8_t *ascii)
+{
+    uint32_t ip = 0u, op = 0u;
+
+    while (op < n) {
+        uint32_t r = n - op, i, k, nb;
+        uint64_t v = 0u;
+
+        if (r > 8u) {
+            r = 8u;
+        }
+        nb = (7u * r + 7u) >> 3;
+        for (k = 0u; k < nb; k++) {
+            v |= (uint64_t)packed[ip + k] << (8u * k);
+        }
+        for (i = 0u; i < r; i++) {
+            uint8_t b = 0u;
+
+            for (k = 0u; k < 7u; k++) {
+                if (((v >> (7u * i + k)) & 1u) != 0u) {
+                    b = (uint8_t)(b | (1u << k));
+                }
+            }
+            ascii[op + i] = b;
+        }
+        ip += nb;
+        op += r;
+    }
+}
+
+/* One hand-built TEXT block through the public decoder. plen is the PACKED
+ * length; n is derived from it by text_len_for_packed. mode 0 generates the
+ * ASCII source and checks the exact bytes; mode 1 generates arbitrary packed
+ * bytes and checks the bytes our independent unpack model predicts. Accepted
+ * streams are folded into the shared digest so the determinism gate covers
+ * them too. */
+static void text_stream_case(uint32_t mode, uint32_t plen, uint32_t seq)
+{
+    static uint8_t src[TEXT_TOK_MAX];
+    static uint8_t tok[TEXT_TOK_MAX];
+    static uint8_t exp[TEXT_TOK_MAX];
+    uint8_t blk[16u + TEXT_TOK_MAX];
+    uint8_t obuf[TEXT_TOK_MAX + 16u];
+    uint32_t i;
+    uint32_t n;
+    uint32_t got;
+    uint32_t olen = 0xDEADBEEFu;
+    int rc;
+
+    if (plen == 0u || plen > TEXT_PACK_MAX) {
+        plen = TEXT_PACK_MAX;
+    }
+    n = text_len_for_packed(plen);
+
+    if (mode == 0u) {
+        /* Structured ASCII: 'a'..'z' plus spaces, all < 0x80. */
+        rs = 0xA5A5A5A5u + plen + seq;
+        for (i = 0u; i < n; i++) {
+            uint32_t r = nr32() % 27u;
+
+            src[i] = (r == 0u) ? (uint8_t)' '
+                               : (uint8_t)('a' + (r - 1u));
+        }
+        got = text_pack_model(src, n, tok);
+        memcpy(exp, src, n);
+    } else {
+        /* Arbitrary packed bits, including bit 7 on every byte: legal in a
+         * fixed-rate pack. The independent unpack model names the bytes. */
+        rs = 0x5A5A5A5Au + plen + seq;
+        for (i = 0u; i < plen; i++) {
+            tok[i] = nr();
+        }
+        got = plen;
+        text_unpack_model(tok, n, exp);
+    }
+    /* Both models must agree with the wire's one structural constraint. */
+    if (got != plen) {
+        printf("FAIL text_stream mode=%u plen=%u seq=%u model packed %u\n",
+               (unsigned)mode, (unsigned)plen, (unsigned)seq, (unsigned)got);
+        fails++;
+        return;
+    }
+
+    text_block_header(blk, n, 16u + plen, seq);
+    memcpy(blk + 16u, tok, plen);
+
+    memset(obuf, 0xCC, sizeof obuf);
+    rc = zpse_decompress_block(blk, 16u + plen, obuf, n, &olen, dec_arena);
+
+    if (rc < 0) {
+        /* Rejected: length untouched and nothing written into or past the
+         * declared output length (the decoder writes to scratch first). */
+        int clean = (olen == 0xDEADBEEFu);
+
+        for (i = 0u; i < (uint32_t)sizeof obuf; i++) {
+            if (obuf[i] != 0xCCu) {
+                clean = 0;
+            }
+        }
+        if (!clean) {
+            printf("FAIL text_stream mode=%u plen=%u seq=%u rejected but "
+                   "wrote (rc=%d olen=%u)\n", (unsigned)mode, (unsigned)plen,
+                   (unsigned)seq, rc, (unsigned)olen);
+            fails++;
+        }
+    } else if (rc == ZPSE_OK) {
+        /* Accepted: reported length must match, the bytes must equal our
+         * independent model, and the canary past n must be intact. */
+        int ok = (olen == n) && (memcmp(obuf, exp, n) == 0);
+
+        for (i = n; i < (uint32_t)sizeof obuf; i++) {
+            if (obuf[i] != 0xCCu) {
+                ok = 0;
+            }
+        }
+        if (!ok) {
+            printf("FAIL text_stream mode=%u plen=%u seq=%u accepted wrong "
+                   "(rc=%d olen=%u n=%u packed=%u)\n", (unsigned)mode,
+                   (unsigned)plen, (unsigned)seq, rc, (unsigned)olen,
+                   (unsigned)n, (unsigned)plen);
+            fails++;
+        }
+        mix(blk, 16u + plen);
+        mix(obuf, n);
+        mix_u32(olen);
+    } else {
+        printf("FAIL text_stream mode=%u plen=%u seq=%u rc=%d n=%u\n",
+               (unsigned)mode, (unsigned)plen, (unsigned)seq, rc,
+               (unsigned)n);
+        fails++;
     }
 }
 
@@ -344,6 +592,32 @@ int main(int argc, char **argv)
                 seq++;
                 continue;
             }
+            /* The TEXT form is ASCII-only by definition: any block that holds
+             * a byte >= 0x80 must not carry the TEXT sync. Parse the header we
+             * just wrote and check the chosen form. */
+            {
+                uint32_t j;
+                int non_ascii = 0;
+
+                for (j = 0u; j < n; j++) {
+                    if (in[j] >= 0x80u) {
+                        non_ascii = 1;
+                        break;
+                    }
+                }
+                if (non_ascii) {
+                    ZpseBlockHeader bh;
+                    int prc = zpse_block_header_parse(&bh, comp, clen);
+
+                    if (prc == ZPSE_OK &&
+                        bh.sync == (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
+                        printf("FAIL case=%u shape=%s n=%u TEXT on non-ASCII "
+                               "input\n", (unsigned)cases,
+                               shape_name[shape], (unsigned)n);
+                        fails++;
+                    }
+                }
+            }
             memset(out, 0xA5, n);
             rc = zpse_decompress_block(comp, clen, out, n, &olen, dec_arena);
             if (rc < 0 || olen != n || memcmp(in, out, n) != 0) {
@@ -365,13 +639,16 @@ int main(int argc, char **argv)
     /* Frames: same contract, over several nominal block sizes, including
      * one that splits a 64 KiB payload into 256 blocks. */
     {
-        static const uint32_t fn[6] = { 20000u, 12345u, 65536u, 3000u,
-                                        50000u, 900u };
-        static const uint32_t fnbs[6] = { 1024u, 4096u, 65536u, 256u,
-                                          8192u, 512u };
-        static const uint32_t fshape[6] = { 12u, 13u, 11u, 16u, 14u, 15u };
+        static const uint32_t fn[7] = { 20000u, 12345u, 65536u, 3000u,
+                                        50000u, 900u, 20000u };
+        static const uint32_t fnbs[7] = { 1024u, 4096u, 65536u, 256u,
+                                          8192u, 512u, 4096u };
+        /* Last case is the all-ASCII prose shape, so the frame path reaches
+         * the TEXT form and its bytes enter the frame-level digest. */
+        static const uint32_t fshape[7] = { 12u, 13u, 11u, 16u, 14u, 15u,
+                                            18u };
 
-        for (i = 0; i < 6; i++) {
+        for (i = 0; i < 7; i++) {
             uint32_t n = fn[i];
             size_t flen = 0u;
             size_t olen = 0u;
@@ -407,6 +684,25 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Hand-built TEXT streams: a finite set of ASCII-source streams (exact
+     * decode checked) and arbitrary bit-pattern streams (exact unpack model
+     * checked), across PACKED lengths from 1 to 224 -- i.e. decoded lengths
+     * from 1 to 256. This is the form's own envelope, built by hand, so it is
+     * covered independently of the encoder's form selector. */
+    {
+        static const uint32_t tplens[8] = {
+            1u, 2u, 7u, 8u, 14u, 29u, 88u, TEXT_PACK_MAX
+        };
+        uint32_t m;
+        uint32_t k;
+
+        for (m = 0u; m < 2u; m++) {
+            for (k = 0u; k < 8u; k++) {
+                text_stream_case(m, tplens[k], seq++);
+            }
+        }
+    }
+
     /* Continuous fuzzing mode: run until killed by timeout. Gated by
      * ZPSE_FUZZ_CONTINUE so the unit-test runner (run.sh/run.ps1) still
      * executes the finite corpus once and exits with a stable digest; CI
@@ -419,6 +715,10 @@ int main(int argc, char **argv)
             uint32_t clen = 0u;
             uint32_t olen = 0u;
             int rc;
+
+            /* Also hand a fresh TEXT block to the decoder every iteration. */
+            text_stream_case((cont_cases & 1u) ? 1u : 0u,
+                             1u + (nr32() % TEXT_PACK_MAX), seq);
 
             fill(shape, n);
             rc = zpse_compress_block(in, n, comp, sizeof comp, &clen, seq,

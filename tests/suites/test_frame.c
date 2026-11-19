@@ -73,6 +73,63 @@ static void fill_input(uint32_t n, int kind)
     }
 }
 
+/* Deterministic English-like prose for the TEXT page. A first-order Markov
+ * walk over a fixed prose corpus keeps every byte printable ASCII without
+ * repeating a long substring for the LZ match finder. That is the shape the
+ * ASCII gate convicts and the fixed-rate 7-bit pack wins: no low alphabet to
+ * tempt FLAT, no easy prediction for the ladder. */
+static void fill_prose(uint8_t *p, uint32_t n, uint32_t seed)
+{
+    static const char corpus[] =
+        "The quick brown fox jumps over the lazy dog. This is a sentence of "
+        "English prose with common words and ordinary punctuation. The "
+        "encoder must decide which form to use for each block of bytes. When "
+        "the input is plain text the static table can replace frequent pairs "
+        "of characters with single tokens. Each token expands to two or more "
+        "bytes on decode, and the result is a smaller stream than the "
+        "original. There is no predictor and no mask and no residual codec "
+        "in this form, only the byte stream that the table describes. The "
+        "header is short because the block is a page. A reader finds the "
+        "extent of every block by reading one short header at a time, and "
+        "checks the low sixteen bits of a checksum before it trusts any of "
+        "the fields inside. Nothing in the table depends on the level that "
+        "the encoder was asked to use, so the same bytes must come out at "
+        "every effort from fastest to max. Deterministic input and a fixed "
+        "seed keep the test repeatable on every machine and every build, "
+        "which matters for a format that promises the same compressed stream "
+        "on every platform that implements it correctly.";
+    uint8_t next[128][128];
+    uint8_t cnt[128];
+    uint32_t clen = (uint32_t)(sizeof corpus - 1u);
+    uint32_t prev = (uint32_t)'T';
+    uint32_t r = seed;
+    uint32_t i;
+
+    memset(next, 0, sizeof next);
+    memset(cnt, 0, sizeof cnt);
+    for (i = 0u; i + 1u < clen; i++) {
+        uint32_t c = (uint8_t)corpus[i];
+        uint32_t d = (uint8_t)corpus[i + 1u];
+
+        if (c < 128u && d < 128u && cnt[c] < 128u) {
+            next[c][cnt[c]++] = (uint8_t)d;
+        }
+    }
+    for (i = 0u; i < n; i++) {
+        if ((i % 80u) == 79u) {
+            p[i] = '\n';
+            prev = (uint32_t)'T';
+        } else {
+            if (cnt[prev] == 0u) {
+                prev = (uint32_t)'T';
+            }
+            r = r * 1664525u + 1013904223u;
+            p[i] = next[prev][(r >> 16) % cnt[prev]];
+            prev = p[i];
+        }
+    }
+}
+
 /* Rewrite the frame header so a deliberate field edit survives its CRC. */
 static void reseal_header(uint8_t *frame)
 {
@@ -353,8 +410,12 @@ static void corrupt_cases(void)
     {
         size_t nlen = 0;
 
-        CHECK(zpse_compress_frame(in, FRAME_N, comp, sizeof comp, &nlen, BLK,
-                                  ea) == ZPSE_OK,
+        /* The checksum flag keeps an all-ASCII input off the whole-input
+         * FLAT7 fast frame. This case is about a PSE1 frame with no index
+         * table, so it must stay a PSE1 frame. */
+        CHECK(zpse_compress_frame_ex(in, FRAME_N, comp, sizeof comp, &nlen,
+                                     BLK, (uint32_t)ZPSE_ENC_CHECKSUM, ea) ==
+                  ZPSE_OK,
               "plain frame encode");
         CHECK(zpse_frame_index_count(comp, nlen, &count) == ZPSE_OK &&
                   count == 0u,
@@ -365,12 +426,11 @@ static void corrupt_cases(void)
     }
 }
 
-/* A frame of 4 KiB pages: every block takes a 16-byte header (FLAT, or a token
- * for a constant page), so a streaming reader finds each block's extent by
- * reading one short header at a time. This pins the whole path the automatic
- * FLAT form introduced: three page shapes, distinct sequence numbers, LAST on
- * the final block only, and a walk that lands exactly on the end of the
- * frame. */
+/* A frame of 4 KiB pages: every block takes a 16-byte header (token, FLAT or
+ * TEXT), so a streaming reader finds each block's extent by reading one short
+ * header at a time. This pins the whole path the automatic page forms
+ * introduced: four page shapes, distinct sequence numbers, LAST on the final
+ * block only, and a walk that lands exactly on the end of the frame. */
 static void page_frame_roundtrip(void)
 {
     size_t clen = 0;
@@ -381,6 +441,7 @@ static void page_frame_roundtrip(void)
     uint32_t ntok = 0u;
     uint32_t nflat_coded = 0u;
     uint32_t nflat_raw = 0u;
+    uint32_t ntext = 0u;
     uint32_t nladder = 0u;
     ZpseFrameHeader fh;
 
@@ -389,17 +450,25 @@ static void page_frame_roundtrip(void)
         uint32_t i;
 
         for (i = 0u; i < (uint32_t)ZPSE_BLOCK_SHORT_MAX; i++) {
-            switch (page % 3u) {
+            switch (page % 4u) {
             case 0u:
                 in[off + i] = (uint8_t)(0x40u + page);          /* constant */
                 break;
             case 1u:
                 in[off + i] = (uint8_t)('a' + (rnd() & 3u));    /* low alpha */
                 break;
-            default:
+            case 2u:
                 in[off + i] = (uint8_t)rnd();                   /* incompressible */
                 break;
+            default:
+                break; /* ASCII prose: filled just below */
             }
+        }
+        if (page % 4u == 3u) {
+            /* Printable ASCII with a line break every 32 bytes: no low
+             * alphabet and no repeat, so the ASCII gate takes the page and
+             * writes it as a TEXT block. */
+            fill_prose(in + off, ZPSE_BLOCK_SHORT_MAX, 12345u);
         }
     }
     CHECK(zpse_compress_frame(in, FRAME_N, comp, sizeof comp, &clen,
@@ -465,6 +534,15 @@ static void page_frame_roundtrip(void)
               "page %u LAST flag", k);
         if (bh.sync == ZPSE_BLOCK_SYNC_TOKEN) {
             ntok++;
+        } else if (bh.sync == ZPSE_BLOCK_SYNC_TEXT) {
+            ntext++;
+            /* TEXT carries no codec fields, but it is still a page block: a
+             * 16-byte header, sized by the same helper. */
+            CHECK(bh.header_size == ZPSE_BLOCK_HEADER_SIZE_SHORT,
+                  "page %u TEXT header is 16 bytes", k);
+            CHECK(zpse_block_header_size(comp + pos, avail) ==
+                      ZPSE_BLOCK_HEADER_SIZE_SHORT,
+                  "page %u TEXT header size helper says 16", k);
         } else if (bh.sync == ZPSE_BLOCK_SYNC_FLAT &&
                    bh.transform_id != ZPSE_FLAT_RAW) {
             nflat_coded++;
@@ -479,9 +557,12 @@ static void page_frame_roundtrip(void)
           (unsigned long)pos, (unsigned long)clen);
     CHECK(ntok > 0u, "a constant page became a token");
     CHECK(nflat_coded > 0u, "a low-alpha page became a coded FLAT block");
+    CHECK(ntext > 0u, "a prose page became a TEXT block");
     /* Incompressible and structured low-alpha pages fall through to the
      * level ladder; FLAT is only the one-pass path for irregular low-alphabet
-     * and pointer pages. */
+     * and pointer pages. This page mix has no raw FLAT page, but the counter
+     * is kept so a future page shape can assert it without re-adding it. */
+    (void)nflat_raw;
     CHECK(nladder > 0u, "an incompressible page took the ladder");
 }
 
@@ -497,7 +578,9 @@ static void flat_overlong(void)
     uint32_t i;
 
     for (i = 0u; i < (uint32_t)ZPSE_BLOCK_SHORT_MAX; i++) {
-        in[i] = (uint8_t)('a' + (rnd() & 3u)); /* low alpha -> FLAT */
+        /* Four high-byte symbols: still a low-alphabet FLAT page, but not
+         * all-ASCII, so the whole-input FLAT7 frame fast path cannot take it. */
+        in[i] = (uint8_t)(0x80u + (rnd() & 3u));
     }
     CHECK(zpse_compress_frame(in, ZPSE_BLOCK_SHORT_MAX, comp, sizeof comp,
                               &clen, ZPSE_BLOCK_SHORT_MAX, ea) == ZPSE_OK,
@@ -540,6 +623,62 @@ static void flat_overlong(void)
     }
 }
 
+/* The TEXT form is a 16-byte header too, and its c field is equally untrusted:
+ * a claim that runs past the end of the frame must be refused before any token
+ * stream is decoded or any output byte is written. */
+static void text_overlong(void)
+{
+    size_t clen = 0;
+    size_t got = 0;
+    uint8_t *hdr;
+    ZpseBlockHeader bh;
+
+    fill_prose(in, ZPSE_BLOCK_SHORT_MAX, 12345u);
+    /* Prose is all ASCII and would otherwise be captured by the whole-input
+     * FLAT7 frame magic, leaving no TEXT block to inflate. The checksum flag
+     * opts out of that fast path while the block form stays TEXT. */
+    CHECK(zpse_compress_frame_ex(in, ZPSE_BLOCK_SHORT_MAX, comp, sizeof comp,
+                                 &clen, ZPSE_BLOCK_SHORT_MAX,
+                                 (uint32_t)ZPSE_ENC_CHECKSUM, ea) == ZPSE_OK,
+          "overlong TEXT source frame");
+    memset(&bh, 0, sizeof bh);
+    hdr = comp + ZPSE_FRAME_HEADER_SIZE;
+    CHECK(zpse_block_header_parse(&bh, hdr,
+                                  (uint32_t)(clen - ZPSE_FRAME_HEADER_SIZE)) ==
+                  ZPSE_OK &&
+              bh.sync == ZPSE_BLOCK_SYNC_TEXT,
+          "source block is TEXT");
+    if (bh.sync != ZPSE_BLOCK_SYNC_TEXT) {
+        return;
+    }
+    /* Inflate the 16-bit compressed-size field past the end of the frame and
+     * re-seal the header CRC: the refusal has to come from the size against
+     * the remaining input, not from a checksum. */
+    zpse_store_u16le(hdr + 8u, (uint16_t)60000u);
+    zpse_store_u16le(hdr + 14u,
+                     (uint16_t)(zpse_crc32c(hdr, 14u) & UINT32_C(0xFFFF)));
+    CHECK(zpse_block_header_parse(&bh, hdr,
+                                  (uint32_t)(clen - ZPSE_FRAME_HEADER_SIZE)) ==
+                  ZPSE_OK &&
+              bh.compressed_block_size == 60000u,
+          "overlong TEXT header parses with the inflated size");
+    memset(out, 0x5A, sizeof out);
+    CHECK(zpse_decompress_frame(comp, clen, out, sizeof out, &got, da) < 0,
+          "overlong TEXT size refused");
+    {
+        size_t j;
+        int touched = 0;
+
+        for (j = 0; j < sizeof out; j++) {
+            if (out[j] != 0x5A) {
+                touched = 1;
+                break;
+            }
+        }
+        CHECK(!touched, "overlong TEXT size wrote into the output buffer");
+    }
+}
+
 int main(void)
 {
     static const uint32_t blocks[] = { 4096u, 16384u, 65536u, 32768u };
@@ -551,6 +690,7 @@ int main(void)
     seek_all(65536u, 65536u, 0u, 1); /* one block */
     page_frame_roundtrip();
     flat_overlong();
+    text_overlong();
     corrupt_cases();
 
     /* A block size that does not divide the input leaves a short block

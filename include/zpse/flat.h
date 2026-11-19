@@ -10,7 +10,7 @@
  * live with their respective owners.
  *
  * Wire header at [0..16), payload at [16, c):
- *   [0..2)   u16 sync  = ZPSE_FLAT_SYNC (0x50B9)
+ *   [0..2)   u16 sync  = 0x50B9
  *   [2]      u8  flags = RESET | optional LAST (RAW/CRC/HAS_META must be 0)
  *   [3]      u8  codec (ZpseFlatCodec)
  *   [4]      u8  param (meaning depends on codec, see below)
@@ -41,15 +41,10 @@
 #define ZPSE_FLAT_AVX2 1
 #endif
 
-#define ZPSE_FLAT_SYNC         ((uint16_t)0x50B9)
-#define ZPSE_FLAT_HEADER_SIZE  ((uint32_t)16u)
 #define ZPSE_FLAT_MAX_N        ((uint32_t)4096u)
 
-/* Header flag bits (byte [2]). RESET and LAST are the only legal bits. */
-#define ZPSE_FLAT_F_RESET      ((uint8_t)(1u << 3))
-#define ZPSE_FLAT_F_LAST       ((uint8_t)(1u << 1))
-/* RAW, CRC and HAS_META must all be 0 in a FLAT header. */
-#define ZPSE_FLAT_F_FORBIDDEN  ((uint8_t)(0x01u | 0x04u | 0x10u))
+/* Header flag bits (byte [2]): RESET = 1<<3 and LAST = 1<<1 are the only
+ * legal bits. RAW (0x01), CRC (0x04) and HAS_META (0x10) must all be 0. */
 
 /* Codec ids are defined as ZPSE_FLAT_* macros in zpse/constants.h so the
  * header parser and the decoder agree on one definition. */

@@ -4,6 +4,9 @@
  * prefixed so the amalgamation has no duplicate symbols. */
 
 #include "crc32c.c"
+#include "lzfast.c"
+#include "repack.c"
+#include "rlefast.c"
 #include "arena.c"
 #include "types.c"
 #include "transform.c"
@@ -19,8 +22,11 @@
 #include "segment.c"
 #include "block.c"
 #include "frame.c"
+#include "flat7.c"
 #include "parallel.c"
 #include "vector.c"
 #include "pagefast.c"
 #include "flat.c"
+#include "text.c"
 #include "api.c"
+#include "f64fast.c"

@@ -2,7 +2,10 @@
 #define ZPSE_FRAME_H
 
 /* Frame-level helpers. Block framing loops live here;
- * per-block work delegates to block.h. */
+ * per-block work delegates to block.h.
+ *
+ * FLAT7 is a separate whole-frame codec with its own magic; it is sniffed and
+ * handed off in api.c and is not one of the block frames built below. */
 
 /* Whole-frame decode of a page-sized frame reads each block's 16-byte header
  * once (its compressed/uncompressed sizes, flags and decoded CRC from a

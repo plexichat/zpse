@@ -68,11 +68,11 @@ and the lz4 *CLI* are not the same encoder.
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.08:1 | 408 | 1908 |
-| | zpse 1 `FASTEST` | 1.24:1 | 816 | 2998 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.09:1 | 408 | 1908 |
+| | zpse 1 `FASTEST` | 1.27:1 | 816 | 2998 |
 | | zpse 9 `MAX` | 2.31:1 | 183 | 1087 |
-| 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.25:1 | 719 | 8562 |
-| | zpse 1 `FASTEST` | 4.01:1 | 1716 | 14528 |
+| 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.24:1 | 719 | 8562 |
+| | zpse 1 `FASTEST` | 4.02:1 | 1716 | 14528 |
 | | zpse 9 `MAX` | 5.28:1 | 677 | 9128 |
 | 64 KiB block, all zeros | zpse 6 (default) | 978:1 | 10030 | 64680 |
 | 64 KiB block, random | zpse 6 (default) | 1.00:1 | 1600 | 64700 |
@@ -89,7 +89,9 @@ The short version:
   at 220-790 MB/s on those files. The probe, the trials and the entropy pass
   are the minority of the time; the pass is the ceiling.
 * **Decode is fast** because the tile path is a vectorised reconstruction
-  rather than a serial command loop, and the LZ forms decode through a lookup.
+  rather than a serial command loop, and the fast LZ form decodes in one tight
+  C+E+B loop -- literal copy, escape decode and match-body copy -- with no
+  per-field checks in its trusted region.
 * **Encode is the price.** The encoder chooses a shape per block; lz4 makes no
   such decision and is about four times faster on text.
 
@@ -102,19 +104,19 @@ pinned core, output written normally.
 
 | file | bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| `dickens` | 10,192,446 | 1.19:1 | 830 | 4787 |
-| `mozilla` | 51,220,480 | 2.02:1 | 328 | 1419 |
+| `dickens` | 10,192,446 | 1.23:1 | 830 | 4787 |
+| `mozilla` | 51,220,480 | 2.01:1 | 328 | 1419 |
 | `mr` | 9,970,564 | 2.50:1 | 332 | 1431 |
 | `nci` | 33,553,445 | 5.43:1 | 585 | 1840 |
 | `ooffice` | 6,152,192 | 1.49:1 | 241 | 1183 |
 | `osdb` | 10,085,684 | 1.15:1 | 602 | 4713 |
 | `reymont` | 6,627,202 | 1.99:1 | 344 | 2085 |
-| `samba` | 21,606,400 | 2.61:1 | 442 | 1902 |
+| `samba` | 21,606,400 | 2.59:1 | 442 | 1902 |
 | `sao` | 7,251,944 | 1.01:1 | 1026 | 7533 |
 | `webster` | 41,458,703 | 2.10:1 | 345 | 2116 |
 | `x-ray` | 8,474,240 | 1.71:1 | 475 | 3011 |
-| `xml` | 5,345,280 | 4.22:1 | 618 | 2247 |
-| **total** | **211,938,580** | **2.08:1** | **408** | **1908** |
+| `xml` | 5,345,280 | 4.20:1 | 618 | 2247 |
+| **total** | **211,938,580** | **2.09:1** | **408** | **1908** |
 
 Half of Silesia is English prose, the shape the tile model is weakest on.
 `sao` and `osdb` are close to the raw path doing a copy; `nci`, `samba` and
@@ -152,7 +154,7 @@ spends. The two files that are not finder-bound are bound by the trial loop
 instead -- `x-ray` (medical image) and `mr` spend 54% and 51% of a block in
 their one full shape trial. Raising the ceiling means either a faster finder
 or fewer finder passes, and fewer passes costs ratio: level 1 writes no LZ
-form at all and runs at 816 MB/s for 1.24:1, and `LZ_FAST` is one pass at
+form at all and runs at 816 MB/s for 1.27:1, and `LZ_FAST` is one pass at
 2.19:1.
 
 The finder is one hash probe per position over a 2^15-entry table, with a
@@ -171,9 +173,9 @@ codec's, not the filesystem's; the read floor is printed by the script.
 | tool | packed bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
 | zpse 1 `FASTEST` | 170,031,147 | 1.25:1 | 721 | 1638 |
-| zpse 5 `BALANCED` | 105,731,196 | 2.00:1 | 363 | 1197 |
-| zpse 6 (default) | 102,052,646 | 2.08:1 | 363 | 1143 |
-| zpse 9 `MAX` | 91,665,498 | 2.31:1 | 245 | 990 |
+| zpse 5 `BALANCED` | 105,307,341 | 2.01:1 | 363 | 1197 |
+| zpse 6 (default) | 101,781,169 | 2.08:1 | 363 | 1143 |
+| zpse 9 `MAX` | 91,646,686 | 2.31:1 | 245 | 990 |
 | lz4 1 | 100,924,480 | 2.10:1 | 1333 | 1541 |
 | lz4 3 | 81,440,500 | 2.60:1 | 441 | 1518 |
 | lz4 9 | 78,001,045 | 2.72:1 | 208 | 1450 |
@@ -202,11 +204,10 @@ comparison over the concatenation:
 
 | tool | packed bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| zpse 1 `FASTEST` | 16,355,993 | 4.36:1 | 548 | 931 |
-| zpse 5 `BALANCED` | 12,529,172 | 5.69:1 | 455 | 939 |
-| zpse 6 (default) | 12,514,963 | 5.70:1 | 476 | 877 |
-| zpse 9 `MAX` | 12,505,979 | 5.70:1 | 455 | 992 |
-| zpse 6 `LZ_FAST` | 20,431,878 | 3.49:1 | 523 | 834 |
+| zpse 1 `FASTEST` | 16,190,105 | 4.40:1 | 548 | 931 |
+| zpse 5 `BALANCED` | 12,533,517 | 5.69:1 | 455 | 939 |
+| zpse 6 (default) | 12,517,932 | 5.70:1 | 476 | 877 |
+| zpse 9 `MAX` | 12,508,891 | 5.70:1 | 455 | 992 |
 | lz4 CLI -1 | 21,744,005 | 3.28:1 | 474 | 750 |
 | lz4 CLI -3 | 20,141,108 | 3.54:1 | 117 | 732 |
 | lz4 CLI -9 (HC) | 19,786,464 | 3.60:1 | 54 | 771 |
@@ -263,7 +264,7 @@ corpus, and the corpus sha256 is pinned by the generator.
 | --- | ---: | ---: | ---: |
 | zpse 1 `FASTEST` | 1.66:1 | 321 | 2646 |
 | zpse 6 (default) | 2.28:1 | 215 | 1891 |
-| zpse 9 `MAX` | 2.43:1 | 160 | 1387 |
+| zpse 9 `MAX` | 2.42:1 | 160 | 1387 |
 | lz4 1 | 2.03:1 | 1047 | 3761 |
 | lz4hc 4 | 2.26:1 | 190 | 4372 |
 | lz4hc 9 | 2.30:1 | 70 | 4489 |
@@ -273,12 +274,17 @@ Pages now take a single one-pass path. A 16-byte **FLAT** block carries a
 constant page as a token, an irregular low-alphabet page as packed NIBBLE4 or
 BIT2 indices, and a pointer-lane page as SUBLANE; these decode in one SIMD pass
 at roughly 9 GB/s *on the shapes they cover*. Structured pages (ramps, strides,
-alternation, text) fall through to the same 9-level ladder larger blocks use,
-because FLAT's fixed-width packing loses badly to the ladder's DELTA and tile
-forms on them. The old `PAGE_FAST`, `LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags
-are retired: every level now picks the same page form for the same bytes, so
-the ladder is monotonic on pages as it is elsewhere. The ratios above reflect
-that split -- level 9's entropy pass turns 2.28:1 into 2.43:1.
+alternation) fall through to the same 9-level ladder larger blocks use, because
+FLAT's fixed-width packing loses badly to the ladder's DELTA and tile forms on
+them. Text is no longer part of that fallthrough: a whole-ASCII page may use
+the TEXT form, and a stream of ASCII pages may take the FLAT7 whole-frame fast
+path, which packs eight characters into seven bytes and decodes in one spread
+pass. A redundancy gate keeps repetitive ASCII on the ladder, where the match
+finder earns its ratio; high-entropy printable ASCII takes the pack. The old
+`PAGE_FAST`, `LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags are retired: every level
+now picks the same page form for the same bytes, so the ladder is monotonic on
+pages as it is elsewhere. The ratios above reflect that split -- level 9's
+entropy pass turns 2.28:1 into 2.42:1.
 
 The honest decode result: because most content pages take the ladder, the
 **mixed-corpus decode rate is about 1.9 GB/s, not 5 GB/s**. The 9 GB/s FLAT
@@ -336,13 +342,13 @@ best of three):
 
 | level | mean ratio | mean encode MB/s | mean decode MB/s | what changes |
 | --- | ---: | ---: | ---: | --- |
-| 1 `FASTEST` | 4.01:1 | 1716 | 14528 | one trial, cheap prescreen, no match finder |
+| 1 `FASTEST` | 4.02:1 | 1716 | 14528 | one trial, cheap prescreen, no match finder |
 | 2 | 4.09:1 | 1472 | 13424 | full prescreen, two trials |
 | 3 `FASTER` | 4.09:1 | 1345 | 13619 | three trials |
 | 4 | 4.09:1 | 1304 | 12877 | four trials, still no match finder |
-| 5 `BALANCED` | 5.20:1 | 708 | 8427 | price every plane, guarded field cut, LZ at 1.25x |
-| 6 (default) | 5.25:1 | 719 | 8562 | margin 1.1875x, decode bill 6 bytes/command |
-| 7 | 5.25:1 | 739 | 7533 | margin 1.125x |
+| 5 `BALANCED` | 5.19:1 | 708 | 8427 | price every plane, guarded field cut, LZ at 1.25x |
+| 6 (default) | 5.24:1 | 719 | 8562 | margin 1.1875x, decode bill 6 bytes/command |
+| 7 | 5.24:1 | 739 | 7533 | margin 1.125x |
 | 8 | 5.25:1 | 716 | 8182 | margin 1.0625x, accel 20, tied-tail cut |
 | 9 `MAX` | 5.28:1 | 677 | 9128 | margin 1.0625x, one sample, accel 24, fast LZ candidate, Huffman over the LZ payload |
 
@@ -441,8 +447,8 @@ characters into seven bytes.
 A block may instead be coded as **intra-block LZ**: a literal stream and a
 command stream, with every reference a 16-bit distance inside the block. The
 four most recent distances are numbered 1 to 4 and cost nothing to name again.
-The **fast LZ** form (`ZPSE_ENC_LZ_FAST`) uses a fixed 16-bit distance, a
-one-byte repeat code and no distance varint -- lz4's shape -- and is offered at
+The **fast LZ** form (`ZPSE_ENC_LZ_FAST`) uses a fixed 16-bit distance and no
+distance varint or repeat code -- exactly lz4's shape -- and is offered at
 the deepest levels or requested explicitly. The **hexadecimal LZ** form packs
 common literal/length pairs into a nibble and is used for page-sized blocks
 from level 7 up. Every form is kept only when it is strictly smaller than
@@ -473,6 +479,30 @@ is validated before use. The payload CRC32-C is optional and off by default
 (`ZPSE_ENC_CHECKSUM`), because a checksum pass is a large fraction of a fast
 decode; the decoder verifies anything tagged. When the flag is not set the
 header's CRC field is written as 0 and no pass is made.
+
+**FLAT7** (`F7P1`) is a whole ASCII frame: a 40-byte header and one 7-bit-packed
+region, with a redundancy gate that leaves repetitive ASCII on the ladder.
+
+**lzfast** is a minimal LZ4-style finder and raw token stream — no header of its
+own, fixed two-byte distances, and no lazy probe, backward walk or repeat slots.
+It is a library entry point with no CLI flag.
+
+**REPACK** (`ZRPK`) maps a low-alphabet ASCII buffer to dense w-bit codes
+(w = 1..7), with a 16-byte inverse map for w <= 4 and a 128-byte one otherwise;
+it declines non-ASCII input, and at w = 7 its payload is byte-for-byte the FLAT7
+pack.
+
+**RLE1** codes run-structured small integers as (value, run-1) pairs under a
+CRC'd 12-byte header, committing only when 90% of the sampled bytes fall in
+maximal runs of at least four values in 0..127.
+
+**f64fast** (`F64F`) pins DELTA_TRANSPOSE_8 for float64 arrays whose lane-high
+bytes come from a small dominant alphabet, wrapping a normal PSE1 frame; it is
+a library entry point with no CLI flag.
+
+None of these is a new block form: the ladder decoder never chooses them, and a
+caller opts in explicitly. The CLI's `-F7`/`-7` and `-R` arms time FLAT7 and
+REPACK against the block codec on the same input.
 
 ## Building and testing
 
@@ -515,8 +545,12 @@ twin. `-DZPSE_AVX2_ABI_OK=0` builds the kernels out anywhere, which is how that
 configuration is tested on Linux.
 
 The suite is `tests/runners/run.sh`: parity, fuzz, sizes, levels, LZ, ASCII,
-frames, the page dictionary, the Huffman form and the parallel encoder. The
-benchmarks are all under `tests/benchmarks/`:
+frames, the page dictionary, the Huffman form, the parallel encoder, hostile
+inputs, fill prediction, page forms, FLAT7, the column reference and corpus
+cases, and the ORDER segment-state decoder. The `parity`, `fuzz` and `lseed`
+suites are each built in default, forced-scalar and trial-swap modes and must
+print the same digest in all three. The benchmarks are all under
+`tests/benchmarks/`:
 
 | script | table |
 | --- | --- |
@@ -560,8 +594,10 @@ Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
 pages), `-t N` workers (encode streams through the worker ring; decode reads a
 batch of blocks on one thread, decodes them side by side and writes them in
 order on another, so a frame is still never resident whole), `-x` writes an
-index, `-F` requests `LZ_FAST`, `-D` requests `DECODE_FAST`, and `-n BYTES`
-limits how much of each input `bench` reads.
+index, `-F` requests `LZ_FAST`, `-D` requests `DECODE_FAST`, `-F7` (or `-7`)
+adds an in-memory FLAT7 arm to `bench`, `-R` adds an in-memory ZRPK arm to
+`bench` (and tries a ZRPK frame first in `c`, sniffing it in `d`), and
+`-n BYTES` limits how much of each input `bench` reads.
 
 ## Documentation
 
@@ -584,10 +620,19 @@ limits how much of each input `bench` reads.
   zpse's stream is 42% smaller.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
-  is the only metric, level 4 or `PAGE_FAST` is the lever, and
+  is the only metric, level 4 is the lever, and
   `ZPSE_ENC_DECODE_FAST` (`-D`) is the per-block one: it keeps an LZ form only
   when it is an eighth smaller than the tile stream, so a block where the two
   forms are close is written the way the decoder reads fastest.
+* **The whole-frame paths are caller-driven.** Five paths sit outside the
+  ladder. FLAT7 (`F7P1`), REPACK (`ZRPK`), RLE1 (`RLE1`) and f64fast (`F64F`)
+  are self-delimiting containers with a magic and a narrow input gate; each
+  declines anything outside its gate back to the ordinary block codec. lzfast
+  is a bare LZ4-style token stream with no header, gate or magic of its own.
+  FLAT7 and REPACK have in-memory A/B arms in `bench` (`-F7`/`-7` and `-R`);
+  lzfast, RLE1 and f64fast are library entry points with no CLI flag. None is
+  a general-purpose replacement for the ladder. REPACK is a ratio codec, not
+  a speed path: its decode is much slower than the ordinary block decoder.
 * **No column semantics.** The format does not know record boundaries or null
   meanings; the byte transpose recovers the split for fixed-width records by
   accident. A nullable column costs more than null suppression would.

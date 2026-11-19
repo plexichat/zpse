@@ -50,7 +50,7 @@ static uint32_t pf_ctz32(uint32_t x)
  *   ref[j]        first byte seen at vector-lane position j (j = offset % 32)
  *   lane_diff[j]  OR of (byte ^ ref[j]) over the page; 0 means that position
  *                 held the same byte in every lane (the POINTER signal)
- *   zero_cnt[j]   number of zero bytes at position j, max 128 per lane
+ *   zero_cnt[j]   number of zero bytes at position j, up to n/32 per lane
  *   abits[8]      the 256-bit alphabet bitmap: bit v of word v>>5 == value seen
  */
 typedef struct ZpsePfAcc {
@@ -60,7 +60,7 @@ typedef struct ZpsePfAcc {
     uint8_t  alpha_over;    /* a 17th distinct value was seen */
     uint8_t  ref[32];
     uint8_t  lane_diff[32];
-    uint8_t  zero_cnt[32];
+    uint16_t zero_cnt[32];
     uint32_t nzero;
     uint8_t  high_or;       /* OR of every byte & 0x80 */
     uint8_t  first;
@@ -98,7 +98,7 @@ static void pf_record(ZpsePfAcc *a, uint8_t v)
 static void pf_add_byte(ZpsePfAcc *a, uint8_t b, uint32_t lane)
 {
     if (b == 0u) {
-        a->zero_cnt[lane] = (uint8_t)(a->zero_cnt[lane] + 1u);
+        a->zero_cnt[lane] = (uint16_t)(a->zero_cnt[lane] + 1u);
     }
     a->lane_diff[lane] |= (uint8_t)(b ^ a->ref[lane]);
     a->high_or |= (uint8_t)(b & 0x80u);
@@ -185,13 +185,13 @@ static int pf_finish(const ZpsePfAcc *a, uint32_t n, ZpsePageInfo *info)
 
     info->value = a->first;
     info->flags = 0u;
-    info->nzero = (uint16_t)a->nzero;
+    info->nzero = a->nzero;
     /* Publish the per-lane stats from the shared accumulator. Both kernels
      * have finished filling a->lane_diff/zero_cnt by now (AVX2 stores them
      * after its main loop, scalar writes them via pf_add_byte), so copying
      * here keeps the two paths bit-identical without a second scan. */
-    memcpy(info->lane_diff, a->lane_diff, 32u);
-    memcpy(info->zero_cnt, a->zero_cnt, 32u);
+    memcpy(info->lane_diff, a->lane_diff, sizeof a->lane_diff);
+    memcpy(info->zero_cnt, a->zero_cnt, sizeof a->zero_cnt);
     for (i = 0u; i < 8u; i++) {
         bits += pf_popcount32(a->abits[i]);
     }
@@ -275,7 +275,6 @@ static ZPSE_PF_AVX2 void pf_classify_avx2(const uint8_t *in, uint32_t n,
     const __m256i ref = _mm256_loadu_si256(
         (const __m256i *)(const void *)in);
     const __m256i zero = _mm256_setzero_si256();
-    const __m256i one = _mm256_set1_epi8(1);
     const __m256i mask1f = _mm256_set1_epi8((char)0x1F);
     const __m256i mask0f = _mm256_set1_epi8((char)0x0F);
     const __m256i mask07 = _mm256_set1_epi8((char)0x07);
@@ -285,7 +284,13 @@ static ZPSE_PF_AVX2 void pf_classify_avx2(const uint8_t *in, uint32_t n,
         1, 2, 4, 8, 16, 32, 64, (char)0x80,
         1, 2, 4, 8, 16, 32, 64, (char)0x80,
         1, 2, 4, 8, 16, 32, 64, (char)0x80);
-    __m256i zcnt = zero;
+    /* 16-bit lane counters: two registers cover the 32 byte positions. A
+     * byte-wide zcnt wraps at 256 (n = 8192), reporting zero zeros for an
+     * all-zero page. Sign-extend the 0/0xFF zero mask to -1/0 words and
+     * subtract, so each zero adds exactly one to its 16-bit lane counter;
+     * a lane holds at most n/32 zeros, far below the 16-bit limit. */
+    __m256i zcnt_lo = zero;
+    __m256i zcnt_hi = zero;
     __m256i ldiff = zero;
     __m256i hacc = zero;
     __m256i bits = zero;
@@ -296,8 +301,12 @@ static ZPSE_PF_AVX2 void pf_classify_avx2(const uint8_t *in, uint32_t n,
         __m256i v = _mm256_loadu_si256(
             (const __m256i *)(const void *)(in + i));
         __m256i isz = _mm256_cmpeq_epi8(v, zero);
+        __m256i inc_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(isz));
+        __m256i inc_hi = _mm256_cvtepi8_epi16(
+            _mm256_extracti128_si256(isz, 1));
 
-        zcnt = _mm256_add_epi8(zcnt, _mm256_and_si256(isz, one));
+        zcnt_lo = _mm256_sub_epi16(zcnt_lo, inc_lo);
+        zcnt_hi = _mm256_sub_epi16(zcnt_hi, inc_hi);
         ldiff = _mm256_or_si256(ldiff, _mm256_xor_si256(v, ref));
         hacc = _mm256_or_si256(hacc, v);
 
@@ -334,7 +343,8 @@ static ZPSE_PF_AVX2 void pf_classify_avx2(const uint8_t *in, uint32_t n,
         }
     }
 
-    _mm256_storeu_si256((__m256i *)(void *)a->zero_cnt, zcnt);
+    _mm256_storeu_si256((__m256i *)(void *)a->zero_cnt, zcnt_lo);
+    _mm256_storeu_si256((__m256i *)(void *)(a->zero_cnt + 16), zcnt_hi);
     _mm256_storeu_si256((__m256i *)(void *)a->lane_diff, ldiff);
     {
         uint32_t hm = (uint32_t)_mm256_movemask_epi8(hacc);

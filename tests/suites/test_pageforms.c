@@ -25,6 +25,7 @@
 
 #include "zpse/zpse.h"
 #include "zpse/constants.h"
+#include "zpse/text.h"
 
 /* INSTANT is bit 13, next to PAGE_TURBO (bit 10). Keep building until the
  * definition lands in the public header, the same fallback the page harness
@@ -32,6 +33,17 @@
 #ifndef ZPSE_ENC_PAGE_INSTANT
 #define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
 #endif
+
+/* The TEXT page form (sync 0x50BA) is the latest wire addition. Keep the
+ * fallback so this suite preprocesses before constants.h lands it. */
+#ifndef ZPSE_BLOCK_SYNC_TEXT
+#define ZPSE_BLOCK_SYNC_TEXT ((uint16_t)0x50BA)
+#endif
+
+/* The TEXT payload is a finder-free 7-bit pack (8 ASCII bytes -> 7 payload
+ * bytes), not the old static-BPE token stream. The property test below carries
+ * its own independent pack/unpack model, so no generated table is pulled into
+ * this suite and no codec helper is used to build its expected bytes. */
 
 #define PAGE 4096u
 #define NSHAPES 12u
@@ -47,6 +59,16 @@ static uint8_t dec[PAGE];
 static uint8_t tok[TOKLEN];
 static uint8_t copy[TOKLEN];
 static uint8_t flat_copy[COMP_CAP];
+
+/* The TEXT tests also carry 64 KiB blocks (n == ZPSE_MAX_BLOCK_SIZE), which
+ * the 4 KiB page buffers above cannot hold. These are the same fixed, aligned,
+ * no-allocation style, sized for the largest block plus a raw-block envelope. */
+#define TEXT_MAX 65536u
+#define TEXT_CAP (TEXT_MAX + 256u)
+static uint8_t tsrc[TEXT_MAX];
+static uint8_t tcomp[TEXT_CAP];
+static uint8_t tdec[TEXT_MAX];
+static uint8_t tcopy[TEXT_CAP];
 
 static int checks;
 static int fails;
@@ -694,6 +716,403 @@ static void test_flags(void)
           "unknown bit 11 is still refused");
 }
 
+/* ---- The TEXT page form (sync 0x50BA) ----------------------------------
+ * The payload is the fixed-rate 7-bit pack from src/text.c; the 16-byte header
+ * names no codec, and a stored n of 0 spells 65536. These tests cover three
+ * things: every size/shape/level round-trips byte-for-byte; the wire header is
+ * exactly the one an independent builder writes; and the pack/unpack is right
+ * for hand-built streams (checked against an independent bit-loop model, never
+ * against the codec's own encode/decode path). */
+
+static uint32_t text_rng;
+
+static uint32_t text_rnd(void)
+{
+    text_rng = text_rng * 1664525u + 1013904223u;
+    return text_rng;
+}
+
+/* kind 0 = high-entropy 7-bit ASCII (no adjacent equal bytes), 1 = the
+ * repetitive prose of make_page shape 9, 2 = prose head / noise tail. Every
+ * byte is < 128, so the 7-bit pack writer is eligible. */
+static void text_build_input(uint8_t *out, uint32_t n, int kind)
+{
+    static const char words[] =
+        "the quick brown fox jumps over the lazy dog and the river flows ";
+    uint32_t nw = (uint32_t)(sizeof words - 1u);
+    uint32_t i, prev = 0u;
+
+    text_rng = 0xC0FFEEu ^ (uint32_t)kind * 2654435761u;
+    for (i = 0u; i < n; i++) {
+        uint8_t v;
+
+        if (kind == 1u || (kind == 2u && i < n / 2u)) {
+            v = (uint8_t)words[(i * 7u + (i >> 5)) % nw];
+        } else {
+            v = (uint8_t)((text_rnd() >> 24) & 0x7Fu);
+            if (v == prev) v = (uint8_t)((v + 1u) & 0x7Fu);
+        }
+        out[i] = v;
+        prev = v;
+    }
+}
+
+/* Independent TEXT header builder: fixed sync and zero reserved bytes, the
+ * flags/sizes/seq taken from the arguments, and the low 16 bits of crc32c over
+ * the first fourteen bytes (token_crc computes exactly that). */
+static void text_expected_header(uint8_t out[16], uint32_t n, uint32_t c,
+                                 uint32_t seq, uint8_t flags)
+{
+    uint16_t crc;
+    uint16_t nstored = (n == TEXT_MAX) ? 0u : (uint16_t)n;
+
+    memset(out, 0, 16u);
+    out[0] = (uint8_t)ZPSE_BLOCK_SYNC_TEXT;
+    out[1] = (uint8_t)(ZPSE_BLOCK_SYNC_TEXT >> 8);
+    out[2] = flags;
+    /* [3..6) reserved, left zero. */
+    out[6] = (uint8_t)nstored;
+    out[7] = (uint8_t)(nstored >> 8);
+    out[8] = (uint8_t)c;
+    out[9] = (uint8_t)(c >> 8);
+    out[10] = (uint8_t)seq;
+    out[11] = (uint8_t)(seq >> 8);
+    out[12] = (uint8_t)(seq >> 16);
+    out[13] = (uint8_t)(seq >> 24);
+    crc = token_crc(out);
+    out[14] = (uint8_t)crc;
+    out[15] = (uint8_t)(crc >> 8);
+}
+
+/* Ask the public encoder for a TEXT block at any of the three effort levels.
+ * Returns the block length and the level that produced it, or 0 if none did. */
+static uint32_t text_find(uint8_t *blk, uint32_t cap, const uint8_t *in,
+                          uint32_t n, uint32_t seq, int last,
+                          uint32_t *level_out)
+{
+    static const uint32_t levels[3] = {
+        (uint32_t)ZPSE_ENC_SPEED_FASTEST,
+        (uint32_t)ZPSE_ENC_SPEED_BALANCED,
+        (uint32_t)ZPSE_ENC_SPEED_MAX
+    };
+    unsigned f;
+
+    for (f = 0u; f < 3u; f++) {
+        uint32_t clen = 0u;
+        int rc = zpse_compress_block_ex(in, n, blk, cap, &clen, seq, last,
+                                        levels[f], ea);
+
+        if (rc == ZPSE_OK &&
+            clen >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT &&
+            (uint16_t)le16(blk) == (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
+            *level_out = levels[f];
+            return clen;
+        }
+    }
+    return 0u;
+}
+
+/* If the encoder has not selected TEXT for an input yet, build a legal TEXT
+ * block directly from the public serializer and the public codec. This keeps
+ * the wire checks running even before the encoder's form selection lands. */
+static uint32_t text_hand_build(uint8_t *blk, uint32_t cap, const uint8_t *in,
+                                uint32_t n, uint32_t seq, int last)
+{
+    ZpseBlockHeader h;
+    uint32_t plen, total;
+
+    plen = zpse_text_price(in, n);
+    if (plen == 0u) return 0u;
+    total = 16u + plen;
+    if (total > cap || total > 65535u) return 0u;
+    memset(&h, 0, sizeof h);
+    h.sync = ZPSE_BLOCK_SYNC_TEXT;
+    h.block_flags = (uint8_t)(ZPSE_B_RESET | (last ? ZPSE_B_LAST : 0u));
+    h.uncompressed_size = n;
+    h.compressed_block_size = total;
+    h.block_sequence_number = seq;
+    h.header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    zpse_block_header_serialize_text(blk, &h);
+    if (zpse_text_encode(in, n, blk + 16u, plen) != plen) return 0u;
+    return total;
+}
+
+static void test_text(void)
+{
+    static const uint32_t ns[] = { 1u, 4095u, 4096u, 16384u, 65536u };
+    static const uint32_t levels[3] = {
+        (uint32_t)ZPSE_ENC_SPEED_FASTEST,
+        (uint32_t)ZPSE_ENC_SPEED_BALANCED,
+        (uint32_t)ZPSE_ENC_SPEED_MAX
+    };
+    static const int kinds[] = { 0, 1, 2 };
+    ZpseBlockHeader h;
+    uint32_t n, c, seq, clen, olen, cs, us, level;
+    unsigned i, k, f;
+    int rc, last, found;
+
+    /* 1. Byte-exact round-trip at every size, shape and level. Whether the
+     * encoder actually selects TEXT is a separate concern; every form must
+     * reconstruct the input exactly. */
+    for (i = 0u; i < sizeof ns / sizeof ns[0]; i++) {
+        n = ns[i];
+        for (k = 0u; k < sizeof kinds / sizeof kinds[0]; k++) {
+            for (f = 0u; f < 3u; f++) {
+                text_build_input(tsrc, n, kinds[k]);
+                memset(tcomp, 0xA5, sizeof tcomp);
+                rc = zpse_compress_block_ex(tsrc, n, tcomp, sizeof tcomp,
+                                            &clen, 0x1234u + i, (f == 2u),
+                                            levels[f], ea);
+                CHECK(rc == ZPSE_OK,
+                      "text rt n %u kind %d level %u encode (%s)", n, kinds[k],
+                      (unsigned)(levels[f] >> ZPSE_ENC_SPEED_SHIFT),
+                      zpse_status_name(rc));
+                if (rc != ZPSE_OK) continue;
+                memset(tdec, 0x5A, sizeof tdec);
+                rc = zpse_decompress_block(tcomp, clen, tdec, sizeof tdec,
+                                           &olen, da);
+                CHECK(rc == ZPSE_OK && olen == n &&
+                          memcmp(tdec, tsrc, n) == 0,
+                      "text rt n %u kind %d level %u (%s)", n, kinds[k],
+                      (unsigned)(levels[f] >> ZPSE_ENC_SPEED_SHIFT),
+                      zpse_status_name(rc));
+            }
+        }
+    }
+
+    /* 2/3. The exact TEXT header of an input that selects TEXT, and its probe.
+     * Prose is the shape the ASCII gate convicts; fall back to a hand-built
+     * block only if form selection has not landed in this build yet. */
+    seq = 0x77u; last = 0;
+    text_build_input(tsrc, PAGE, 1);
+    clen = text_find(tcomp, sizeof tcomp, tsrc, PAGE, seq, last, &level);
+    found = (clen >= 16u);
+    if (!found) clen = text_hand_build(tcomp, sizeof tcomp, tsrc, PAGE,
+                                       seq, last);
+    CHECK(clen >= 16u, "text header: no TEXT block for 4096-byte prose");
+    if (clen >= 16u) {
+        uint8_t want[16];
+        uint8_t flags = (uint8_t)(ZPSE_B_RESET | (last ? ZPSE_B_LAST : 0u));
+
+        text_expected_header(want, PAGE, clen, seq, flags);
+        CHECK(memcmp(tcomp, want, 16u) == 0,
+              "text header bytes match the independent builder");
+        CHECK(zpse_block_header_parse(&h, tcomp, clen) == ZPSE_OK &&
+                  h.sync == (uint16_t)ZPSE_BLOCK_SYNC_TEXT &&
+                  h.header_size == (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT &&
+                  (h.block_flags & ZPSE_B_RESET) != 0u &&
+                  h.uncompressed_size == PAGE &&
+                  h.compressed_block_size == clen &&
+                  h.block_sequence_number == seq,
+              "text header parses with sync/RESET/16/sizes/seq");
+        CHECK(zpse_block_probe(tcomp, clen, &cs, &us) == ZPSE_OK &&
+                  cs == clen && us == PAGE,
+              "text probe returns %u / 4096", clen);
+        c = le16(tcomp + 8u);
+        CHECK(c == clen, "text c at [8] is the block length (%u/%u)", c, clen);
+    }
+
+    /* 4. 64 KiB: n is stored as the zero sentinel but parses and decodes as
+     * 65536, and the probe reports that same uncompressed size. */
+    seq = 0x9999u; last = 1;
+    text_build_input(tsrc, TEXT_MAX, 1);
+    clen = text_find(tcomp, sizeof tcomp, tsrc, TEXT_MAX, seq, last, &level);
+    if (clen < 16u)
+        clen = text_hand_build(tcomp, sizeof tcomp, tsrc, TEXT_MAX, seq, last);
+    CHECK(clen >= 16u, "text 64 KiB: no TEXT block for prose");
+    if (clen >= 16u) {
+        CHECK(le16(tcomp + 6u) == 0u,
+              "text 64 KiB: n at [6] is the 0 sentinel (got %u)",
+              le16(tcomp + 6u));
+        CHECK(zpse_block_header_parse(&h, tcomp, clen) == ZPSE_OK &&
+                  h.uncompressed_size == TEXT_MAX &&
+                  h.compressed_block_size == clen,
+              "text 64 KiB: parsed n is 65536");
+        memset(tdec, 0x5A, sizeof tdec);
+        rc = zpse_decompress_block(tcomp, clen, tdec, sizeof tdec, &olen, da);
+        CHECK(rc == ZPSE_OK && olen == TEXT_MAX &&
+                  memcmp(tdec, tsrc, TEXT_MAX) == 0,
+              "text 64 KiB: round-trip (%s)", zpse_status_name(rc));
+        CHECK(zpse_block_probe(tcomp, clen, &cs, &us) == ZPSE_OK &&
+                  cs == clen && us == TEXT_MAX,
+              "text 64 KiB: probe returns %u / 65536", clen);
+    }
+
+    /* 5. Retag there and back: only seq, LAST and the CRC may move. The codec,
+     * reserved bytes, sizes and the whole token payload stay untouched. */
+    seq = 0x7u; last = 0;
+    text_build_input(tsrc, PAGE, 1);
+    clen = text_find(tcomp, sizeof tcomp, tsrc, PAGE, seq, last, &level);
+    if (clen < 16u)
+        clen = text_hand_build(tcomp, sizeof tcomp, tsrc, PAGE, seq, last);
+    CHECK(clen >= 16u, "text retag: no TEXT block for prose");
+    if (clen >= 16u) {
+        memcpy(tcopy, tcomp, (size_t)clen);
+        CHECK(zpse_block_retag(tcomp, clen, 0x2222u, 1) == ZPSE_OK,
+              "text retag to (0x2222, last)");
+        CHECK(zpse_block_header_parse(&h, tcomp, clen) == ZPSE_OK &&
+                  h.sync == (uint16_t)ZPSE_BLOCK_SYNC_TEXT &&
+                  h.header_size == (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT &&
+                  h.block_sequence_number == 0x2222u &&
+                  (h.block_flags & ZPSE_B_LAST) != 0u &&
+                  h.uncompressed_size == PAGE &&
+                  h.compressed_block_size == clen,
+              "text retag updates seq/LAST, keeps the TEXT identity and sizes");
+        CHECK(le16(tcomp + 14u) == (uint32_t)token_crc(tcomp),
+              "text retag refreshed the CRC16 at [14]");
+        CHECK(memcmp(tcomp + 3u, tcopy + 3u, 7u) == 0 &&
+                  memcmp(tcomp + 16u, tcopy + 16u, (size_t)clen - 16u) == 0,
+              "text retag left reserved/sizes and the payload alone");
+        memset(tdec, 0, sizeof tdec);
+        rc = zpse_decompress_block(tcomp, clen, tdec, sizeof tdec, &olen, da);
+        CHECK(rc == ZPSE_OK && olen == PAGE &&
+                  memcmp(tdec, tsrc, PAGE) == 0,
+              "a retagged TEXT block still decodes byte-for-byte");
+        CHECK(zpse_block_retag(tcomp, clen, seq, last) == ZPSE_OK &&
+                  memcmp(tcomp, tcopy, (size_t)clen) == 0,
+              "a there-and-back TEXT retag is byte-neutral");
+        CHECK(zpse_block_retag(tcomp, clen, seq, last) == ZPSE_OK &&
+                  memcmp(tcomp, tcopy, (size_t)clen) == 0,
+              "retagging TEXT to its current position is a no-op");
+
+        memcpy(tcomp, tcopy, (size_t)clen);
+        tcomp[14] ^= 0x01u;
+        CHECK(zpse_block_retag(tcomp, clen, 9u, 1) == ZPSE_BAD_HEADER_CRC,
+              "text retag refuses a bad CRC");
+        {
+            uint32_t bad = 0u, j;
+
+            for (j = 0u; j < clen; j++)
+                if (tcomp[j] != tcopy[j]) bad++;
+            CHECK(bad == 1u && tcomp[14] != tcopy[14],
+                  "a refused TEXT retag rewrote nothing (%u bytes differ)",
+                  bad);
+        }
+    }
+}
+
+/* Independent 7-bit pack model. A group of up to eight ASCII bytes becomes
+ * ceil(7r/8) payload bytes: bit 7*i+k of the group is bit k of byte i. This is
+ * the same bit layout as src/tile.c's compact8/spread8, written here as a
+ * plain bit loop so the codec's masks and shufb tables cannot make the model
+ * self-consistently wrong. Returns the packed length, n - (n>>3). */
+static uint32_t text_pack_model(const uint8_t *ascii, uint32_t n,
+                                uint8_t *packed)
+{
+    uint32_t ip = 0u, op = 0u;
+
+    while (ip < n) {
+        uint32_t r = n - ip, i, k, nb;
+        uint64_t v = 0u;
+
+        if (r > 8u) {
+            r = 8u;
+        }
+        for (i = 0u; i < r; i++) {
+            for (k = 0u; k < 7u; k++) {
+                if (((ascii[ip + i] >> k) & 1u) != 0u) {
+                    v |= UINT64_C(1) << (7u * i + k);
+                }
+            }
+        }
+        nb = (7u * r + 7u) >> 3;
+        for (k = 0u; k < nb; k++) {
+            packed[op + k] = (uint8_t)(v >> (8u * k));
+        }
+        ip += r;
+        op += nb;
+    }
+    return op;
+}
+
+/* The exact inverse, used only to double-check the model's own packed bytes:
+ * reassemble each group's 56 bits, then spread them back to r ASCII bytes. */
+static void text_unpack_model(const uint8_t *packed, uint32_t plen,
+                              uint8_t *ascii, uint32_t n)
+{
+    uint32_t ip = 0u, op = 0u;
+
+    (void)plen; /* all nb bytes of each group are consumed by the loop below */
+
+    while (op < n) {
+        uint32_t r = n - op, i, k, nb;
+        uint64_t v = 0u;
+
+        if (r > 8u) {
+            r = 8u;
+        }
+        nb = (7u * r + 7u) >> 3;
+        for (k = 0u; k < nb; k++) {
+            v |= (uint64_t)packed[ip + k] << (8u * k);
+        }
+        for (i = 0u; i < r; i++) {
+            uint8_t b = 0u;
+
+            for (k = 0u; k < 7u; k++) {
+                if (((v >> (7u * i + k)) & 1u) != 0u) {
+                    b = (uint8_t)(b | (1u << k));
+                }
+            }
+            ascii[op + i] = b;
+        }
+        ip += nb;
+        op += r;
+    }
+}
+
+/* Independent 7-bit-pack property test: hand-build a TEXT stream (16-byte
+ * header + packed payload), name n as the decoded length, and require the
+ * public zpse_text_decode (and the whole block path) to reproduce the source
+ * bytes. The edge sweep covers every small n and the odd sizes around powers
+ * of two, where the decoder's 8-byte-store unroll and exact-length tail meet;
+ * the random batch covers lengths across a page driven by a fixed LCG. */
+static void test_text_property(void)
+{
+    static const uint32_t edges[] = {
+        1u, 2u, 3u, 4u, 5u, 6u, 7u, 9u, 11u, 13u, 15u, 17u,
+        31u, 33u, 63u, 65u, 127u, 129u, 255u, 257u,
+        511u, 512u
+    };
+    const uint32_t nedges = (uint32_t)(sizeof edges / sizeof edges[0]);
+    uint32_t i;
+
+    text_rng = 0xC0FFEEu;
+
+    for (i = 0u; i < nedges + 400u; i++) {
+        uint32_t n = (i < nedges) ? edges[i] : (1u + text_rnd() % 512u);
+        uint32_t plen, olen;
+        int rc;
+
+        /* n ASCII source bytes (every byte < 128), one fixed LCG stream. */
+        {
+            uint32_t k;
+
+            for (k = 0u; k < n; k++) {
+                src[k] = (uint8_t)((text_rnd() >> 24) & 0x7Fu);
+            }
+        }
+        plen = text_pack_model(src, n, comp + 16u);
+        CHECK(plen == n - (n >> 3),
+              "text property n %u: packed length %u", n, plen);
+        text_unpack_model(comp + 16u, plen, tcomp, n);
+        CHECK(memcmp(tcomp, src, n) == 0,
+              "text property n %u: model round-trip", n);
+
+        text_expected_header(comp, n, 16u + plen, 0u,
+                             (uint8_t)ZPSE_B_RESET);
+        memset(dec, 0xA5, sizeof dec);
+        rc = zpse_text_decode(comp + 16u, plen, dec, n);
+        CHECK(rc == 0 && memcmp(dec, src, n) == 0,
+              "text property n %u: zpse_text_decode (%d)", n, rc);
+
+        memset(dec, 0xA5, sizeof dec);
+        olen = 0u;
+        rc = zpse_decompress_block(comp, 16u + plen, dec, n, &olen, da);
+        CHECK(rc == ZPSE_OK && olen == n && memcmp(dec, src, n) == 0,
+              "text property n %u: block decode (%d)", n, rc);
+    }
+}
+
 int main(void)
 {
     test_roundtrips();
@@ -701,6 +1120,8 @@ int main(void)
     test_flat();
     test_flat_property();
     test_flags();
+    test_text();
+    test_text_property();
     printf("PAGEFORMS: checks=%d fails=%d %s\n", checks, fails,
            fails == 0 ? "OK" : "FAILED");
     return fails == 0 ? 0 : 1;

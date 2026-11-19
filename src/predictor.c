@@ -72,6 +72,12 @@ void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal)
     zpse_lane_seed_table(s, initial_literal, (uint8_t)ZPSE_P_ORDER2);
 }
 
+/* zpse_lane_reset_for writes both histories with one 16-byte memset starting
+ * at s->last, which is exact only while the two 8-byte arrays are adjacent. */
+_Static_assert(offsetof(ZpseLaneState, second_last) ==
+               offsetof(ZpseLaneState, last) + 8u,
+               "last/second_last must be adjacent for the 16-byte reset");
+
 ZPSE_HOT void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
                            uint8_t predictor_id)
 {

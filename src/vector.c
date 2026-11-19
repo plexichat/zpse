@@ -438,17 +438,21 @@ static ZPSE_TARGET_SSSE3 int zpse_compact8_pshufb(
     __m128i sh;
     __m128i r;
     int n;
+
+    n = (int)zpse_popcount8(mask8);
+    /* _mm_storel_epi64 below always writes a full 8 bytes. That is only safe
+     * when all 8 output bytes are valid (n == 8): callers pack groups tightly
+     * and the final group may land in an exactly-sized buffer, so a partial
+     * group must not write past its logical end. For n < 8 use the scalar
+     * loop, which writes exactly n bytes. */
+    if (n < 8) {
+        return zpse_compact8_scalar(dst, data, mask8);
+    }
     d = _mm_loadl_epi64((const __m128i *)(const void *)data);
     sh = _mm_loadl_epi64(
         (const __m128i *)(const void *)(lut_2k + (size_t)mask8 * 8u));
     r = _mm_shuffle_epi8(d, sh);
-    /* The LUT puts the compacted bytes at output positions 0..n-1 and zeros
-     * the rest, so the low 64 bits of the shuffled result are exactly the n
-     * bytes the scalar path writes. Store them straight to dst: no 16-byte
-     * temporary and no memcpy. At n < 8 the trailing bytes written here are
-     * zeros that the caller's length (n) excludes. */
     _mm_storel_epi64((__m128i *)(void *)dst, r);
-    n = (int)zpse_popcount8(mask8);
     return n;
 }
 #endif

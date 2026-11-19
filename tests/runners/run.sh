@@ -45,7 +45,7 @@ same() {
 
 fail=0
 
-for t in test_roundtrip test_transforms test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_lzh test_huf test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus test_pagedict test_pageforms; do
+for t in test_roundtrip test_transforms test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_lzh test_huf test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus test_pagedict test_pageforms test_flat7; do
     src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
@@ -192,6 +192,54 @@ if [ "$pf_built" -eq 1 ]; then
         fail=1
     else
         echo "pageforms ok (noavx): $(cat "$tmp/pageforms.def.log") identical streams"
+    fi
+fi
+
+# End-to-end CLI smoke check. The block-level TEXT form (sync 0x50BA) is also
+# exercised through the public tool, not just the in-tree suites: build the CLI,
+# feed it deterministic all-ASCII prose at -l 6 with 64 KiB blocks, ask `dir`
+# to walk the indexed frame, then decompress and compare byte for byte. `dir`
+# needs a FrameIndex, hence -x. Every failure prints a FAILURE line so the
+# final summary reports it.
+echo "=== CLI smoke check (ASCII prose, -l 6 -b 65536) ==="
+cli="$tmp/zpse_cli$exe"
+cli_src="$repo/tests/tools/zpse_cli.c"
+if [ ! -f "$cli" ] || [ "$cli_src" -nt "$cli" ]; then
+    if ! "$CC" -std=c11 -O2 -Wall -Wextra -I "$inc" \
+        "$cli_src" "$unity" -o "$cli"; then
+        echo "BUILD FAILED: zpse_cli (smoke check)"
+        fail=1
+    fi
+fi
+if [ "$fail" -eq 0 ]; then
+    ascii_in="$tmp/cli_ascii.in"
+    ascii_frame="$tmp/cli_ascii.zpse"
+    ascii_out="$tmp/cli_ascii.out"
+    # Deterministic English-like prose: fixed sentences with a varying counter
+    # on each line so there are no long exact repeats, comfortably past the
+    # 4096-byte TEXT gate and inside one 64 KiB block.
+    : >"$ascii_in"
+    k=0
+    while [ "$k" -lt 256 ]; do
+        printf '%s %u %s\n' \
+            "the quick brown fox jumps over the lazy dog and then runs through the green field near the old village" \
+            "$k" \
+            "english prose with common words and ordinary punctuation is what the static table expects to see here" \
+            >>"$ascii_in"
+        k=$((k + 1))
+    done
+    if ! "$cli" c -l 6 -b 65536 -x "$ascii_in" "$ascii_frame"; then
+        echo "CLI FAILURE: compress (c -l 6 -b 65536 -x)"
+        fail=1
+    elif ! "$cli" dir "$ascii_frame" >"$tmp/cli_ascii.dir"; then
+        echo "CLI FAILURE: dir on frame"
+        fail=1
+    elif ! "$cli" d "$ascii_frame" "$ascii_out"; then
+        echo "CLI FAILURE: decompress (d)"
+        fail=1
+    elif ! same "$ascii_in" "$ascii_out"; then
+        echo "CLI FAILURE: round-trip mismatch (ascii prose)"
+        fail=1
     fi
 fi
 

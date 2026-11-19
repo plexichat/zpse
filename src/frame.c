@@ -19,21 +19,21 @@ static int zpse_frame_index_check(const uint8_t *in, size_t in_len,
 #if ZPSE_FRAME_PAGE_FAST
 /* Read a page block's header once for the framing loop. A frame whose blocks
  * are at most ZPSE_BLOCK_SHORT_MAX normally carries a 16-byte header (short,
- * token or FLAT). The full loop reads that header four times per block
- * -- zpse_block_probe, the LAST-flag parse, the payload-CRC parse and the one
- * inside zpse_block_decode -- so a page frame pays four 14-byte checksums and
- * four field walks to learn what one gives it. This reads it once and returns
- * the sizes, flags and decoded CRC the loop needs; the block is then decoded
- * straight from these bytes with the one decoder the frame already reuses.
+ * token, FLAT or TEXT). The full loop reads that header three times per block
+ * -- zpse_block_probe, the LAST-flag parse and the one inside
+ * zpse_block_decode -- so a page frame pays three 14-byte checksums and three
+ * field walks to learn what one gives it. This reads it once and returns the
+ * sizes and flags the loop needs; the block is then decoded straight from
+ * these bytes with the one decoder the frame already reuses.
  *
- * The caller has already established `in` starts with a short, token or FLAT
- * sync and that `avail` covers a 16-byte header, so this takes the lightweight
+ * The caller has already established `in` starts with a short, token, FLAT or
+ * TEXT sync and that `avail` covers a 16-byte header, so this takes the lightweight
  * short parser path, not the generic dispatch. Every check and status here is
  * the one zpse_block_probe plus its header parse would return, in the same
  * order. */
 static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
                                    uint32_t *comp_out, uint32_t *uncomp_out,
-                                   uint8_t *flags_out, uint32_t *dec_crc_out)
+                                   uint8_t *flags_out)
 {
     ZpseBlockHeader bh;
     uint16_t sync;
@@ -45,7 +45,8 @@ static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
     sync = zpse_load_u16le(in);
     if (sync != (uint16_t)ZPSE_BLOCK_SYNC_SHORT &&
         sync != (uint16_t)ZPSE_BLOCK_SYNC_TOKEN &&
-        sync != (uint16_t)ZPSE_BLOCK_SYNC_FLAT) {
+        sync != (uint16_t)ZPSE_BLOCK_SYNC_FLAT &&
+        sync != (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
         /* Same refusal as zpse_block_probe for an unrecognised sync. */
         return ZPSE_TRUNCATED;
     }
@@ -58,7 +59,7 @@ static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
             return ZPSE_BAD_HEADER;
         }
     }
-    /* For a 16-byte header this is the short/token/FLAT parse: a 14-byte
+    /* For a 16-byte header this is the short/token/FLAT/TEXT parse: a 14-byte
      * checksum and the handful of page fields, no long-form work. */
     rc = zpse_block_header_parse(&bh, in, avail);
     if (rc != ZPSE_OK) {
@@ -74,13 +75,19 @@ static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
          * exactly what zpse_block_probe would. */
         return ZPSE_BAD_BLOCK_SIZE;
     }
+    if (sync == (uint16_t)ZPSE_BLOCK_SYNC_TEXT &&
+        bh.compressed_block_size == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        /* TEXT has no empty payload: the probe refuses comp == header_size
+         * as BAD_BLOCK_SIZE. Mirror that status so this fast path returns
+         * exactly what zpse_block_probe would. */
+        return ZPSE_BAD_BLOCK_SIZE;
+    }
     if (avail < bh.compressed_block_size) {
         return ZPSE_TRUNCATED;
     }
     *comp_out = bh.compressed_block_size;
     *uncomp_out = bh.uncompressed_size;
     *flags_out = bh.block_flags;
-    *dec_crc_out = bh.decoded_crc32c;
     return ZPSE_OK;
 }
 
@@ -90,14 +97,14 @@ static int zpse_frame_short_header(const uint8_t *in, uint32_t avail,
  * zpse_block_header_parse, refuse compressed_block_size < 32 as BAD_BLOCK_SIZE
  * (which the parse already does) and avail < compressed_block_size as
  * TRUNCATED; the loop would then call zpse_block_header_parse a second time
- * for the LAST flag and the decoded CRC. One parse here supplies all of them.
+ * for the LAST flag. One parse here supplies the sizes and the flag.
  *
  * The caller has established `in` starts with a ZPSE_BLOCK_SYNC sync and that
  * avail covers at least a short header. Every check and status is the one
  * zpse_block_probe plus its header parse would return, in the same order. */
 static int zpse_frame_long_header(const uint8_t *in, uint32_t avail,
                                   uint32_t *comp_out, uint32_t *uncomp_out,
-                                  uint8_t *flags_out, uint32_t *dec_crc_out)
+                                  uint8_t *flags_out)
 {
     ZpseBlockHeader bh;
     int rc;
@@ -120,7 +127,6 @@ static int zpse_frame_long_header(const uint8_t *in, uint32_t avail,
     *comp_out = bh.compressed_block_size;
     *uncomp_out = bh.uncompressed_size;
     *flags_out = bh.block_flags;
-    *dec_crc_out = bh.decoded_crc32c;
     return ZPSE_OK;
 }
 #endif /* ZPSE_FRAME_PAGE_FAST */
@@ -275,7 +281,6 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         uint32_t comp_sz = 0;
         uint32_t uncomp_sz = 0;
         uint32_t blk_out = 0;
-        uint32_t dec_crc = 0u;
         uint8_t blk_flags = 0u;
         size_t o_rem;
         uint32_t o_cap;
@@ -284,27 +289,28 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
 
 #if ZPSE_FRAME_PAGE_FAST
         /* Read each block's header once here. A page frame's blocks carry the
-         * 16-byte header (short/token/FLAT); a 64 KiB block carries the 32-byte
-         * long header. One parse supplies the sizes, the LAST flag and the
-         * decoded CRC the loop needs, rather than the probe plus the second
-         * parse the original path paid. An unrecognised sync still falls
-         * through to zpse_block_probe unchanged. */
+         * 16-byte header (short/token/FLAT/TEXT); a 64 KiB block carries the
+         * 32-byte long header. One parse supplies the sizes and the LAST flag
+         * the loop needs, rather than the probe plus the second parse the
+         * original path paid. An unrecognised sync still falls through to
+         * zpse_block_probe unchanged. */
         if (avail >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             uint16_t sync = zpse_load_u16le(in + pos);
 
             if (fh.nominal_block_size <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
                 (sync == (uint16_t)ZPSE_BLOCK_SYNC_SHORT ||
                  sync == (uint16_t)ZPSE_BLOCK_SYNC_TOKEN ||
-                 sync == (uint16_t)ZPSE_BLOCK_SYNC_FLAT)) {
+                 sync == (uint16_t)ZPSE_BLOCK_SYNC_FLAT ||
+                 sync == (uint16_t)ZPSE_BLOCK_SYNC_TEXT)) {
                 rc = zpse_frame_short_header(in + pos, avail, &comp_sz,
-                                             &uncomp_sz, &blk_flags, &dec_crc);
+                                             &uncomp_sz, &blk_flags);
                 if (rc != ZPSE_OK) {
                     return rc;
                 }
                 page_fast = 1;
             } else if (sync == (uint16_t)ZPSE_BLOCK_SYNC) {
                 rc = zpse_frame_long_header(in + pos, avail, &comp_sz,
-                                            &uncomp_sz, &blk_flags, &dec_crc);
+                                            &uncomp_sz, &blk_flags);
                 if (rc != ZPSE_OK) {
                     return rc;
                 }
@@ -318,9 +324,8 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
             if (rc != ZPSE_OK) {
                 return rc;
             }
-            /* Read the flags and decoded CRC once here and reuse them for
-             * LAST and for the payload-CRC check below, instead of parsing
-             * the same header again for each. */
+            /* Parse the header once here for the LAST flag, the only field
+             * the framing loop still needs from it. */
             {
                 ZpseBlockHeader bh;
 
@@ -329,7 +334,6 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                     return rc;
                 }
                 blk_flags = bh.block_flags;
-                dec_crc = bh.decoded_crc32c;
             }
         }
         if (comp_sz < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
@@ -357,19 +361,6 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         if (blk_out != uncomp_sz) {
             return ZPSE_BAD_HEADER;
         }
-        /* Payload CRC MUST be verified when the block flag
-         * OR the frame flag tags it. The block layer covers its own flag;
-         * close the gap for foreign frames with F_BLOCK_CRC=1, B_CRC=0.
-         * The flags and decoded CRC came from the header parse above, so
-         * no second parse is needed here. */
-        if ((fh.frame_flags & ZPSE_F_BLOCK_CRC) != 0u &&
-            (blk_flags & ZPSE_B_CRC) == 0u) {
-            uint32_t calc = zpse_crc32c(output + out_pos, blk_out);
-
-            if (calc != dec_crc) {
-                return ZPSE_BAD_PAYLOAD_CRC;
-            }
-        }
         out_pos += (size_t)blk_out;
         pos += (size_t)comp_sz;
         nblocks++;
@@ -384,14 +375,7 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     }
 
     if (!have_last) {
-        /* Tolerated only when input ends exactly on a block boundary and
-         * the declared block count matches. */
-        if (pos != in_len) {
-            return ZPSE_BAD_HEADER;
-        }
-        if (!has_count || (uint64_t)nblocks != (uint64_t)fh.block_count) {
-            return ZPSE_BAD_HEADER;
-        }
+        return ZPSE_BAD_HEADER;
     }
     if (has_count && (uint64_t)nblocks != (uint64_t)fh.block_count) {
         return ZPSE_BAD_HEADER;

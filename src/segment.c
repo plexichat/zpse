@@ -23,8 +23,6 @@
  * tests these four header bytes and the record length, and hands every
  * other record to the general path. */
 #define ZPSE_ASCII_REC   232u
-#define ZPSE_ASCII_FLAGS (uint8_t)((uint8_t)ZPSE_M_ASCII_PACK | \
-                                   (uint8_t)ZPSE_TILE_FLAG_RESET)
 
 /* Every header byte of that exact record, so the shortcut below cannot
  * accept a record the general path would reject: flags, CONST_ZERO, a
@@ -36,7 +34,7 @@
  * run scan below makes it once per record of a run (256 times per 64 KiB
  * on text). The word is little-endian by construction --
  *
- *   [0] ZPSE_ASCII_FLAGS  [1] CONST_ZERO   [2] 255
+ *   [0] flags 0x87        [1] CONST_ZERO   [2] 255
  *   [3] 0                 [4..5] mask size 0 (u16le)
  *   [6..7] ZPSE_ASCII_REC - 8 = 224 (u16le)
  *
@@ -120,8 +118,9 @@ static int seg_all_hit_pred(uint8_t pid)
 }
 
 /* The eight-byte header of that record, with byte 1 (the predictor, which
- * seg_all_hit_pred tests) masked out: flags == RESET, exception count 255,
- * and both payload sizes zero. */
+ * seg_all_hit_pred tests) masked out: flags == RESET, a full tile's
+ * length-minus-one of 255, a zero exception count, and both payload sizes
+ * zero. */
 #define ZPSE_ALLHIT_PAT UINT64_C(0x0000000000FF0080)
 
 /* ---- 256-byte fill for a full constant tile ------------------------- *
@@ -1208,6 +1207,11 @@ static void seg_scan_two(const uint16_t ks[12], uint8_t *best,
 /* Partition of the staging buffer below. */
 #define ZPSE_PS_STG_LEN 304u /* 16 head + 256 body + 32 pad */
 
+/* The tail branch stages a full 256-byte tile and then zeroes the 32 pad
+ * bytes after it, so the buffer must hold head + tile + pad. */
+_Static_assert(ZPSE_PS_STG_LEN >= 16u + 256u + 32u,
+               "staging buffer must hold head + full tile + pad");
+
 /* Accumulate one 32-byte chunk's hits into the nine counters.
  * Each comparison contributes 0xFF (-1) per matching byte, so a byte-lane
  * counter sums the hits directly: no movemask plus popcount round trip per
@@ -2145,91 +2149,6 @@ static int seg_plane_is_const(const uint8_t *p, uint32_t n)
 }
 
 
-/* Cheap size estimate for a transformed plane, from the prescreen alone.
- *
- * zpse_block_encode ranks transform candidates with it before spending a
- * classify + mode search + pack on each: per tile it takes the best
- * closed-form predictor's exact exception count k and prices the record at
- * 10 (length prefix + header) + k residual bytes + min(k, 32) mask bytes
- * (no mask at the two extremes). It ignores the bit-packed residual modes,
- * which shave a similar fraction off every candidate, so the ranking is
- * what matters, not the absolute number. */
-uint32_t zpse_segment_proxy_cost(const uint8_t *plane, uint32_t plane_len)
-{
-    int have_avx2 = (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) ? 1 : 0;
-    uint32_t tc = (plane_len + 255u) / 256u;
-    /* The PRICE keeps the envelope every threshold was tuned with, not the
-     * eight bytes the segment header now costs: this number ranks candidates
-     * against each other, and moving it by eight flips the near ties the
-     * sweep was tuned on -- measured, 64 KiB level 6 grew 80 697 025 to
-     * 81 043 247 while every other page size shrank. */
-    uint32_t cost = 16u;
-    uint32_t sum = 0u;
-    uint32_t t;
-    uint32_t step;
-    uint8_t init;
-
-    if (plane == 0 || plane_len == 0u)
-        return UINT32_MAX;
-    init = plane[0];
-    /* A constant plane is emitted in the dense form (seg_dense_emit): twelve
-     * bytes per 4 KiB instead of ten per tile. Pricing it as tiles would
-     * overstate it by an order of magnitude, and this estimate is what
-     * decides which candidates are worth a trial at all -- a candidate ten
-     * times smaller than the estimate says would be pruned before it could
-     * win. Non-constant planes stop at the first differing word. */
-    if (seg_plane_is_const(plane, plane_len)) {
-        uint32_t ch = (plane_len + ZPSE_DENSE_MAX_LEN - 1u) /
-                      ZPSE_DENSE_MAX_LEN;
-
-        return (uint32_t)ZPSE_SEGMENT_HEADER_SIZE +
-               (uint32_t)ZPSE_DENSE_HEADER_SIZE * ch;
-    }
-    /* Every second tile, or every fourth once the window holds enough of
-     * them: the estimate is a sum over the window and only its ORDER
-     * against another candidate's sum is read, so the sample has to be
-     * representative, not complete. The skipped tiles are priced at the
-     * sampled tiles' average, which keeps the estimate unbiased; what the
-     * wider stride costs is variance.
-     *
-     * The wide stride is taken only for a FULL proxy window (16 KiB, 64
-     * tiles), where a quarter of it is still 16 tiles of evidence.
-     * Measured: it takes the proxy from ~18.0k to ~11.5k cycles of a 64 KiB
-     * block -- 6% of a lowentropy block's encode, and the proxy is a fifth
-     * of that. Nothing below a full window gets it: a short block is
-     * proxied by a quarter of its own tiles (8 KiB is 32 tiles, so 8), and
-     * that is where the size gate (tests/test_sizes.c) caught it -- three
-     * 8 KiB cases of the corpus grew by 281 bytes each. With the window
-     * rule every one of the 768 pinned lengths is unchanged, and so is the
-     * total of the 2,718-case fuzz corpus, whose mixed-region shapes are
-     * the ones a coarse sample would mis-rank. */
-    step = (tc >= 64u) ? 4u : 2u;
-    for (t = 0; t < tc; t += step) {
-        uint32_t seg_pos = t * 256u;
-        uint16_t nt =
-            (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
-        uint16_t ks[12];
-        uint16_t bk;
-        uint32_t i;
-
-        seg_prescreen(plane + seg_pos, nt, plane, seg_pos, init, 0,
-                      have_avx2, ks);
-        bk = ks[seg_screen_pred[0]];
-        for (i = 1; i < 9u; i++) {
-            uint16_t c = ks[seg_screen_pred[i]];
-            if (c < bk)
-                bk = c;
-        }
-        sum += 10u;
-        if (bk != 0u) {
-            sum += bk;
-            if (bk != nt)
-                sum += (bk < 32u) ? bk : 32u;
-        }
-    }
-    return cost + sum * step;
-}
-
 /* Trial-level noise probe, called once per tile the general path writes.
  * `flat_covered` accumulates the length of the trial's LEADING run of tiles
  * that did not pay for themselves -- a tile whose record (the u16 length
@@ -2887,12 +2806,6 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
 #endif
     return (int)at;
 }
-
-/* Tiles a palette decision prices before deciding, and the plane size in
- * tiles below which it does not price at all. See the projection in
- * zpse_segment_encode. */
-#define ZPSE_EST_TILES 8u
-#define ZPSE_EST_MIN_TILES 16u
 
 /* Price of a plane's tile records, from a sample of `tiles` tiles spread
  * evenly over it.
@@ -4031,7 +3944,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
          * losing more bytes than the guess saved; below it the exact rule
          * still runs the tiles and compares, as it always did.
          *
-         * This used to be a separate sample of ZPSE_EST_TILES tiles, each
+         * This used to be a separate sample of eight tiles, each
          * run through the whole classify/mode-search/pack pipeline. That is
          * a third of a plane's tile work paid on top of the tiles
          * themselves, and it is pure loss on the planes where the tiles do

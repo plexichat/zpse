@@ -5,6 +5,7 @@
 #include "zpse/zpse.h"
 #include "zpse/bits.h"
 #include "zpse/crc32c.h"
+#include "zpse/text.h"
 #include "zpse/mask.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
@@ -305,6 +306,545 @@ static void test_flat_crc_bytes(void)
     }
 }
 
+/* The TEXT page form (sync 0x50BA): a 16-byte header with no codec field --
+ * bytes [3..6) are reserved zero, n at [6..8) is the decoded size (0 spells
+ * 65536), c at [8..10) is the total block size. text_fix_crc repairs the
+ * 16-bit header CRC after a field is changed, so the field check -- not the
+ * checksum -- is what rejects a corrupt envelope. The payload is a fixed-rate
+ * 7-bit pack: eight ASCII bytes become seven, so its length is n - (n>>3) and
+ * length is the only structural constraint. Packed bytes may have bit 7 set. */
+
+#define TEXT_N     64u
+#define TEXT_PLEN  (TEXT_N - (TEXT_N >> 3))
+
+/* Independent 8->7 pack: bit 7*i+k of each group is bit k of byte i. Built here
+ * rather than calling zpse_text_encode so a bug in the encoder cannot make the
+ * hand-built streams self-consistently wrong. */
+static uint32_t text_pack_bits(const uint8_t *src, uint32_t n, uint8_t *dst)
+{
+    uint32_t ip = 0u, op = 0u;
+
+    while (ip < n) {
+        uint32_t r = n - ip, i, k, nb;
+        uint64_t v = 0u;
+
+        if (r > 8u) {
+            r = 8u;
+        }
+        for (i = 0u; i < r; i++) {
+            for (k = 0u; k < 7u; k++) {
+                if (((src[ip + i] >> k) & 1u) != 0u) {
+                    v |= UINT64_C(1) << (7u * i + k);
+                }
+            }
+        }
+        nb = (7u * r + 7u) >> 3;
+        for (k = 0u; k < nb; k++) {
+            dst[op + k] = (uint8_t)(v >> (8u * k));
+        }
+        ip += r;
+        op += nb;
+    }
+    return op;
+}
+
+/* Independent 7->8 unpack, used to name the exact bytes that any packed bit
+ * pattern (including bit 7 set) must decode to. */
+static void text_unpack_bits(const uint8_t *packed, uint32_t n, uint8_t *dst)
+{
+    uint32_t ip = 0u, op = 0u;
+
+    while (op < n) {
+        uint32_t r = n - op, i, k, nb;
+        uint64_t v = 0u;
+
+        if (r > 8u) {
+            r = 8u;
+        }
+        nb = (7u * r + 7u) >> 3;
+        for (k = 0u; k < nb; k++) {
+            v |= (uint64_t)packed[ip + k] << (8u * k);
+        }
+        for (i = 0u; i < r; i++) {
+            uint8_t b = 0u;
+
+            for (k = 0u; k < 7u; k++) {
+                if (((v >> (7u * i + k)) & 1u) != 0u) {
+                    b = (uint8_t)(b | (1u << k));
+                }
+            }
+            dst[op + i] = b;
+        }
+        ip += nb;
+        op += r;
+    }
+}
+
+static void text_fix_crc(uint8_t *b)
+{
+    zpse_store_u16le(b + 14, (uint16_t)(zpse_crc32c(b, 14u) & 0xFFFFu));
+}
+
+/* A minimal TEXT block: RESET only, n ASCII 'A' bytes packed to n-n/8 bytes so
+ * the stream decodes to exactly n bytes. Built by hand so these cases do not
+ * depend on the encoder choosing this form. */
+static void text_make(uint8_t *b, uint32_t n, uint8_t flags, uint32_t seq)
+{
+    static uint8_t src[65536u];
+    uint32_t i, plen;
+
+    for (i = 0u; i < n; i++) {
+        src[i] = 0x41u;
+    }
+    plen = n - (n >> 3);
+    memset(b, 0, 16u + plen);
+    zpse_store_u16le(b + 0, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+    b[2] = flags;
+    b[3] = 0u; b[4] = 0u; b[5] = 0u;
+    zpse_store_u16le(b + 6, (uint16_t)n);
+    zpse_store_u16le(b + 8, (uint16_t)(16u + plen));
+    zpse_store_u32le(b + 10, seq);
+    (void)text_pack_bits(src, n, b + 16u);
+    text_fix_crc(b);
+}
+
+/* Build a TEXT block with an arbitrary packed payload of `plen` bytes. n is
+ * the DECLARED decoded size (0 means 65536) and c is 16 + plen, so a mismatch
+ * between n and the fixed rate n - (n>>3) is what decode has to catch. */
+static void text_seed_p(uint8_t *b, uint32_t n, const uint8_t *payload,
+                        uint32_t plen)
+{
+    uint32_t i;
+
+    memset(b, 0, 16u + plen);
+    zpse_store_u16le(b + 0, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+    b[2] = (uint8_t)ZPSE_B_RESET;
+    b[3] = 0u; b[4] = 0u; b[5] = 0u;
+    zpse_store_u16le(b + 6, (uint16_t)n);
+    zpse_store_u16le(b + 8, (uint16_t)(16u + plen));
+    zpse_store_u32le(b + 10, 17u);
+    for (i = 0u; i < plen; i++) {
+        b[16u + i] = payload[i];
+    }
+    text_fix_crc(b);
+}
+
+/* A corrupt TEXT block must get the expected parser status and a clean
+ * negative from the whole decode path, leave the caller's length untouched and
+ * write nothing into or past the output cap. */
+static void text_reject(const char *what, const uint8_t *blk, uint32_t len,
+                        int expect_parse)
+{
+    uint8_t obuf[64u + 16u];
+    uint32_t olen = 0xDEADBEEFu;
+    ZpseBlockHeader h;
+    int prc = zpse_block_header_parse_text(&h, blk, len);
+    int rc, i, clean;
+
+    memset(obuf, 0xCC, sizeof obuf);
+    rc = zpse_decompress_block(blk, len, obuf, 64u, &olen, dec_arena);
+    CHECK(prc == expect_parse, "text parse: %s -> %s", what,
+          zpse_status_name(prc));
+    clean = (rc < 0 && olen == 0xDEADBEEFu);
+    for (i = 0; i < (int)sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) {
+            clean = 0;
+        }
+    }
+    CHECK(clean, "text: %s -> clean status, no write past cap", what);
+}
+
+/* Hostile-bitstream cases for the TEXT block form (sync 0x50BA). Every case
+ * repairs the CRC where needed so a field check -- not the checksum -- is what
+ * rejects a corrupt envelope, and checks the canary past the output cap as well
+ * as the status. */
+static void test_text_hostile(void)
+{
+    static uint8_t t64_in[65536u];
+    static uint8_t t64_stream[65536u];
+    static uint8_t t64_blk[16u + 65536u];
+    static uint8_t t64_out[65536u + 16u];
+    uint8_t tb[16u + TEXT_PLEN];
+    uint8_t obuf[64u + 16u];
+    uint8_t decscratch[32u];
+    uint8_t tok[256u * 7u];
+    uint8_t texp[2048u];
+    uint8_t tok1[1u];
+    uint8_t tok2[2u];
+    uint8_t tok3[8u];
+    uint8_t scratch[2048u + 16u];
+    ZpseBlockHeader h, h2;
+    uint32_t olen, i, j, v, L, total;
+    int rc, ok;
+
+    /* Baseline: a valid RESET-only TEXT block of 64 ASCII 'A' bytes, packed to
+     * 56 payload bytes, parses and decodes byte-exactly, with an intact canary
+     * past the cap. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    CHECK(zpse_block_header_parse_text(&h, tb, sizeof tb) == ZPSE_OK &&
+              h.sync == (uint16_t)ZPSE_BLOCK_SYNC_TEXT &&
+              h.block_flags == (uint8_t)ZPSE_B_RESET &&
+              h.uncompressed_size == 64u &&
+              h.compressed_block_size == sizeof tb &&
+              h.block_sequence_number == 23u &&
+              h.header_size == ZPSE_BLOCK_HEADER_SIZE_SHORT,
+          "text: baseline block parses");
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_block(tb, sizeof tb, obuf, 64u, &olen, dec_arena);
+    ok = (rc == ZPSE_OK && olen == 64u);
+    for (j = 0u; j < 64u; j++) {
+        if (obuf[j] != 0x41u) { ok = 0; }
+    }
+    for (j = 64u; j < sizeof obuf; j++) {
+        if (obuf[j] != 0xCCu) { ok = 0; }
+    }
+    CHECK(ok, "text: valid stream decodes to n bytes, canary intact");
+
+    /* LAST is the one optional flag bit: still legal, still fills exactly n. */
+    text_make(tb, 64u, (uint8_t)(ZPSE_B_RESET | ZPSE_B_LAST), 23u);
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_block(tb, sizeof tb, obuf, 64u, &olen, dec_arena);
+    ok = (rc == ZPSE_OK && olen == 64u);
+    for (j = 0u; j < 64u; j++) {
+        if (obuf[j] != 0x41u) { ok = 0; }
+    }
+    for (j = 64u; j < sizeof obuf; j++) {
+        if (obuf[j] != 0xCCu) { ok = 0; }
+    }
+    CHECK(ok, "text: LAST bit accepted, fills exactly n");
+
+    /* Header parse <-> serialize round-trip: serialising a parsed header and
+     * parsing it back must reproduce every field of the parsed header. */
+    memset(&h2, 0, sizeof h2);
+    zpse_block_header_serialize_text(tb, &h);
+    CHECK(zpse_block_header_parse_text(&h2, tb, 16u) == ZPSE_OK &&
+              h2.sync == h.sync &&
+              h2.block_version == h.block_version &&
+              h2.block_flags == h.block_flags &&
+              h2.uncompressed_size == h.uncompressed_size &&
+              h2.compressed_block_size == h.compressed_block_size &&
+              h2.transform_id == h.transform_id &&
+              h2.segment_count == h.segment_count &&
+              h2.transform_meta_size == h.transform_meta_size &&
+              h2.tile_size == h.tile_size &&
+              h2.predictor_profile == h.predictor_profile &&
+              h2.reserved0 == h.reserved0 &&
+              h2.block_sequence_number == h.block_sequence_number &&
+              h2.decoded_crc32c == h.decoded_crc32c &&
+              h2.header_crc32c == h.header_crc32c &&
+              h2.header_size == h.header_size,
+          "text: serialize -> parse round-trips every header field");
+
+    /* Truncated header: one byte short. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    text_reject("truncated header", tb, 15u, ZPSE_TRUNCATED);
+
+    /* c past the bytes supplied (parser accepts, decode path's length
+     * arithmetic rejects with TRUNCATED). */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    zpse_store_u16le(tb + 8, (uint16_t)(sizeof tb + 1u));
+    text_fix_crc(tb);
+    text_reject("comp past input", tb, sizeof tb, ZPSE_OK);
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0xDEADBEEFu;
+    CHECK(zpse_decompress_block(tb, sizeof tb, obuf, 64u, &olen, dec_arena) ==
+              ZPSE_TRUNCATED,
+          "text: comp past input -> TRUNCATED from decode path");
+
+    /* c below the 16-byte header, c==0, and c==16 with no payload at all. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    zpse_store_u16le(tb + 8, 15u);
+    text_fix_crc(tb);
+    text_reject("comp below header", tb, sizeof tb, ZPSE_BAD_BLOCK_SIZE);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    zpse_store_u16le(tb + 8, 0u);
+    text_fix_crc(tb);
+    text_reject("comp zero", tb, sizeof tb, ZPSE_BAD_BLOCK_SIZE);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    zpse_store_u16le(tb + 8, 16u);
+    text_fix_crc(tb);
+    text_reject("comp == header, empty payload", tb, sizeof tb, ZPSE_OK);
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0xDEADBEEFu;
+    CHECK(zpse_decompress_block(tb, sizeof tb, obuf, 64u, &olen, dec_arena) ==
+              ZPSE_BAD_BLOCK_SIZE,
+          "text: empty payload -> BAD_BLOCK_SIZE from decode path");
+
+    /* Bad CRC16: flip a covered byte, do not repair. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[6] ^= 0xFFu;
+    text_reject("bad CRC16", tb, sizeof tb, ZPSE_BAD_HEADER_CRC);
+
+    /* Both CRC bytes are covered: flip every bit of each and the header parser
+     * must report BAD_HEADER_CRC; a full flip of either byte must also be
+     * rejected by the whole decode path with an intact output canary. */
+    {
+        uint8_t hb[16u + TEXT_PLEN];
+        uint8_t work2[16u + TEXT_PLEN];
+
+        text_make(hb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+        for (i = 14u; i <= 15u; i++) {
+            for (j = 0u; j < 8u; j++) {
+                memcpy(work2, hb, 16u);
+                work2[i] ^= (uint8_t)(1u << j);
+                CHECK(zpse_block_header_parse_text(&h2, work2, 16u) ==
+                          ZPSE_BAD_HEADER_CRC,
+                      "text CRC byte %u bit %u rejected", i, j);
+            }
+        }
+        for (i = 14u; i <= 15u; i++) {
+            memcpy(work2, hb, sizeof hb);
+            work2[i] ^= 0xFFu;
+            text_reject("text CRC byte flip", work2, (uint32_t)sizeof hb,
+                        ZPSE_BAD_HEADER_CRC);
+        }
+    }
+
+    /* n=0 on the wire is legal and spells 65536. Build a real 64 KiB packed
+     * stream with the encoder (57344 bytes, still small enough for the 16-bit
+     * c field), then check both the valid decode and a length mismatch. */
+    {
+        static const char phrase[] = "the quick brown fox jumps over the lazy dog ";
+        uint32_t plen, pk = 0u, kk;
+
+        for (kk = 0u; kk < 65536u; kk++) {
+            if (phrase[pk] == '\0') { pk = 0u; }
+            t64_in[kk] = (uint8_t)phrase[pk++];
+        }
+        plen = zpse_text_encode(t64_in, 65536u, t64_stream,
+                                (uint32_t)sizeof t64_stream);
+        CHECK(plen != 0u && plen + 16u <= 65535u,
+              "text: 64 KiB input encodes to a u16-sized stream");
+        if (plen != 0u) {
+            uint32_t k, plen2;
+
+            memset(t64_blk, 0, 16u);
+            zpse_store_u16le(t64_blk + 0, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+            t64_blk[2] = (uint8_t)ZPSE_B_RESET;
+            zpse_store_u16le(t64_blk + 6, 0u);
+            zpse_store_u16le(t64_blk + 8, (uint16_t)(16u + plen));
+            zpse_store_u32le(t64_blk + 10, 5u);
+            memcpy(t64_blk + 16u, t64_stream, plen);
+            text_fix_crc(t64_blk);
+            CHECK(zpse_block_header_parse_text(&h, t64_blk,
+                                               16u + plen) == ZPSE_OK &&
+                      h.uncompressed_size == 65536u,
+                  "text: n=0 on wire parses as 65536");
+            memset(t64_out, 0xCC, sizeof t64_out);
+            olen = 0u;
+            rc = zpse_decompress_block(t64_blk, 16u + plen, t64_out, 65536u,
+                                       &olen, dec_arena);
+            ok = (rc == ZPSE_OK && olen == 65536u);
+            for (k = 0u; k < 65536u; k++) {
+                if (t64_out[k] != t64_in[k]) { ok = 0; }
+            }
+            for (k = 65536u; k < 65536u + 16u; k++) {
+                if (t64_out[k] != 0xCCu) { ok = 0; }
+            }
+            CHECK(ok, "text: n=0 stream decodes to 64 KiB, canary intact");
+
+            /* Drop the last packed byte: the header still declares 65536 but
+             * the payload is now one byte short of n - (n>>3), so the fixed
+             * rate check must reject it. */
+            plen2 = plen - 1u;
+            zpse_store_u16le(t64_blk + 8, (uint16_t)(16u + plen2));
+            text_fix_crc(t64_blk);
+            memset(t64_out, 0xCC, sizeof t64_out);
+            olen = 0xDEADBEEFu;
+            rc = zpse_decompress_block(t64_blk, 16u + plen2, t64_out, 65536u,
+                                       &olen, dec_arena);
+            ok = (rc < 0 && olen == 0xDEADBEEFu);
+            for (k = 0u; k < sizeof t64_out; k++) {
+                if (t64_out[k] != 0xCCu) { ok = 0; }
+            }
+            CHECK(ok, "text: n=65536 vs shorter packed stream -> clean reject");
+
+            /* The serializer writes 65536 back as n=0 on the wire. */
+            memset(&h2, 0, sizeof h2);
+            h2.uncompressed_size = 65536u;
+            zpse_block_header_serialize_text(tb, &h2);
+            CHECK(zpse_load_u16le(tb + 6) == 0u,
+                  "text: 65536 serialises as n=0 on the wire");
+        }
+    }
+
+    /* Length mismatches at the codec boundary. A fixed-rate pack has exactly
+     * one structural check: in_len must be n - (n>>3). Every bit pattern is
+     * legal payload, so a byte >= 0x80 is not an error -- a wrong length is. */
+    tok1[0] = 0x80u; /* bit 7 set is legal; 1 byte is short for n = 8 */
+    CHECK(zpse_text_decode(tok1, 1u, decscratch, 8u) < 0,
+          "text: packed length short for n -> negative");
+    tok2[0] = 0x41u; tok2[1] = 0x41u; /* 2 bytes, n=1 expects 1 */
+    CHECK(zpse_text_decode(tok2, 2u, decscratch, 1u) < 0,
+          "text: packed length long for n -> negative");
+    memset(tok3, 0x41u, sizeof tok3); /* 6 bytes, n=8 expects 7 */
+    CHECK(zpse_text_decode(tok3, 6u, decscratch, 8u) < 0,
+          "text: packed length one short of n -> negative");
+
+    /* The same two mismatches at the block level, with an intact header so
+     * the pack decoder -- not the envelope check -- is what rejects them. */
+    text_seed_p(tb, 8u, tok1, 1u);
+    text_reject("short stream for n", tb, 17u, ZPSE_OK);
+    tok2[0] = 0x41u; tok2[1] = 0x41u;
+    text_seed_p(tb, 1u, tok2, 2u);
+    text_reject("long stream for n", tb, 18u, ZPSE_OK);
+
+    /* Every packed byte value 0x00..0xFF is legal bits, including bit 7. Feed
+     * all 256 values (each as a full eight-byte group's seven packed bytes)
+     * as one valid-length stream: n = 256*8 and in_len = 256*7. An unmapped
+     * or overflowing spread must show up as a wrong byte or a canary hit. */
+    total = 0u;
+    for (v = 0u; v < 256u; v++) {
+        for (L = 0u; L < 7u; L++) {
+            tok[total++] = (uint8_t)v;
+        }
+    }
+    text_unpack_bits(tok, 2048u, texp);
+    memset(scratch, 0xCC, sizeof scratch);
+    rc = zpse_text_decode(tok, total, scratch, 2048u);
+    ok = (rc == 0 && memcmp(scratch, texp, 2048u) == 0);
+    for (j = 2048u; j < (uint32_t)sizeof scratch; j++) {
+        if (scratch[j] != 0xCCu) { ok = 0; }
+    }
+    CHECK(ok, "text: all 256 packed byte values decode, no write past n");
+
+    /* Wrong flags: RESET is required, LAST the only optional bit. Every other
+     * bit names a form or feature this header has no room for. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] = 0u;
+    text_fix_crc(tb);
+    text_reject("missing RESET", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] |= ZPSE_B_RAW;
+    text_fix_crc(tb);
+    text_reject("RAW flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] |= ZPSE_B_CRC;
+    text_fix_crc(tb);
+    text_reject("CRC flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] |= ZPSE_B_HAS_META;
+    text_fix_crc(tb);
+    text_reject("HAS_META flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] |= ZPSE_B_LZ;
+    text_fix_crc(tb);
+    text_reject("LZ flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] |= ZPSE_B_LZ_TILE;
+    text_fix_crc(tb);
+    text_reject("LZ_TILE flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] |= ZPSE_B_LZ2;
+    text_fix_crc(tb);
+    text_reject("LZ2 flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    /* ZPSE_B_RESERVED_MASK is empty: there is no reserved FLAG bit left to
+     * set, the reserved BYTES are [3..6) and covered below. Still refuse a
+     * byte with every forbidden bit set at once. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    tb[2] = (uint8_t)(ZPSE_B_RAW | ZPSE_B_CRC | ZPSE_B_HAS_META |
+                      ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2);
+    text_fix_crc(tb);
+    text_reject("all forbidden flag bits", tb, sizeof tb, ZPSE_BAD_HEADER);
+
+    /* Nonzero reserved bytes [3],[4],[5]. */
+    for (i = 3u; i <= 5u; i++) {
+        text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+        tb[i] = 1u;
+        text_fix_crc(tb);
+        text_reject("reserved byte nonzero", tb, sizeof tb, ZPSE_BAD_HEADER);
+    }
+
+    /* Wrong sync, CRC repaired: the block layer sees no TEXT header and the
+     * generic parser refuses the unknown sync. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    zpse_store_u16le(tb, (uint16_t)(ZPSE_BLOCK_SYNC_TEXT + 1u));
+    text_fix_crc(tb);
+    text_reject("wrong sync", tb, sizeof tb, ZPSE_BAD_HEADER);
+
+    /* Output cap one byte short: OVERFLOW with zero writes. */
+    text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0xDEADBEEFu;
+    rc = zpse_decompress_block(tb, sizeof tb, obuf, 63u, &olen, dec_arena);
+    ok = (rc == ZPSE_OUTPUT_OVERFLOW && olen == 0xDEADBEEFu);
+    for (j = 0u; j < sizeof obuf; j++) {
+        if (obuf[j] != 0xCCu) { ok = 0; }
+    }
+    CHECK(ok, "text: cap n-1 -> OUTPUT_OVERFLOW, no write");
+
+    /* Random garbage and 1-4 random bit flips of a valid block: each must
+     * either reject cleanly (length and every canary byte untouched) or decode
+     * byte-exactly to what the same packed stream gives the codec directly. */
+    {
+        uint8_t rb[16u + TEXT_PLEN];
+        uint8_t refbuf[64u + 16u];
+        uint32_t r = 0x1BADB002u;
+        uint32_t nref, k;
+        int bad = 0, phase;
+
+        for (phase = 0; phase < 2; phase++) {
+            uint32_t cases = (phase == 0) ? 50u : 20u;
+            for (i = 0u; i < cases; i++) {
+                if (phase == 0) {
+                    for (j = 0u; j < sizeof rb; j++) {
+                        r = r * 1664525u + 1013904223u;
+                        rb[j] = (uint8_t)(r >> 24);
+                    }
+                    /* Keep the form selected so the TEXT path is dispatched. */
+                    zpse_store_u16le(rb, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+                } else {
+                    uint32_t nf = 1u + (i & 3u); /* 1..4 bit flips */
+                    text_make(rb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
+                    for (k = 0u; k < nf; k++) {
+                        uint32_t pos;
+                        r = r * 1664525u + 1013904223u;
+                        pos = (r >> 8) % (uint32_t)sizeof rb;
+                        r = r * 1664525u + 1013904223u;
+                        rb[pos] ^= (uint8_t)(1u << ((r >> 24) & 7u));
+                    }
+                }
+                /* Independent reference: parse + direct decode. */
+                memset(refbuf, 0xCC, sizeof refbuf);
+                if (zpse_block_header_parse_text(&h2, rb,
+                                                 (uint32_t)sizeof rb) == ZPSE_OK &&
+                    h2.uncompressed_size <= 64u) {
+                    nref = h2.uncompressed_size;
+                    if (zpse_text_decode(rb + 16u, (uint32_t)sizeof rb - 16u,
+                                         refbuf, nref) < 0) {
+                        nref = 0xFFFFFFFFu;
+                    }
+                } else {
+                    nref = 0xFFFFFFFFu;
+                }
+                memset(obuf, 0xCC, sizeof obuf);
+                olen = 0xDEADBEEFu;
+                rc = zpse_decompress_block(rb, (uint32_t)sizeof rb, obuf, 64u,
+                                           &olen, dec_arena);
+                if (rc < 0) {
+                    if (olen != 0xDEADBEEFu) { bad = 1; }
+                    for (j = 0u; j < sizeof obuf; j++) {
+                        if (obuf[j] != 0xCCu) { bad = 1; }
+                    }
+                } else if (nref == 0xFFFFFFFFu) {
+                    bad = 1;
+                } else {
+                    if (rc != ZPSE_OK || olen != nref ||
+                        memcmp(obuf, refbuf, nref) != 0) {
+                        bad = 1;
+                    }
+                    for (j = nref; j < sizeof obuf; j++) {
+                        if (obuf[j] != 0xCCu) { bad = 1; }
+                    }
+                }
+            }
+        }
+        CHECK(!bad, "50x random TEXT streams + random bit flips cleanly handled");
+    }
+}
+
 int main(void) {
     uint32_t olen = 0;
     int rc, i;
@@ -576,6 +1116,9 @@ int main(void) {
               (bh.block_flags & ZPSE_B_LAST) != 0u,
               "token: serialize -> build round-trips");
     }
+
+    /* TEXT page form: the hostile-stream cases live in test_text_hostile. */
+    test_text_hostile();
 
     /* FLAT page form (sync 0x50B9). A minimal RAW block is built by hand so
      * these cases do not depend on the encoder choosing this form. Each case

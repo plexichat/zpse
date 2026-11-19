@@ -43,11 +43,14 @@
 #include "parallel.h"
 #include "vector.h"
 #include "api.h"
+#include "zpse/flat7.h"
+#include "zpse/text.h"
 
-/* New page encoder flags (ZPSE_ENC_*). They change no wire form: every stream
- * they select is read by the ordinary decoder. Their values live in
- * constants.h (TURBO, HUF) and api.h (INSTANT); collected here so a caller
- * including the umbrella sees what each one trades.
+/* Retired page encoder flags (ZPSE_ENC_*). The page path no longer selects a
+ * form by flag: every level picks the same page form for the same bytes, so
+ * these defines are kept for source compatibility and are otherwise ignored.
+ * Their values live in constants.h (TURBO, HUF) and api.h (INSTANT); collected
+ * here so a caller including the umbrella sees what each one used to trade.
  *
  * ZPSE_ENC_PAGE_TURBO    Page rate profile: one cheap LZ pass behind the page
  *                        decode-first margin, skipping the multi-candidate

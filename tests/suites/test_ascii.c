@@ -11,7 +11,11 @@
  * length, the exact header the packer writes, the round trip through
  * zpse_tile_decode, one-byte mutations of each header field (every one must
  * be refused, not decoded into something), and the encoder's use of the
- * form at each effort level on ASCII, mixed and non-ASCII blocks.
+ * form at each effort level on ASCII, mixed and non-ASCII blocks. It also
+ * pins the block-level TEXT form: on prose at and above the ASCII gate's
+ * minimum block size the block's sync must be ZPSE_BLOCK_SYNC_TEXT, while one
+ * byte at or above 0x80 anywhere in the block must keep that sync from being
+ * selected, at every level and at the 16-bit n sentinel.
  *
  * Exit 0 on success, 1 on any failure.
  */
@@ -50,6 +54,17 @@ static long failures;
         }                                                                  \
     } while (0)
 
+/* Same check with a printf-style message, for the sweeps whose failure must
+ * name the size and level that caused it. */
+#define CHECKF(cond, fmt, ...)                                             \
+    do {                                                                   \
+        checks++;                                                          \
+        if (!(cond)) {                                                     \
+            failures++;                                                    \
+            printf("FAIL " fmt " (line %d)\n", __VA_ARGS__, __LINE__);     \
+        }                                                                  \
+    } while (0)
+
 /* A readable, deterministic ASCII tile: printable, with a newline every 32
  * bytes so the tile is not one repeated byte. */
 static void ascii_fill(uint8_t *p, uint16_t n, uint32_t seed)
@@ -60,6 +75,63 @@ static void ascii_fill(uint8_t *p, uint16_t n, uint32_t seed)
         uint32_t r = seed + (uint32_t)i * 2654435761u;
 
         p[i] = (uint8_t)((i % 32u) == 31u ? '\n' : (uint8_t)(' ' + (r >> 24) % 95u));
+    }
+}
+
+/* Deterministic English-like prose for the block-level TEXT test. A
+ * first-order Markov walk over a fixed prose corpus is rich in repeated
+ * digrams yet never repeats a long substring for the LZ match finder. That
+ * is the shape the ASCII gate convicts and the fixed-rate 7-bit TEXT pack
+ * wins: every byte < 0x80, no low alphabet, no easy prediction. */
+static void prose_fill(uint8_t *p, uint32_t n, uint32_t seed)
+{
+    static const char corpus[] =
+        "The quick brown fox jumps over the lazy dog. This is a sentence of "
+        "English prose with common words and ordinary punctuation. The "
+        "encoder must decide which form to use for each block of bytes. When "
+        "the input is plain text the static table can replace frequent pairs "
+        "of characters with single tokens. Each token expands to two or more "
+        "bytes on decode, and the result is a smaller stream than the "
+        "original. There is no predictor and no mask and no residual codec "
+        "in this form, only the byte stream that the table describes. The "
+        "header is short because the block is a page. A reader finds the "
+        "extent of every block by reading one short header at a time, and "
+        "checks the low sixteen bits of a checksum before it trusts any of "
+        "the fields inside. Nothing in the table depends on the level that "
+        "the encoder was asked to use, so the same bytes must come out at "
+        "every effort from fastest to max. Deterministic input and a fixed "
+        "seed keep the test repeatable on every machine and every build, "
+        "which matters for a format that promises the same compressed stream "
+        "on every platform that implements it correctly.";
+    uint8_t next[128][128];
+    uint8_t cnt[128];
+    uint32_t clen = (uint32_t)(sizeof corpus - 1u);
+    uint32_t prev = (uint32_t)'T';
+    uint32_t r = seed;
+    uint32_t i;
+
+    memset(next, 0, sizeof next);
+    memset(cnt, 0, sizeof cnt);
+    for (i = 0u; i + 1u < clen; i++) {
+        uint32_t c = (uint8_t)corpus[i];
+        uint32_t d = (uint8_t)corpus[i + 1u];
+
+        if (c < 128u && d < 128u && cnt[c] < 128u) {
+            next[c][cnt[c]++] = (uint8_t)d;
+        }
+    }
+    for (i = 0u; i < n; i++) {
+        if ((i % 80u) == 79u) {
+            p[i] = '\n';
+            prev = (uint32_t)'T';
+        } else {
+            if (cnt[prev] == 0u) {
+                prev = (uint32_t)'T';
+            }
+            r = r * 1664525u + 1013904223u;
+            p[i] = next[prev][(r >> 16) % cnt[prev]];
+            prev = p[i];
+        }
     }
 }
 
@@ -312,11 +384,94 @@ static void test_blocks(void)
     }
 }
 
+/* The block-level TEXT form. The ASCII gate fires at 4096 bytes (the
+ * threshold lives in block.c as ZPSE_ASCII_MIN_BLOCK) and writes a 16-byte
+ * header whose n field spells 65536 as zero. Below the threshold the form is
+ * ineligible. One high bit anywhere rejects the whole block: the gate must
+ * not fire and the bytes must still round-trip. Every level, three sizes and
+ * three flip positions (head, middle, tail) are swept deterministically. */
+static void test_text_form(void)
+{
+    static const uint32_t levels[9] = {
+        ZPSE_ENC_SPEED_FASTEST, ZPSE_ENC_SPEED_L2,
+        ZPSE_ENC_SPEED_FASTER, ZPSE_ENC_SPEED_L4,
+        ZPSE_ENC_SPEED_BALANCED, ZPSE_ENC_SPEED_L6,
+        ZPSE_ENC_SPEED_L7, ZPSE_ENC_SPEED_L8,
+        ZPSE_ENC_SPEED_MAX
+    };
+    static const char *names[9] = {"fastest", "2", "faster", "4",
+                                   "balanced", "6", "7", "8", "max"};
+    static const uint32_t lens[3] = { 4095u, 4096u, 65536u };
+    uint32_t li, lj;
+
+    for (li = 0; li < 9u; li++) {
+        for (lj = 0; lj < sizeof lens / sizeof lens[0]; lj++) {
+            ZpseBlockHeader bh;
+            uint32_t n = lens[lj];
+            uint32_t cl, ol;
+            uint32_t pk;
+            int rc;
+
+            prose_fill(in, n, 12345u);
+            rc = zpse_compress_block_ex(in, n, comp, sizeof comp, &cl, 7, 1,
+                                        levels[li], E);
+            CHECKF(rc == 0, "TEXT prose compress n=%u %s", n, names[li]);
+            if (rc != 0) {
+                continue;
+            }
+            CHECKF(zpse_block_header_parse(&bh, comp, cl) == 0,
+                   "TEXT prose header parse n=%u %s", n, names[li]);
+            if (n >= 4096u) {
+                CHECKF(bh.sync == ZPSE_BLOCK_SYNC_TEXT,
+                       "prose n=%u %s takes TEXT (sync 0x%04X)", n,
+                       names[li], (unsigned)bh.sync);
+            } else {
+                CHECKF(bh.sync != ZPSE_BLOCK_SYNC_TEXT,
+                       "prose n=%u %s below the gate is not TEXT", n,
+                       names[li]);
+            }
+            memset(out, 0x5A, sizeof out);
+            rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol, D);
+            CHECKF(rc == 0 && ol == n && memcmp(in, out, n) == 0,
+                   "TEXT prose roundtrip n=%u %s", n, names[li]);
+            CHECKF(cl < n, "TEXT prose n=%u %s beats raw (%u)", n,
+                   names[li], cl);
+
+            /* Flip a single byte to 0x80 at the head, middle or tail. */
+            for (pk = 0u; pk < 3u; pk++) {
+                uint32_t at = (pk == 0u) ? 0u
+                            : (pk == 1u) ? n / 2u : n - 1u;
+                uint8_t keep = in[at];
+
+                in[at] = 0x80u;
+                rc = zpse_compress_block_ex(in, n, comp, sizeof comp, &cl, 7,
+                                            1, levels[li], E);
+                CHECKF(rc == 0, "non-ASCII compress n=%u at=%u %s", n, at,
+                       names[li]);
+                if (rc == 0) {
+                    CHECKF(zpse_block_header_parse(&bh, comp, cl) == 0,
+                           "non-ASCII header parse n=%u at=%u", n, at);
+                    CHECKF(bh.sync != ZPSE_BLOCK_SYNC_TEXT,
+                           "0x80 at %u of %u %s rejects the TEXT form", at,
+                           n, names[li]);
+                    rc = zpse_decompress_block(comp, cl, out, sizeof out, &ol,
+                                               D);
+                    CHECKF(rc == 0 && ol == n && memcmp(in, out, n) == 0,
+                           "non-ASCII roundtrip n=%u at=%u %s", n, at,
+                           names[li]);
+                }
+                in[at] = keep;
+            }
+        }
+    }
+}
+
 int main(void)
 {
     test_lengths();
     test_rejects();
     test_blocks();
+    test_text_form();
     printf("ASCII: %ld checks, %ld failures\n", checks, failures);
     if (failures != 0) {
         return 1;

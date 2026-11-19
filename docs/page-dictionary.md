@@ -105,11 +105,12 @@ holding which way each set overwrites next, so a set's tags are replaced in
 turn rather than the first one being sticky.
 
 `zpse_block_retag` rewrites `block_sequence_number` and the is-last flag in
-whichever header form the block carries -- the 32-byte one, or a page's 16-byte
-one -- and re-emits the header checksum, which is a CRC32-C over 28 bytes in the
-long form and a 16-bit truncation over 14 in the short one. The payload is not
-touched: it decodes to the page's bytes, which did not change, so a payload
-checksum written with the block still holds. It refuses a NULL block
+whichever header form the block carries -- the 32-byte long header or one of
+the four 16-byte short forms (page, one-value token, FLAT page and TEXT page) --
+and re-emits the header checksum: CRC32-C over 28 bytes in the long form and a
+16-bit truncation of CRC32-C over the first 14 bytes in each short form. The
+payload is not touched: it decodes to the page's bytes, which did not change,
+so a payload checksum written with the block still holds. It refuses a NULL block
 (`ZPSE_BAD_ARG`), a length below a page header (`ZPSE_TRUNCATED`), a length the
 header disagrees with or a block with no sync (`ZPSE_BAD_HEADER`) and a bad
 header CRC (`ZPSE_BAD_HEADER_CRC`), so a store cannot turn a corrupt entry into a

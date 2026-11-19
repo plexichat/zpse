@@ -240,7 +240,7 @@ int main(void) {
         CHECK(zpse_encoder_init(&e, ea, sizeof ea) == 0, "enc ok");
         CHECK(e.best == ea + 0x31000 && e.hist == ea + 0x63800, "enc carve");
         CHECK(e.comb == ea + 0x61800, "enc comb offset");
-        /* Combinadic scratch is 8 KiB of arena, not a global table: its region
+        /* The comb scratch is 8 KiB of arena, not a global table: its region
          * must stay clear of the neighbouring planes. Adjacent ends are fine
          * (comb_end == shuf_start, o2_end == comb_start, comb_end == hist_start);
          * an overlap is not. */
@@ -267,6 +267,60 @@ int main(void) {
               zpse_frame_header_read(&fh2, buf) == ZPSE_UNSUPPORTED_FEATURE,
               "frame reserved bit rejected");
     }
+
+    /* TEXT page header serialize -> parse. Its 16-byte envelope mirrors FLAT
+     * except that the uncompressed size is a 16-bit n where 0 spells 65536, so
+     * both a full block and a small one must survive with every field the form
+     * defines intact and with the CRC agreeing over bytes [0..14). */
+#if defined(ZPSE_BLOCK_SYNC_TEXT)
+    {
+        static const uint32_t sizes[] = { 65536u, 1234u };
+        uint32_t si;
+
+        for (si = 0u; si < sizeof sizes / sizeof sizes[0]; si++) {
+            ZpseBlockHeader h, h2;
+            uint8_t buf[16];
+            uint16_t crc;
+
+            memset(&h, 0, sizeof h);
+            h.sync = ZPSE_BLOCK_SYNC_TEXT;
+            h.block_flags = (uint8_t)(ZPSE_B_RESET | ZPSE_B_LAST);
+            h.uncompressed_size = sizes[si];
+            h.compressed_block_size = 4000u;
+            h.block_sequence_number = 0x11223344u;
+            h.header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+            /* Fields the TEXT parser pins rather than carries: seed h with
+             * those same values so the whole struct is a round trip. */
+            h.block_version = ZPSE_BLOCK_VERSION;
+            h.transform_id = 0u;
+            h.segment_count = 1u;
+            h.transform_meta_size = 0u;
+            h.tile_size = (uint16_t)ZPSE_TILE_SIZE;
+            h.predictor_profile = 0u;
+            h.reserved0 = 0u;
+            h.decoded_crc32c = 0u;
+
+            zpse_block_header_serialize_text(buf, &h);
+            CHECK(zpse_block_header_parse_text(&h2, buf, sizeof buf) == 0,
+                  "TEXT header parse (n=%u)", sizes[si]);
+            CHECK(h2.sync == ZPSE_BLOCK_SYNC_TEXT, "TEXT sync roundtrip");
+            CHECK(h2.block_flags == h.block_flags, "TEXT flags roundtrip");
+            CHECK(h2.uncompressed_size == sizes[si],
+                  "TEXT n roundtrip (%u)", sizes[si]);
+            CHECK(h2.compressed_block_size == h.compressed_block_size,
+                  "TEXT c roundtrip");
+            CHECK(h2.block_sequence_number == h.block_sequence_number,
+                  "TEXT seq roundtrip");
+            CHECK(h2.header_size == ZPSE_BLOCK_HEADER_SIZE_SHORT,
+                  "TEXT header_size == 16");
+            crc = (uint16_t)(zpse_crc32c(buf, 14u) & UINT32_C(0xFFFF));
+            CHECK(h2.header_crc32c == crc, "TEXT CRC agreement");
+            CHECK(zpse_load_u16le(buf + 6u) ==
+                      (sizes[si] == 65536u ? 0u : (uint16_t)sizes[si]),
+                  "TEXT wire n (%u)", sizes[si]);
+        }
+    }
+#endif
 
     /* Mask K-derivation edges. */
     {

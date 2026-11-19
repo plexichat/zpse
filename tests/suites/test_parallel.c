@@ -93,10 +93,45 @@ static void digest_bytes(const uint8_t *p, size_t n)
     }
 }
 
+/* The TEXT form's own kind: deterministic ASCII prose. A fixed-seed local
+ * LCG picks words from a fixed vocabulary, so the byte stream is identical on
+ * every call and on every platform, independent of the suite's shared rng.
+ * Word-level repetition is what makes TEXT win the block. */
+static void fill_text(uint32_t n)
+{
+    static const char *const w[24] = {
+        "the", "of", "and", "a", "to", "in", "is", "that", "for",
+        "it", "as", "was", "with", "be", "by", "on", "not", "he",
+        "this", "are", "or", "his", "from", "at"
+    };
+    uint32_t seed = 0x13579BDFu;
+    uint32_t at = 0u;
+    uint32_t k = 0u;
+
+    while (at < n) {
+        const char *s;
+        uint32_t j;
+
+        seed = seed * 1103515245u + 12345u;
+        s = w[(seed >> 16) % 24u];
+        for (j = 0; s[j] != '\0' && at < n; j++) {
+            in[at++] = (uint8_t)s[j];
+        }
+        if (at < n) {
+            in[at++] = (uint8_t)((k % 13u == 12u) ? '.' : ' ');
+        }
+        k++;
+    }
+}
+
 static void fill_input(uint32_t n, int kind)
 {
     uint32_t i;
 
+    if (kind == 4) {
+        fill_text(n);
+        return;
+    }
     for (i = 0; i < n; i++) {
         switch (kind) {
         case 0: /* ramp in 8-byte lanes: transposes and stride kernels */
@@ -169,6 +204,40 @@ static void run_case(uint32_t n, uint32_t block, unsigned threads,
     CHECK(plen == rlen && memcmp(par, ref, rlen) == 0,
           "%u workers wrote different bytes (n %u, block %u, flags %u, "
           "index %d)", threads, n, block, enc_flags, indexed);
+
+    /* Form selection is a pure function of (input bytes, enc_flags), not of
+     * how those bytes were split across workers. Parse the first block of
+     * the reference, the one-worker fallback and the threaded frame and
+     * require the same chosen form (sync) and the same first-block bytes in
+     * all three -- not merely an equal frame length. The pattern is the one
+     * the batch walk below uses (frame header, then one header per block). */
+    if (rlen > (size_t)ZPSE_FRAME_HEADER_SIZE) {
+        ZpseBlockHeader hb[3];
+        const uint8_t *bp[3] = {
+            ref + ZPSE_FRAME_HEADER_SIZE,
+            plain + ZPSE_FRAME_HEADER_SIZE,
+            par + ZPSE_FRAME_HEADER_SIZE
+        };
+        uint32_t avail = (uint32_t)(rlen - (size_t)ZPSE_FRAME_HEADER_SIZE);
+
+        CHECK(zpse_block_header_parse(&hb[0], bp[0], avail) == ZPSE_OK &&
+              zpse_block_header_parse(&hb[1], bp[1], avail) == ZPSE_OK &&
+              zpse_block_header_parse(&hb[2], bp[2], avail) == ZPSE_OK,
+              "form parse (n %u, block %u, flags %u, index %d)", n, block,
+              enc_flags, indexed);
+        CHECK(hb[0].sync == hb[1].sync && hb[0].sync == hb[2].sync,
+              "form sync differs (n %u, block %u, flags %u, index %d): "
+              "%04x/%04x/%04x", n, block, enc_flags, indexed,
+              (unsigned)hb[0].sync, (unsigned)hb[1].sync,
+              (unsigned)hb[2].sync);
+        CHECK(hb[0].compressed_block_size >= (uint32_t)ZPSE_BLOCK_HEADER_SIZE &&
+              (size_t)hb[0].compressed_block_size <=
+                  rlen - (size_t)ZPSE_FRAME_HEADER_SIZE &&
+              memcmp(bp[0], bp[1], hb[0].compressed_block_size) == 0 &&
+              memcmp(bp[0], bp[2], hb[0].compressed_block_size) == 0,
+              "first block bytes differ (n %u, block %u, flags %u, index %d)",
+              n, block, enc_flags, indexed);
+    }
     digest_bytes(par, plen);
 
     /* What the frame is for: it has to decode to the input, in one pass. */
@@ -383,6 +452,29 @@ int main(void)
     run_case(65536u, 65536u, MAXTHREADS, 0u, 0, 0);
     run_case(65536u, 65536u, MAXTHREADS, (uint32_t)ZPSE_ENC_SPEED_MAX, 2, 1);
 
+    /* The TEXT form's own kind: deterministic ASCII prose at both block
+     * sizes it is written for (4 KiB pages and full 64 KiB blocks), indexed
+     * and not, at the one-worker fallback and the many-worker path. run_case
+     * requires every worker count to produce the serial frame byte for byte,
+     * and the form-selection check above requires the same chosen form in the
+     * reference, the fallback and the threaded frame. */
+    {
+        static const uint32_t blocks[] = { 4096u, 65536u };
+        static const unsigned counts_text[] = { 1u, MAXTHREADS };
+        const uint32_t n = 128u * 1024u; /* 32 pages or 2 full blocks */
+        unsigned bi, ti;
+        int indexed;
+
+        for (bi = 0; bi < sizeof blocks / sizeof blocks[0]; bi++) {
+            for (indexed = 0; indexed <= 1; indexed++) {
+                for (ti = 0;
+                     ti < sizeof counts_text / sizeof counts_text[0]; ti++) {
+                    run_case(n, blocks[bi], counts_text[ti], 0u, 4, indexed);
+                }
+            }
+        }
+    }
+
     /* A short final block, at four block sizes, every worker count. */
     {
         static const uint32_t blocks[] = { 4096u, 16384u, 32768u, 65536u };
@@ -425,6 +517,11 @@ int main(void)
      * count, on a frame that reaches each of the forms the CLI can write. */
     run_stream_case(400u * 1024u, 65536u, MAXTHREADS, 0u, 2, 1, 1u);
     run_stream_case(400u * 1024u, 65536u, MAXTHREADS, 0u, 2, 1,
+                    STRM_DEPTH_MAX);
+    /* The TEXT kind, at both ring depths: the streamed path must select and
+     * emit the same prose blocks as the buffered serial encoder. */
+    run_stream_case(400u * 1024u, 65536u, MAXTHREADS, 0u, 4, 1, 1u);
+    run_stream_case(400u * 1024u, 65536u, MAXTHREADS, 0u, 4, 1,
                     STRM_DEPTH_MAX);
     run_stream_case(400u * 1024u + 77u, 16384u, MAXTHREADS,
                     (uint32_t)ZPSE_ENC_SPEED_MAX, 1, 0, STRM_DEPTH_MAX);

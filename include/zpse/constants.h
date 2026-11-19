@@ -56,6 +56,34 @@
 #define ZPSE_FLAT_NIBBLE4       ((uint8_t)1)
 #define ZPSE_FLAT_BIT2          ((uint8_t)2)
 #define ZPSE_FLAT_SUBLELANE     ((uint8_t)3)
+/* The TEXT page form (sync ZPSE_BLOCK_SYNC_TEXT): a 16-byte header naming no
+ * codec -- the payload is the caller's own byte stream. All header bytes
+ * little-endian:
+ *   [0..2)   u16 sync = ZPSE_BLOCK_SYNC_TEXT (0x50BA)
+ *   [2]      u8  flags -- ZPSE_B_RESET required, ZPSE_B_LAST optional; every
+ *                         other bit (RAW, CRC, HAS_META, LZ*, reserved) is
+ *                         rejected
+ *   [3..6)   u8  reserved, MUST be 0
+ *   [6..8)   u16 n     -- uncompressed size; 0 means 65536, else literal n
+ *   [8..10)  u16 c     -- total block size incl. this 16-byte header, >= 16
+ *   [10..14) u32 seq   -- block sequence number
+ *   [14..16) u16 crc16 -- low 16 bits of crc32c over bytes [0..14)
+ * The writer declines a block when 16 + plen > 65535, since c is 16-bit. */
+#define ZPSE_BLOCK_SYNC_TEXT    ((uint16_t)0x50BA)
+
+/* FLAT7 stream format constants (src/flat7.c). A FLAT7 stream carries a
+ * 20-byte base header followed by 16-byte region records (plus a 4-byte CRC
+ * on some regions). The magic is stored little-endian, so the four bytes on
+ * the wire spell "F7P1". */
+#define ZPSE_FLAT7_MAGIC            UINT32_C(0x31503746) /* "F7P1" little-endian */
+#define ZPSE_FLAT7_VER_MAJOR        ((uint8_t)1)
+#define ZPSE_FLAT7_VER_MINOR        ((uint8_t)0)
+#define ZPSE_FLAT7_BASE_SIZE        20u
+#define ZPSE_FLAT7_REGION_SIZE      16u
+#define ZPSE_FLAT7_CRC_SIZE         4u
+#define ZPSE_FLAT7_REGION_ASCII7    ((uint8_t)0)
+#define ZPSE_FLAT7_REGION_RAW       ((uint8_t)1)
+#define ZPSE_FLAT7_MIN_SIZE         4096u
 
 #define ZPSE_FRAME_HEADER_SIZE  32u
 #define ZPSE_BLOCK_HEADER_SIZE  32u
@@ -101,17 +129,18 @@
 #define ZPSE_MIN_BLOCK_SIZE     UINT32_C(1)
 #define ZPSE_TILE_SIZE          256u
 #define ZPSE_MAX_TILE_LEN       256u
-#define ZPSE_NUM_LANES          8u
 
-#define ZPSE_MAX_SEGMENTS       16u /* max segment_count value (1,2,4,8,16) */
-#define ZPSE_ORDER2_SIZE        4096u
+/* segment_count is one of 1, 2, 4, 8 or 16. */
 
 /* Frame flags (Sec. 3.2). */
-#define ZPSE_F_BLOCK_CRC        (UINT16_C(1) << 0)
 #define ZPSE_F_CONTENT_SIZE     (UINT16_C(1) << 1)
 #define ZPSE_F_BLOCK_COUNT      (UINT16_C(1) << 2)
 #define ZPSE_F_FRAME_INDEX      (UINT16_C(1) << 3)
-#define ZPSE_F_RESERVED_MASK    (UINT16_C(0xFFF0))
+/* Bits 4-15 were always reserved. Bit 0 used to be the frame-level payload
+ * CRC flag; that CRC and the flag are gone, so the bit has no meaning left.
+ * Refuse it like any other reserved bit rather than accept a frame whose
+ * payload goes unchecked, which is what an accepted bit 0 would mean now. */
+#define ZPSE_F_RESERVED_MASK    (UINT16_C(0xFFF1))
 
 /* Block flags (Sec. 4.2). */
 #define ZPSE_B_RAW              (UINT8_C(1) << 0)
@@ -136,13 +165,14 @@
  * compatibility shim -- a v1 reader sees bit 6 in the reserved mask and
  * refuses the block, which is what the reserved bits were for. */
 #define ZPSE_B_LZ_TILE          (UINT8_C(1) << 6)
-/* The fast LZ form (src/lz2.c): a token, its literals and a fixed 16-bit
- * distance, with neither the repeat-distance cache nor the one-byte
- * lookahead that ZPSE_B_LZ spends its per-position budget on. It exists as
- * its own form because the two codecs want different rungs: the cheap levels
- * take this one on every block, the deep ones keep the repeat cache where
- * its size shows. Bit 7 was the reserved mask and is now the last form, so
- * the mask is empty rather than wrong. */
+/* The fast LZ form (src/lz2.c): a token, its literals and one fixed 16-bit
+ * little-endian distance -- lz4's shape, and the only distance work the
+ * decoder does. The four-slot repeat cache is gone at every level: a cached
+ * distance saved a byte but put a branch on every command, and removing it
+ * measured +26.5% decode for +1.366% packed size over twelve 64 KiB Silesia
+ * blocks (see docs/HISTORY.md). Every level therefore writes this one
+ * fixed-distance form. Bit 7 was the reserved mask and is now the last form,
+ * so the mask is empty rather than wrong. */
 #define ZPSE_B_LZ2              (UINT8_C(1) << 7)
 /* The two LZ bits are one two-bit form id, not two independent flags: 1 (bit 5
  * alone) is the token form, 2 (bit 7 alone) the fast form, and 3 -- both bits,
@@ -167,9 +197,10 @@
  * format (src/huf_tables.inc), so a block costs 12 bytes of overhead and no
  * table; see include/zpse/huf.h.
  *
- * It is spelled with the flag pattern both LZ bits set plus bit 6 -- 110 --
- * which is free until now: the hex form is 011 and refuses the tile bit, and
- * the two plain forms each refuse the other's bit, so a block whose flags
+ * It is spelled with the flag pattern bit 6 (the tile bit) plus bit 7 (the
+ * fast-LZ bit) set -- 110, read from bit 7 down to bit 5 -- which is free
+ * until now: the hex form is 101 (bit 5 plus bit 7) and refuses the tile bit,
+ * and the two plain forms each refuse the other's bit, so a block whose flags
  * are 110 cannot have been written by any earlier version. A reader that
  * predates this form sees bit 6 in what was the reserved mask and refuses
  * the block, which is exactly what a reserved bit is for. The envelope is
@@ -471,9 +502,7 @@ static inline uint32_t zpse_segment_price(uint32_t enc_flags) {
 
 /* Segment flags (Sec. 6.1). Only 0x01 is legal in v1. */
 #define ZPSE_S_LEN_PREFIX       (UINT8_C(1) << 0)
-#define ZPSE_S_DIR_BIT          (UINT8_C(1) << 1)
 
-/* CRC32-C check value for "123456789". */
-#define ZPSE_CRC32C_CHECK       UINT32_C(0xE3069283)
+/* The standard CRC32-C check value for "123456789" is 0xE3069283. */
 
 #endif /* ZPSE_CONSTANTS_H */

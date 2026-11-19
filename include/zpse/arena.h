@@ -2,7 +2,14 @@
 #define ZPSE_ARENA_H
 
 /* Fixed arena layouts. Caller-owned, 64-byte
- * aligned, zeroed at context creation. No allocation afterwards. */
+ * aligned, zeroed at context creation. No allocation afterwards.
+ *
+ * Both arenas open with a 4 KiB (0x01000) control block at base 0x00000.
+ * The decoder's live regions end at 0x44800, and 0x0B800 bytes of guard
+ * carry that to the 0x50000 start of the 64 KiB LZ body buffer. The
+ * encoder's live regions end at 0x6D800, and 0x06800 bytes of guard carry
+ * that to the 0x74000 arena end. The guards are only padding between named
+ * regions, never part of the stream. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -12,31 +19,25 @@
 #define ZPSE_ARENA_ALIGN    64u
 
 /* Decoder offsets. */
-#define ZPSE_D_OFF_CTRL     0x00000u
 #define ZPSE_D_OFF_RECON    0x01000u
 #define ZPSE_D_OFF_OUT      0x11000u
 #define ZPSE_D_OFF_ORDER1   0x21000u
 #define ZPSE_D_OFF_O2       0x21800u
 #define ZPSE_D_OFF_COMB     0x41800u
 #define ZPSE_D_OFF_SHUF     0x43800u
-#define ZPSE_D_OFF_GUARD    0x44800u
 /* Where a ZPSE_B_LZ_TILE block's body is unpacked: the tile path reads it
  * from here exactly as it would read it from the block, so the 64 KiB a
  * block body can take has to be its own region rather than borrowed from
  * recon/out_stage, which the segment decoder is using at the same time. */
 #define ZPSE_D_OFF_LZBUF    0x50000u
 
-#define ZPSE_D_SZ_CTRL      0x01000u
 #define ZPSE_D_SZ_RECON     0x10000u
 #define ZPSE_D_SZ_OUT       0x10000u
 #define ZPSE_D_SZ_ORDER1    0x00800u
 #define ZPSE_D_SZ_O2        0x20000u
-/* 8 KiB generic scratch: dense/tile exception buffers and the old
- * combinadic rank/unrank workspace (the rank/unrank code is gone, the
- * bytes are still needed by the dense decoder). */
+/* 8 KiB generic scratch for dense/tile exception buffers. */
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
-#define ZPSE_D_SZ_GUARD     0x0B800u
 #define ZPSE_D_SZ_LZBUF     0x10000u
 
 /* Padding block decode leaves between the segment planes it writes for a
@@ -51,7 +52,6 @@
 #define ZPSE_D_PLANE_SKEW   64u
 
 /* Encoder offsets. */
-#define ZPSE_E_OFF_CTRL     0x00000u
 #define ZPSE_E_OFF_INPUT    0x01000u
 #define ZPSE_E_OFF_TSTAGE   0x11000u
 #define ZPSE_E_OFF_CAND     0x21000u
@@ -62,9 +62,7 @@
 #define ZPSE_E_OFF_HIST     0x63800u
 #define ZPSE_E_OFF_SHUF     0x64800u
 #define ZPSE_E_OFF_LZ       0x65800u
-#define ZPSE_E_OFF_GUARD    0x6D800u
 
-#define ZPSE_E_SZ_CTRL      0x01000u
 #define ZPSE_E_SZ_INPUT     0x10000u
 #define ZPSE_E_SZ_TSTAGE    0x10000u
 #define ZPSE_E_SZ_CAND      0x10000u
@@ -83,7 +81,6 @@
  * it, so it is the encoder arena that pays for it and the decoder never
  * carries it. */
 #define ZPSE_E_SZ_LZ        0x08000u
-#define ZPSE_E_SZ_GUARD     0x06800u
 
 typedef struct ZpseDecoder {
     uint8_t *arena;       /* base, 64-B aligned, 384 KiB (incl. 64 KiB lzbuf) */

@@ -160,7 +160,10 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
  * It now tests the room in front of every store, and this path decodes in
  * place instead of through a per-worker staging block.
  *
- * Returns ZPSE_OK with *out_len_out, or a negative status. */
+ * Returns ZPSE_OK with *out_len_out, or a negative status.
+ *
+ * FLAT7 frames are never emitted by the parallel/stream APIs, and parallel
+ * decode declines them with ZPSE_UNSUPPORTED_FEATURE (they carry no index). */
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    uint8_t *output, size_t out_cap,
                                    size_t *out_len_out, unsigned threads,

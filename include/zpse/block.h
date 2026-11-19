@@ -95,10 +95,11 @@ void zpse_pagedict_insert(ZpsePageDict *d, uint64_t lo, uint64_t hi,
                           uint32_t slot);
 
 /* Retag a stored block for a new position: rewrite block_sequence_number and
- * the is-last flag, in place, in whichever header form the block carries (the
- * 32-byte one or a page's 16-byte one), fixing the header CRC. The payload is
- * not touched: it decodes to the page's bytes, which are unchanged, so the
- * payload checksum a block is written with still holds.
+ * the is-last flag, in place, in whichever header form the block carries --
+ * the 32-byte long header or one of the four 16-byte short forms (page,
+ * one-value token, FLAT page and TEXT page) -- fixing the header CRC. The
+ * payload is not touched: it decodes to the page's bytes, which are unchanged,
+ * so the payload checksum a block is written with still holds.
  *
  * The block must be a complete block written by this library -- block_len is
  * what its header says its size is. Returns ZPSE_OK, ZPSE_BAD_ARG for a NULL

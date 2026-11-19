@@ -22,7 +22,8 @@ uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len)
     }
     if (sync == ZPSE_BLOCK_SYNC_SHORT ||
         sync == ZPSE_BLOCK_SYNC_TOKEN ||
-        sync == ZPSE_BLOCK_SYNC_FLAT) {
+        sync == ZPSE_BLOCK_SYNC_FLAT ||
+        sync == ZPSE_BLOCK_SYNC_TEXT) {
         return (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
     }
     return 0u;
@@ -62,6 +63,11 @@ static int zpse_block_header_parse_short(ZpseBlockHeader *out,
     if (((flags & ZPSE_B_HAS_META) != 0u) != (meta8 > 0u)) {
         return ZPSE_BAD_HEADER;
     }
+    /* ZpseTransformMeta holds at most 16 seed bytes and no legal transform
+     * needs more; a larger declaration would only drive an OOB access later. */
+    if (meta8 > 16u) {
+        return ZPSE_BAD_HEADER;
+    }
     if ((flags & ZPSE_B_RESERVED_MASK) != 0u) {
         return ZPSE_UNSUPPORTED_FEATURE;
     }
@@ -92,90 +98,6 @@ static int zpse_block_header_parse_short(ZpseBlockHeader *out,
     out->header_crc32c = stored;
     out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
     return ZPSE_OK;
-}
-
-int zpse_frame_header_parse(ZpseFrameHeader *out, const uint8_t *buf, uint32_t len)
-{
-    uint32_t magic;
-    uint8_t major, minor;
-    uint16_t flags;
-    uint32_t nominal;
-    uint64_t content_size;
-    uint32_t block_count;
-    uint32_t index_off;
-    uint32_t stored_crc, calc_crc;
-
-    if (out == 0 || buf == 0) {
-        return ZPSE_BAD_ARG;
-    }
-    if (len < ZPSE_FRAME_HEADER_SIZE) {
-        return ZPSE_TRUNCATED;
-    }
-    magic = zpse_load_u32le(buf + 0);
-    major = buf[4];
-    minor = buf[5];
-    flags = zpse_load_u16le(buf + 6);
-    nominal = zpse_load_u32le(buf + 8);
-    content_size = zpse_load_u64le(buf + 12);
-    block_count = zpse_load_u32le(buf + 20);
-    index_off = zpse_load_u32le(buf + 24);
-    stored_crc = zpse_load_u32le(buf + 28);
-
-    if (magic != ZPSE_MAGIC) {
-        return ZPSE_BAD_MAGIC;
-    }
-    if (major != ZPSE_FRAME_MAJOR || minor != ZPSE_FRAME_MINOR) {
-        return ZPSE_BAD_VERSION;
-    }
-    calc_crc = zpse_crc32c(buf, 28);
-    if (calc_crc != stored_crc) {
-        return ZPSE_BAD_HEADER_CRC;
-    }
-    if ((flags & ZPSE_F_RESERVED_MASK) != 0) {
-        return ZPSE_UNSUPPORTED_FEATURE;
-    }
-    if (nominal < ZPSE_MIN_BLOCK_SIZE || nominal > ZPSE_MAX_BLOCK_SIZE) {
-        return ZPSE_BAD_BLOCK_SIZE;
-    }
-    if ((flags & ZPSE_F_FRAME_INDEX) != 0) {
-        if (index_off == 0) {
-            return ZPSE_BAD_HEADER;
-        }
-    } else {
-        if (index_off != 0) {
-            return ZPSE_BAD_HEADER;
-        }
-    }
-
-    out->magic = magic;
-    out->version_major = major;
-    out->version_minor = minor;
-    out->frame_flags = flags;
-    out->nominal_block_size = nominal;
-    out->content_size = content_size;
-    out->block_count = block_count;
-    out->frame_index_offset = index_off;
-    out->header_crc32c = stored_crc;
-    return ZPSE_OK;
-}
-
-void zpse_frame_header_serialize(uint8_t out[32], const ZpseFrameHeader *h)
-{
-    uint32_t crc;
-
-    if (out == 0 || h == 0) {
-        return;
-    }
-    zpse_store_u32le(out + 0, h->magic);
-    out[4] = h->version_major;
-    out[5] = h->version_minor;
-    zpse_store_u16le(out + 6, h->frame_flags);
-    zpse_store_u32le(out + 8, h->nominal_block_size);
-    zpse_store_u64le(out + 12, h->content_size);
-    zpse_store_u32le(out + 20, h->block_count);
-    zpse_store_u32le(out + 24, h->frame_index_offset);
-    crc = zpse_crc32c(out, 28);
-    zpse_store_u32le(out + 28, crc);
 }
 
 /* A one-value token (v1.1) is the 16-byte page header with a different sync
@@ -324,6 +246,74 @@ int zpse_block_header_parse_flat(ZpseBlockHeader *out, const uint8_t *buf,
     return ZPSE_OK;
 }
 
+/* The TEXT page form: the 16-byte header names no codec -- bytes [3..6) are
+ * reserved, and n at [6..8) is the uncompressed size with 0 meaning 65536.
+ * CRC over bytes [0..14), reserved bytes 0, exactly RESET (+ optional LAST),
+ * comp >= 16 and n in 1..65536 (or its 0 encoding) are the whole envelope; the
+ * block parser dispatches here on the TEXT sync. */
+int zpse_block_header_parse_text(ZpseBlockHeader *out, const uint8_t *buf,
+                                 uint32_t len)
+{
+    uint8_t flags;
+    uint16_t nstored;
+    uint32_t uncomp, comp, seq;
+    uint16_t stored, calc;
+
+    if (out == 0 || buf == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_TRUNCATED;
+    }
+    if (zpse_load_u16le(buf + 0) != (uint16_t)ZPSE_BLOCK_SYNC_TEXT) {
+        return ZPSE_BAD_HEADER;
+    }
+
+    flags = buf[2];
+    nstored = zpse_load_u16le(buf + 6);
+    comp = (uint32_t)zpse_load_u16le(buf + 8);
+    seq = zpse_load_u32le(buf + 10);
+    stored = zpse_load_u16le(buf + 14);
+    calc = (uint16_t)(zpse_crc32c(buf, 14) & UINT32_C(0xFFFF));
+
+    if (calc != stored) {
+        return ZPSE_BAD_HEADER_CRC;
+    }
+    if (buf[3] != 0u || buf[4] != 0u || buf[5] != 0u) {
+        return ZPSE_BAD_HEADER;
+    }
+    /* RESET is the only required-1 bit and LAST the only optional one; every
+     * other bit names a form or feature this header has no room for. */
+    if ((flags & (uint8_t)ZPSE_B_RESET) == 0u ||
+        (flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_CRC | ZPSE_B_HAS_META |
+                           ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                           ZPSE_B_RESERVED_MASK)) != 0u) {
+        return ZPSE_BAD_HEADER;
+    }
+    if (comp < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+        return ZPSE_BAD_BLOCK_SIZE;
+    }
+    /* On the wire n is 16-bit: 0 is legal and spells 65536, not an error. */
+    uncomp = (nstored == 0u) ? UINT32_C(65536) : (uint32_t)nstored;
+
+    out->sync = ZPSE_BLOCK_SYNC_TEXT;
+    out->block_version = ZPSE_BLOCK_VERSION;
+    out->block_flags = flags;
+    out->uncompressed_size = uncomp;
+    out->compressed_block_size = comp;
+    out->transform_id = 0u;
+    out->segment_count = 1u;
+    out->transform_meta_size = 0u;
+    out->tile_size = (uint16_t)ZPSE_TILE_SIZE;
+    out->predictor_profile = 0u;
+    out->reserved0 = 0u;
+    out->block_sequence_number = seq;
+    out->decoded_crc32c = 0u;
+    out->header_crc32c = stored;
+    out->header_size = (uint8_t)ZPSE_BLOCK_HEADER_SIZE_SHORT;
+    return ZPSE_OK;
+}
+
 int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t len)
 {
     uint16_t sync;
@@ -360,6 +350,11 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
             return ZPSE_TRUNCATED;
         }
         return zpse_block_header_parse_flat(out, buf, len);
+    case ZPSE_BLOCK_SYNC_TEXT:
+        if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
+            return ZPSE_TRUNCATED;
+        }
+        return zpse_block_header_parse_text(out, buf, len);
     case ZPSE_BLOCK_SYNC_SHORT:
         if (len < (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT) {
             return ZPSE_TRUNCATED;
@@ -418,6 +413,11 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     }
     if (r0 != 0) {
         return ZPSE_UNSUPPORTED_FEATURE;
+    }
+    /* ZpseTransformMeta holds at most 16 seed bytes and no legal transform
+     * needs more; a larger declaration would only drive an OOB access later. */
+    if (meta_size > 16u) {
+        return ZPSE_BAD_HEADER;
     }
     has_meta = (meta_size > 0) ? 1 : 0;
     if (((flags & ZPSE_B_HAS_META) != 0) != has_meta) {
@@ -514,6 +514,32 @@ void zpse_block_header_serialize_flat(uint8_t out[16], const ZpseBlockHeader *h)
     zpse_store_u16le(out + 14, (uint16_t)(crc & UINT32_C(0xFFFF)));
 }
 
+/* Mirror of the TEXT parser: the sync and reserved bytes are fixed, flags,
+ * n and c/seq are taken from an already-validated `h`, and the 16-bit CRC is
+ * recomputed over the first fourteen bytes. A size of 65536 is stored as 0. */
+void zpse_block_header_serialize_text(uint8_t out[16], const ZpseBlockHeader *h)
+{
+    uint32_t crc;
+    uint16_t nstored;
+
+    if (out == 0 || h == 0) {
+        return;
+    }
+    zpse_store_u16le(out + 0, (uint16_t)ZPSE_BLOCK_SYNC_TEXT);
+    out[2] = h->block_flags;
+    out[3] = 0u;
+    out[4] = 0u;
+    out[5] = 0u;
+    nstored = (h->uncompressed_size == UINT32_C(65536))
+                  ? 0u
+                  : (uint16_t)h->uncompressed_size;
+    zpse_store_u16le(out + 6, nstored);
+    zpse_store_u16le(out + 8, (uint16_t)h->compressed_block_size);
+    zpse_store_u32le(out + 10, h->block_sequence_number);
+    crc = zpse_crc32c(out, 14);
+    zpse_store_u16le(out + 14, (uint16_t)(crc & UINT32_C(0xFFFF)));
+}
+
 void zpse_block_header_serialize(uint8_t out[32], const ZpseBlockHeader *h)
 {
     uint32_t crc;
@@ -589,44 +615,6 @@ void zpse_segment_header_serialize(uint8_t out[8], const ZpseSegmentHeader *h)
     out[7] = h->segment_flags;
 }
 
-int zpse_tile_header_parse(ZpseTileHeader *out, const uint8_t *buf, uint32_t len)
-{
-    uint8_t flags, mask_mode, res_mode, pid;
-
-    if (out == 0 || buf == 0) {
-        return ZPSE_BAD_ARG;
-    }
-    if (len < ZPSE_TILE_HEADER_SIZE) {
-        return ZPSE_TRUNCATED;
-    }
-    flags = buf[0];
-    pid = buf[1];
-    /* Structural mode validation at parse time (Sec. 6.2/11.1): the size
-     * equation and K-derivation need cross-field context and stay with
-     * zpse_tile_validate, but unknown modes and reserved bits fail here. */
-    if ((flags & (uint8_t)0x40) != 0) {
-        return ZPSE_UNSUPPORTED_FEATURE; /* bit 6 reserved-0 */
-    }
-    mask_mode = (uint8_t)(flags & (uint8_t)0x07);
-    res_mode = (uint8_t)((flags & (uint8_t)0x38) >> 3u);
-    if (mask_mode > 6u) {
-        return ZPSE_BAD_MASK; /* mode 7 reserved */
-    }
-    if (res_mode > 4u) {
-        return ZPSE_BAD_RESIDUAL; /* modes 5..7 reserved */
-    }
-    if (pid > (uint8_t)ZPSE_P_STRIDE_3) {
-        return ZPSE_BAD_PREDICTOR;
-    }
-    out->tile_flags = flags;
-    out->predictor_id = pid;
-    out->tile_length_minus_1 = buf[2];
-    out->exception_count = buf[3];
-    out->mask_payload_size = zpse_load_u16le(buf + 4);
-    out->residual_payload_size = zpse_load_u16le(buf + 6);
-    return ZPSE_OK;
-}
-
 int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
                               const uint8_t *buf, uint16_t len,
                               uint8_t segment_count)
@@ -650,9 +638,7 @@ int zpse_transform_meta_parse(ZpseTransformMeta *out, uint8_t transform_id,
     out->width_W = 1;
     out->stride_flags = 0;
     out->has_seeds = 0;
-    for (i = 0; i < 16; i++) {
-        out->seeds[i] = 0;
-    }
+    memset(out->seeds, 0, sizeof out->seeds);
 
     switch (transform_id) {
     case ZPSE_T_RAW_BYTES:

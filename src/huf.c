@@ -779,14 +779,26 @@ static int huf_decode4(const uint16_t *dt, const uint8_t *ib[ZPSE_HUF_STREAMS],
             ZPSE_HUF_RUN_DO(a3, b3, i3, p3, dt);
         }
     }
-    ob[0] = p0;
-    ob[1] = p1;
-    ob[2] = p2;
-    ob[3] = p3;
-    return huf_finish(dt, i0, ie[0], b0, p0, oe[0]) &
-           huf_finish(dt, i1, ie[1], b1, p1, oe[1]) &
-           huf_finish(dt, i2, ie[2], b2, p2, oe[2]) &
-           huf_finish(dt, i3, ie[3], b3, p3, oe[3]);
+    /* The run loop stops short of each stream's end; huf_finish decodes the
+     * remaining (< ZPSE_HUF_RUN) symbols, advancing its own cursor from p_k
+     * all the way to oe[k]. Report that true end in ob[] rather than the
+     * fast-loop end, so a caller reading ob[] sees every symbol emitted.
+     * huf_finish always runs to oe, so the tail count is oe[k] - p_k; the
+     * recomputation below is exact. All four finish calls run (& is not
+     * short-circuit), so all four ends are final regardless of the verdict. */
+    {
+        int ok;
+
+        ok = huf_finish(dt, i0, ie[0], b0, p0, oe[0]) &
+             huf_finish(dt, i1, ie[1], b1, p1, oe[1]) &
+             huf_finish(dt, i2, ie[2], b2, p2, oe[2]) &
+             huf_finish(dt, i3, ie[3], b3, p3, oe[3]);
+        ob[0] = oe[0];
+        ob[1] = oe[1];
+        ob[2] = oe[2];
+        ob[3] = oe[3];
+        return ok;
+    }
 }
 
 /* Parse and validate the twelve-byte header for both decoders. Fills the

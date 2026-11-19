@@ -201,6 +201,34 @@ int zpse_tile_is_ascii(const uint8_t *actual, uint16_t nt);
 int zpse_ascii_scan(const uint8_t *p, uint32_t n);
 uint32_t zpse_ascii_len(uint32_t n);
 
+/* Whole-stream ASCII pack/unpack over any byte count (not just one tile).
+ * These use the same BMI2/scalar kernels as the tile form, with the dispatch
+ * hoisted out of the loop, so a caller walking a long run of ASCII bytes (the
+ * FLAT7 region codec) pays one gate for the whole run rather than one per
+ * 256-byte tile.
+ *
+ * The pack kernels write overlapping 8-byte stores that stay inside the
+ * packed length except possibly for the final store, which can run up to 7
+ * bytes past it. The caller MUST therefore reserve zpse_ascii_len(n) + 8
+ * bytes of output space, even though only zpse_ascii_len(n) bytes are valid.
+ * n and out_n must be group-consistent with the pack (out_n is the original
+ * byte count; both are uint32_t, so runs up to 65536 are fine). */
+uint32_t zpse_ascii_pack_stream(const uint8_t *in, uint32_t n, uint8_t *out);
+
+/* Fused check+pack: bit-identical payload to zpse_ascii_pack_stream, but also
+ * OR-reduces the high bit of every loaded byte into `*all_ascii` (set to 1
+ * iff every byte was < 0x80). This lets a caller pack a cache-resident chunk
+ * and learn its ASCII verdict from the same walk, instead of scanning first.
+ * As with the plain packer, the caller reserves zpse_ascii_len(n) + 8 bytes
+ * of output scratch. `all_ascii` may not be NULL. */
+uint32_t zpse_ascii_pack_checked(const uint8_t *in, uint32_t n, uint8_t *out,
+                                 int *all_ascii);
+void zpse_ascii_unpack_stream(const uint8_t *in, uint32_t in_len,
+                              uint8_t *out, uint32_t out_n);
+/* Defined so a codec (FLAT7) can take the fast whole-stream path when it is
+ * available without probing for the kernels itself. */
+#define ZPSE_HAVE_ASCII_STREAM 1
+
 /* Unpack one ASCII payload (exactly zpse_tile_ascii_len(nt) - 8 bytes)
  * into nt bytes. Exposed so a decoder walking a run of consecutive ASCII
  * records can skip the per-tile entry point: the form reads no lane state

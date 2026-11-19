@@ -203,6 +203,20 @@ nothing until the copy changes. The remaining gap to lz4 on prose is about a
 quarter, and it sits on the escape-heavy side, where the careful path still
 uses the rle-table copy helper.
 
+The repeat-distance cache itself did not survive that line of reasoning. It
+coded a recent distance as one byte (0xFC | slot), which saved a byte wherever
+the finder named one, and the test for it was a branch on every command. What
+the branch cost was not in the original argument: removing the cache leaves a
+fixed two-byte little-endian distance -- lz4's shape, and one 16-bit load as
+the decoder's only distance work. Measured in memory on twelve 64 KiB Silesia
+blocks, decode went 2.31 -> 2.93 GB/s (+26.5%), encode +12.8%, packed size
++1.366%. Seven of the twelve files stayed within 0.2% of their old size,
+because the finder rarely names a recent distance on prose; the cost lands on
+the spike-pattern cases in test_sizes, mozilla +4.02% and nci +3.89%, where a
+recent distance is worth a byte often enough to miss it. Dropping the rep
+slots also frees the 0xFC..0xFF low-byte range that had to be escaped around,
+so the full 1..65535 distance range is usable.
+
 ## Coding the token stream
 
 The LZ forms left a residue that was easy to see and hard to take: the command
@@ -1574,3 +1588,113 @@ cost is encode rate: 408 -> 294 MB/s on Silesia, because more blocks reach the
 finder. It stays off by default because the shipped posture favours encode
 rate; it is available for a caller whose workload is text and whose budget is
 decode or storage rather than encode.
+
+## The whole-ASCII fast path, and the ratio wall around it
+
+Everything above about text comes back to one measurement: the match finder is
+59% to 91% of a level-6 block's encode on the text files (dickens 59.3%,
+mozilla 68.5%, samba 70.5%, xml 79.3%, ooffice 80.2%, reymont 90.9%,
+webster 91.0%), and what it spends is a serial T<->V dependency -- each key's
+table load feeds the next value comparison, so a wider datapath does not make
+the chain shorter. The decoder has the opposite shape: it is already at the
+machine on the tile forms, and the LZ command loops are the only thing holding
+it back. That is why the place to look for more speed is a form that never
+enters either pipeline: an input whose only structure is that every byte is
+seven bits wide.
+
+The finder-free kernel is cheap. Timed alone over printable ASCII, the 8-to-7
+compact runs at about 17 GB/s through the AVX2 path and about 26 GB/s through
+the BMI2 path on encode; it is shifts and masks with no table and no branch per
+byte. FLAT7 is that kernel wrapped in a whole-input frame -- a 40-byte header
+and one 7-bit-packed region -- with the inverse spread on decode. Eight bytes
+always pack to seven, so its ratio is fixed at 8/7 = 1.143:1 on a full group
+however the bytes are distributed. That is both its promise and its ceiling:
+it cannot take advantage of redundancy, which is exactly what the finder's
+gate is for, and on a low-alphabet or repeated ASCII file the ladder writes a
+fraction of the bytes at a small extra cost.
+
+The cost that is not in the kernel is the hierarchy around it. Reaching the
+payload through the whole-frame path -- magic sniff, frame header, block
+directory, segment and tile bookkeeping -- measures about 2.3x the decode of
+calling the flat kernel on a resident payload. On a FLAT7 frame, whose only
+payload is one packed region, all of that is paid to inherit the ordinary
+decoder's transparent support; a direct call skips it. The speed claim has to
+be made against the whole path a caller actually runs, not against the kernel.
+
+Measured one worker at a time against the normal frame path (forced by
+ZPSE_ENC_CHECKSUM, which FLAT7 declines), best-of-N, codec only: on ASCII that
+clears the redundancy gate FLAT7 encodes at least 3x as fast as the normal
+frame, and the whole-input speedup lands between 4.45x and 10.1x on the
+eligible inputs. Decode is 1.1x to 1.4x faster there, because the pack is
+already close to the kernel and the frame is the larger share of both sides.
+Across a mixed corpus the total is about 1x -- the eligible frames are a small
+share of the bytes, and on everything with structure the block codec wins the
+ratio by too much for the pack's rate to matter. The honest claim is a niche:
+take FLAT7 for high-entropy printable ASCII that nothing else compresses, and
+take the ladder for the rest.
+
+What is left is the ratio-versus-speed corner. FLAT7's 1.143:1 cannot be
+lowered without giving up the fixed-width pack, and every attempt to make the
+ladder decode like a flat form has run into a wall: on the whole frame, decode
+does not reach about 3x while the ratio stays good, because the serial chain
+in the pack and the branchy per-command decoder both sit on the critical path.
+The change that would break it is not a faster version of either -- it is a
+fast static-dictionary coder to supply the ratio, paired with a branchless
+AVX2 decoder with one straight-line chain to issue. Until that pair exists the
+two forms stay separated by the gate, and the numbers above say which side of
+it a caller should land on.
+
+## The fixed-distance form, its tight decoder, and the whole-frame fast paths
+
+Removing the repeat-distance cache from the fast form settled a debate that had
+run through the page work: the cache coded a recent distance as one byte, but
+the test for it sat on every command and its escape had to be carved out of the
+low byte's 1..65535 range. With it gone the fast form is one LZ4-style command
+-- a token, its literals and a fixed two-byte distance -- written at every
+level that offers it, from the explicit LZ_FAST option to the deepest level's
+last candidate. Over twelve 64 KiB Silesia blocks decode went 2.31 -> 2.93
+GB/s (+26.5%), encode +12.8% and packed size +1.366%; seven files stayed within
+0.2% of their old size and the cost landed on the spike-pattern cases where a
+recent distance was worth a byte often enough to miss it. That change is
+recorded in full earlier; what it set up is the loop below.
+
+The decoder then stopped being a chain of checked fields. Its trusted region
+runs three pieces of LZ4's own decode shape: C, three fixed stores for a short
+match at off >= 8, writing 18 bytes with no loop and no length dispatch; E,
+inlined 16-byte literal stores in 32-byte steps instead of a libc call; and B,
+a bounded escape decoder that chains at most one byte on a hostile 255. Two
+guards, one on output room and one on input position, replace the per-field
+tests, and the last 560 bytes take the fully checked tail. The streams decode
+byte-exact on all twelve Silesia blocks and on the hostile corpus. The C+E+B
+loop measures faster than the checked loop and narrows the gap to lz4 on this
+host; an earlier harness that gave the stream 512 bytes of slack measured an
+even larger gain, and the shipped loop trades part of that for the 560-byte
+output guard. A same-host in-memory comparison put lz4 only modestly ahead of
+the decoder, not by the factor of two that published numbers from other
+machines suggested -- that "twice as fast" reading came from comparing
+different builds. B is inside the measurement noise; the gain is C and E, with
+B kept because a hostile escape must not break the guard. Precise A/B rates for
+these mirrors live in the temp harness logs, not in a script under
+tests/benchmarks/, so they are not quoted here as project figures.
+
+Beside the block LZ forms, five whole-input fast paths now sit outside the
+ladder, each with a gate and a magic of its own, and each declining back to the
+ordinary codec. FLAT7 (F7P1) is the finder-free 8-to-7 ASCII pack described
+above: its 1.143:1 ratio is a ceiling, so the redundancy gate keeps repetitive
+ASCII on the ladder. lzfast is the smallest useful finder -- the fast form's
+command shape with the lazy probe, backward walk and repeat slots removed -- and
+it trades a little ratio for a cheaper encode; the 13-bit table is the default
+because it was the faster of the two sizes tried. repack (ZRPK) maps a
+low-alphabet ASCII buffer to dense w-bit codes for w = 1..7, uses a 16-byte
+inverse map at w <= 4 and a 128-byte one above that, and at w = 7 is
+byte-for-byte the FLAT7 pack; non-ASCII input is declined. rlefast (RLE1)
+commits only when at least 90% of the first 64 KiB fall in maximal runs of four
+or more bytes whose value is 0..127, so it is a narrow codec for run-structured
+data, not for small integers in general. f64fast (F64F) pins transform 9
+(DELTA_TRANSPOSE_8) with no sweep and no LZ_TILE wrap for float64 arrays whose
+lane-high bytes come from a small, strongly dominated alphabet. The gates are
+what keep these from being general codecs: each declines the input it was not
+designed for, and the ladder writes the stream for everything else. The precise
+A/B rates that decided these gates live in temp harnesses, not in a script under
+tests/benchmarks/, so this section records the format, the gate and the reason
+rather than quoting rates as project figures.

@@ -599,15 +599,30 @@ static ZPSE_DENSE_AVX2_TARGET uint32_t dense_recon_lane_avx2(
                 const __m128i bits =
                     _mm_and_si128(_mm_set1_epi8((char)m8), bitv);
                 __m128i idx = dense_unit_index(bits, bitv, one);
-                __m128i r = _mm_shuffle_epi8(
-                    _mm_loadl_epi64(
-                        (const __m128i *)(const void *)(units + consumed)),
-                    idx);
                 __m128i mb = _mm_cmpeq_epi8(bits, bitv);
+                __m128i r;
                 __m128i x;
+                uint8_t ubuf[8] = { 0 };
 
                 cnt = (uint32_t)(uint8_t)_mm_extract_epi8(idx, 7) +
                       (m8 >> 7u);
+                /* This branch covers any group with a clear mask bit, so cnt
+                 * is normally < 8: a wide load of units+consumed would read
+                 * past the last valid unit once scratch is sized to k (it is
+                 * safe today only because dense.h mandates a 4096-byte pad).
+                 * Copy just the real units into a zeroed 8-byte buffer and
+                 * load from that. Bytes past cnt are never selected by idx
+                 * for a set lane and are cleared by mb, so the result is
+                 * byte-identical to the old wide load. */
+                if (cnt >= 8u) {
+                    r = _mm_loadl_epi64(
+                        (const __m128i *)(const void *)(units + consumed));
+                } else {
+                    memcpy(ubuf, units + consumed, (size_t)cnt);
+                    r = _mm_loadl_epi64(
+                        (const __m128i *)(const void *)ubuf);
+                }
+                r = _mm_shuffle_epi8(r, idx);
                 if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
                     x = r;
                 } else {

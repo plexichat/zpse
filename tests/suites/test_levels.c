@@ -102,11 +102,41 @@ static double now_ns(void)
 #endif
 }
 
+/* Deterministic ASCII prose for the third page shape below: a small word
+ * vocabulary with a full stop every few words, so the TEXT page form has the
+ * word-level repetition it is built for. No RNG, so all nine levels see the
+ * same bytes and the ladder compares sizes of one identical page. */
+static void prose_page(uint8_t *dst, uint32_t n)
+{
+    static const char *const w[24] = {
+        "the", "of", "and", "a", "to", "in", "is", "that", "for",
+        "it", "as", "was", "with", "be", "by", "on", "not", "he",
+        "this", "are", "or", "his", "from", "at"
+    };
+    uint32_t at = 0u;
+    uint32_t k = 0u;
+
+    while (at < n) {
+        const char *s = w[k % 24u];
+        uint32_t j;
+
+        for (j = 0; s[j] != '\0' && at < n; j++) {
+            dst[at++] = (uint8_t)s[j];
+        }
+        if (at < n) {
+            dst[at++] = (uint8_t)((k % 17u == 16u) ? '.' : ' ');
+        }
+        k++;
+    }
+}
+
 /* 4 KiB is the one block size the ladder above does not cover (its smallest
- * is 8 KiB). A page goes through the single FLAT page path at every level, so
- * all nine levels must decode to the same bytes and write the same size. Pin
- * that on two representative pages -- a low-alphabet one and a 256-symbol one
- * -- with deterministic input so the corpus is identical on every run. */
+ * is 8 KiB). A page goes through a single page form at every level -- FLAT
+ * for the low-alphabet and 256-symbol pages, TEXT for the prose page -- so
+ * all nine levels must decode to the same bytes and write a size that does
+ * not grow going down the ladder. Pin that on three representative pages --
+ * a low-alphabet one, a 256-symbol one and an ASCII prose one -- with
+ * deterministic input so the corpus is identical on every run. */
 static void page_levels(void)
 {
     uint32_t sizes[9];
@@ -114,13 +144,17 @@ static void page_levels(void)
     uint32_t i;
     int b;
 
-    for (b = 0; b < 2; b++) {
+    for (b = 0; b < 3; b++) {
         unsigned li;
         int have_first = 0;
 
-        for (i = 0u; i < 4096u; i++) {
-            in[i] = (b == 0) ? (uint8_t)(i & 7u)
-                             : (uint8_t)(i * 131u + 17u);
+        if (b == 2) {
+            prose_page(in, 4096u);
+        } else {
+            for (i = 0u; i < 4096u; i++) {
+                in[i] = (b == 0) ? (uint8_t)(i & 7u)
+                                 : (uint8_t)(i * 131u + 17u);
+            }
         }
         for (li = 0u; li < 9u; li++) {
             uint32_t cl = 0u;

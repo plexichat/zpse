@@ -3355,7 +3355,7 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
         *len_out = k;
         return ZPSE_OK;
     case ZPSE_R_PALETTE_BITS: {
-        uint8_t seen[8];
+        uint32_t seen[8];
         unsigned nu = 0;
         uint8_t m;
         unsigned b;
@@ -3369,19 +3369,19 @@ int zpse_residual_payload_len(uint8_t mode, uint16_t k,
          * branch per value (~1900 probes for a 235-exception tile) and
          * this is the encoder's mode-search length estimator, so it runs
          * once per candidate mode per tile. v <= 254, so v >> 5 is in
-         * 0..7 and the bitmap is eight bytes. The statuses are unchanged
+         * 0..7 and the bitmap is eight 32-bit words. The statuses are unchanged
          * and are still decided in ascending value order: a value above
          * 254 is rejected before it is tested for membership, and the
          * seventeenth distinct value is the one that is rejected. */
         memset(seen, 0, sizeof seen);
         for (i = 0; i < k; i++) {
             uint8_t v = exc_in[i];
-            uint8_t bit;
+            uint32_t bit;
 
             if (v > 254u) {
                 return ZPSE_BAD_RESIDUAL;
             }
-            bit = (uint8_t)(1u << (v & 31u));
+            bit = 1u << (v & 31u);
             if ((seen[v >> 5u] & bit) != 0u) {
                 continue;
             }
