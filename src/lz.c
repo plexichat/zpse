@@ -92,6 +92,13 @@ lz_extend_avx2(const uint8_t *in, uint32_t pos, uint32_t cand, uint32_t len,
  * length does not divide into commands. */
 #define LZ_HDR 8u
 
+/* Guards for zpse_lz_decode's trusted fast region. RESERVE is the output
+ * slack one command's wild stores may cross; BACK is the input slack one
+ * command's speculative reads may cross. Both leave the checked tail room
+ * to rewrite every byte written past the real output. */
+#define ZPSE_LZ_TRUST_RESERVE 576u
+#define ZPSE_LZ_TRUST_BACK    352u
+
 /* Output under construction: one forward-growing stream, so a command is
  * written once, where it stays. A token, its literals, its distance and,
  * when the token asked for one, its length escape -- the same order the
@@ -1180,13 +1187,136 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
         uint32_t op_done = 0u;
         uint32_t cmd_left = cmd_count;
         uint32_t rep0 = 1u, rep1 = 1u, rep2 = 1u, rep3 = 1u;
+        uint32_t low = (n > ZPSE_LZ_TRUST_RESERVE)
+                           ? (n - ZPSE_LZ_TRUST_RESERVE) : 0u;
+        const uint8_t *safe_lp = (in_len > ZPSE_LZ_TRUST_BACK)
+                                     ? (tend - ZPSE_LZ_TRUST_BACK) : in;
 
+        /* Trusted fast region. Two guards, tested once per command, bound
+         * every speculative read and write below: no per-command room test,
+         * no command-count test and no 255-chain walk in the body. This region
+         * produces the same output as the checked path: an in-memory temp
+         * harness (never checked in, so not a reproducible in-tree script)
+         * found decode byte-identical on Silesia blocks and on a corpus of
+         * hostile/truncated/corrupt inputs, with a null A/A comparison. The
+         * design rationale and the measurement belong in docs/HISTORY.md.
+         *
+         * Output: op < n - RESERVE leaves room for the widest command -- a
+         * 269-byte literal run (15 + one bounded escape byte) copied in
+         * 32-byte steps, a 274-byte match (19 + 255), and the stores' slack.
+         * Input: lp is kept BACK bytes from the end; a command reads one
+         * token, one escape per nibble, the literals rounded up to a 32-byte
+         * step, three distance groups and one match escape.
+         *
+         * A 255 escape continuation, a fourth distance group, or a run wider
+         * than the guard bails to the checked tail with `lp` at the command's
+         * own start, so full 255-chain semantics and every rejection stay in
+         * that one place. */
+        while (op < out + low && lp <= safe_lp) {
+            const uint8_t *cs = lp;
+            const uint8_t *litp;
+            uint32_t tok, lit, mn, mlen, v, off;
+            uint8_t b;
+
+            tok = *lp++;
+            lit = tok >> 4;
+            mn = tok & 15u;
+            mlen = mn + ZPSE_LZ_MIN_MATCH;
+            if (lit == 15u) {
+                b = *lp++;              /* bounded rvl: one byte only */
+                if (b == 255u) { lp = cs; goto trusted_done; }
+                lit += b;
+            }
+            litp = lp;
+            lp += lit;
+            /* distance varint: up to three groups, bail on a fourth */
+            {
+                uint32_t b0 = (uint32_t)*lp++;
+                if (b0 < 0x80u) {
+                    v = b0;
+                } else {
+                    uint32_t b1 = (uint32_t)*lp++;
+                    if (b1 < 0x80u) {
+                        v = (b0 & 0x7Fu) | (b1 << 7u);
+                    } else {
+                        uint32_t b2 = (uint32_t)*lp++;
+                        if (b2 < 0x80u) {
+                            v = (b0 & 0x7Fu) | ((b1 & 0x7Fu) << 7u)
+                                | (b2 << 14u);
+                        } else {
+                            lp = cs; goto trusted_done;
+                        }
+                    }
+                }
+            }
+            /* Careful skips the match escape for a literal-only command. */
+            if (v != 0u && mn == 15u) {
+                b = *lp++;
+                if (b == 255u) { lp = cs; goto trusted_done; }
+                mlen += b;
+            }
+            /* commit: all fields decoded, lp at the next command */
+            cmd_left--;
+            if (lit <= 14u) {
+                memcpy(op, litp, 16u);
+            } else {
+                uint8_t *d = op;
+                const uint8_t *s = litp;
+                uint8_t *e = d + lit;
+                do {
+                    memcpy(d, s, 16u);
+                    memcpy(d + 16u, s + 16u, 16u);
+                    d += 32u; s += 32u;
+                } while (d < e);
+            }
+            op += lit;
+            op_rem -= lit;
+            op_done += lit;
+            lit_seen += lit;
+            if (v == 0u) {
+                if (lit == 0u) {
+                    return ZPSE_BAD_LZ;
+                }
+                continue;
+            }
+            {
+                uint32_t isrep = (v <= 4u) ? 1u : 0u;
+                uint32_t i = v - 1u;
+                uint32_t roff = (i == 0u) ? rep0
+                              : ((i == 1u) ? rep1
+                              : ((i == 2u) ? rep2 : rep3));
+                uint32_t n1, n2, n3;
+
+                off = isrep != 0u ? roff : (v - 4u);
+                n1 = isrep != 0u ? ((i >= 1u) ? rep0 : rep1) : rep0;
+                n2 = isrep != 0u ? ((i >= 2u) ? rep1 : rep2) : rep1;
+                n3 = isrep != 0u ? ((i == 3u) ? rep2 : rep3) : rep2;
+                rep0 = off; rep1 = n1; rep2 = n2; rep3 = n3;
+            }
+            if (off > op_done) {
+                return ZPSE_BAD_LZ;
+            }
+            if (off >= 16u && mlen <= 16u) {
+                memcpy(op, op - (ptrdiff_t)off, 16u);
+            } else if (off >= 16u && mlen <= 20u) {
+                memcpy(op, op - (ptrdiff_t)off, 16u);
+                memcpy(op + 16u, op + 16u - (ptrdiff_t)off, 4u);
+            } else if (off >= 32u && mlen <= 32u) {
+                memcpy(op, op - (ptrdiff_t)off, 32u);
+            } else if (off >= 8u && mlen <= 8u) {
+                memcpy(op, op - (ptrdiff_t)off, 8u);
+            } else {
+                lz_copy_match(op, off, mlen, op_rem);
+            }
+            op += mlen;
+            op_rem -= mlen;
+            op_done += mlen;
+        }
+    trusted_done:
+        /* Fully checked tail: the last RESERVE bytes of output, hostile
+         * streams, and any command the trusted region bailed on. */
         while (op_rem != 0u) {
-            uint32_t tok;
-            uint32_t lit;
-            uint32_t off;
-            uint32_t mlen;
-            uint32_t v;
+            uint32_t tok, lit, off, mlen, v;
             uint8_t b;
 
             if (cmd_left == 0u) {
@@ -1196,147 +1326,6 @@ ZPSE_HOT int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
             if (lp >= tend) {
                 return ZPSE_BAD_LZ;
             }
-            /* ---- The escape-free fast region --------------------------
-             * A token whose two nibbles are both below fifteen names a
-             * literal run of at most fourteen bytes and a match of at most
-             * eighteen, so a command of that shape needs no per-field bound
-             * test at all -- only the room it is about to use, which one
-             * compare against each buffer covers. That shape is four commands
-             * in five on prose and most of them on the binaries, and it is
-             * what the fast form (src/lz2.c) has always had and this loop
-             * never did: measured over the twelve Silesia files, this form's
-             * decode ran at 1.50 GB/s against the fast one's 2.22.
-             *
-             * The eighteen bytes of payload and thirty-two of output are
-             * what makes every read and write below provably in bounds:
-             * the token, fourteen literals, the two distance bytes and one
-             * to spare; fourteen literals plus an eighteen-byte match and
-             * nothing else. A command that does not fit either budget, or
-             * a distance that needs a third group, falls through to the
-             * careful path with `lp` untouched -- the token is read again
-             * there, so nothing is consumed twice and no stream this
-             * function refused before is accepted now. */
-            if ((size_t)(tend - lp) >= 18u && op_rem >= 32u) {
-                tok = *lp;
-                if (((tok >> 4) != 15u) && ((tok & 15u) != 15u)) {
-                    /* The distance is read BEFORE the literals are copied, so
-                     * a third group -- which is the one shape this region
-                     * cannot take -- leaves `lp` and the output exactly as
-                     * the careful path expects to find them. `lit` is at most
-                     * fourteen, so `dp[1]` is inside the eighteen bytes the
-                     * region proved it has. */
-                    const uint8_t *dp;
-                    uint32_t b0;
-
-                    lit = tok >> 4;
-                    dp = lp + 1u + lit;
-                    b0 = (uint32_t)dp[0];
-                    /* The width of the distance is data, and the two forms
-                     * are nearly a coin toss on the binaries, so decoding
-                     * both and selecting measured WORSE than testing: on the
-                     * twelve-file corpus at the default level this form went
-                     * from 5.25 to 5.13 GB/s on dickens, 2.35 to 2.16 on
-                     * webster and 1.79 to 1.78 on nci, i.e. the mispredicted
-                     * branch is cheaper than the extra ALU work plus the
-                     * third-group test it would still need. */
-                    if (b0 < 0x80u) {
-                        v = b0;
-                        dp += 1;
-                    } else if (dp[1] < 0x80u) {
-                        v = (b0 & 0x7Fu) | ((uint32_t)dp[1] << 7u);
-                        dp += 2;
-                    } else {
-                        goto careful;
-                    }
-                    /* The run as one 8-byte store, or two overlapping ones
-                     * when it is nine to fourteen bytes: a memcpy of `lit`
-                     * is a size dispatch per command, and the bytes past the
-                     * run are the distance and the next token, both written
-                     * before anything reads them. A single sixteen-byte store
-                     * here was measured at 1.86 GB/s against this shape's
-                     * 1.87 on text_en, so the roomier store buys nothing on
-                     * this decoder and the narrower pair stays. */
-                    if (lit <= 8u) {
-                        memcpy(op, lp + 1u, 8u);
-                    } else {
-                        memcpy(op, lp + 1u, 8u);
-                        memcpy(op + lit - 8u, lp + 1u + lit - 8u, 8u);
-                    }
-                    op += lit;
-                    op_rem -= lit;
-                    op_done += lit;
-                    lit_seen += lit;
-                    lp = dp;
-                    if (v == 0u) {
-                        if (lit == 0u) {
-                            return ZPSE_BAD_LZ;
-                        }
-                        continue;
-                    }
-                    /* The distance cache, without a branch on the kind of
-                     * distance. Whether this command names one of the four
-                     * recent distances or an explicit one is data, and on the
-                     * binaries -- where this form is what the gate writes --
-                     * it is close to a coin toss, so the test mispredicted per
-                     * command. Both candidates are computed and selected. */
-                    {
-                        uint32_t isrep = (v <= 4u) ? 1u : 0u;
-                        uint32_t i = v - 1u;
-                        uint32_t roff = (i == 0u)
-                                            ? rep0
-                                            : ((i == 1u) ? rep1
-                                                         : ((i == 2u) ? rep2 : rep3));
-                        uint32_t n1, n2, n3;
-
-                        off = isrep != 0u ? roff : (v - 4u);
-                        n1 = isrep != 0u ? ((i >= 1u) ? rep0 : rep1) : rep0;
-                        n2 = isrep != 0u ? ((i >= 2u) ? rep1 : rep2) : rep1;
-                        n3 = isrep != 0u ? ((i == 3u) ? rep2 : rep3) : rep2;
-                        rep0 = off;
-                        rep1 = n1;
-                        rep2 = n2;
-                        rep3 = n3;
-                    }
-                    mlen = (uint32_t)(tok & 15u) + ZPSE_LZ_MIN_MATCH;
-                    if (off > op_done) {
-                        return ZPSE_BAD_LZ;
-                    }
-                    /* A short match at a distance at least as wide as the
-                     * store: one store covers the match, and the bytes it
-                     * writes past it are output a later command overwrites.
-                     * Eighteen is the longest match this region can see, so
-                     * the two wide shapes are the only ones it needs -- past
-                     * those the copier's own overlap handling runs. */
-                    if (off >= 16u && mlen <= 16u) {
-                        memcpy(op, op - (ptrdiff_t)off, 16u);
-                    } else if (off >= 16u && mlen <= 20u && op_rem >= 20u) {
-                        /* Seventeen to twenty bytes at a distance of sixteen
-                         * or more: see lz_copy_match, which this region grew
-                         * to keep out of its loops. */
-                        memcpy(op, op - (ptrdiff_t)off, 16u);
-                        memcpy(op + 16u, op + 16u - (ptrdiff_t)off, 4u);
-                    } else if (off >= 32u && mlen <= 32u && op_rem >= 32u) {
-                        memcpy(op, op - (ptrdiff_t)off, 32u);
-                    } else if (off >= 8u && mlen <= 8u && op_rem >= 8u) {
-                        /* The short-distance match. All three of the tests
-                         * above are false for it (off is under sixteen, so
-                         * even the wide store's own guard could not have
-                         * run), and the copier reaches the same eight-byte
-                         * store through a call and its branch tree. One load
-                         * and one store here instead -- the shape that
-                         * dominates a tile body, where the LZ stream's
-                         * distances are the short ones of a record layout. */
-                        memcpy(op, op - (ptrdiff_t)off, 8u);
-                    } else {
-                        lz_copy_match(op, off, mlen, op_rem);
-                    }
-                    op += mlen;
-                    op_rem -= mlen;
-                    op_done += mlen;
-                    continue;
-                }
-            }
-        careful:
             tok = *lp++;
             lit = tok >> 4;
             if (lit == 15u) {

@@ -1703,3 +1703,33 @@ designed for, and the ladder writes the stream for everything else. The precise
 A/B rates that decided these gates live in temp harnesses, not in a script under
 tests/benchmarks/, so this section records the format, the gate and the reason
 rather than quoting rates as project figures.
+
+## The token decoder gets a trusted region too
+
+The token form's decoder (`zpse_lz_decode`, `src/lz.c`) was the last command loop
+still written as a chain of per-field checks. Its earlier fast path was an
+escape-free region inside the careful loop: a command qualified only when both
+token nibbles were under fifteen, which fit in eighteen payload and thirty-two
+output bytes, and even then it re-tested its room on every command. The fast
+form (`src/lz2.c`) had already shown the better shape a trusted region ahead of
+the checked loop, with two bounds tested once per command and a fully checked
+tail for everything the region cannot take; that change narrowed the gap to
+LZ4 and, with the fixed-distance command, made its decode markedly faster.
+
+The token decoder now has that shape. `op < n - 576` (RESERVE, room for the
+widest command -- a 269-byte literal run and a 274-byte match plus store slack)
+bounds the output and `lp <= tend - 352` (BACK) bounds the speculative reads.
+A 255-escape continuation, a fourth distance group, or a run wider than the
+guard bails to the checked tail with `lp` rewound to the command's own start, so
+full escape semantics and every rejection still live in one place. The stream is
+unchanged by construction; only how fast the same bytes are rebuilt moved.
+
+An in-memory A/B on the twelve 64 KiB Silesia blocks found token-heavy decode
+-- mozilla, ooffice, samba and nci, the files whose blocks the token form
+dominates -- faster by a clear margin, byte-exact on every block and on a corpus
+of hostile, truncated and corrupt inputs, with an A/A null comparison to bound
+the host's noise. That is the region removing per-command tests from the common
+command, not a ratio trade: no packed size moved. The harness was temporary and
+was never checked in as a script under `tests/benchmarks/`, so the measurement
+is recorded here as a design note rather than as a project figure for the
+README.

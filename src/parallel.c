@@ -794,12 +794,14 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
  * k * nominal in the caller's buffer, and the index already says where the
  * block starts, so the worker decodes straight into its final place. The
  * only per-worker state is the decoder arena. That is only true because a
- * block decode is bounded by its own output: the LZ decoder used to write a
- * few bytes past the end of a run and rely on the next command to reclaim
- * them, which in a frame means overwriting the next block's first bytes.
- * The literal copy now tests the room in front of where it stores
- * (lz_copy_literals), so exactly `nominal` bytes are written and no worker
- * can touch another's. */
+ * block decode is bounded by its own output: the LZ decoder writes a few
+ * bytes past the end of a run and relies on the next command to reclaim
+ * them, which in a frame would mean overwriting the next block's first
+ * bytes. Its trusted region only runs while more than a command's worth of
+ * output room remains (the RESERVE guard in lz.c/lz2.c), so every speculative
+ * store stays inside this block's `nominal` bytes; the last RESERVE bytes are
+ * decoded by the checked tail, which stores within the exact capacity. No
+ * worker can touch another's output. */
 typedef struct ZpseMtDecJob {
     const uint8_t *in;
     size_t in_len;
