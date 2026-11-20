@@ -10,6 +10,7 @@
 #include "zpse/residual.h"
 #include "zpse/status.h"
 #include "zpse/dpcm1.h"
+#include "zpse/mrd.h"
 
 static unsigned char enc_arena[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static unsigned char dec_arena[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
@@ -1015,6 +1016,199 @@ static void test_dpcm1_hostile(void)
     dpcm1_reject("exact need one byte long", b, len + 1u);
 }
 
+/* ---- MRD1 whole-frame form ("MRD1") -----------------------------------
+ * Like DPCM1 there is no block-layer parser, so every case goes through
+ * zpse_decompress_frame, which sniffs the magic and hands the bytes to
+ * zpse_mrd_decode. The builder writes legal streams by hand, independent of
+ * the encoder; each hostile case then mutates exactly one field. Wire layout:
+ * a 24-byte header, verbatim prefix, a control stream (0x80 + u16 marks a
+ * zero run, other bytes are signed deltas), then 6 bytes per escape (u32
+ * delta index, i16 true delta). */
+static uint32_t mrd_build(uint8_t *b, uint32_t n, uint16_t first,
+                          const uint8_t *cs, uint32_t coff,
+                          const uint8_t *esctab, uint32_t ne,
+                          uint32_t nruns)
+{
+    uint32_t i;
+
+    memset(b, 0, 24u + coff + 6u * ne);
+    b[0] = 'M'; b[1] = 'R'; b[2] = 'D'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, first);
+    zpse_store_u16le(b + 10u, 0u);
+    zpse_store_u32le(b + 12u, ne);
+    zpse_store_u32le(b + 16u, coff);
+    zpse_store_u32le(b + 20u, nruns);
+    for (i = 0u; i < coff; i++) b[24u + i] = cs[i];
+    for (i = 0u; i < 6u * ne; i++) b[24u + coff + i] = esctab[i];
+    return 24u + coff + 6u * ne;
+}
+
+/* Header-only seed for cases whose declared counts are deliberately bogus;
+ * the decoder must reject on the field check before it reads any payload. */
+static void mrd_hdr(uint8_t *b, uint32_t n, uint32_t ne,
+                    uint32_t coff, uint32_t nruns)
+{
+    memset(b, 0, 1024u);
+    b[0] = 'M'; b[1] = 'R'; b[2] = 'D'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, 1000u);
+    zpse_store_u16le(b + 10u, 0u);
+    zpse_store_u32le(b + 12u, ne);
+    zpse_store_u32le(b + 16u, coff);
+    zpse_store_u32le(b + 20u, nruns);
+}
+
+/* A corrupt MRD1 frame must get a negative status from the public frame path,
+ * leave the caller's length untouched and write nothing into the output. */
+static void mrd_reject(const char *what, const uint8_t *blk, uint32_t len)
+{
+    uint8_t obuf[256u + 16u];
+    size_t olen = (size_t)0xDEADBEEFu;
+    uint32_t i;
+    int rc, clean;
+
+    memset(obuf, 0xCC, sizeof obuf);
+    rc = zpse_decompress_frame(blk, len, obuf, 256u, &olen, dec_arena);
+    clean = (rc < 0 && olen == (size_t)0xDEADBEEFu);
+    for (i = 0u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) clean = 0;
+    }
+    CHECK(clean, "mrd1: %s -> clean status, no write past cap", what);
+}
+
+/* A few MRD1 rejections are found only while walking the control stream,
+ * after the decoder has already emitted the leading sample(s). For those the
+ * only bytes it may have touched are the first `lead`; everything after is
+ * still the canary. This still bounds any write to the decoded prefix. */
+static void mrd_reject_lead(const char *what, const uint8_t *blk,
+                            uint32_t len, uint32_t lead)
+{
+    uint8_t obuf[256u + 16u];
+    size_t olen = (size_t)0xDEADBEEFu;
+    uint32_t i;
+    int rc, clean;
+
+    memset(obuf, 0xCC, sizeof obuf);
+    rc = zpse_decompress_frame(blk, len, obuf, 256u, &olen, dec_arena);
+    clean = (rc < 0 && olen == (size_t)0xDEADBEEFu);
+    for (i = lead; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) clean = 0;
+    }
+    CHECK(clean, "mrd1: %s -> clean status, no write past %u leading bytes",
+          what, lead);
+}
+
+static void test_mrd1_hostile(void)
+{
+    uint8_t b[1024u];
+    uint8_t obuf[256u + 16u];
+    uint8_t ref[162u];
+    uint8_t deltas[80u];
+    uint32_t i, len;
+    size_t olen;
+    uint16_t v;
+    int rc, ok;
+
+    /* Valid baseline: 80 literal +10 deltas, n = 162, ns = 81. */
+    for (i = 0u; i < 80u; i++) deltas[i] = 10u;
+    len = mrd_build(b, 162u, 1000u, deltas, 80u, 0, 0u, 0u);
+    CHECK(len == 104u, "mrd1: baseline literal stream is 104 bytes");
+    v = 1000u;
+    ref[0] = (uint8_t)v; ref[1] = (uint8_t)(v >> 8);
+    for (i = 0u; i < 80u; i++) {
+        v = (uint16_t)(v + 10u);
+        ref[2u + 2u * i] = (uint8_t)v;
+        ref[3u + 2u * i] = (uint8_t)(v >> 8);
+    }
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_frame(b, len, obuf, 256u, &olen, dec_arena);
+    ok = (rc == ZPSE_OK && olen == 162u && memcmp(obuf, ref, 162u) == 0);
+    for (i = 162u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) ok = 0;
+    }
+    CHECK(ok, "mrd1: literal baseline decodes byte-exactly, canary intact");
+
+    /* Valid baseline: one zero run of 80 samples (0x80, u16 80). */
+    deltas[0] = 0x80u; deltas[1] = 80u; deltas[2] = 0u;
+    len = mrd_build(b, 162u, 1000u, deltas, 3u, 0, 0u, 1u);
+    CHECK(len == 27u, "mrd1: baseline RLE stream is 27 bytes");
+    memset(ref, 0, sizeof ref);
+    for (i = 0u; i < 81u; i++) {
+        ref[2u * i] = (uint8_t)1000u;
+        ref[2u * i + 1u] = (uint8_t)(1000u >> 8);
+    }
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_frame(b, len, obuf, 256u, &olen, dec_arena);
+    ok = (rc == ZPSE_OK && olen == 162u && memcmp(obuf, ref, 162u) == 0);
+    for (i = 162u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) ok = 0;
+    }
+    CHECK(ok, "mrd1: RLE baseline decodes byte-exactly, canary intact");
+
+    /* Wrong magic: the frame sniffer sees no MRD1 and falls through. */
+    len = mrd_build(b, 162u, 1000u, deltas, 3u, 0, 0u, 1u);
+    b[0] = 'X';
+    mrd_reject("wrong magic", b, len);
+
+    /* Truncation: magic only, then a header short of 24 bytes. */
+    len = mrd_build(b, 162u, 1000u, deltas, 3u, 0, 0u, 1u);
+    mrd_reject("magic only", b, 4u);
+    mrd_reject("short header", b, 15u);
+
+    /* RLE run longer than the samples left (65535 > ns-1 = 80), and one
+     * shorter than the minimum run of 16. */
+    mrd_hdr(b, 162u, 0u, 3u, 1u);
+    b[24] = 0x80u; b[25] = 0xFFu; b[26] = 0xFFu;
+    mrd_reject_lead("RLE run past n", b, 27u, 2u);
+    mrd_hdr(b, 162u, 0u, 3u, 1u);
+    b[24] = 0x80u; b[25] = 0x08u; b[26] = 0x00u;
+    mrd_reject_lead("RLE run under minimum", b, 27u, 2u);
+
+    /* Escape position out of range, and two that are not strictly increasing. */
+    mrd_hdr(b, 162u, 1u, 1u, 0u);
+    b[24] = 0x01u;
+    zpse_store_u32le(b + 25u, 99999u);
+    zpse_store_u16le(b + 29u, 5u);
+    mrd_reject("escape pos out of range", b, 31u);
+    mrd_hdr(b, 162u, 2u, 2u, 0u);
+    b[24] = 0x01u; b[25] = 0x01u;
+    zpse_store_u32le(b + 26u, 6u); zpse_store_u16le(b + 30u, 5u);
+    zpse_store_u32le(b + 32u, 6u); zpse_store_u16le(b + 36u, 7u);
+    mrd_reject("non-monotonic escapes", b, 38u);
+
+    /* Escape count above ns-1 (= 80): rejected before any escape is read. */
+    mrd_hdr(b, 162u, 100u, 1u, 0u);
+    b[24] = 0x01u;
+    mrd_reject("escape count > ns-1", b, 25u);
+
+    /* Odd n, and a control stream too short to cover ns-1 deltas. */
+    mrd_hdr(b, 161u, 0u, 1u, 0u);
+    b[24] = 0x01u;
+    mrd_reject("odd n", b, 25u);
+    CHECK(zpse_mrd_decode(b, 25u, obuf, 161u) == ZPSE_MRD_DECLINE,
+          "mrd1: decoder rejects odd n directly");
+    mrd_hdr(b, 162u, 0u, 1u, 0u);
+    b[24] = 0x01u;
+    mrd_reject_lead("didx short of ns-1", b, 25u, 4u);
+
+    /* Exact byte count: one byte short, one byte long, and a coff so large
+     * the derived need cannot equal the supplied length. */
+    len = mrd_build(b, 162u, 1000u, deltas, 3u, 0, 0u, 1u);
+    mrd_reject("exact need one byte short", b, len - 1u);
+    mrd_reject("exact need one byte long", b, len + 1u);
+    mrd_hdr(b, 162u, 0u, 0xFFFFFFF0u, 0u);
+    b[24] = 0x01u;
+    mrd_reject("coff overflow", b, 25u);
+
+    /* RLE token count above coff/3. */
+    mrd_hdr(b, 162u, 0u, 3u, 100u);
+    b[24] = 0x80u; b[25] = 0x10u; b[26] = 0x00u;
+    mrd_reject("RLE count > coff/3", b, 27u);
+}
+
 int main(void) {
     uint32_t olen = 0;
     int rc, i;
@@ -1292,6 +1486,9 @@ int main(void) {
 
     /* DPCM1 whole-frame form: hostile fields and exact-length checks. */
     test_dpcm1_hostile();
+
+    /* MRD1 whole-frame form: hostile fields and exact-length checks. */
+    test_mrd1_hostile();
 
     /* FLAT page form (sync 0x50B9). A minimal RAW block is built by hand so
      * these cases do not depend on the encoder choosing this form. Each case

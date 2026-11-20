@@ -289,6 +289,75 @@ static void fuzz_dpcm1_seeds(void)
     fuzz_decode_frame(d2, len2);
 }
 
+/* Deterministic MRD1 whole-frame seeds. Arbitrary fuzz bytes almost never
+ * carry this magic, so these hand-built frames keep the valid decode path and
+ * the hostile-field checks in every invocation's corpus. Layout: a 24-byte
+ * header, verbatim prefix, a control stream (0x80 + u16 marks a zero run),
+ * then 6 bytes per escape (u32 delta index, i16 true delta). */
+static uint32_t mrd_seed(uint8_t *b, uint32_t n, uint16_t first,
+                         const uint8_t *pre, uint32_t plen,
+                         const uint8_t *cs, uint32_t coff,
+                         const uint8_t *esctab, uint32_t ne,
+                         uint32_t nruns)
+{
+    uint32_t i;
+
+    memset(b, 0, 24u + plen + coff + 6u * ne);
+    b[0] = 'M'; b[1] = 'R'; b[2] = 'D'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, first);
+    zpse_store_u16le(b + 10u, (uint16_t)plen);
+    zpse_store_u32le(b + 12u, ne);
+    zpse_store_u32le(b + 16u, coff);
+    zpse_store_u32le(b + 20u, nruns);
+    for (i = 0u; i < plen; i++) b[24u + i] = pre[i];
+    for (i = 0u; i < coff; i++) b[24u + plen + i] = cs[i];
+    for (i = 0u; i < 6u * ne; i++) b[24u + plen + coff + i] = esctab[i];
+    return 24u + plen + coff + 6u * ne;
+}
+
+static void fuzz_mrd_seeds(void)
+{
+    static uint8_t m0[64u];   /* n=32: 15 literal deltas */
+    static uint8_t m1[64u];   /* n=64: one RLE run of 31 */
+    static uint8_t m2[80u];   /* n=36: prefix + one escape */
+    static uint8_t deltas[32u];
+    static uint8_t prefix[4u] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
+    uint8_t esc[12u];
+    uint32_t len0, len1, len2, i;
+
+    for (i = 0u; i < 15u; i++) deltas[i] = 10u;
+    len0 = mrd_seed(m0, 32u, 0x1234u, 0, 0u, deltas, 15u, 0, 0u, 0u);
+    fuzz_decode_frame(m0, len0);
+
+    deltas[0] = 0x80u; deltas[1] = 31u; deltas[2] = 0u;
+    len1 = mrd_seed(m1, 64u, 0x1234u, 0, 0u, deltas, 3u, 0, 0u, 1u);
+    fuzz_decode_frame(m1, len1);
+
+    for (i = 0u; i < 15u; i++) deltas[i] = 10u;
+    deltas[5] = 0u; /* escape placeholder */
+    zpse_store_u32le(esc, 5u);
+    zpse_store_u16le(esc + 4u, 1000u);
+    len2 = mrd_seed(m2, 36u, 0x1234u, prefix, 4u, deltas, 15u, esc, 1u, 0u);
+    fuzz_decode_frame(m2, len2);
+
+    /* Corrupt variants: each must be rejected cleanly, never crash. */
+    fuzz_decode_frame(m0, 4u);                  /* magic only */
+    fuzz_decode_frame(m0, 15u);                 /* short header */
+    fuzz_decode_frame(m0, len0 - 1u);           /* exact need one short */
+    fuzz_decode_frame(m0, len0 + 1u);           /* exact need one long */
+    m0[0] = 'X';
+    fuzz_decode_frame(m0, len0);                /* wrong magic */
+    m0[0] = 'M';
+    zpse_store_u32le(m0 + 4u, 31u);
+    fuzz_decode_frame(m0, len0);                /* odd n */
+    zpse_store_u32le(m0 + 4u, 32u);
+    m1[25] = 0xFFu; m1[26] = 0xFFu;
+    fuzz_decode_frame(m1, len1);                /* RLE run past n */
+    zpse_store_u32le(m2 + 43u, 99999u);         /* escape pos out of range */
+    fuzz_decode_frame(m2, len2);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     /* Split the input: first half as a block, second half as a frame,
@@ -298,6 +367,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     fuzz_flat_seeds();
     fuzz_text_seeds();
     fuzz_dpcm1_seeds();
+    fuzz_mrd_seeds();
 
     fuzz_decode_block(data, size);
     if (half > 0u) {

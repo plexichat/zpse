@@ -6,6 +6,7 @@
 #include "zpse/block.h"
 #include "zpse/f64fast.h"
 #include "zpse/dpcm1.h"
+#include "zpse/mrd.h"
 #include "zpse/flat7.h"
 #include "zpse/frame.h"
 #include "zpse/repack.h"
@@ -34,9 +35,12 @@
 #ifndef ZPSE_ENC_DPCM1
 #define ZPSE_ENC_DPCM1 (UINT32_C(1) << 17)
 #endif
+#ifndef ZPSE_ENC_MRD
+#define ZPSE_ENC_MRD (UINT32_C(1) << 18)
+#endif
 #define ZPSE_WHOLE_FRAME_FLAGS                                                \
     ((uint32_t)(ZPSE_ENC_REPACK | ZPSE_ENC_RLEFAST | ZPSE_ENC_F64FAST |      \
-                ZPSE_ENC_DPCM1))
+                ZPSE_ENC_DPCM1 | ZPSE_ENC_MRD))
 
 /* Smallest valid ZRPK (repack whole-frame) header: magic/version/width/flags
  * (8), n u64 (8), payload_len/distinct/header_crc32 (12) and a 16-byte MAP16
@@ -82,6 +86,13 @@ static int api_is_dcm1(const uint8_t *in, size_t in_len)
 {
     return in_len >= 4u && in[0] == 'D' && in[1] == 'C' &&
            in[2] == 'M' && in[3] == '1';
+}
+
+/* A seventh whole-frame magic: "MRD1", the DPCM + zero-run-RLE form. */
+static int api_is_mrd1(const uint8_t *in, size_t in_len)
+{
+    return in_len >= 4u && in[0] == 'M' && in[1] == 'R' &&
+           in[2] == 'D' && in[3] == '1';
 }
 
 /* ---- Combined cheap pre-gate for the whole-frame opt-ins --------------
@@ -197,7 +208,8 @@ static int enc_flags_ok(uint32_t enc_flags)
                      ZPSE_ENC_DECODE_FAST | ZPSE_ENC_PAGE_TURBO |
                      ZPSE_ENC_PAGE_HUF | ZPSE_ENC_PAGE_INSTANT |
                      ZPSE_ENC_REPACK | ZPSE_ENC_RLEFAST |
-                      ZPSE_ENC_F64FAST | ZPSE_ENC_DPCM1)) != 0u) {
+                      ZPSE_ENC_F64FAST | ZPSE_ENC_DPCM1 |
+                      ZPSE_ENC_MRD)) != 0u) {
         return 0;
     }
     lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
@@ -319,6 +331,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
         int rle_on = (enc_flags & ZPSE_ENC_RLEFAST) != 0u;
         int f64_on = (enc_flags & ZPSE_ENC_F64FAST) != 0u;
         int dpcm_on = (enc_flags & ZPSE_ENC_DPCM1) != 0u;
+        int mrd_on = (enc_flags & ZPSE_ENC_MRD) != 0u;
         int ascii_ok = 1;
         int rle_ok = 0;
         size_t repack_len = 0;
@@ -375,6 +388,19 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
             if (zpse_dpcm1_encode(in, (uint32_t)n, out, cap32,
                                   &dpcm_len) == ZPSE_DPCM1_COMMIT) {
                 *out_len_out = (size_t)dpcm_len;
+                return ZPSE_OK;
+            }
+        }
+        /* MRD is tried last, after DPCM1. Its own prefix probe and content
+         * gate are its first action, so a decline leaves out untouched. */
+        if (mrd_on && n <= (size_t)UINT32_MAX) {
+            uint32_t cap32 = (out_cap > (size_t)UINT32_MAX)
+                                 ? UINT32_MAX : (uint32_t)out_cap;
+            uint32_t mrd_len = 0u;
+
+            if (zpse_mrd_encode(in, (uint32_t)n, out, cap32,
+                                &mrd_len) == ZPSE_MRD_COMMIT) {
+                *out_len_out = (size_t)mrd_len;
                 return ZPSE_OK;
             }
         }
@@ -448,7 +474,7 @@ int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
      * rather than being misreported as truncated. */
     if (zpse_flat7_is_frame(in, in_len) || api_is_zrpk(in, in_len) ||
         api_is_rle1(in, in_len) || api_is_f64f(in, in_len) ||
-        api_is_dcm1(in, in_len)) {
+        api_is_dcm1(in, in_len) || api_is_mrd1(in, in_len)) {
         return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (in_len < 32u) {
@@ -579,6 +605,28 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
         }
         if (zpse_dpcm1_decode(in, (uint32_t)in_len, output, n) !=
             ZPSE_DPCM1_COMMIT) {
+            return ZPSE_BAD_HEADER;
+        }
+        *out_len_out = (size_t)n;
+        return ZPSE_OK;
+    }
+    /* MRD1 is a separate whole-frame magic with its own decoder. Its 24-byte
+     * header carries the original length at offset 4 (u32 LE). */
+    if (api_is_mrd1(in, in_len)) {
+        uint32_t n;
+
+        if (in_len < (size_t)ZPSE_MRD_HEADER_SIZE) {
+            return ZPSE_TRUNCATED;
+        }
+        if (in_len > (size_t)UINT32_MAX) {
+            return ZPSE_TRUNCATED;
+        }
+        n = api_load32le(in + 4); /* original length, u32 LE */
+        if ((size_t)n > out_cap) {
+            return ZPSE_OUTPUT_OVERFLOW;
+        }
+        if (zpse_mrd_decode(in, (uint32_t)in_len, output, n) !=
+            ZPSE_MRD_COMMIT) {
             return ZPSE_BAD_HEADER;
         }
         *out_len_out = (size_t)n;

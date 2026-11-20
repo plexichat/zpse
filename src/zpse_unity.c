@@ -31,3 +31,4 @@
 #include "api.c"
 #include "f64fast.c"
 #include "dpcm1.c"
+#include "mrd.c"

@@ -1768,3 +1768,92 @@ byte-exact on all twelve Silesia files: the x-ray is the only input this gate
 accepts, and the other eleven decline and keep their existing streams. The
 measurement came from a temporary harness and was never checked in as a script
 under tests/benchmarks/, so no figure from it is quoted in the README.
+
+## Committing the fast form in the finder-first pass
+
+The finder-first commit in `block.c` (around line 5729) runs before the sweep and
+the tile stages have priced anything, so whatever it commits wins the block
+outright. On `nci` the finder and the tile forms price within 0.2% of each
+other, which means that pass is deciding the block's form on a rounding error --
+and the token LZ form it committed there was the mistake. When two forms are
+that close, committing the one whose decoder is a command loop instead of the
+tile kernel pays a large decode bill for almost no ratio. The experiment
+committed LZ2, the fixed-distance fast form, in that pass instead, on the theory
+that a form already priced inside the noise could be swapped for the one that
+decodes about twice as fast at no ratio cost.
+
+On `nci` it did what the theory said. On the current tree (HEAD 83217f7), in
+memory on core 7 with QPC, best of nine, arms alternating, and an A/A null
+comparison putting the noise floor at 0.12%: packed goes 6,184,688 -> 6,008,734
+bytes (-2.84%, a better ratio), encode +9.88% and decode +114.99% -- about
+2.15x. The round trip was byte-exact on all twelve Silesia files.
+
+That is the whole win, and it does not travel. The toggle was global rather
+than content-gated, so eight of the twelve files changed size: `mozilla` +6.19%
+(+1.58 MB) and `ooffice` +7.78% (+321 KB) regressed, the same prose trade the
+earlier parked fast-form discussion settled by keeping the token form as the
+default and the fast form behind its flag. Worse, the columnar `sparse_mix`
+ladder broke: level 5 -> 6 grew 8,516 -> 9,106 bytes where it is supposed to
+shrink. That is the documented stage-order and guard-bypass hazard from that
+same discussion -- a decode-speed guard that differs by level lets the
+committed form step in front of the tile-body stage and decide first, and the
+level ladder inherits the difference.
+
+So the idea is discarded rather than parked as a switch. Shipping it needs two
+separate things: a content gate that fires only on the 16-bit structures `nci`
+is made of, so the other eleven files keep their existing streams; and the
+stage-order fix, so committing a form early can no longer bypass the tile-body
+stage and invert the ladder. With both in place it may be worth revisiting,
+because the `nci` number is real. The A/B was run in a temporary harness that
+was never checked in as a script under `tests/benchmarks/`, so the figures above
+are a design note, not a project number; no table in the README was updated.
+
+## Zero-run RLE on the smooth 16-bit image (MRD)
+
+DPCM1 made Silesia's x-ray a one-byte-per-delta stream, but its gate was drawn
+so that `mr` -- whose 16-bit samples are smooth enough that the ladder's sparse
+masks already price them cheaply -- would decline: a fixed byte per sample buys
+nothing there. MRD keeps DPCM1's previous-sample predictor, one signed byte for
+each delta in [-127,127] and a sorted escape table (u32 delta index, i16 true
+delta) for the rare larger ones, and adds the one thing `mr` has that x-ray
+does not: long stretches of *equal* samples. A run of at least sixteen
+consecutive zero deltas is written as a single three-byte token (marker 0x80
+plus a u16 run length) and rebuilt by splatting the held sample, so a flat
+stretch costs three bytes rather than one per sample and no bitmap at all. The
+marker is int8 -128, outside the fitting range, so neither a literal delta nor
+an escape placeholder (0x00) can collide with it. Decode keeps DPCM1's SSE2
+inclusive scan over stretches of literal deltas and adds a 16-bit splat for the
+runs; there is no mask, residual, transform or Huffman stage behind it.
+
+Nothing is emitted unless the caller sets ZPSE_ENC_MRD (bit 18) on
+zpse_compress_frame_ex, and MRD is tried last, after DPCM1. Its content gate is
+the first thing it does: at least 95% of a sample of deltas must fit int8, the
+mean absolute delta must lie in [4,14), and at least 5% of the sampled deltas
+must be zero -- the room the RLE token needs. `mr` clears it (mean |delta|
+about 11), the x-ray declines at 25, and the other ten files decline on the fit
+or mean test. A decline writes nothing: the whole-frame flag bits are stripped
+before the ordinary frame encoder runs, so its PSE1 stream is byte-for-byte the
+one produced without the flag. The experiment used a runtime arm toggle so one
+binary could emit both arms for measurement; the landed code has no toggle --
+selection is the flag plus the content gate, as with f64fast and DPCM1.
+
+The encoder measures the exact control-stream length in a first pass and
+declines unless it is no larger than the input and fits the caller's buffer.
+The decoder validates magic, original length, parity, prefix, escape count,
+control length and RLE-token count before touching output, requires the byte
+count to match exactly, checks every escape position is in range and strictly
+increasing, and bounds each run by the samples still to be written. Hostile
+frames -- bad magic, truncation, a run past the end or below the minimum, an
+out-of-range or non-monotonic escape, an escape count above ns-1, odd n, a
+short or overflowing control length, and an RLE count above coff/3 -- are all
+rejected cleanly with a guard page after the output buffer, so no write can
+escape the caller's length.
+
+Measured on `mr`, the frame went from 3,988,552 B (2.50:1) to 3,832,738 B
+(2.60:1). On a same-host alternating decode A/B (QPC, one pinned core, best of
+nine, with an A/A control) the MRD frame decoded 2.4-2.8x faster than the PSE1
+frame, and the round trip was byte-exact on all twelve Silesia files: `mr` is
+the only input this gate accepts, and the other eleven keep their existing
+streams. The measurement came from a temporary harness and was never checked
+in as a script under `tests/benchmarks/`, so no figure from it is quoted in the
+README.
