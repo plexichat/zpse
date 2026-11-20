@@ -1,12 +1,15 @@
-/* What ZPSE_ENC_DECODE_FAST moves, block by block.
+/* What ZPSE_ENC_DECODE_FAST used to move, block by block.
  *
- * The preset only decides the shape of blocks whose two forms are close, so
- * a frame total says almost nothing about it: on the Silesia text files it
- * changes no block at all, and on `mozilla` it moves a tenth of them, in both
- * directions. This walks each file at 64 KiB and compresses every block
- * twice, once at the level and once with DECODE_FAST set, printing how many
- * blocks differ and what the two totals are -- the table docs/HISTORY.md
- * quotes for the decode-first entry.
+ * The decode-first preset this benchmark was written for has been removed
+ * from the encoder; the flag is now accepted but inert, so a current build
+ * prints two identical columns. Kept to reproduce the historical table in
+ * docs/HISTORY.md, which records what the preset did when it existed.
+ *
+ * When it existed the preset only decided the shape of blocks whose two forms
+ * were close, so a frame total said almost nothing about it: on the Silesia
+ * text files it changed no block at all, and on `mozilla` it moved a tenth of
+ * them, in both directions. This walks each file at 64 KiB and compresses
+ * every block twice, once at the level and once with DECODE_FAST set.
  *
  * Usage: bench_decode_first [--level N] FILE ...
  *   --level N   default 6, the level the entry was measured at

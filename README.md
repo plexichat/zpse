@@ -620,10 +620,9 @@ adds an in-memory FLAT7 arm to `bench`, `-R` adds an in-memory ZRPK arm to
   zpse's stream is 42% smaller.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
-  is the only metric, level 4 is the lever, and
-  `ZPSE_ENC_DECODE_FAST` (`-D`) is the per-block one: it keeps an LZ form only
-  when it is an eighth smaller than the tile stream, so a block where the two
-  forms are close is written the way the decoder reads fastest.
+  is the only metric, level 4 is the lever. The per-block
+  `ZPSE_ENC_DECODE_FAST` (`-D`) bit is accepted but currently inert: no encoder
+  path reads it, so it does not change which form is written.
 * **The whole-frame paths are caller-driven.** Five paths sit outside the
   ladder. FLAT7 (`F7P1`), REPACK (`ZRPK`), RLE1 (`RLE1`) and f64fast (`F64F`)
   are self-delimiting containers with a magic and a narrow input gate; each

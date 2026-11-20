@@ -1306,6 +1306,11 @@ the LZ-over-tile stage to win. Decode rates stayed inside the host's band on
 every file. The flag is for a caller whose only metric is decode, not a
 default.
 
+The preset was subsequently removed from the encoder, so the table above
+records what the flag once did, not what any current build does. The bit is
+still accepted at the API and CLI but no encoder path reads it; the per-block
+decode-first trade it describes is not available today.
+
 ### Pricing the wrapped tile by its payload
 
 The stage that wraps a tile body in LZ was the one form whose decode cost
