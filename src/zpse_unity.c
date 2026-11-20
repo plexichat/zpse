@@ -30,3 +30,4 @@
 #include "text.c"
 #include "api.c"
 #include "f64fast.c"
+#include "dpcm1.c"

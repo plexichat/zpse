@@ -9,6 +9,7 @@
 #include "zpse/mask.h"
 #include "zpse/residual.h"
 #include "zpse/status.h"
+#include "zpse/dpcm1.h"
 
 static unsigned char enc_arena[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static unsigned char dec_arena[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
@@ -845,6 +846,175 @@ static void test_text_hostile(void)
     }
 }
 
+/* ---- DPCM1 whole-frame form ("DCM1") ----------------------------------
+ * This form has no block-layer parser, so every case goes through
+ * zpse_decompress_frame, which sniffs the magic and hands the bytes to
+ * zpse_dpcm1_decode. The builder writes legal streams by hand, independent of
+ * the encoder; each hostile case then mutates exactly one field. Wire layout:
+ * 16-byte header, verbatim prefix, ns-1 signed delta bytes, then 6 bytes per
+ * escape (u32 delta index, i16 true delta). */
+static uint32_t dpcm1_build(uint8_t *b, uint32_t ns, uint16_t first,
+                            const uint8_t *deltas,
+                            const uint8_t *prefix, uint32_t plen,
+                            const uint8_t *esctab, uint32_t ne)
+{
+    uint32_t nd = ns - 1u;
+    uint32_t n = 2u * ns + plen;
+    uint32_t i;
+
+    memset(b, 0, 16u + plen + nd + 6u * ne);
+    b[0] = 'D'; b[1] = 'C'; b[2] = 'M'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, first);
+    zpse_store_u16le(b + 10u, (uint16_t)plen);
+    zpse_store_u32le(b + 12u, ne);
+    for (i = 0u; i < plen; i++) b[16u + i] = prefix[i];
+    for (i = 0u; i < nd; i++) b[16u + plen + i] = deltas[i];
+    for (i = 0u; i < 6u * ne; i++) b[16u + plen + nd + i] = esctab[i];
+    return 16u + plen + nd + 6u * ne;
+}
+
+/* The shared baseline: 16 samples, no prefix, no escapes, all deltas +20. */
+static uint32_t dpcm1_base(uint8_t *b, uint8_t *deltas)
+{
+    uint32_t i;
+
+    for (i = 0u; i < 16u; i++) deltas[i] = 20u;
+    return dpcm1_build(b, 16u, 0x1000u, deltas, 0, 0u, 0, 0u);
+}
+
+/* A corrupt DCM1 frame must get a negative status from the public frame path,
+ * leave the caller's length untouched and write nothing into the output. */
+static void dpcm1_reject(const char *what, const uint8_t *blk, uint32_t len)
+{
+    uint8_t obuf[128u + 16u];
+    size_t olen = (size_t)0xDEADBEEFu;
+    uint32_t i;
+    int rc, clean;
+
+    memset(obuf, 0xCC, sizeof obuf);
+    rc = zpse_decompress_frame(blk, len, obuf, 128u, &olen, dec_arena);
+    clean = (rc < 0 && olen == (size_t)0xDEADBEEFu);
+    for (i = 0u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) clean = 0;
+    }
+    CHECK(clean, "dpcm1: %s -> clean status, no write past cap", what);
+}
+
+static void test_dpcm1_hostile(void)
+{
+    uint8_t b[128u];
+    uint8_t deltas[16u];
+    uint8_t prefix[4u] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
+    uint8_t esc[12u];
+    uint8_t obuf[128u + 16u];
+    uint8_t ref[64u];
+    uint32_t len, i;
+    size_t olen;
+    uint16_t v;
+    int rc, ok;
+
+    /* Valid baseline, no prefix: byte-exact decode and intact canary. */
+    len = dpcm1_base(b, deltas);
+    CHECK(len == 31u, "dpcm1: baseline stream is 31 bytes");
+    v = 0x1000u;
+    ref[0] = (uint8_t)v; ref[1] = (uint8_t)(v >> 8);
+    for (i = 0u; i < 15u; i++) {
+        v = (uint16_t)(v + 20u);
+        ref[2u + 2u * i] = (uint8_t)v;
+        ref[3u + 2u * i] = (uint8_t)(v >> 8);
+    }
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_frame(b, len, obuf, 128u, &olen, dec_arena);
+    ok = (rc == ZPSE_OK && olen == 32u && memcmp(obuf, ref, 32u) == 0);
+    for (i = 32u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) ok = 0;
+    }
+    CHECK(ok, "dpcm1: valid stream decodes byte-exactly, canary intact");
+
+    /* Valid prefix + one escape at delta index 5. */
+    for (i = 0u; i < 16u; i++) deltas[i] = 20u;
+    deltas[5] = 0u; /* placeholder for the escaped delta */
+    zpse_store_u32le(esc, 5u);
+    zpse_store_u16le(esc + 4u, (uint16_t)1000u);
+    len = dpcm1_build(b, 16u, 0x2000u, deltas, prefix, 4u, esc, 1u);
+    CHECK(len == 41u, "dpcm1: prefix+escape stream is 41 bytes");
+    memcpy(ref, prefix, 4u);
+    v = 0x2000u;
+    ref[4] = (uint8_t)v; ref[5] = (uint8_t)(v >> 8);
+    for (i = 0u; i < 15u; i++) {
+        v = (uint16_t)(v + (i == 5u ? 1000u : 20u));
+        ref[6u + 2u * i] = (uint8_t)v;
+        ref[7u + 2u * i] = (uint8_t)(v >> 8);
+    }
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_frame(b, len, obuf, 128u, &olen, dec_arena);
+    ok = (rc == ZPSE_OK && olen == 36u && memcmp(obuf, ref, 36u) == 0);
+    for (i = 36u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) ok = 0;
+    }
+    CHECK(ok, "dpcm1: prefix + escape decodes byte-exactly, canary intact");
+
+    /* Wrong magic: the frame sniffer sees no DCM1 and falls through. */
+    len = dpcm1_base(b, deltas);
+    b[0] = 'X';
+    dpcm1_reject("wrong magic", b, len);
+
+    /* Truncation: magic only, then a header short of the 16-byte minimum. */
+    len = dpcm1_base(b, deltas);
+    dpcm1_reject("magic only", b, 4u);
+    dpcm1_reject("short header", b, 15u);
+
+    /* Original length field: a wrong value makes the exact need disagree with
+     * the bytes supplied; the decoder itself also rejects a mismatched n. */
+    len = dpcm1_base(b, deltas);
+    zpse_store_u32le(b + 4u, 34u);
+    dpcm1_reject("bad original length", b, len);
+    CHECK(zpse_dpcm1_decode(b, len, obuf, 34u) == ZPSE_DPCM1_DECLINE,
+          "dpcm1: decoder rejects n that disagrees with the header");
+
+    zpse_store_u32le(b + 4u, 33u);
+    dpcm1_reject("odd n", b, len);
+
+    /* Prefix field: odd parity, longer than n-2, and leaving fewer than two
+     * samples for the predictor. */
+    len = dpcm1_base(b, deltas);
+    zpse_store_u16le(b + 10u, 3u);
+    dpcm1_reject("odd prefix", b, len);
+    len = dpcm1_base(b, deltas);
+    zpse_store_u16le(b + 10u, 32u);
+    dpcm1_reject("prefix past n-2", b, len);
+    len = dpcm1_base(b, deltas);
+    zpse_store_u16le(b + 10u, 30u);
+    dpcm1_reject("prefix leaves one sample", b, len);
+
+    /* Escape count above ns-1 (= 15 for this stream). */
+    len = dpcm1_base(b, deltas);
+    zpse_store_u32le(b + 12u, 16u);
+    dpcm1_reject("escape count > ns-1", b, len);
+
+    /* Escape positions: must be strictly increasing and below ns-1. */
+    for (i = 0u; i < 16u; i++) deltas[i] = 20u;
+    zpse_store_u32le(esc, 5u);
+    zpse_store_u16le(esc + 4u, (uint16_t)1000u);
+    zpse_store_u32le(esc + 6u, 3u);
+    zpse_store_u16le(esc + 10u, (uint16_t)2000u);
+    len = dpcm1_build(b, 16u, 0x1000u, deltas, 0, 0u, esc, 2u);
+    dpcm1_reject("non-monotonic escapes", b, len);
+
+    zpse_store_u32le(esc, 15u); /* == ns-1 is out of range */
+    zpse_store_u16le(esc + 4u, (uint16_t)1000u);
+    len = dpcm1_build(b, 16u, 0x1000u, deltas, 0, 0u, esc, 1u);
+    dpcm1_reject("escape position out of range", b, len);
+
+    /* The exact byte count is part of the format: one byte short or long. */
+    len = dpcm1_base(b, deltas);
+    dpcm1_reject("exact need one byte short", b, len - 1u);
+    dpcm1_reject("exact need one byte long", b, len + 1u);
+}
+
 int main(void) {
     uint32_t olen = 0;
     int rc, i;
@@ -1119,6 +1289,9 @@ int main(void) {
 
     /* TEXT page form: the hostile-stream cases live in test_text_hostile. */
     test_text_hostile();
+
+    /* DPCM1 whole-frame form: hostile fields and exact-length checks. */
+    test_dpcm1_hostile();
 
     /* FLAT page form (sync 0x50B9). A minimal RAW block is built by hand so
      * these cases do not depend on the encoder choosing this form. Each case

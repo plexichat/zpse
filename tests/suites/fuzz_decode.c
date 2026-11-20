@@ -201,6 +201,94 @@ static void fuzz_text_seeds(void)
     fuzz_decode_block(t2, 15u);            /* truncated TEXT header */
 }
 
+/* Deterministic DPCM1 whole-frame seeds ("DCM1"). Arbitrary fuzz bytes almost
+ * never carry this magic, so these hand-built frames keep the valid decode
+ * path and the hostile-field checks in every invocation's corpus. Layout:
+ * 16-byte header, verbatim prefix, ns-1 signed delta bytes, then 6 bytes per
+ * escape (u32 delta index, i16 true delta); n = 2*ns + prefix_len. */
+static uint32_t dpcm1_seed(uint8_t *b, uint32_t ns, uint16_t first,
+                           const uint8_t *deltas,
+                           const uint8_t *prefix, uint32_t plen,
+                           const uint8_t *esctab, uint32_t ne)
+{
+    uint32_t nd = ns - 1u;
+    uint32_t n = 2u * ns + plen;
+    uint32_t i;
+
+    memset(b, 0, 16u + plen + nd + 6u * ne);
+    b[0] = 'D'; b[1] = 'C'; b[2] = 'M'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, first);
+    zpse_store_u16le(b + 10u, (uint16_t)plen);
+    zpse_store_u32le(b + 12u, ne);
+    for (i = 0u; i < plen; i++) b[16u + i] = prefix[i];
+    for (i = 0u; i < nd; i++) b[16u + plen + i] = deltas[i];
+    for (i = 0u; i < 6u * ne; i++) b[16u + plen + nd + i] = esctab[i];
+    return 16u + plen + nd + 6u * ne;
+}
+
+static void fuzz_dpcm1_seeds(void)
+{
+    static uint8_t d0[32u];                       /* n=8, no prefix/escape */
+    static uint8_t d1[48u];                       /* prefix + one escape */
+    static uint8_t d2[48u];                       /* two escapes */
+    static uint8_t deltas[8u];
+    static uint8_t prefix[4u] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
+    uint8_t esc[12u];
+    uint32_t len0, len1, len2, i;
+
+    for (i = 0u; i < 8u; i++) deltas[i] = 20u;
+
+    /* Valid small frame: 4 samples, 3 delta bytes, no prefix. */
+    len0 = dpcm1_seed(d0, 4u, 0x1234u, deltas, 0, 0u, 0, 0u);
+    fuzz_decode_frame(d0, len0);
+
+    /* Valid edge frame: verbatim prefix and an out-of-byte-range delta carried
+     * in the escape table, with a zero placeholder in the delta bytes. */
+    deltas[2] = 0u;
+    zpse_store_u32le(esc, 2u);
+    zpse_store_u16le(esc + 4u, (uint16_t)1000u);
+    len1 = dpcm1_seed(d1, 4u, 0x1234u, deltas, prefix, 4u, esc, 1u);
+    fuzz_decode_frame(d1, len1);
+
+    /* Two escapes, for the strictly-increasing position check. */
+    deltas[0] = 0u;
+    deltas[1] = 0u;
+    zpse_store_u32le(esc, 0u);
+    zpse_store_u16le(esc + 4u, (uint16_t)500u);
+    zpse_store_u32le(esc + 6u, 1u);
+    zpse_store_u16le(esc + 10u, (uint16_t)600u);
+    len2 = dpcm1_seed(d2, 4u, 0x1234u, deltas, 0, 0u, esc, 2u);
+    fuzz_decode_frame(d2, len2);
+
+    /* Corrupt variants: each must be rejected cleanly, never crash. */
+    fuzz_decode_frame(d0, 4u);                    /* magic only */
+    fuzz_decode_frame(d0, 15u);                   /* short header */
+    fuzz_decode_frame(d0, len0 - 1u);             /* exact need one short */
+    fuzz_decode_frame(d0, len0 + 1u);             /* exact need one long */
+    d0[0] = 'X';
+    fuzz_decode_frame(d0, len0);                  /* wrong magic */
+    d0[0] = 'D';
+    zpse_store_u32le(d0 + 4u, 9u);
+    fuzz_decode_frame(d0, len0);                  /* bad original length */
+    zpse_store_u32le(d0 + 4u, 7u);
+    fuzz_decode_frame(d0, len0);                  /* odd n */
+    zpse_store_u32le(d0 + 4u, 8u);
+    zpse_store_u16le(d0 + 10u, 1u);
+    fuzz_decode_frame(d0, len0);                  /* odd prefix */
+    zpse_store_u16le(d0 + 10u, 8u);
+    fuzz_decode_frame(d0, len0);                  /* prefix past n-2 */
+    zpse_store_u16le(d0 + 10u, 0u);
+    zpse_store_u32le(d0 + 12u, 4u);
+    fuzz_decode_frame(d0, len0);                  /* ne > ns-1 */
+    zpse_store_u32le(d0 + 12u, 0u);
+
+    zpse_store_u32le(d1 + 23u, 3u);               /* escape pos == ns-1 */
+    fuzz_decode_frame(d1, len1);
+    zpse_store_u32le(d2 + 19u, 1u);               /* duplicate position */
+    fuzz_decode_frame(d2, len2);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     /* Split the input: first half as a block, second half as a frame,
@@ -209,6 +297,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     fuzz_flat_seeds();
     fuzz_text_seeds();
+    fuzz_dpcm1_seeds();
 
     fuzz_decode_block(data, size);
     if (half > 0u) {

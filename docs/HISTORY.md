@@ -1733,3 +1733,38 @@ command, not a ratio trade: no packed size moved. The harness was temporary and
 was never checked in as a script under `tests/benchmarks/`, so the measurement
 is recorded here as a design note rather than as a project figure for the
 README.
+
+## A one-byte-per-delta form for the x-ray's 16-bit samples
+
+The 16-bit medical image in Silesia has a shape the ladder cannot exploit
+cheaply: after a 240-byte header, successive samples differ by a small signed
+amount, so the information is in the deltas rather than in the sample values.
+The new whole-frame form stores exactly that -- a fixed previous-sample
+predictor, one signed byte for every delta in [-127,127], and a sorted escape
+table (u32 delta index, i16 true delta) for the rare deltas outside that range.
+The leading raw byte prefix is copied verbatim instead of being escaped as
+samples, so prediction starts at the first real sample and the 240-byte header
+survives byte for byte. Decode is a byte read, an SSE2 inclusive scan over eight
+16-bit lanes and a scatter of the escapes; there is no mask, residual,
+transform or Huffman stage behind it. That is why it is a fast form for one
+input shape rather than a general codec.
+
+Nothing is emitted unless the caller opts in with ZPSE_ENC_DPCM1 (bit 17) on
+zpse_compress_frame_ex. Even then two gates decide. A content gate accepts only
+data whose sampled deltas are at least 90% int8 fits with mean |delta| at least
+18: smooth input such as Silesia "mr" is already cheaper under PSE1 and must
+fall through to the ladder. The exact encoded length is computed in a first
+pass, before any output byte is written, and the form declines unless that
+length is no larger than the raw input and fits the caller's buffer. The
+decoder validates magic, length, parity, prefix and escape count before
+touching output, requires the byte count to match exactly, and rejects escape
+positions that are out of range or not strictly increasing, so a hostile stream
+cannot steer the scatter past the delta window.
+
+Measured on the x-ray file, the frame went from 4,952,679 B (1.711:1) to
+4,390,381 B (1.930:1). On a same-host alternating A/B with core 5 pinned,
+decode measured 2.711x faster than the normal frame path, and the result was
+byte-exact on all twelve Silesia files: the x-ray is the only input this gate
+accepts, and the other eleven decline and keep their existing streams. The
+measurement came from a temporary harness and was never checked in as a script
+under tests/benchmarks/, so no figure from it is quoted in the README.
