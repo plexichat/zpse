@@ -356,6 +356,27 @@ static void fuzz_mrd_seeds(void)
     fuzz_decode_frame(m1, len1);                /* RLE run past n */
     zpse_store_u32le(m2 + 43u, 99999u);         /* escape pos out of range */
     fuzz_decode_frame(m2, len2);
+
+    /* Deterministic reproductions of the two literal-path overflow shapes:
+     * (1) coff > ns-1 (n=4 names 100 deltas), and (2) a legal coff where an
+     * RLE token leaves didx close to ns-1 and eight literal bytes form one
+     * 8-lane store past the final sample. Both must be rejected cleanly. */
+    {
+        static uint8_t m3[128u];
+        static uint8_t m4[64u];
+        static uint8_t big[100u];
+        uint8_t mix[11u];
+        uint32_t len3, len4, j;
+
+        for (j = 0u; j < 100u; j++) big[j] = 1u;
+        len3 = mrd_seed(m3, 4u, 1000u, 0, 0u, big, 100u, 0, 0u, 0u);
+        fuzz_decode_frame(m3, len3);
+
+        mix[0] = 0x80u; mix[1] = 16u; mix[2] = 0u;
+        for (j = 3u; j < 11u; j++) mix[j] = 1u;
+        len4 = mrd_seed(m4, 40u, 1000u, 0, 0u, mix, 11u, 0, 0u, 1u);
+        fuzz_decode_frame(m4, len4);
+    }
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)

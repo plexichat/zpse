@@ -1014,6 +1014,8 @@ static void test_dpcm1_hostile(void)
     len = dpcm1_base(b, deltas);
     dpcm1_reject("exact need one byte short", b, len - 1u);
     dpcm1_reject("exact need one byte long", b, len + 1u);
+    /* A header with no payload at all still has to decline cleanly. */
+    dpcm1_reject("exact header only", b, 16u);
 }
 
 /* ---- MRD1 whole-frame form ("MRD1") -----------------------------------
@@ -1153,10 +1155,13 @@ static void test_mrd1_hostile(void)
     b[0] = 'X';
     mrd_reject("wrong magic", b, len);
 
-    /* Truncation: magic only, then a header short of 24 bytes. */
+    /* Truncation: magic only, a header short of 24 bytes, then the exact 24
+     * bytes with no control stream (need is 27 for this stream). */
     len = mrd_build(b, 162u, 1000u, deltas, 3u, 0, 0u, 1u);
     mrd_reject("magic only", b, 4u);
     mrd_reject("short header", b, 15u);
+    mrd_reject("exact header one short", b, 23u);
+    mrd_reject("exact header only", b, 24u);
 
     /* RLE run longer than the samples left (65535 > ns-1 = 80), and one
      * shorter than the minimum run of 16. */
@@ -1167,12 +1172,41 @@ static void test_mrd1_hostile(void)
     b[24] = 0x80u; b[25] = 0x08u; b[26] = 0x00u;
     mrd_reject_lead("RLE run under minimum", b, 27u, 2u);
 
+    /* A run reached after a literal still has to fit the deltas that remain:
+     * ns-1 = 80, one literal uses didx 0, so 80 overshoots while 79 lands
+     * exactly on the final sample. */
+    mrd_hdr(b, 162u, 0u, 4u, 1u);
+    b[24] = 0x01u; b[25] = 0x80u; zpse_store_u16le(b + 26u, 80u);
+    mrd_reject_lead("RLE run crosses final sample", b, 28u, 4u);
+    mrd_hdr(b, 162u, 0u, 4u, 1u);
+    b[24] = 0x01u; b[25] = 0x80u; zpse_store_u16le(b + 26u, 79u);
+    memset(obuf, 0xCC, sizeof obuf);
+    olen = 0u;
+    rc = zpse_decompress_frame(b, 28u, obuf, 256u, &olen, dec_arena);
+    ref[0] = (uint8_t)1000u; ref[1] = (uint8_t)(1000u >> 8);
+    v = 1001u; /* mrd_hdr's first sample, plus the +1 literal */
+    for (i = 0u; i < 80u; i++) {
+        ref[2u + 2u * i] = (uint8_t)v;
+        ref[3u + 2u * i] = (uint8_t)(v >> 8);
+    }
+    ok = (rc == ZPSE_OK && olen == 162u && memcmp(obuf, ref, 162u) == 0);
+    for (i = 162u; i < sizeof obuf; i++) {
+        if (obuf[i] != 0xCCu) ok = 0;
+    }
+    CHECK(ok, "mrd1: RLE run ending at final sample decodes byte-exactly, canary intact");
+
     /* Escape position out of range, and two that are not strictly increasing. */
     mrd_hdr(b, 162u, 1u, 1u, 0u);
     b[24] = 0x01u;
     zpse_store_u32le(b + 25u, 99999u);
     zpse_store_u16le(b + 29u, 5u);
     mrd_reject("escape pos out of range", b, 31u);
+    /* ns-1 = 80 is one past the last delta index (0..79). */
+    mrd_hdr(b, 162u, 1u, 1u, 0u);
+    b[24] = 0x01u;
+    zpse_store_u32le(b + 25u, 80u);
+    zpse_store_u16le(b + 29u, 5u);
+    mrd_reject("escape pos == ns-1", b, 31u);
     mrd_hdr(b, 162u, 2u, 2u, 0u);
     b[24] = 0x01u; b[25] = 0x01u;
     zpse_store_u32le(b + 26u, 6u); zpse_store_u16le(b + 30u, 5u);
@@ -1207,6 +1241,83 @@ static void test_mrd1_hostile(void)
     mrd_hdr(b, 162u, 0u, 3u, 100u);
     b[24] = 0x80u; b[25] = 0x10u; b[26] = 0x00u;
     mrd_reject("RLE count > coff/3", b, 27u);
+
+    /* Prefix field: odd, past n-2 (=160), and exactly n-2 (which leaves only
+     * one sample). Each is otherwise self-consistent with the supplied length. */
+    mrd_hdr(b, 162u, 0u, 1u, 0u);
+    zpse_store_u16le(b + 10u, 3u);
+    b[27u] = 0x01u;
+    mrd_reject("odd prefix", b, 28u);
+    mrd_hdr(b, 162u, 0u, 1u, 0u);
+    zpse_store_u16le(b + 10u, 162u);
+    b[186u] = 0x01u;
+    mrd_reject("prefix past n-2", b, 187u);
+    mrd_hdr(b, 162u, 0u, 1u, 0u);
+    zpse_store_u16le(b + 10u, 160u);
+    b[184u] = 0x01u;
+    mrd_reject("prefix leaves one sample", b, 185u);
+
+    /* BUG 1: coff > ns-1. n=4 has ns-1=1 delta but the header names 100
+     * literal bytes; the literal loops used to walk didx to ~100 and write
+     * ~200 bytes into the four-byte output. */
+    mrd_hdr(b, 4u, 0u, 100u, 0u);
+    for (i = 24u; i < 124u; i++) b[i] = 0x01u;
+    mrd_reject_lead("coff > ns-1", b, 124u, 2u);
+
+    /* BUG 2: even with coff <= ns-1, a literal stretch can cross the final
+     * sample. Here n=40 (ns-1=19), a 16-sample RLE token uses didx 0..15 and
+     * the remaining eight literal bytes form one 8-lane SIMD store at didx 16
+     * -- only three deltas remain, so the store used to write five samples
+     * past the end. */
+    mrd_hdr(b, 40u, 0u, 11u, 1u);
+    b[24] = 0x80u; zpse_store_u16le(b + 25u, 16u);
+    for (i = 27u; i < 35u; i++) b[i] = 0x01u;
+    mrd_reject_lead("literal stretch past final sample", b, 35u, 34u);
+    /* The tiny-frame shape: eight literals for a one-delta frame. */
+    mrd_hdr(b, 4u, 0u, 8u, 0u);
+    for (i = 24u; i < 32u; i++) b[i] = 0x01u;
+    mrd_reject_lead("literal overflow, tiny frame", b, 32u, 2u);
+}
+
+/* A zero run longer than one u16 token is split by the encoder. A split at
+ * exactly 65535 used to leave a 1..15 remainder, which the decoder rejects
+ * (runs must be >=16), so the encoder now folds that tail into the previous
+ * token. This round-trip is the regression for that long-run failure. */
+static void test_mrd_long_run(void)
+{
+    enum { NS = 73729u, N = 2u * NS, RUN = 65543u }; /* RUN = 65535 + 8 */
+    static uint8_t src[N];
+    static uint8_t enc[16384u];
+    static uint8_t dec[N + 16u];
+    uint32_t i, elen = 0u;
+    uint16_t v = 1000u;
+    int rc, ok;
+
+    /* RUN zero deltas followed by +100 deltas. The gate samples every 9th
+     * delta (8192 points), sees ~909 of the +100 deltas and accepts. */
+    zpse_store_u16le(src, v);
+    for (i = 1u; i < NS; i++) {
+        if (i > RUN) v = (uint16_t)(v + 100u);
+        zpse_store_u16le(src + 2u * i, v);
+    }
+
+    rc = zpse_mrd_encode(src, N, enc, (uint32_t)sizeof enc, &elen);
+    CHECK(rc == ZPSE_MRD_COMMIT, "mrd1: 65535+8 zero run encodes");
+    if (rc != ZPSE_MRD_COMMIT) return;
+
+    /* Two legal tokens: 65527 and 16, never a 1..15 tail. */
+    CHECK(zpse_load_u32le(enc + 16u) == 8191u && /* 6 token bytes + 8185 literals */
+          enc[24u] == 0x80u && zpse_load_u16le(enc + 25u) == 65527u &&
+          enc[27u] == 0x80u && zpse_load_u16le(enc + 28u) == 16u,
+          "mrd1: long run split into two legal tokens");
+
+    memset(dec, 0xCC, sizeof dec);
+    rc = zpse_mrd_decode(enc, elen, dec, N);
+    ok = (rc == ZPSE_MRD_COMMIT && memcmp(dec, src, N) == 0);
+    for (i = N; i < sizeof dec; i++) {
+        if (dec[i] != 0xCCu) ok = 0;
+    }
+    CHECK(ok, "mrd1: 65535+8 zero run round-trips byte-exactly, canary intact");
 }
 
 int main(void) {
@@ -1489,6 +1600,7 @@ int main(void) {
 
     /* MRD1 whole-frame form: hostile fields and exact-length checks. */
     test_mrd1_hostile();
+    test_mrd_long_run();
 
     /* FLAT page form (sync 0x50B9). A minimal RAW block is built by hand so
      * these cases do not depend on the encoder choosing this form. Each case

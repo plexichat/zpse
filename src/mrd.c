@@ -129,6 +129,13 @@ static uint32_t mrd_emit_run(uint8_t *dst, uint32_t run)
 
     while (run != 0u) {
         uint32_t take = run > MRD_MAX_RUN ? MRD_MAX_RUN : run;
+
+        /* A token's run must be >=MRD_MIN_RUN or the decoder declines it.
+         * Splitting at exactly 65535 can leave a 1..15 tail, so shorten this
+         * token just enough to make the tail a legal >=16 run instead. */
+        if (run > MRD_MAX_RUN && run - take < MRD_MIN_RUN) {
+            take -= MRD_MIN_RUN - (run - take);
+        }
         if (dst != 0) {
             dst[0] = (uint8_t)MRD_MARKER;
             zpse_store_u16le(dst + 1u, (uint16_t)take);
@@ -293,6 +300,13 @@ int zpse_mrd_decode(const uint8_t *in, uint32_t in_len,
     if (ne > ns - 1u) return ZPSE_MRD_DECLINE;
     coff = zpse_load_u32le(in + 16u);
     nruns = zpse_load_u32le(in + 20u);
+    /* Invariant: every control byte accounts for at least one of the ns-1
+     * deltas -- a literal (or escape placeholder) is one byte for one delta,
+     * and a 3-byte RLE token stands for >=16. So coff may never exceed ns-1.
+     * Without this, a self-consistent header can give the literal loops more
+     * bytes than there are deltas, walking didx past the final sample and
+     * writing outside `out` before the end-of-stream check gets a say. */
+    if (coff > ns - 1u) return ZPSE_MRD_DECLINE;
     need = (uint64_t)ZPSE_MRD_HEADER_SIZE + (uint64_t)prefix +
            (uint64_t)coff + 6u * (uint64_t)ne;
     if (need != (uint64_t)in_len) return ZPSE_MRD_DECLINE;
@@ -358,11 +372,21 @@ int zpse_mrd_decode(const uint8_t *in, uint32_t in_len,
                    cp[avail] != (uint8_t)MRD_MARKER) {
                 ++avail;
             }
+            /* Each of these bytes emits one sample, starting at didx+1. Even
+             * with coff <= ns-1 an RLE token earlier in the stream can leave
+             * didx close to ns-1, so bound this stretch by the deltas left
+             * before any vector store (which always emits eight). */
+            if (avail > ns - 1u - didx) return ZPSE_MRD_DECLINE;
 #ifdef MRD_SIMD
             if (avail == 8u) {
-                __m128i raw = _mm_loadl_epi64((const __m128i *)cp);
-                __m128i sign = _mm_cmplt_epi8(raw, _mm_setzero_si128());
-                __m128i v = _mm_unpacklo_epi8(raw, sign);
+                __m128i raw, sign, v;
+
+                /* One store emits eight samples, so all eight output slots
+                 * must still be inside the ns samples. */
+                if (ns - 1u - didx < 8u) return ZPSE_MRD_DECLINE;
+                raw = _mm_loadl_epi64((const __m128i *)cp);
+                sign = _mm_cmplt_epi8(raw, _mm_setzero_si128());
+                v = _mm_unpacklo_epi8(raw, sign);
 
                 while (ei < ne && zpse_load_u32le(esc + (size_t)6u * ei) < didx + 8u) {
                     uint32_t p = zpse_load_u32le(esc + (size_t)6u * ei);
@@ -393,7 +417,12 @@ int zpse_mrd_decode(const uint8_t *in, uint32_t in_len,
             {
                 uint32_t k;
                 for (k = 0u; k < avail; ++k) {
-                    int32_t d = (int32_t)(int8_t)cp[k];
+                    int32_t d;
+
+                    /* Per-store backstop: didx+1 is the sample slot written
+                     * below, and only slots 0..ns-1 exist. */
+                    if (didx >= ns - 1u) return ZPSE_MRD_DECLINE;
+                    d = (int32_t)(int8_t)cp[k];
                     while (ei < ne && zpse_load_u32le(esc + (size_t)6u * ei) == didx) {
                         d = (int16_t)zpse_load_u16le(esc + (size_t)6u * ei + 4u);
                         ++ei;
