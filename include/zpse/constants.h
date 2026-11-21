@@ -165,28 +165,15 @@
  * compatibility shim -- a v1 reader sees bit 6 in the reserved mask and
  * refuses the block, which is what the reserved bits were for. */
 #define ZPSE_B_LZ_TILE          (UINT8_C(1) << 6)
-/* The fast LZ form (src/lz2.c): a token, its literals and one fixed 16-bit
- * little-endian distance -- lz4's shape, and the only distance work the
- * decoder does. The four-slot repeat cache is gone at every level: a cached
- * distance saved a byte but put a branch on every command, and removing it
- * measured +26.5% decode for +1.366% packed size over twelve 64 KiB Silesia
- * blocks (see docs/HISTORY.md). Every level therefore writes this one
- * fixed-distance form. Bit 7 was the reserved mask and is now the last form,
- * so the mask is empty rather than wrong. */
+/* The fast LZ form. It is still a selector in the level ladder, but its
+ * payload is now a raw LZ4 block like every other LZ form (src/lz4block.c).
+ * Bit 7 was the reserved mask and is now the last form, so the mask is empty
+ * rather than wrong. */
 #define ZPSE_B_LZ2              (UINT8_C(1) << 7)
 /* The two LZ bits are one two-bit form id, not two independent flags: 1 (bit 5
- * alone) is the token form, 2 (bit 7 alone) the fast form, and 3 -- both bits,
- * a combination neither of the first two ever writes -- is the hexadecimal
- * form (src/lzh.c). It is spelled this way because the flags byte has no bit
- * left: the reserved mask is empty, so the third codec had to be named with
- * the space the first two already had rather than by widening the header. A
- * block whose bits say 3 is an LZH block and nothing else.
- *
- * The hex form codes a command's two fields as one 4-bit code from a table of
- * the sixteen (literal run, match length) pairs the corpus asks for most, so
- * two commands share a byte; a pair outside the table costs a byte token after
- * a 15 nibble. It exists as a measured experiment (see the README's LZ section
- * for the numbers), not as a replacement for either form. */
+ * alone), 2 (bit 7 alone) and 3 (both) are the three LZ selectors. All three
+ * now carry the same raw LZ4 payload; the old token, fast and hexadecimal
+ * codecs were removed. */
 #define ZPSE_B_LZ_HEX           (UINT8_C(ZPSE_B_LZ) | UINT8_C(ZPSE_B_LZ2))
 /* The entropy-coded LZ form: an intra-block LZ stream, Huffman coded. Its
  * payload is
@@ -212,15 +199,12 @@
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 
-/* Write the fast LZ form and nothing else. With this set the block is one
- * greedy match-finder pass: no probe, no trial, no candidate list, no
- * decision -- which is the trade lz4 makes, and the reason to ask for it.
- * The streams it writes are the same ZPSE_B_LZ2 blocks the deepest level
- * offers as its last candidate, so a decoder needs to know nothing about the
+/* Write an LZ block and nothing else: no probe, no trial, no candidate list,
+ * no decision. With LZ4-backed LZ forms the payload is the same raw LZ4 block
+ * the deepest level offers, so a decoder needs to know nothing about the
  * option. What the caller gives up is the tile forms, and with them the ratio
  * on typed columns, where a transpose plus a predictor beats any LZ parse;
- * what it gets is one pass at the finder's own rate, with the literal and
- * command writing as the only other work. */
+ * what it gets is one LZ4 pass per block with no decision machinery. */
 #define ZPSE_ENC_LZ_FAST        (UINT32_C(1) << 5)
 
 /* Write the page with ONE shape, chosen by measurement rather than by the

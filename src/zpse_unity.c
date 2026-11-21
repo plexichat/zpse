@@ -4,7 +4,6 @@
  * prefixed so the amalgamation has no duplicate symbols. */
 
 #include "crc32c.c"
-#include "lzfast.c"
 #include "repack.c"
 #include "rlefast.c"
 #include "arena.c"
@@ -14,9 +13,11 @@
 #include "mask.c"
 #include "residual.c"
 #include "dense.c"
-#include "lz.c"
-#include "lz2.c"
-#include "lzh.c"
+/* Vendored LZ4 1.10.0 supplies every intra-block LZ codec. lz4block.c keeps
+ * the existing block-form API but routes it through LZ4_compress_default /
+ * LZ4_decompress_safe. */
+#include "vendor/lz4.c"
+#include "lz4block.c"
 #include "huf.c"
 #include "tile.c"
 #include "segment.c"

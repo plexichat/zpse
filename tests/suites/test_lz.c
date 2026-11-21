@@ -119,112 +119,49 @@ static void roundtrip_cases(void)
     }
 }
 
-/* A payload built by hand, so each structural rule can be broken on its
- * own rather than found by chance in a corrupted stream. */
-static uint32_t build_payload(uint8_t *dst, uint32_t cap, uint32_t lit_bytes,
-                              const uint8_t *lits, const uint32_t *cmds,
-                              uint32_t ncmds)
-{
-    uint32_t at = 8u;
-    uint32_t lit_at = 0u;
-    uint32_t i;
-
-    /* One forward stream again: each command is its token byte, its
-     * literals, then its distance. Every command below is small enough for
-     * the token's own nibbles, so no stream here needs an escape. */
-    if (cap < 8u) {
-        return 0u;
-    }
-    for (i = 0; i < ncmds; i++) {
-        uint32_t cw = cmds[i];
-        uint32_t off = cw & 0xFFFFu;
-        uint32_t lit = (cw >> 16) & 0xFFu;
-        uint32_t mlen = ((cw >> 24) & 0xFFu) + ZPSE_LZ_MIN_MATCH;
-        uint32_t v = (off == 0u) ? 0u : (off + 4u);
-
-        if (at + 3u + lit > cap) {
-            return 0u;
-        }
-        dst[at++] = (uint8_t)(((lit << 4) & 0xF0u) |
-                              ((mlen - ZPSE_LZ_MIN_MATCH) & 0x0Fu));
-        if (lit > 0u) {
-            memcpy(dst + at, lits + lit_at, lit);
-            at += lit;
-            lit_at += lit;
-        }
-        while (v >= 0x80u) {
-            dst[at++] = (uint8_t)(v | 0x80u);
-            v >>= 7;
-        }
-        dst[at++] = (uint8_t)v;
-    }
-    zpse_store_u32le(dst, lit_bytes);
-    zpse_store_u32le(dst + 4u, ncmds);
-    return at;
-}
-
-static uint32_t cmd(uint32_t off, uint32_t lit, uint32_t mlen)
-{
-    return (off & 0xFFFFu) | ((lit & 0xFFu) << 16) |
-           (((mlen - ZPSE_LZ_MIN_MATCH) & 0xFFu) << 24);
-}
+/* The LZ forms are LZ4 raw blocks with an eight-byte accounting header, so
+ * there is no token wire format to build by hand any more. The structural
+ * rules are now LZ4's: the output length is known from the block, a match may
+ * not reach outside it, and a short or corrupt block is refused. */
 
 static void hostile_cases(void)
 {
-    static uint8_t buf[256];
-    static const uint8_t lits[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
-    uint32_t cmds[4];
+    static uint8_t seed[64];
     uint32_t pl;
     uint32_t n;
 
-    /* A well-formed two-token stream: four literals, then a match. */
-    cmds[0] = cmd(0u, 4u, 0u);
-    cmds[1] = cmd(4u, 0u, 8u);
-    pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 2u);
-    memset(out, 0, 16u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_OK, "hand-built stream");
-    CHECK(memcmp(out, "\1\2\3\4\1\2\3\4\1\2\3\4", 12u) == 0,
-          "hand-built bytes");
+    for (n = 0; n < sizeof seed; n++) {
+        seed[n] = (uint8_t)(1u + (n & 3u));
+    }
 
-    /* Offset past the bytes written so far. */
-    cmds[0] = cmd(5u, 4u, 8u);
-    pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "offset past start");
+    /* A real payload round-trips, and the LZ4 block inside it is what
+     * carries the bytes -- the eight-byte header is only accounting. */
+    pl = zpse_lz_encode(seed, sizeof seed, payload, sizeof payload, tab,
+                        ZPSE_LZ_HASH_BITS);
+    CHECK(pl > 0u, "seed payload");
+    if (pl == 0u) {
+        return;
+    }
+    memset(out, 0, sizeof out);
+    CHECK(zpse_lz_decode(payload, pl, out, (uint32_t)sizeof seed) == ZPSE_OK,
+          "seed stream");
+    CHECK(memcmp(out, seed, sizeof seed) == 0, "seed bytes");
 
-    /* A match that would write past the output. */
-    cmds[0] = cmd(0u, 4u, 9u);
-    pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "match overruns");
-
-    /* Trailing literals the tokens never emit. */
-    cmds[0] = cmd(0u, 4u, 4u);
-    pl = build_payload(buf, sizeof buf, 8u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "literals unused");
-
-    /* A command after the output is already full. */
-    cmds[0] = cmd(0u, 4u, 8u);
-    cmds[1] = cmd(0u, 0u, 0u);
-    pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 2u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "commands unused");
-
-    /* Zero progress: a literal-only command with no literals. */
-    cmds[0] = cmd(0u, 0u, 0u);
-    pl = build_payload(buf, sizeof buf, 0u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "no progress");
-
-    /* Literal count past the payload. */
-    cmds[0] = cmd(0u, 4u, 0u);
-    pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    zpse_store_u32le(buf, 8u);
-    CHECK(zpse_lz_decode(buf, pl, out, 12u) == ZPSE_BAD_LZ, "literal count");
-
-    /* Not a whole number of command words, and nothing at all. */
-    pl = build_payload(buf, sizeof buf, 4u, lits, cmds, 1u);
-    CHECK(zpse_lz_decode(buf, pl - 1u, out, 12u) == ZPSE_BAD_LZ,
-          "partial command word");
-    CHECK(zpse_lz_decode(buf, 4u, out, 12u) == ZPSE_TRUNCATED, "no commands");
-    CHECK(zpse_lz_decode(buf, pl, out, 0u) == ZPSE_BAD_BLOCK_SIZE,
-          "no output");
+    /* No LZ4 block at all, a header claiming zero commands, a truncated
+     * block, a wrong output length and a zero output length are all refused. */
+    CHECK(zpse_lz_decode(payload, 4u, out, (uint32_t)sizeof seed) == ZPSE_BAD_LZ,
+          "no stream");
+    zpse_store_u32le(payload + 4u, 0u);
+    CHECK(zpse_lz_decode(payload, pl, out, (uint32_t)sizeof seed) == ZPSE_BAD_LZ,
+          "no commands");
+    zpse_store_u32le(payload + 4u, 1u);
+    CHECK(zpse_lz_decode(payload, pl - 1u, out, (uint32_t)sizeof seed) ==
+              ZPSE_BAD_LZ,
+          "partial block");
+    CHECK(zpse_lz_decode(payload, pl, out, (uint32_t)sizeof seed + 1u) ==
+              ZPSE_BAD_LZ,
+          "wrong output size");
+    CHECK(zpse_lz_decode(payload, pl, out, 0u) == ZPSE_BAD_LZ, "no output");
 
     /* Every truncation of a real payload, and every byte corrupted, has to
      * come back as a status. The decode is allowed to write into `out` as

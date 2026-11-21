@@ -2791,12 +2791,25 @@ static const ZpseLevel *zpse_level_row(uint32_t lvl)
     return &zpse_level[lvl <= 9u ? lvl : 9u];
 }
 
-/* Minimum output bytes per LZ command at this level's acceleration factor. */
+/* Minimum output bytes per LZ command.
+ *
+ * The LZ payload is now a raw LZ4 block, so every effort level writes the
+ * identical stream for a given block: there is no lazy pass, wider table or
+ * stronger finder for a deeper level to buy. A level-dependent threshold
+ * would therefore only let a deeper level ACCEPT a block a shallower one
+ * refused, which makes the ladder invert instead of getting smaller. The
+ * threshold is pinned to the balanced level's acceleration factor so the
+ * LZ decision is the same at every level. */
+#define ZPSE_LZ4_SCREEN_NUM 18u
+#define ZPSE_LZ4_SCREEN_SAMPLES 2u
+
 static uint32_t zpse_lz_min_bpc(uint32_t speed)
 {
-    uint32_t accel = (uint32_t)zpse_level_row(zpse_enc_speed(speed))->accel;
+    uint32_t accel;
     uint32_t bpc;
 
+    (void)speed;
+    accel = (uint32_t)zpse_level_row(ZPSE_ENC_SPEED_DEFAULT)->accel;
     if (accel == 0u) {
         accel = 1u;
     }
@@ -3061,8 +3074,10 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                  : (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES;
     }
 #endif
-    const ZpseLevel *row = zpse_level_row(lvl);
-    uint32_t num = (uint32_t)row->screen_num;
+    /* LZ4 writes one stream per block at every level, so the screen must not
+     * vary with the level either: a deeper level that accepts a block the
+     * balanced one refused would write a larger block and invert the ladder. */
+    uint32_t num = (uint32_t)ZPSE_LZ4_SCREEN_NUM;
     uint32_t lz_s;
     uint32_t tile_s;
 
@@ -3156,7 +3171,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * (zeros_burst), and that head prices LZ at several times what the
      * block's pass reaches. Asked only after the tile price has already said
      * yes, so a block the old screen refused pays nothing new. */
-    if (row->samples > 1u && have_best &&
+    if (ZPSE_LZ4_SCREEN_SAMPLES > 1u && have_best &&
         !zpse_block_lz_sample_can_win(lz_s, sn, n, best_total)) {
         uint32_t off = (n - sn) / 2u;
         uint32_t lz_m = zpse_lz_encode_sample(in + off, sn, e->cand,
@@ -3197,7 +3212,7 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                  uint16_t meta_len, uint32_t speed,
                                  int have_best, uint32_t best_total)
 {
-    uint32_t lvl = zpse_enc_speed(speed);
+    (void)speed; /* LZ4 encoding is level-independent; see ZPSE_LZ4_SCREEN_NUM. */
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
                       ? n
                       : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
@@ -3213,8 +3228,10 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                  : (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES;
     }
 #endif
-    const ZpseLevel *row = zpse_level_row(lvl);
-    uint32_t num = (uint32_t)row->screen_num;
+    /* LZ4 writes one stream per block at every level, so the screen must not
+     * vary with the level either: a deeper level that accepts a block the
+     * balanced one refused would write a larger block and invert the ladder. */
+    uint32_t num = (uint32_t)ZPSE_LZ4_SCREEN_NUM;
     uint32_t lz_s;
     uint32_t tile_s;
 
@@ -3254,7 +3271,7 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         (uint64_t)lz_s * (uint64_t)num) {
         return 0;
     }
-    if (row->samples > 1u && have_best) {
+    if (ZPSE_LZ4_SCREEN_SAMPLES > 1u && have_best) {
         uint32_t off = (n - sn) / 2u;
         uint32_t lz_m = zpse_lz2_encode_sample(in + off, sn, e->cand,
                                                (uint32_t)ZPSE_E_SZ_CAND, e->lz,

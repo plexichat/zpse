@@ -145,14 +145,14 @@ int main(void)
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
     }
-    check("alt00FF", 65536u, 79u);
+    check("alt00FF", 65536u, 97u);
 
     memset(in, 0, sizeof in);
     for (i = 0; i < 65536u; i += 256u) {
         in[i] = (uint8_t)i;
         in[i + 1u] = (uint8_t)(i >> 8);
     }
-    check("spike every 256", 65536u, 1066u);
+    check("spike every 256", 65536u, 1326u);
 
     {
         uint32_t r = 0xBEEFu;
@@ -165,7 +165,7 @@ int main(void)
     check("4-bit noise", 65536u, 33280u);
 
     memset(in, 0, sizeof in);
-    check("zeros", 65536u, 67u);
+    check("zeros", 65536u, 78u);
 
     if (fails != 0) {
         printf("DECIDE: %d FAILED\n", fails);

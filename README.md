@@ -68,9 +68,9 @@ and the lz4 *CLI* are not the same encoder.
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.09:1 | 408 | 1908 |
-| | zpse 1 `FASTEST` | 1.27:1 | 816 | 2998 |
-| | zpse 9 `MAX` | 2.31:1 | 183 | 1087 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.12:1 | 506 | 3291 |
+| | zpse 1 `FASTEST` | 1.27:1 | 991 | 3382 |
+| | zpse 9 `MAX` | 2.19:1 | 429 | 2454 |
 | 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.24:1 | 719 | 8562 |
 | | zpse 1 `FASTEST` | 4.02:1 | 1716 | 14528 |
 | | zpse 9 `MAX` | 5.28:1 | 677 | 9128 |
@@ -84,65 +84,54 @@ The short version:
 
 * **Typed columns are the strong case.** Predictors and byte transposes beat a
   match finder when values are monotone, fixed-width or dictionary-coded.
-* **Text is the weak case, and the match finder is why.** On Silesia the LZ
-  pass is between 33% and 92% of a block's encode, and the finder itself runs
-  at 220-790 MB/s on those files. The probe, the trials and the entropy pass
-  are the minority of the time; the pass is the ceiling.
-* **Decode is fast** because the tile path is a vectorised reconstruction
-  rather than a serial command loop, and the fast LZ form decodes in one tight
-  C+E+B loop -- literal copy, escape decode and match-body copy -- with no
-  per-field checks in its trusted region.
-* **Encode is the price.** The encoder chooses a shape per block; lz4 makes no
-  such decision and is about four times faster on text.
+* **Text is the weak case, and the block decision is why.** LZ compression is
+  now done by vendored LZ4 1.10.0, so the cost is the per-block shape sweep --
+  the screens, the tile trials and the candidate pricing -- rather than a
+  custom match finder.
+* **Decode is fast** because the tile path is a vectorised reconstruction and
+  the LZ forms are raw LZ4 blocks decoded by `LZ4_decompress_safe` into the
+  block's declared output size.
+* **Encode is the price.** The encoder still chooses a shape per block; lz4
+  makes no such decision. The LZ work inside that decision is LZ4's, so the
+  remaining gap is the decision itself.
 
 ### Silesia
 
 Twelve real files, 211,938,580 bytes, fetched from
 `mattmahoney.net/dc/silesia.zip` by `tests/benchmarks/silesia.sh`. Per-file
 rows are the CLI's own block bench at the default level, best of two, one
-pinned core, output written normally.
+pinned core, output written normally. These rows were regenerated with
+`SILESIA_DIR=... CC=gcc bash tests/benchmarks/silesia.sh 6 2` under WSL2
+(gcc 15.2); they are not directly comparable to the clang-built tables below.
 
 | file | bytes | ratio | encode MB/s | decode MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| `dickens` | 10,192,446 | 1.23:1 | 830 | 4787 |
-| `mozilla` | 51,220,480 | 2.01:1 | 328 | 1419 |
-| `mr` | 9,970,564 | 2.50:1 | 332 | 1431 |
-| `nci` | 33,553,445 | 5.43:1 | 585 | 1840 |
-| `ooffice` | 6,152,192 | 1.49:1 | 241 | 1183 |
-| `osdb` | 10,085,684 | 1.15:1 | 602 | 4713 |
-| `reymont` | 6,627,202 | 1.99:1 | 344 | 2085 |
-| `samba` | 21,606,400 | 2.59:1 | 442 | 1902 |
-| `sao` | 7,251,944 | 1.01:1 | 1026 | 7533 |
-| `webster` | 41,458,703 | 2.10:1 | 345 | 2116 |
-| `x-ray` | 8,474,240 | 1.71:1 | 475 | 3011 |
-| `xml` | 5,345,280 | 4.20:1 | 618 | 2247 |
-| **total** | **211,938,580** | **2.09:1** | **408** | **1908** |
+| `dickens` | 10,192,446 | 1.35:1 | 568 | 4046 |
+| `mozilla` | 51,220,480 | 1.92:1 | 494 | 3154 |
+| `mr` | 9,970,564 | 2.49:1 | 429 | 1360 |
+| `nci` | 33,553,445 | 5.21:1 | 702 | 4632 |
+| `ooffice` | 6,152,192 | 1.47:1 | 406 | 3179 |
+| `osdb` | 10,085,684 | 1.90:1 | 502 | 4527 |
+| `reymont` | 6,627,202 | 1.85:1 | 429 | 2495 |
+| `samba` | 21,606,400 | 2.54:1 | 560 | 3772 |
+| `sao` | 7,251,944 | 1.09:1 | 471 | 4119 |
+| `webster` | 41,458,703 | 2.01:1 | 416 | 3343 |
+| `x-ray` | 8,474,240 | 1.71:1 | 587 | 2801 |
+| `xml` | 5,345,280 | 3.91:1 | 714 | 4016 |
+| **total** | **211,938,580** | **2.12:1** | **506** | **3291** |
 
 Half of Silesia is English prose, the shape the tile model is weakest on.
 `sao` and `osdb` are close to the raw path doing a copy; `nci`, `samba` and
 `xml` are the structured files the predictors handle well.
 
-### Where a Silesia encode actually goes
+### Where a Silesia encode goes now
 
-`build/blkstat` (a scratch tool, not part of the suite) reads the library's own
-`ZPSE_BLOCK_STATS` cycle counters and attributes a block's encode to the
-decision probe, the full trials, the match-finder pass and the two pre-passes.
-Level 6, 64 KiB blocks, best of three passes per file:
-
-| file | finder | probe | trials | gate + order | rest | block MB/s |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `webster` | 91.0% | 0.0% | 0.1% | 6.1% | 2.8% | 340 |
-| `reymont` | 90.9% | 0.3% | 0.0% | 5.5% | 3.2% | 366 |
-| `xml` | 79.3% | 2.0% | 1.7% | 10.1% | 6.9% | 620 |
-| `ooffice` | 80.2% | 8.0% | 5.0% | 0.5% | 6.4% | 243 |
-| `mozilla` | 68.5% | 10.7% | 6.8% | 0.7% | 13.2% | 351 |
-| `samba` | 70.5% | 7.1% | 6.3% | 5.1% | 10.9% | 450 |
-| `nci` | 63.1% | 22.5% | 2.6% | 5.0% | 6.7% | 604 |
-| `dickens` | 59.3% | 1.1% | 7.7% | 13.3% | 18.6% | 878 |
-| `osdb` | 43.1% | 22.3% | 20.0% | 1.0% | 13.7% | 690 |
-| `sao` | 31.1% | 34.8% | 9.3% | 1.8% | 23.0% | 1075 |
-| `mr` | 0.5% | 12.3% | 51.3% | 0.9% | 34.9% | 344 |
-| `x-ray` | 0.0% | 18.4% | 54.1% | 0.7% | 26.7% | 470 |
+The old per-stage counter table is gone with the custom match finder: there is
+no finder pass to attribute time to any more. A block still pays for the
+screens, the tile trials and the final candidate pricing, but the LZ candidate
+itself is now a single `LZ4_compress_default` call. The per-file totals above
+are the current figures; the stage breakdown was produced by a scratch tool
+that is not part of the suite and was not re-run for this change.
 
 That is the answer to "why is the whole path not 500 MB/s": on the text and
 executable files the block is one match-finder pass, and the finder runs at
@@ -444,29 +433,24 @@ data. A plane that is one value throughout has a dense form that codes 4 KiB in
 twelve bytes. An all-ASCII block has a seven-bit form that packs eight
 characters into seven bytes.
 
-A block may instead be coded as **intra-block LZ**: a literal stream and a
-command stream, with every reference a 16-bit distance inside the block. The
-four most recent distances are numbered 1 to 4 and cost nothing to name again.
-The **fast LZ** form (`ZPSE_ENC_LZ_FAST`) uses a fixed 16-bit distance and no
-distance varint or repeat code -- exactly lz4's shape -- and is offered at
-the deepest levels or requested explicitly. The **hexadecimal LZ** form packs
-common literal/length pairs into a nibble and is used for page-sized blocks
-from level 7 up. Every form is kept only when it is strictly smaller than
-everything already tried.
+A block may instead be coded as **intra-block LZ**. Every LZ form is now a raw
+block from vendored **LZ4 1.10.0** (`src/vendor/lz4.c`, BSD-2, notice in
+`src/vendor/LICENSE.lz4`): `LZ4_compress_default` on the way in and
+`LZ4_decompress_safe` on the way out, with the block's uncompressed size as the
+only parameter the decoder needs. The three block-form selectors (`ZPSE_B_LZ`,
+`ZPSE_B_LZ2`, `ZPSE_B_LZ_HEX`) and `ZPSE_ENC_LZ_FAST` are still accepted and
+still select an LZ block, but they all carry the same LZ4 payload; the old
+token, varint-distance, repeat-cache, hexadecimal and `lzfast` codecs are gone.
+An LZ block is kept only when it is smaller than everything already tried.
 
-At the deepest level a block's LZ payload may be coded a second time, by
-**Huffman**: four fixed ten-bit tables, fitted offline on real LZ payloads
-(`tests/benchmarks/huf_train.c`) and compiled in, with each block naming the
-one it used. The payload is split into four independent bit streams, so the
-entropy layer has four chains to run side by side and no dictionary to carry,
-and it wraps a payload that already won rather than replacing the match
-finder -- which is why it composes with every LZ form. It is offered from
-level 9 up, or at any level with `ZPSE_ENC_HUF`, and kept only when it saves at
-least a sixty-fourth of the payload it wraps. Over `dickens`, `nci` and
-`mozilla` at level 9 it takes 71% of blocks and cuts the payloads it wraps by
-6.9%, for 10 KiB of read-only tables. The writer runs at 1.66-1.70 cycles per
-byte of payload (2.2 GB/s) on real Silesia payloads and the reader at 2.4
-(1.5 GB/s), both scalar, with no per-block state and no allocation.
+At the deepest level a block's LZ4 payload may be coded a second time, by
+**Huffman**: four fixed ten-bit tables compiled in from `src/huf_tables.inc`,
+with each block naming the one it used. The payload is split into four
+independent bit streams and wraps a payload that already won, so it composes
+with the LZ4 form. It is offered from level 9 up, or at any level with
+`ZPSE_ENC_HUF`, and kept only when it saves at least a sixty-fourth of the
+payload it wraps. It is a size-only option: if the entropy layer does not pay
+for itself on an LZ4 stream the block stays as raw LZ4.
 
 All block forms carry the same header shape and decode independently. That is
 what makes a block the unit of random access, and an optional `FrameIndex` lets
@@ -482,10 +466,6 @@ header's CRC field is written as 0 and no pass is made.
 
 **FLAT7** (`F7P1`) is a whole ASCII frame: a 40-byte header and one 7-bit-packed
 region, with a redundancy gate that leaves repetitive ASCII on the ladder.
-
-**lzfast** is a minimal LZ4-style finder and raw token stream — no header of its
-own, fixed two-byte distances, and no lazy probe, backward walk or repeat slots.
-It is a library entry point with no CLI flag.
 
 **REPACK** (`ZRPK`) maps a low-alphabet ASCII buffer to dense w-bit codes
 (w = 1..7), with a 16-byte inverse map for w <= 4 and a 128-byte one otherwise;
@@ -557,7 +537,7 @@ print the same digest in all three. The benchmarks are all under
 | `bench.c` | 64 KiB byte patterns and machine ceilings |
 | `bench_levels.c` | nine levels over the 25-case columnar matrix |
 | `bench_columnar.c` | per-case transforms and cross-codec comparison |
-| `bench_lz2.c` | both intra-block LZ codecs: encode and decode rate, `ZPSE_LZ2_BLOCK` for a page-sized block |
+| `bench_lz2.c` | both intra-block LZ form entry points (now LZ4-backed): encode and decode rate |
 | `bench_pareto.sh` | ratio/encode/decode frontier against lz4 and zstd |
 | `silesia.sh` | Silesia per-file table (downloads the corpus) |
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
@@ -608,30 +588,28 @@ adds an in-memory FLAT7 arm to `bench`, `-R` adds an in-memory ZRPK arm to
 
 ## Known limitations
 
-* **No cross-block window, one optional entropy stage.** The match finder is a
-  single-probe hash one (lz4's shape, not zstd's search), and each block is
-  independent. The Huffman form wraps a winning LZ payload and is offered at
-  level 9 or on request; it is not a general entropy coder for the tile forms.
-  Ratio loses to zstd on redundant text and on memory pages.
+* **No cross-block window, one optional entropy stage.** LZ blocks are raw LZ4
+  blocks, whose 2-byte distances give a 64 KiB window by definition, so each
+  block is independent. The Huffman form wraps a winning LZ4 payload and is
+  offered at level 9 or on request; it is not a general entropy coder for the
+  tile forms. Ratio loses to zstd on redundant text and on memory pages.
 * **Encode is slower than lz4's** because every block is decided, not merely
-  encoded, and because the match finder runs once per block at 220-790 MB/s on
-  real data. On Silesia the default level is about 27% of the lz4 CLI's encode
-  rate at the same ratio; on typed columns the two run at the same rate and
-  zpse's stream is 42% smaller.
+  encoded: the screens, tile trials and candidate pricing dominate. The LZ
+  candidate itself is a single LZ4 call. On Silesia the default level encodes
+  at about 506 MB/s against lz4 1's ~830 MB/s in the same CLI harness.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
   is the only metric, level 4 is the lever. The per-block
   `ZPSE_ENC_DECODE_FAST` (`-D`) bit is accepted but currently inert: no encoder
   path reads it, so it does not change which form is written.
-* **The whole-frame paths are caller-driven.** Five paths sit outside the
+* **The whole-frame paths are caller-driven.** Four paths sit outside the
   ladder. FLAT7 (`F7P1`), REPACK (`ZRPK`), RLE1 (`RLE1`) and f64fast (`F64F`)
   are self-delimiting containers with a magic and a narrow input gate; each
-  declines anything outside its gate back to the ordinary block codec. lzfast
-  is a bare LZ4-style token stream with no header, gate or magic of its own.
-  FLAT7 and REPACK have in-memory A/B arms in `bench` (`-F7`/`-7` and `-R`);
-  lzfast, RLE1 and f64fast are library entry points with no CLI flag. None is
-  a general-purpose replacement for the ladder. REPACK is a ratio codec, not
-  a speed path: its decode is much slower than the ordinary block decoder.
+  declines anything outside its gate back to the ordinary block codec. FLAT7
+  and REPACK have in-memory A/B arms in `bench` (`-F7`/`-7` and `-R`); RLE1 and
+  f64fast are library entry points with no CLI flag. None is a general-purpose
+  replacement for the ladder. REPACK is a ratio codec, not a speed path: its
+  decode is much slower than the ordinary block decoder.
 * **No column semantics.** The format does not know record boundaries or null
   meanings; the byte transpose recovers the split for fixed-width records by
   accident. A nullable column costs more than null suppression would.
