@@ -8,11 +8,12 @@
  * SSE2 inclusive scan and a scatter of the escapes; nothing here calls the
  * block/segment machinery.
  *
- * PRODUCTION FORM: selected only by ZPSE_ENC_DPCM1 on the frame encoder. No
- * runtime toggle. The prefix probe and the content gate below are the exact
- * predicates the measured prototype used, with the raw prefix added so the
- * x-ray file's 240-byte header is preserved byte for byte instead of being
- * escaped as 120 samples.
+ * PRODUCTION FORM: the frame encoder tries this codec by default at every
+ * level, before MRD and before the PSE1 ladder. ZPSE_ENC_DPCM1 is accepted but
+ * ignored (deprecated no-op); only CHECKSUM skips the attempt. The prefix probe
+ * and the content gate below are the exact predicates the measured prototype
+ * used, with the raw prefix added so the x-ray file's 240-byte header is
+ * preserved byte for byte instead of being escaped as 120 samples.
  */
 
 #include "zpse/dpcm1.h"

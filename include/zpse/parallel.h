@@ -163,7 +163,9 @@ int zpse_compress_frame_stream(const uint8_t *in, size_t in_len,
  * Returns ZPSE_OK with *out_len_out, or a negative status.
  *
  * FLAT7 frames are never emitted by the parallel/stream APIs, and parallel
- * decode declines them with ZPSE_UNSUPPORTED_FEATURE (they carry no index). */
+ * decode declines them with ZPSE_UNSUPPORTED_FEATURE (they carry no index).
+ * Whole-frame streams (ZRPK, RLE1, F64F, DCM1, MRD1) are indivisible and
+ * decode serially on the calling thread regardless of `threads`. */
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    uint8_t *output, size_t out_cap,
                                    size_t *out_len_out, unsigned threads,

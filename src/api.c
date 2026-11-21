@@ -16,13 +16,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Opt-in whole-frame codecs. These three bits are defined here rather than in
- * a public header because this translation unit is the only consumer; the header
+/* Whole-frame codec flags. These five bits are defined here rather than in a
+ * public header because this translation unit is the only consumer; the header
  * owner can promote them verbatim without changing any behaviour. They sit
  * above every allocated ZPSE_ENC_* bit (12 is PAGE_HUF, 13 is PAGE_INSTANT,
- * 11 stays reserved), so no existing caller's flags change meaning and the
- * default PSE1 path is byte-for-byte what it was. The flag only affects
- * zpse_compress_frame_ex; every other _ex entry point ignores it. */
+ * 11 stays reserved), so no existing caller's flags change meaning.
+ *
+ * Bits 14-16 (REPACK / RLEFAST / F64FAST) are still pure opt-ins: no bit means
+ * no attempt. Bits 17-18 (DPCM1 / MRD) are DEPRECATED NO-OPs: the two 16-bit
+ * codecs are content-gated and run by default on every call to
+ * zpse_compress_frame_ex without CHECKSUM, so passing either bit produces the
+ * same bytes as passing none. The bits remain accepted so an older caller
+ * still compiles and round-trips. All five are stripped before the block
+ * encoder sees them, and only zpse_compress_frame_ex acts on them. */
 #ifndef ZPSE_ENC_REPACK
 #define ZPSE_ENC_REPACK (UINT32_C(1) << 14)
 #endif
@@ -60,9 +66,9 @@ static uint64_t api_load64le(const uint8_t *p)
     return (uint64_t)api_load32le(p) | ((uint64_t)api_load32le(p + 4) << 32);
 }
 
-/* Six distinct four-byte magics: PSE1 = "PSE1", F7P1 = "F7P1",
- * "ZRPK", "RLE1", "F64F" and "DCM1". They differ in at least one byte, so no
- * sniff below can match a normal PSE1 frame or another whole-frame form. */
+/* Seven distinct four-byte magics: PSE1 = "PSE1", F7P1 = "F7P1",
+ * "ZRPK", "RLE1", "F64F", "DCM1" and "MRD1". They differ in at least one byte,
+ * so no sniff below can match a normal PSE1 frame or another whole-frame form. */
 static int api_is_zrpk(const uint8_t *in, size_t in_len)
 {
     return in_len >= 4u && in[0] == 'Z' && in[1] == 'R' &&
@@ -81,7 +87,7 @@ static int api_is_f64f(const uint8_t *in, size_t in_len)
            in[2] == '4' && in[3] == 'F';
 }
 
-/* A sixth whole-frame magic: "DCM1", the 16-bit-sample DPCM form. */
+/* The sixth whole-frame magic: "DCM1", the 16-bit-sample DPCM form. */
 static int api_is_dcm1(const uint8_t *in, size_t in_len)
 {
     return in_len >= 4u && in[0] == 'D' && in[1] == 'C' &&
@@ -108,11 +114,13 @@ static int api_is_mrd1(const uint8_t *in, size_t in_len)
  * means that codec would decline on its own, so skipping it cannot change a
  * verdict or a byte of output. A set flag only means the codec is still worth
  * calling; its own gate and capacity checks remain the final authority. The
- * attempt order is deliberately left as repack, rlefast, f64fast, dpcm1 --
- * several codecs can accept the same input, and reordering would change which
- * magic the first commit writes. DPCM1 has no shared pre-gate fact (its own
- * prefix probe and content gate are its first action). No pre-gate fact is
- * computed for a codec that was not opted in. */
+ * attempt order is deliberately left as repack, rlefast, f64fast -- several
+ * codecs can accept the same input, and reordering would change which magic
+ * the first commit writes. No pre-gate fact is computed for a codec that was
+ * not opted in. DPCM1 and MRD are not part of this opt-in set: they run
+ * unconditionally (subject only to CHECKSUM) in a separate block below, and
+ * each opens with its own prefix probe and content gate, so neither needs a
+ * shared pre-gate fact. */
 static void api_wf_sample_gates(const uint8_t *in, size_t n,
                                 int *ascii_ok, int *rle_ok)
 {
@@ -189,11 +197,13 @@ const char *zpse_version_string(void)
 /* Encoder options are ZPSE_ENC_CHECKSUM, ZPSE_ENC_LZ_FAST, ZPSE_ENC_PAGE_FAST,
  * ZPSE_ENC_LZ_HEX, ZPSE_ENC_HUF, ZPSE_ENC_DECODE_FAST, ZPSE_ENC_PAGE_TURBO,
  * ZPSE_ENC_PAGE_HUF and ZPSE_ENC_PAGE_INSTANT, plus one of the nine levels in
- * bits 1-4 (an empty level field means the default level). The four whole-frame
- * opt-ins (ZPSE_ENC_REPACK / ZPSE_ENC_RLEFAST / ZPSE_ENC_F64FAST /
- * ZPSE_ENC_DPCM1, bits 14, 15, 16 and 17) are accepted here so a caller may
- * pass them without a BAD_ARG, but only the frame encoder acts on them.
- * Anything else is a bad argument rather than a silent round to a neighbour:
+ * bits 1-4 (an empty level field means the default level). The five frame-level
+ * flags (ZPSE_ENC_REPACK / ZPSE_ENC_RLEFAST / ZPSE_ENC_F64FAST /
+ * ZPSE_ENC_DPCM1 / ZPSE_ENC_MRD, bits 14-18) are all accepted here so a caller
+ * may pass them without a BAD_ARG. Only zpse_compress_frame_ex acts on them:
+ * bits 14-16 are genuine opt-ins; bits 17-18 are deprecated no-ops because
+ * those codecs now run by default. Anything else is a bad argument rather than
+ * a silent round to a neighbour:
  * the level is the caller's own speed/size trade, so a codec that cannot
  * honour it must say so. Bits outside those fields are refused for the same
  * reason -- notably bit 11, which stays reserved. */
@@ -318,20 +328,18 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     if (!enc_flags_ok(enc_flags)) {
         return ZPSE_BAD_ARG;
     }
-    /* Opt-in whole-frame forms. This is ADDITIVE: with no bit set the body
-     * below is the original PSE1 frame encoder, byte for byte. A checksum
-     * cannot be carried by a whole-frame stream, so those requests fall
-     * through to the normal encoder too. The combined pre-gate above lets a
-     * codec be skipped when its own cheap gate would certainly decline; the
-     * codecs that remain are still tried in the original order (first commit
-     * wins), so both accepted streams and declines are unchanged. */
-    if ((enc_flags & ZPSE_WHOLE_FRAME_FLAGS) != 0u &&
+    /* Opt-in whole-frame forms: only bits 14-16 still control an attempt.
+     * With none of them set this block is skipped entirely. A checksum cannot
+     * be carried by a whole-frame stream, so those requests fall through to
+     * the normal encoder too. The combined pre-gate above lets a codec be
+     * skipped when its own cheap gate would certainly decline; the codecs that
+     * remain are still tried in the original order (first commit wins). */
+    if ((enc_flags & (ZPSE_ENC_REPACK | ZPSE_ENC_RLEFAST |
+                      ZPSE_ENC_F64FAST)) != 0u &&
         (enc_flags & ZPSE_ENC_CHECKSUM) == 0u) {
         int repack_on = (enc_flags & ZPSE_ENC_REPACK) != 0u;
         int rle_on = (enc_flags & ZPSE_ENC_RLEFAST) != 0u;
         int f64_on = (enc_flags & ZPSE_ENC_F64FAST) != 0u;
-        int dpcm_on = (enc_flags & ZPSE_ENC_DPCM1) != 0u;
-        int mrd_on = (enc_flags & ZPSE_ENC_MRD) != 0u;
         int ascii_ok = 1;
         int rle_ok = 0;
         size_t repack_len = 0;
@@ -377,32 +385,32 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
                 return ZPSE_OK;
             }
         }
-        /* DPCM1 is tried last. It has no shared pre-gate fact: its own prefix
-         * probe and content gate are the first thing it does, so an opted-in
-         * call always reaches it and a decline leaves out untouched. */
-        if (dpcm_on && n <= (size_t)UINT32_MAX) {
-            uint32_t cap32 = (out_cap > (size_t)UINT32_MAX)
-                                 ? UINT32_MAX : (uint32_t)out_cap;
-            uint32_t dpcm_len = 0u;
+    }
+    /* Default whole-frame forms. DPCM1 (16-bit rough deltas, x-ray shape) and
+     * MRD (16-bit zero-heavy deltas, mr shape) are enabled at every level and
+     * need no flag: each opens with its own prefix probe and content gate and
+     * is the first thing that touches `out` on that attempt, so a decline
+     * leaves the buffer untouched for the next codec or the PSE1 encoder. Bits
+     * 17 and 18 are accepted but ignored -- passing them changes no byte. The
+     * level field still controls every PSE1 file normally; these two codecs
+     * are not levels and are tried in the fixed order DPCM1, then MRD. A
+     * CHECKSUM request skips both, since neither whole-frame form can carry a
+     * payload CRC. */
+    if ((enc_flags & ZPSE_ENC_CHECKSUM) == 0u &&
+        n <= (size_t)UINT32_MAX) {
+        uint32_t cap32 = (out_cap > (size_t)UINT32_MAX)
+                             ? UINT32_MAX : (uint32_t)out_cap;
+        uint32_t wf_len = 0u;
 
-            if (zpse_dpcm1_encode(in, (uint32_t)n, out, cap32,
-                                  &dpcm_len) == ZPSE_DPCM1_COMMIT) {
-                *out_len_out = (size_t)dpcm_len;
-                return ZPSE_OK;
-            }
+        if (zpse_dpcm1_encode(in, (uint32_t)n, out, cap32, &wf_len) ==
+            ZPSE_DPCM1_COMMIT) {
+            *out_len_out = (size_t)wf_len;
+            return ZPSE_OK;
         }
-        /* MRD is tried last, after DPCM1. Its own prefix probe and content
-         * gate are its first action, so a decline leaves out untouched. */
-        if (mrd_on && n <= (size_t)UINT32_MAX) {
-            uint32_t cap32 = (out_cap > (size_t)UINT32_MAX)
-                                 ? UINT32_MAX : (uint32_t)out_cap;
-            uint32_t mrd_len = 0u;
-
-            if (zpse_mrd_encode(in, (uint32_t)n, out, cap32,
-                                &mrd_len) == ZPSE_MRD_COMMIT) {
-                *out_len_out = (size_t)mrd_len;
-                return ZPSE_OK;
-            }
+        if (zpse_mrd_encode(in, (uint32_t)n, out, cap32, &wf_len) ==
+            ZPSE_MRD_COMMIT) {
+            *out_len_out = (size_t)wf_len;
+            return ZPSE_OK;
         }
     }
     rc = zpse_encoder_init(&enc, enc_arena, (size_t)ZPSE_ENC_ARENA_SIZE);

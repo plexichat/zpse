@@ -443,6 +443,134 @@ static void run_stream_case(uint32_t n, uint32_t block, unsigned max_threads,
     }
 }
 
+/* ---- whole-frame streams on the parallel decoder -----------------------
+ * DCM1/MRD1 streams are indivisible: they carry no FrameIndex, so the
+ * parallel entry point has to hand them to the serial dispatcher. The two
+ * builders below are copied from test_hostile.c so these valid streams are
+ * written by hand, independent of the encoder. */
+static uint32_t wf_dpcm1_build(uint8_t *b, uint32_t ns, uint16_t first,
+                               const uint8_t *deltas,
+                               const uint8_t *prefix, uint32_t plen,
+                               const uint8_t *esctab, uint32_t ne)
+{
+    uint32_t nd = ns - 1u;
+    uint32_t n = 2u * ns + plen;
+    uint32_t i;
+
+    memset(b, 0, 16u + plen + nd + 6u * ne);
+    b[0] = 'D'; b[1] = 'C'; b[2] = 'M'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, first);
+    zpse_store_u16le(b + 10u, (uint16_t)plen);
+    zpse_store_u32le(b + 12u, ne);
+    for (i = 0u; i < plen; i++) b[16u + i] = prefix[i];
+    for (i = 0u; i < nd; i++) b[16u + plen + i] = deltas[i];
+    for (i = 0u; i < 6u * ne; i++) b[16u + plen + nd + i] = esctab[i];
+    return 16u + plen + nd + 6u * ne;
+}
+
+static uint32_t wf_dpcm1_base(uint8_t *b, uint8_t *deltas)
+{
+    uint32_t i;
+
+    for (i = 0u; i < 16u; i++) deltas[i] = 20u;
+    return wf_dpcm1_build(b, 16u, 0x1000u, deltas, 0, 0u, 0, 0u);
+}
+
+static uint32_t wf_mrd_build(uint8_t *b, uint32_t n, uint16_t first,
+                             const uint8_t *cs, uint32_t coff,
+                             const uint8_t *esctab, uint32_t ne,
+                             uint32_t nruns)
+{
+    uint32_t i;
+
+    memset(b, 0, 24u + coff + 6u * ne);
+    b[0] = 'M'; b[1] = 'R'; b[2] = 'D'; b[3] = '1';
+    zpse_store_u32le(b + 4u, n);
+    zpse_store_u16le(b + 8u, first);
+    zpse_store_u16le(b + 10u, 0u);
+    zpse_store_u32le(b + 12u, ne);
+    zpse_store_u32le(b + 16u, coff);
+    zpse_store_u32le(b + 20u, nruns);
+    for (i = 0u; i < coff; i++) b[24u + i] = cs[i];
+    for (i = 0u; i < 6u * ne; i++) b[24u + coff + i] = esctab[i];
+    return 24u + coff + 6u * ne;
+}
+
+static void check_whole_frame_decode(const char *name, const uint8_t *b,
+                                     size_t len, size_t want_n)
+{
+    static const unsigned thread_counts[] = { 1u, 4u };
+    uint8_t serial_out[256u + 16u];
+    uint8_t par_out[256u + 16u];
+    size_t slen = 0u;
+    unsigned k;
+
+    memset(serial_out, 0xCC, sizeof serial_out);
+    CHECK(zpse_decompress_frame(b, len, serial_out, sizeof serial_out, &slen,
+                                da) == ZPSE_OK && slen == want_n,
+          "%s: serial decode", name);
+    for (k = 0u; k < sizeof thread_counts / sizeof thread_counts[0]; k++) {
+        unsigned t = thread_counts[k];
+        size_t got = 0u;
+        size_t i;
+        int clean;
+        int rc;
+
+        memset(par_out, 0xCC, sizeof par_out);
+        rc = zpse_decompress_frame_parallel(b, len, par_out, sizeof par_out,
+                                            &got, t, (void *const *)decs,
+                                            MAXTHREADS);
+        clean = (rc == ZPSE_OK && got == slen &&
+                 memcmp(par_out, serial_out, slen) == 0);
+        for (i = slen; i < sizeof par_out; i++) {
+            if (par_out[i] != 0xCCu) clean = 0;
+        }
+        CHECK(clean, "%s: %u workers decode byte-exactly (%s)", name, t,
+              zpse_status_name(rc));
+    }
+}
+
+static void whole_frame_decode(void)
+{
+    uint8_t b[256u];
+    uint8_t deltas[80u];
+    uint32_t len;
+
+    /* DCM1: 16 samples, all deltas +20 -> a 31-byte stream. */
+    len = wf_dpcm1_base(b, deltas);
+    CHECK(len == 31u, "dpcm1: hand-built stream is 31 bytes");
+    check_whole_frame_decode("DCM1", b, len, 32u);
+
+    /* MRD1: 81 samples, 80 literal +10 deltas -> a 104-byte stream. */
+    {
+        uint32_t i;
+
+        for (i = 0u; i < 80u; i++) deltas[i] = 10u;
+    }
+    len = wf_mrd_build(b, 162u, 1000u, deltas, 80u, 0u, 0u, 0u);
+    CHECK(len == 104u, "mrd1: hand-built stream is 104 bytes");
+    check_whole_frame_decode("MRD1", b, len, 162u);
+
+    /* The lower floor must not turn a genuinely short or corrupt PSE1 frame
+     * into a false success on the serial delegation path. */
+    {
+        size_t got = 0u;
+        uint8_t bad[32u];
+
+        memset(bad, 'X', sizeof bad);
+        CHECK(zpse_decompress_frame_parallel(bad, 4u, out, sizeof out, &got,
+                                             4u, (void *const *)decs,
+                                             MAXTHREADS) == ZPSE_TRUNCATED,
+              "short PSE1 stream is still TRUNCATED");
+        CHECK(zpse_decompress_frame_parallel(bad, sizeof bad, out,
+                                             sizeof out, &got, 4u,
+                                             (void *const *)decs,
+                                             MAXTHREADS) == ZPSE_BAD_MAGIC,
+              "corrupt PSE1 magic is still BAD_MAGIC");
+    }
+}
+
 int main(void)
 {
     static const unsigned counts[] = { 2u, 3u, 4u, MAXTHREADS };
@@ -530,6 +658,8 @@ int main(void)
     run_stream_case(96u * 1024u, 4096u, MAXTHREADS,
                     (uint32_t)(ZPSE_ENC_LZ_FAST | ZPSE_ENC_CHECKSUM), 3, 1,
                     3u);
+
+    whole_frame_decode();
 
     printf("PARALLEL: %s (%d checks, digest %08x)\n",
            fails == 0 ? "ALL OK" : "FAILURES", checks, (unsigned)digest);

@@ -29,6 +29,7 @@ static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
 
 static uint8_t in[FRAME_N];
 static uint8_t comp[FRAME_N + 2u * BLK];
+static uint8_t comp2[FRAME_N + 2u * BLK];
 static uint8_t out[FRAME_N];
 static uint8_t blk[BLK];
 
@@ -679,6 +680,132 @@ static void text_overlong(void)
     }
 }
 
+/* ---- default-on 16-bit whole-frame codecs ------------------------------
+ * Two deterministic 16-bit shapes: x-ray (a 240-byte verbatim zero header
+ * followed by ~25-mean int8 deltas) and mr (no header, ~11-mean deltas with
+ * one zero in every twelve). The encoder's content gates should pick DCM1 and
+ * MRD1 for these on a plain flags=0 call at every level, with no codec flag. */
+#define WF_DPCM1_FLAG (UINT32_C(1) << 17)
+#define WF_MRD_FLAG   (UINT32_C(1) << 18)
+
+static uint16_t wf_wrap16(int32_t v)
+{
+    while (v < 0) v += 65536;
+    while (v > 65535) v -= 65536;
+    return (uint16_t)v;
+}
+
+static void fill_xray(uint8_t *p, uint32_t n)
+{
+    static const int16_t step[6] = { 25, -20, 30, -25, 28, -22 };
+    uint32_t prefix = 240u;
+    uint32_t ns, i;
+    uint16_t v = 4096u;
+
+    memset(p, 0, n);
+    ns = n / 2u - prefix / 2u;
+    zpse_store_u16le(p + prefix, v);
+    for (i = 1u; i < ns; i++) {
+        v = wf_wrap16((int32_t)v + step[i % 6u]);
+        zpse_store_u16le(p + prefix + 2u * i, v);
+    }
+}
+
+static void fill_mr(uint8_t *p, uint32_t n)
+{
+    /* MRD samples every third delta on a 64 KiB frame (8192 of 32767), so
+     * delta indices 0/3/6/9 (mod 12) are the ones the gate sees. One of them
+     * is zero and the other three carry ~13, giving mean ~10 and 25% zeros. */
+    static const int16_t step[12] = {
+        0, 12, -11, 14, -12, 10, -14, 11, -10, 13, -11, 12
+    };
+    uint32_t ns = n / 2u;
+    uint32_t i;
+    uint16_t v = 1000u;
+
+    zpse_store_u16le(p, v);
+    for (i = 1u; i < ns; i++) {
+        v = wf_wrap16((int32_t)v + step[(i - 1u) % 12u]);
+        zpse_store_u16le(p + 2u * i, v);
+    }
+}
+
+static void whole_frame_defaults(void)
+{
+    static const uint32_t levels[] = { 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u };
+    static const char want_magic[2][5] = { "DCM1", "MRD1" };
+    static const uint32_t want_bits[2] = { WF_DPCM1_FLAG, WF_MRD_FLAG };
+    const uint32_t n = BLK;
+    unsigned shape, li;
+
+    for (shape = 0u; shape < 2u; shape++) {
+        size_t clen = 0, plen = 0, olen = 0, got = 0;
+        uint32_t got32 = 0u;
+        size_t j;
+        int touched;
+
+        if (shape == 0u) {
+            fill_xray(in, n);
+        } else {
+            fill_mr(in, n);
+        }
+
+        for (li = 0u; li < 9u; li++) {
+            uint32_t flags = levels[li] << ZPSE_ENC_SPEED_SHIFT;
+
+            CHECK(zpse_compress_frame_ex(in, n, comp, sizeof comp, &clen,
+                                         BLK, flags, ea) == ZPSE_OK,
+                  "whole-frame level %u encode", levels[li]);
+            CHECK(memcmp(comp, want_magic[shape], 4u) == 0,
+                  "whole-frame level %u selected %s (got %.4s)", levels[li],
+                  want_magic[shape], (const char *)comp);
+            memset(out, 0x5A, sizeof out);
+            CHECK(zpse_decompress_frame(comp, clen, out, sizeof out, &olen,
+                                        da) == ZPSE_OK,
+                  "whole-frame level %u decode", levels[li]);
+            CHECK(olen == n && memcmp(out, in, n) == 0,
+                  "whole-frame level %u decoded bytes", levels[li]);
+            touched = 0;
+            for (j = n; j < sizeof out; j++) {
+                if (out[j] != 0x5Au) touched = 1;
+            }
+            CHECK(!touched, "whole-frame level %u wrote past its bytes",
+                  levels[li]);
+        }
+
+        /* Flags 0 and 6 select the same default stream, and the deprecated
+         * bit 17/18 produces byte-for-byte the same stream as no bit. */
+        CHECK(zpse_compress_frame(in, n, comp2, sizeof comp2, &plen, BLK,
+                                  ea) == ZPSE_OK, "flags=0 encode");
+        CHECK(plen == clen && memcmp(comp, comp2, clen) == 0,
+              "flags=0 equals the default-level stream");
+        CHECK(zpse_compress_frame_ex(in, n, comp2, sizeof comp2, &plen, BLK,
+                                     (6u << ZPSE_ENC_SPEED_SHIFT) |
+                                         want_bits[shape], ea) == ZPSE_OK,
+              "deprecated codec flag encode");
+        CHECK(plen == clen && memcmp(comp, comp2, clen) == 0,
+              "deprecated codec flag is a no-op");
+
+        /* CHECKSUM is the only flag that keeps the PSE1 path. */
+        CHECK(zpse_compress_frame_ex(in, n, comp2, sizeof comp2, &plen, BLK,
+                                     (uint32_t)ZPSE_ENC_CHECKSUM |
+                                         (6u << ZPSE_ENC_SPEED_SHIFT) |
+                                         want_bits[shape], ea) == ZPSE_OK,
+              "checksum encode");
+        CHECK(memcmp(comp2, "PSE1", 4u) == 0,
+              "checksum keeps the frame on PSE1 (got %.4s)",
+              (const char *)comp2);
+        CHECK(zpse_decompress_frame(comp2, plen, out, sizeof out, &got, da) ==
+                  ZPSE_OK && got == n && memcmp(out, in, n) == 0,
+              "checksum frame round-trips");
+
+        /* A whole-frame stream has no block index to seek. */
+        CHECK(zpse_seek_frame(comp, clen, 0u, blk, sizeof blk, &got32, da) ==
+                  ZPSE_UNSUPPORTED_FEATURE,
+              "seek on %s refused", want_magic[shape]);
+    }
+}
+
 int main(void)
 {
     static const uint32_t blocks[] = { 4096u, 16384u, 65536u, 32768u };
@@ -691,6 +818,7 @@ int main(void)
     page_frame_roundtrip();
     flat_overlong();
     text_overlong();
+    whole_frame_defaults();
     corrupt_cases();
 
     /* A block size that does not divide the input leaves a short block

@@ -1066,20 +1066,16 @@ static int zpse_mt_run(const uint8_t *in, size_t n, uint8_t *out,
 
 #endif /* ZPSE_MT */
 
-/* One serial decode: both the fallback and what a one-worker request means. */
+/* One serial decode: both the fallback and what a one-worker request means.
+ * Delegate to the public frame decoder rather than calling zpse_frame_decode
+ * directly: it owns the whole-frame magic dispatch (FLAT7, ZRPK, RLE1, F64F,
+ * DCM1, MRD1), and default-encoded x-ray/mr frames are now DCM1/MRD1 streams. */
 static int zpse_mt_dec_serial(const uint8_t *in, size_t in_len,
                               uint8_t *output, size_t out_cap,
                               size_t *out_len_out, void *arena)
 {
-    ZpseDecoder d;
-    int rc;
-
-    rc = zpse_decoder_init(&d, arena, (size_t)ZPSE_DEC_ARENA_SIZE);
-    if (rc != ZPSE_OK) {
-        return rc;
-    }
-    rc = zpse_frame_decode(&d, in, in_len, output, out_cap, out_len_out);
-    return rc < 0 ? rc : ZPSE_OK;
+    return zpse_decompress_frame(in, in_len, output, out_cap, out_len_out,
+                                 arena);
 }
 
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
@@ -1101,15 +1097,29 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
     if (arena_count == 0u) {
         return ZPSE_BAD_ARG;
     }
-    if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
+    /* The magic sniff needs only four bytes. Whole-frame streams can be much
+     * shorter than a PSE1 frame header, so they must reach the serial
+     * dispatcher below before any PSE1-sized floor is applied. A short stream
+     * with no whole-frame magic still ends in TRUNCATED/BAD_MAGIC. */
+    if (in_len < 4u) {
         return ZPSE_TRUNCATED;
     }
     *out_len_out = 0;
     /* FLAT7 has no block index, which is the only way a worker can find a
      * block to decode. Decline it here rather than letting the index resolve
-     * below read its magic as a frame and report BAD_MAGIC. */
+     * below read its magic as a frame and report BAD_MAGIC. (The other
+     * whole-frame forms, including DCM1/MRD1, decode serially instead.) */
     if (zpse_flat7_is_frame(in, in_len)) {
         return ZPSE_UNSUPPORTED_FEATURE;
+    }
+    /* A whole-frame stream may be shorter than a PSE1 frame header (DCM1 with
+     * 16 samples is 31 bytes), so it cannot carry an index and would be
+     * reported TRUNCATED by the resolver's own 32-byte floor. Let the serial
+     * dispatcher sniff it: a genuinely short PSE1 frame still ends in
+     * TRUNCATED there. */
+    if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
+        return zpse_mt_dec_serial(in, in_len, output, out_cap, out_len_out,
+                                  dec_arenas[0]);
     }
     /* The index is the whole reason a block can be found: a header carries
      * its size, not its offset. Validate header and index once here and hand
@@ -1118,6 +1128,13 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
      * with no index reports count 0 and falls back to the serial decoder,
      * which is not slower, only single-threaded. */
     rc = zpse_frame_index_resolve(in, in_len, &fh, &entries, &count);
+    if (rc == ZPSE_BAD_MAGIC) {
+        /* Not a PSE1 frame: a whole-frame stream (DCM1, MRD1, ZRPK, RLE1,
+         * F64F) has no block index, so hand it to the full serial dispatcher,
+         * which sniffs the magic and decodes it directly on this thread. */
+        return zpse_mt_dec_serial(in, in_len, output, out_cap, out_len_out,
+                                  dec_arenas[0]);
+    }
     if (rc != ZPSE_OK) {
         return rc;
     }
