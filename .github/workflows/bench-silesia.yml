@@ -28,10 +28,12 @@ jobs:
       matrix:
         cc: [gcc-15, clang]
     env:
-      # Packed bytes over the twelve files: 126,902,432 at the default level
-      # (6) and 114,711,960 at MAX. See the README's Silesia section.
-      BASELINE_DEFAULT: 126902432
-      BASELINE_MAX: 114711960
+      # Packed-byte totals of the TOTAL row for this workflow's config: the
+      # twelve Silesia files at the default block size, no index or checksum,
+      # one thread. The default row is ZPSE_ENC_SPEED_DEFAULT (level 6) and
+      # MAX is -l 9; reps change timing only, never the packed size.
+      BASELINE_DEFAULT: 99836213
+      BASELINE_MAX: 96606926
     steps:
       - uses: actions/checkout@v5
 

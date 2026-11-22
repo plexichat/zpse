@@ -58,7 +58,7 @@ mkdir -p "$work/src" "$work/corpus" "$work/prof" || exit 1
 # and the corpus writer are copied too, so every compiled source path is
 # relative to $work (gcc embeds that path in its .gcda file name and resolves
 # a relative -fprofile-dir against the run's current directory).
-cp "$repo"/src/* "$work/src/" || exit 1
+cp -R "$repo"/src/. "$work/src/" || exit 1
 cp "$repo/tests/tools/zpse_cli.c" "$work/src/cli.c" || exit 1
 cp "$repo/tests/corpus/corpus_write.c" "$work/src/corpus_write.c" || exit 1
 cp "$repo/tests/corpus/columnar_gen.h" "$work/src/columnar_gen.h" || exit 1
