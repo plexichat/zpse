@@ -20,10 +20,11 @@
 #define ZPSE_LZ_MIN_MATCH       4u
 #define ZPSE_LZ_MAX_MATCH       259u   /* 4 + 255 */
 /* LZ4 owns the match search and needs no caller-supplied table. Only the
- * match/literal bounds used by the block-layer screens stay live here; the
- * old table, hash-width and lazy-step constants are legacy and unused. The
- * two hash-bit values below remain only as inert arguments at the old LZ
- * pass call sites (src/block.c). */
+ * match bounds used by the block-layer screens stay live here; the old
+ * table and hash-width sizing constants are legacy and unused. The two
+ * hash-bit values below remain only as inert arguments at the old LZ pass
+ * call sites (src/block.c); ZPSE_LZ_LAZY_MAX still bounds lazy-window
+ * trial encodes on short blocks. */
 #define ZPSE_LZ_HASH_BITS       13u
 #define ZPSE_LZ_HASH_BITS_WIDE  14u
 
@@ -61,8 +62,8 @@ int zpse_lz4_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
  * real value back before the stream is committed. */
 uint32_t zpse_lz_cmd_count(const uint8_t *payload, uint32_t len);
 
-/* Permanent compatibility aliases for the pre-LZ4 call names. They are the
- * stable spelling used by the block layer and by external callers. */
+/* Compatibility aliases for the pre-LZ4 call names, kept for older callers
+ * and tests; the block layer itself uses zpse_lz4_* directly. */
 #define zpse_lz_encode       zpse_lz4_encode
 #define zpse_lz_encode_sample zpse_lz4_encode_sample
 #define zpse_lz_decode       zpse_lz4_decode

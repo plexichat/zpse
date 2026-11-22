@@ -1395,16 +1395,20 @@ int main(void) {
               "and the page still round-trips");
     }
 
-    /* Every block flag bit now names a form: 5 the LZ form, 6 LZ plus
-     * tiles, 7 the fast LZ form. So a bit set on a payload that is not that
-     * form has to be refused by the form's own envelope check rather than by
-     * a reserved-bit mask -- the flag alone must never be enough to read a
-     * tile payload as commands. Bit 7 first, then the LZ bit. */
+    /* Every block flag bit now names a form: bit 5 the raw-LZ form, bit 6
+     * LZ plus tiles (LZ_TILE), bit 7 the Huffman-coded LZ form (HUF). So a
+     * bit set on a payload that is not that form has to be refused by the
+     * form's own envelope check rather than by a reserved-bit mask -- the
+     * flag alone must never be enough to read a tile payload as commands.
+     * Three cases follow: HUF on a tile payload, LZ on a tile payload, and
+     * the invalid LZ_TILE|HUF combination. */
+    /* The Huffman form on a tile payload: bit 7 alone must not be enough to
+     * make a tile payload look like a Huffman-wrapped LZ stream. */
     memcpy(work, comp, clen);
     work[hostile_short(work, clen) ? 2u : 3u] |= 0x80;
     hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
-    CHECK(rc < 0, "fast LZ flag on a tile payload rejected");
+    CHECK(rc < 0, "Huffman flag on a tile payload rejected");
 
     /* The LZ form on a stream that is not one: the flag alone must not be
      * enough to read a tile payload as commands. */
@@ -1414,16 +1418,14 @@ int main(void) {
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc < 0, "LZ flag on a tile payload rejected");
 
-    /* The entropy-coded form (bit 7 alone) on a stream that is not one.
-     * Its envelope is the LZ forms' own, so a tile payload carrying the flag
-     * is refused by the transform check before the entropy decoder sees a
-     * byte of it -- and the decoder's own header is what has to agree with
-     * the payload length, not the other way round. */
+    /* The invalid LZ_TILE|HUF combination (bits 6 and 7): bit 7 is a fresh
+     * single-bit encoding with no combined pattern, so a block claiming both
+     * forms must be rejected rather than decoded as either one. */
     memcpy(work, comp, clen);
-    work[hostile_short(work, clen) ? 2u : 3u] |= 0x80;
+    work[hostile_short(work, clen) ? 2u : 3u] |= 0xC0;
     hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
-    CHECK(rc < 0, "Huffman flag on a tile payload rejected");
+    CHECK(rc < 0, "invalid LZ_TILE|HUF flags on a tile payload rejected");
 
     /* Bad transform_id with repaired CRC -> BAD_TRANSFORM. */
     memcpy(work, comp, clen);
