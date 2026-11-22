@@ -1533,6 +1533,19 @@ stripping those attributes to make a profile match, would trade a measured
 gain for one nobody has measured; the parity digests are the guard that the
 profile stayed a code-generation choice.
 
+Training on generated pages left the headline workload unprobed. The original
+harness prints only a 4 KiB before/after table, and no Silesia PGO delta was
+ever published. `tests/benchmarks/pgo_silesia.sh` now trains the same two-stage
+clang build on the twelve named Silesia files at 64 KiB and level 6, and runs
+the base and profile binaries in alternating rounds on one pinned core. On this
+host the profile build encoded the same packed bytes for every file at every
+level and cut encode time by roughly a tenth to a quarter across twenty
+alternated runs; decode improved as well. The spread between sessions was wide
+enough that the honest claim is a double-digit encode win with byte-identical
+output, not a precise ratio, and the A/A floor of the host still has to be
+measured before any figure moves into a README row. The profile remains a build
+artifact: keeping it tied to the source and regenerating it for each compiler
+version is the cost of the win, and a stale profile is worse than none.
 
 ## The one-pass page form and why it is a fast path, not the whole path
 
