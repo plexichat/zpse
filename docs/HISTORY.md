@@ -1822,6 +1822,28 @@ because the `nci` number is real. The A/B was run in a temporary harness that
 was never checked in as a script under `tests/benchmarks/`, so the figures above
 are a design note, not a project number; no table in the README was updated.
 
+## Skipping the final LZ pass on a canonical-LZ winner
+
+The final LZ stage in `block.c` is priced last and commits only on a strict
+`t2 < best_total`. When the current winner is already a canonical `ZPSE_B_LZ`
+stream, that pass cannot win: at MAX the lazy LZ winner falls through the gate
+near the finder-first path with `best_idx` 15, and the fast screen's stream
+never beat it, so the stage calls the same stateless LZ4 encoder on the same
+bytes and can only reproduce the size already in hand. The guard parses the
+winner's block header and skips the stage when its flag is plain LZ. Short
+circuiting it as the last conjunct keeps the parse off blocks that never reach
+the stage at all.
+
+The skip is byte-identical: all 36 Silesia outputs (twelve files at levels 1,
+6 and 9) hash the same with and without it, and the L6 and L9 totals are
+unchanged. On a saturated host in one environment it bought +3.59% encode at
+level 9 across 5/5 timing pairs, against 3-4x noise, and was inert at level 6
+where the guard fires on zero or one block per file. An earlier form keyed on
+`best_idx == 15` was rejected: that index also marks other commit paths, so it
+would skip the stage for blocks that were not canonical LZ. Testing the flag
+precisely leaves the `LZ_TILE` and `HUF` forms untouched, which is why the
+outputs stay identical.
+
 ## Zero-run RLE on the smooth 16-bit image (MRD)
 
 DPCM1 made Silesia's x-ray a one-byte-per-delta stream, but its gate was drawn

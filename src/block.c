@@ -2757,6 +2757,23 @@ static int zpse_block_huf_level(uint32_t enc_flags)
                (uint32_t)ZPSE_HUF_MIN_LEVEL;
 }
 
+/* A canonical ZPSE_B_LZ winner cannot be improved by the final LZ4 pass:
+ * at MAX the lazy LZ winner falls through the gate near the finder-first
+ * path with best_idx 15, and the fast screen's stream never beat it. The
+ * final pass calls the same stateless LZ4 encoder, so t2 < best_total
+ * cannot hold. Measured byte-identical on 36/36 Silesia files, +3.59%
+ * encode at level 9 (5/5 pairs), inert at level 6. See docs/HISTORY.md. */
+static int zpse_block_winner_is_lz(ZpseEncoder *e, const uint8_t *out,
+                                   int direct_out)
+{
+    ZpseBlockHeader h;
+    if (zpse_block_header_parse(&h, direct_out ? out : e->best,
+                                ZPSE_BLOCK_HEADER_SIZE) != ZPSE_OK) {
+        return 0;
+    }
+    return (h.block_flags & (uint8_t)ZPSE_B_LZ) != 0u;
+}
+
 /* Which levels run the match finder at all: BALANCED and deeper price
  * every block -- the pass is what those levels are for -- and, when
  * ZPSE_LZ_CHEAP_LEVELS is on, the cheap levels price only the blocks the
@@ -6058,7 +6075,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
             (uint32_t)ZPSE_LZ_FINAL_MIN_LEVEL &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
-                                ZPSE_LZ_MIN_PAYLOAD)) {
+                                ZPSE_LZ_MIN_PAYLOAD) &&
+        !zpse_block_winner_is_lz(e, out, direct_out)) {
         /* The screen prices its sample under ONE candidate's transform, and
          * which one must not depend on the order the sweep attempted them in:
          * both orders are required to write identical streams (test_fuzz
