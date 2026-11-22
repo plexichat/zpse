@@ -13,6 +13,7 @@
 #   SILESIA_DIR  bench an already-extracted corpus instead of downloading
 #   KEEP=1       keep the download directory and print where it is
 #   CC=cc        compiler for the CLI
+#   ZPSE_PGO=0   skip the PGO build (default: try PGO, fall back to plain -O2)
 #
 # Prints a markdown table and appends it to $GITHUB_STEP_SUMMARY when set.
 # Nothing is written to the repository. Exit 0 on success.
@@ -104,9 +105,32 @@ done
 bin="$(mktemp "${TMPDIR:-/tmp}/zpse-cli.XXXXXX")" ||
     { echo "silesia: cannot create a binary path" >&2; exit 1; }
 rm -f "$bin"
-echo "silesia: building the CLI ($CC)" >&2
-"$CC" -std=c11 -O2 -I"$inc" "$cli_src" "$unity" -o "$bin" ||
-    { echo "silesia: CLI build failed" >&2; exit 1; }
+
+# Published numbers use PGO: the training profile is regenerated from the
+# checked-out tree on every run and the helper compares PGO's compressed
+# streams with a plain -O2 build before it writes $bin. Any PGO failure --
+# missing llvm-profdata, a compile error, a byte difference -- is a warning
+# here and the plain build below is the automatic fallback.
+pgo_used=0
+if [ "${ZPSE_PGO:-1}" != "0" ]; then
+    echo "silesia: trying PGO build ($CC)" >&2
+    # shellcheck disable=SC2086
+    if bash "$repo/tests/benchmarks/pgo_cli.sh" "$bin" $files; then
+        pgo_used=1
+    else
+        echo "silesia: warning: PGO build failed; falling back to plain -O2" >&2
+    fi
+fi
+if [ "$pgo_used" -eq 0 ]; then
+    echo "silesia: building the CLI ($CC)" >&2
+    "$CC" -std=c11 -O2 -I"$inc" "$cli_src" "$unity" -o "$bin" ||
+        { echo "silesia: CLI build failed" >&2; exit 1; }
+fi
+if [ "$pgo_used" -eq 1 ]; then
+    echo "silesia: CLI: PGO ($CC; byte identity verified)" >&2
+else
+    echo "silesia: CLI: plain -O2 ($CC)" >&2
+fi
 
 # Pin to one core when taskset is there: these are single-core numbers, and
 # a migrating process is a measurement of the scheduler.

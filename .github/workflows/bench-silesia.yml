@@ -12,6 +12,13 @@
 # the baseline below in the same commit. The slack is 0.1%, which is smaller
 # than any trade this codec would make on purpose (the ladder's own steps are
 # 4-12% on text) and larger than nothing, so a size-neutral refactor passes.
+#
+# The benchmark CLI is built with profile-guided optimisation by default. The
+# profile is regenerated from the checked-out tree on every run (and is never
+# shipped or cached): pgo_cli.sh trains on the corpus the table measures, then
+# refuses to use its own binary unless it writes exactly the same bytes as a
+# plain -O2 build of the same tree. A runner without PGO tooling still gets a
+# table -- the scripts warn on stderr and fall back to plain -O2.
 name: bench-silesia
 
 on:
@@ -46,6 +53,20 @@ jobs:
           python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
             "$RUNNER_TEMP/silesia/silesia.zip" "$RUNNER_TEMP/silesia"
           rm -f "$RUNNER_TEMP/silesia/silesia.zip"
+
+      - name: Ensure llvm-profdata for clang
+        # Ubuntu's clang image normally has it via llvm-tools; install the
+        # package only when it is actually absent. Without it the scripts
+        # fall back to plain -O2, which we do not want silently here.
+        if: matrix.cc == 'clang'
+        run: |
+          set -euo pipefail
+          if ! command -v llvm-profdata >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y llvm
+          fi
+          command -v llvm-profdata
+          llvm-profdata --version
 
       - name: Default level
         # No level argument at all: this row is the library's default

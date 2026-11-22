@@ -32,6 +32,7 @@
 #   ZPSE_LEVELS="1 5 6 9"  zpse levels to put on the table
 #   LZ4=path ZSTD=path  binaries that are not on PATH (built from source)
 #   CC=cc               compiler for the CLI
+#   ZPSE_PGO=0          skip the PGO build (default: try PGO, fall back to plain -O2)
 #   KEEP=1              keep the download directory and print its path
 #
 # Prints a markdown table; appends it to $GITHUB_STEP_SUMMARY when set.
@@ -156,9 +157,30 @@ insize=$(wc -c <"$in")
 command -v "$CC" >/dev/null 2>&1 || fail "no C compiler ($CC)"
 cli="$(mktemp "${TMPDIR:-/tmp}/zpse-cli.XXXXXX")" || fail "cannot make a path"
 rm -f "$cli"
-echo "bench_pareto: building the CLI ($CC)" >&2
-"$CC" -std=c11 -O2 -I"$inc" "$cli_src" "$unity" -o "$cli" ||
-    fail "CLI build failed"
+
+# The profile is rebuilt from the checked-out tree on every run; the helper
+# gates it on byte identity with a plain -O2 build before it writes $cli. A
+# missing PGO toolchain or a gate failure is a warning and the plain build is
+# used instead, so a table is always produced.
+pgo_used=0
+if [ "${ZPSE_PGO:-1}" != "0" ]; then
+    echo "bench_pareto: trying PGO build ($CC)" >&2
+    if bash "$repo/tests/benchmarks/pgo_cli.sh" "$cli" "${inputs[@]}"; then
+        pgo_used=1
+    else
+        echo "bench_pareto: warning: PGO build failed; falling back to plain -O2" >&2
+    fi
+fi
+if [ "$pgo_used" -eq 0 ]; then
+    echo "bench_pareto: building the CLI ($CC)" >&2
+    "$CC" -std=c11 -O2 -I"$inc" "$cli_src" "$unity" -o "$cli" ||
+        fail "CLI build failed"
+fi
+if [ "$pgo_used" -eq 1 ]; then
+    echo "bench_pareto: CLI: PGO ($CC; byte identity verified)" >&2
+else
+    echo "bench_pareto: CLI: plain -O2 ($CC)" >&2
+fi
 
 # $LZ4 / $ZSTD point at a build that is not on PATH, which is the case in a
 # sandbox where the binary was compiled from source beside the corpus.
