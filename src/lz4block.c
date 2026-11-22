@@ -1,17 +1,17 @@
-/* Intra-block LZ forms, backed by vendored LZ4 1.10.0.
+/* Intra-block LZ: the single raw-LZ4 block form, backed by vendored LZ4
+ * 1.10.0. This file replaces src/lz.c, src/lz2.c, src/lzh.c and src/lzfast.c.
  *
- * This file replaces src/lz.c, src/lz2.c, src/lzh.c and src/lzfast.c.
- * Every LZ block form now carries the same payload:
+ * Every LZ payload has one shape:
  *
  *   u32 uncompressed_bytes   (kept for the block layer's accounting)
  *   u32 command_count        (LZ4 sequences counted from the stream)
  *   raw LZ4 block            output of LZ4_compress_default
  *
- * The block layer still picks among ZPSE_B_LZ / ZPSE_B_LZ2 /
- * ZPSE_B_LZ_HEX by its existing screens and ladder; all three selectors
- * decode through LZ4_decompress_safe with the block's declared output
- * size. There is no custom token loop, match finder, repeat cache or
- * Huffman-trained LZ format left in the codec.
+ * The old fast (ZPSE_B_LZ2) and hexadecimal (ZPSE_B_LZ_HEX) selectors are
+ * gone, along with their codecs: there is one encode and one decode path,
+ * through LZ4_compress_default / LZ4_decompress_safe with the block's
+ * declared output size. No custom token loop, match finder, repeat cache
+ * or Huffman-trained LZ format is left in the codec.
  *
  * LZ4's raw-block window is 64 KiB by definition, which is exactly the
  * block cap here, so a block is self-contained: no history, no frame and
@@ -19,8 +19,6 @@
  */
 
 #include "zpse/lz.h"
-#include "zpse/lz2.h"
-#include "zpse/lzh.h"
 #include "zpse/bits.h"
 #include "zpse/status.h"
 
@@ -37,19 +35,24 @@
  * from the stream we just wrote, so it is exact for our own output. The
  * walk stops at the last five bytes, which LZ4 reserves for trailing
  * literals. A malformed stream cannot reach this function (only encoded
- * output is counted), but the bounds checks keep it safe anyway. */
-static uint32_t lz4_cmd_count(const uint8_t *payload, uint32_t len)
+ * output is counted), but the bounds checks keep it safe anyway.
+ *
+ * `payload` is the raw block itself, without the [u32 n][u32 cmds] header.
+ * Encoders only ever write a nonzero placeholder in the count word; the
+ * caller that actually needs the count walks the stream once and writes the
+ * real value back before committing it. */
+uint32_t zpse_lz_cmd_count(const uint8_t *payload, uint32_t len)
 {
     const uint8_t *p;
     const uint8_t *end;
     const uint8_t *last;
     uint32_t cmds = 0u;
 
-    if (len <= ZPSE_LZ4_HDR + 5u) {
+    if (len <= 5u) {
         return 1u;
     }
-    p = payload + ZPSE_LZ4_HDR;
-    end = p + (len - ZPSE_LZ4_HDR);
+    p = payload;
+    end = p + len;
     last = end - 5u;
     while (p < last) {
         uint32_t ll;
@@ -111,8 +114,11 @@ static uint32_t lz4_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
         return 0u;
     }
     zpse_store_u32le(dst, n);
-    zpse_store_u32le(dst + 4u,
-                     lz4_cmd_count(dst, (uint32_t)written + ZPSE_LZ4_HDR));
+    /* Nonzero placeholder: the decoder only tests for nonzero, and the block
+     * layer overwrites this word with the real count once a candidate clears
+     * its size gate. Streams that never get that far are discarded or keep a
+     * harmless nonzero value. */
+    zpse_store_u32le(dst + 4u, 1u);
     return (uint32_t)written + ZPSE_LZ4_HDR;
 }
 
@@ -138,83 +144,19 @@ static int lz4_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
     return ZPSE_OK;
 }
 
-uint32_t zpse_lz_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                        uint32_t cap, void *table, uint32_t hash_bits)
+uint32_t zpse_lz4_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
+                         uint32_t cap)
 {
-    (void)table;
-    (void)hash_bits;
     return lz4_encode(in, n, dst, cap);
 }
 
-uint32_t zpse_lz_encode_ex(const uint8_t *in, uint32_t n, uint8_t *dst,
-                           uint32_t cap, void *table, uint32_t hash_bits,
-                           uint32_t lazy_max)
+uint32_t zpse_lz4_encode_sample(const uint8_t *in, uint32_t n, uint8_t *dst,
+                                uint32_t cap)
 {
-    (void)table;
-    (void)hash_bits;
-    (void)lazy_max;
     return lz4_encode(in, n, dst, cap);
 }
 
-uint32_t zpse_lz_encode_sample(const uint8_t *in, uint32_t n, uint8_t *dst,
-                               uint32_t cap, void *table, uint32_t hash_bits,
-                               uint32_t sn)
-{
-    (void)table;
-    (void)hash_bits;
-    (void)sn;
-    return lz4_encode(in, n, dst, cap);
-}
-
-uint32_t zpse_lz2_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                         uint32_t cap, void *table, uint32_t hash_bits)
-{
-    (void)table;
-    (void)hash_bits;
-    return lz4_encode(in, n, dst, cap);
-}
-
-uint32_t zpse_lz2_encode_sample(const uint8_t *in, uint32_t n, uint8_t *dst,
-                                uint32_t cap, void *table, uint32_t hash_bits,
-                                uint32_t sn)
-{
-    (void)table;
-    (void)hash_bits;
-    (void)sn;
-    return lz4_encode(in, n, dst, cap);
-}
-
-uint32_t zpse_lzh_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
-                         uint32_t cap, void *table, uint32_t hash_bits)
-{
-    (void)table;
-    (void)hash_bits;
-    return lz4_encode(in, n, dst, cap);
-}
-
-uint32_t zpse_lzh_encode_sample(const uint8_t *in, uint32_t n, uint8_t *dst,
-                                uint32_t cap, void *table, uint32_t hash_bits,
-                                uint32_t sn)
-{
-    (void)table;
-    (void)hash_bits;
-    (void)sn;
-    return lz4_encode(in, n, dst, cap);
-}
-
-int zpse_lz_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
-                   uint32_t n)
-{
-    return lz4_decode(in, in_len, out, n);
-}
-
-int zpse_lz2_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
-                    uint32_t n)
-{
-    return lz4_decode(in, in_len, out, n);
-}
-
-int zpse_lzh_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
+int zpse_lz4_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
                     uint32_t n)
 {
     return lz4_decode(in, in_len, out, n);

@@ -7,8 +7,6 @@
 #include "zpse/dense.h"
 #include "zpse/huf.h"
 #include "zpse/lz.h"
-#include "zpse/lz2.h"
-#include "zpse/lzh.h"
 #include "zpse/predictor.h"
 #include "zpse/segment.h"
 #include "zpse/status.h"
@@ -483,7 +481,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             (flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET)) !=
                 (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET) ||
             (flags & (uint8_t)(ZPSE_B_CRC | ZPSE_B_HAS_META |
-                               ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                               ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_HUF |
                                ZPSE_B_RESERVED_MASK)) != 0u ||
             c_tok != (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
             n_tok < ZPSE_MIN_BLOCK_SIZE || n_tok > ZPSE_MAX_BLOCK_SIZE) {
@@ -645,7 +643,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if ((h.block_flags & ZPSE_B_RAW) != 0) {
         uint32_t calc;
         if (h.transform_id != 0 || h.segment_count != 1 || meta_size != 0 ||
-            (h.block_flags & (ZPSE_B_LZ_TILE | ZPSE_B_LZ2)) != 0) {
+            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
             return ZPSE_BAD_HEADER;
         }
         if (c != hdr + n) {
@@ -669,56 +667,21 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         return (int)n;
     }
 
-    /* The hexadecimal form: both LZ class bits set, which is the form id the
-     * two forms after this one never write (each refuses the other's bit). It
-     * has their envelope -- transform 0, one segment, no metadata -- and its
-     * own payload codec, so it is dispatched before them. See
-     * include/zpse/lzh.h. */
-    if ((h.block_flags & (uint8_t)ZPSE_B_LZ_HEX) ==
-        (uint8_t)ZPSE_B_LZ_HEX) {
-        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
-            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
-            return ZPSE_BAD_HEADER;
-        }
-        if (c <= hdr) {
-            return ZPSE_BAD_BLOCK_SIZE;
-        }
-        rc = zpse_lzh_decode(in + hdr, c - hdr, output, n);
-        if (rc != ZPSE_OK) {
-            return rc;
-        }
-        if ((h.block_flags & ZPSE_B_CRC) != 0) {
-            uint32_t calc = zpse_crc32c(output, n);
-
-            if (calc != h.decoded_crc32c) {
-                return ZPSE_BAD_PAYLOAD_CRC;
-            }
-        }
-        if (out_len_out != 0) {
-            *out_len_out = n;
-        }
-        return (int)n;
-    }
-
-    /* Intra-block LZ form: one literal stream, one command stream, no
-     * transform and no tiles. The block keeps the shape the raw fallback
-     * uses (transform 0, one segment, no metadata) so a reader can tell
-     * the two apart by flag alone, and every reference it carries is a
-     * distance inside this block. */
-    /* The entropy-coded LZ form: one of the three LZ payloads, Huffman coded,
+    /* The entropy-coded LZ form: the single raw-LZ4 payload, Huffman coded,
      * with the form it unpacks to named inside the payload. It is dispatched
-     * here -- before the three LZ branches below -- because its flag pattern
-     * (110) contains the fast form's bit 7, so the fast form's branch would
-     * otherwise claim it and then refuse it for carrying the tile bit. And
-     * because the payload, not the flag byte, is what says which LZ decoder
-     * to run: the wrapped stream is an LZ payload either way, and the flag
-     * space has no bit left to name a fourth codec in. See
-     * include/zpse/huf.h. */
+     * here -- before the two LZ branches below -- because ZPSE_B_HUF is bit 7
+     * alone: unlike the old combined encodings it cannot be mistaken for an
+     * LZ form by a bit test, but the two invalid combinations 0xA0
+     * (ZPSE_B_LZ | ZPSE_B_HUF) and 0xC0 (ZPSE_B_LZ_TILE | ZPSE_B_HUF) have to
+     * be rejected explicitly. The payload's inner_form is a fixed tag naming
+     * ZPSE_B_LZ, so there is only one LZ decoder to run after the Huffman
+     * pass. See include/zpse/huf.h. */
     if ((h.block_flags & (uint8_t)ZPSE_B_HUF) == (uint8_t)ZPSE_B_HUF) {
         uint32_t ilen = 0u;
         uint8_t iform = 0u;
 
-        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u) {
+        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
+            (h.block_flags & (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0u) {
             return ZPSE_BAD_HEADER;
         }
         if (c <= hdr) {
@@ -732,13 +695,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (rc != ZPSE_OK) {
             return rc;
         }
-        if (iform == (uint8_t)ZPSE_B_LZ2) {
-            rc = zpse_lz2_decode(d->lzbuf, ilen, output, n);
-        } else if (iform == (uint8_t)ZPSE_B_LZ_HEX) {
-            rc = zpse_lzh_decode(d->lzbuf, ilen, output, n);
-        } else {
-            rc = zpse_lz_decode(d->lzbuf, ilen, output, n);
+        if (iform != (uint8_t)ZPSE_B_LZ) {
+            return ZPSE_BAD_HEADER;
         }
+        rc = zpse_lz4_decode(d->lzbuf, ilen, output, n);
         if (rc != ZPSE_OK) {
             return rc;
         }
@@ -755,6 +715,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         return (int)n;
     }
 
+    /* Intra-block LZ4 form: one raw LZ4 block, no transform and no tiles. The
+     * block keeps the shape the raw fallback uses (transform 0, one segment,
+     * no metadata) so a reader can tell the two apart by flag alone, and every
+     * reference it carries is a distance inside this block. */
     if ((h.block_flags & ZPSE_B_LZ) != 0) {
         if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
             (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
@@ -763,36 +727,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (c <= hdr) {
             return ZPSE_BAD_BLOCK_SIZE;
         }
-        rc = zpse_lz_decode(in + hdr, c - hdr, output, n);
-        if (rc != ZPSE_OK) {
-            return rc;
-        }
-        if ((h.block_flags & ZPSE_B_CRC) != 0) {
-            uint32_t calc = zpse_crc32c(output, n);
-
-            if (calc != h.decoded_crc32c) {
-                return ZPSE_BAD_PAYLOAD_CRC;
-            }
-        }
-        if (out_len_out != 0) {
-            *out_len_out = n;
-        }
-        return (int)n;
-    }
-
-    /* The fast LZ form: the same envelope as the block above -- transform 0,
-     * one segment, no metadata -- with a different command encoding (see
-     * include/zpse/lz2.h). It carries no repeat-distance cache, though the
-     * lazy probe and backward walk of the token form are still present. */
-    if ((h.block_flags & ZPSE_B_LZ2) != 0) {
-        if (h.transform_id != 0 || h.segment_count != 1u || meta_size != 0u ||
-            (h.block_flags & (ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
-            return ZPSE_BAD_HEADER;
-        }
-        if (c <= hdr) {
-            return ZPSE_BAD_BLOCK_SIZE;
-        }
-        rc = zpse_lz2_decode(in + hdr, c - hdr, output, n);
+        rc = zpse_lz4_decode(in + hdr, c - hdr, output, n);
         if (rc != ZPSE_OK) {
             return rc;
         }
@@ -817,7 +752,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
      * into the decoder's own buffer and let the tile path read it as if it
      * had been written plainly -- the unpacked bytes are byte for byte what
      * that path was built against, so nothing below needs a second shape.
-     * The length comes first because zpse_lz_decode has to be told the exact
+     * The length comes first because zpse_lz4_decode has to be told the exact
      * output size: a stream is only accepted when it fills it exactly. */
     if ((h.block_flags & ZPSE_B_LZ_TILE) != 0) {
         uint32_t blen;
@@ -833,7 +768,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             blen > (uint32_t)ZPSE_D_SZ_LZBUF) {
             return ZPSE_BAD_BLOCK_SIZE;
         }
-        rc = zpse_lz_decode(in + hdr + 4u, c - (hdr + 4u), d->lzbuf, blen);
+        rc = zpse_lz4_decode(in + hdr + 4u, c - (hdr + 4u), d->lzbuf, blen);
         if (rc != ZPSE_OK) {
             return rc;
         }
@@ -958,18 +893,10 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                            scount == 16u) ? 1 : 0;
         uint32_t skew_off = 0;
 
-        lanes.order1 = d->order1;
-        lanes.o2 = d->o2;
-        lanes.gen = 0u;
-        /* The generation restarts with the lane state, so the previous
-         * block's entries would carry the same stamps; the first tile that
-         * names ORDER2 wipes the table (zpse_lane_o2_use). Wiping here
-         * instead cost every block 128 KiB of memset, whichever predictors
-         * its tiles turned out to use. */
-        lanes.o2_ready = 0;
-        if (lanes.order1 == 0 || lanes.o2 == 0) {
-            return ZPSE_BAD_ARG;
-        }
+        /* Only the histories are live lane state now; the tables the stateful
+         * predictors used to borrow are gone, and the segment decoder seeds
+         * its own history from each tile's initial literal. */
+        zpse_lane_reset_hist(&lanes, 0u);
         cum = 0;
         for (s = 0; s < scount; s++) {
             uint32_t off = seg_off[s];
@@ -988,16 +915,12 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                 plane = region + skew_off;
                 skew_off += seg_lens[s] + ZPSE_D_PLANE_SKEW;
             }
-            /* No lane reset here. zpse_segment_decode established the
-             * segment's entry state itself, from the initial_literal of
-             * the very header this loop just parsed the decoded size out
-             * of, so resetting from init_lit[s] here was the same state
-             * memoized a second time in front of every segment -- and the
-             * expensive half of it (the ORDER tables) 66 KiB a segment.
-             * The histories and the lazily seeded tables that
-             * zpse_segment_decode sets up are exactly what this call would
-             * have produced, and it can see everything it needs: lanes
-             * below already points at the decoder's own tables. */
+            /* No per-segment lane reset: seg_decode_body seeds the first
+             * tile's history from this segment's own header
+             * initial_literal, so that is the entry state. last[] and
+             * second_last[] are the only live lane state left -- 16 bytes,
+             * no tables to seed -- and lanes already points at the
+             * decoder's state, so a reset here would only repeat that work. */
             if ((uint64_t)cum + (uint64_t)seg_lens[s] > ZPSE_MAX_BLOCK_SIZE) {
                 return ZPSE_BAD_SEGMENT_DIRECTORY;
             }
@@ -1264,17 +1187,9 @@ static int zpse_block_try_one(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (base > (uint64_t)cap) {
         return ZPSE_OUTPUT_OVERFLOW;
     }
-    lanes.order1 = e->order1;
-    lanes.o2 = e->o2;
-    lanes.gen = 0u;
-    /* One wipe per trial, and only when the trial reaches ORDER2: the
-     * generation restarts with the lane state, so the previous trial's
-     * entries would carry the same stamps, but a trial whose tiles never
-     * name ORDER2 has nothing to wipe. */
-    lanes.o2_ready = 0;
-    if (lanes.order1 == 0 || lanes.o2 == 0) {
-        return ZPSE_BAD_ARG;
-    }
+    /* Only the histories are live lane state now; the segment encoder seeds
+     * its own from each tile's initial literal. */
+    zpse_lane_reset_hist(&lanes, 0u);
     /* Sixteen prescreens against the tiles this trial is about to write,
      * asked for only while the flat abort could still fire: the abort is
      * armed per segment only while beating the RAW envelope is the trial's
@@ -1815,8 +1730,8 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
 #define ZPSE_FLAT_TRIALS 2
 #endif
 
-/* The margin the fast form's screen asks for on a block shorter than
- * ZPSE_LZ2_SHORT_N, as a multiplier on the level's own (NUM/DEN).
+/* The margin the final LZ screen asks for on a block shorter than
+ * ZPSE_LZ_FINAL_SHORT_N, as a multiplier on the level's own (NUM/DEN).
  *
  * The screen samples a fixed 1 KiB, which on a page is a quarter of the
  * block, so it convicts more readily there than on a 64 KiB block -- but the
@@ -1830,14 +1745,14 @@ static int zpse_block_delta_trial_first(const uint8_t *in, uint32_t n)
  * is for.
  *
  * 4/4 is the screen as it was, every block asking for the level's margin. */
-#ifndef ZPSE_LZ2_SHORT_N
-#define ZPSE_LZ2_SHORT_N 16384u
+#ifndef ZPSE_LZ_FINAL_SHORT_N
+#define ZPSE_LZ_FINAL_SHORT_N 16384u
 #endif
-#ifndef ZPSE_LZ2_SHORT_MARGIN_NUM
-#define ZPSE_LZ2_SHORT_MARGIN_NUM 6u
+#ifndef ZPSE_LZ_FINAL_SHORT_MARGIN_NUM
+#define ZPSE_LZ_FINAL_SHORT_MARGIN_NUM 6u
 #endif
-#ifndef ZPSE_LZ2_SHORT_MARGIN_DEN
-#define ZPSE_LZ2_SHORT_MARGIN_DEN 4u
+#ifndef ZPSE_LZ_FINAL_SHORT_MARGIN_DEN
+#define ZPSE_LZ_FINAL_SHORT_MARGIN_DEN 4u
 #endif
 
 /* The band, as a fraction of the best window price (in 1/2^N), inside which
@@ -2072,10 +1987,7 @@ static uint32_t zpse_block_exact_plane(ZpseEncoder *e, const uint8_t *plane,
     if (tiles == 0u || tiles > ZPSE_DECIDE_TILES) {
         tiles = (tiles == 0u) ? ZPSE_PROBE_TILES : ZPSE_DECIDE_TILES;
     }
-    lanes.order1 = e->order1;
-    lanes.o2 = e->o2;
-    lanes.gen = 0u;
-    lanes.o2_ready = 0;
+    zpse_lane_reset_hist(&lanes, 0u);
     return zpse_segment_probe_cost(e, &lanes, plane, len, tiles, limit);
 }
 
@@ -2552,10 +2464,10 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * not fit (which the caller reads as "this candidate lost", not as an
  * error). The block header is written last-to-first: the payload at
  * dst + 32, then the envelope around it. */
-/* ---- The LZ form's decode bill, as a per-level acceleration factor ---- *
+/* ---- The LZ4 form's decode bill, as a per-level acceleration factor ---- *
  *
- * An LZ stream decodes at the speed of its own command loop, one 4-byte
- * command per output run, so its rate follows the AVERAGE RUN LENGTH.
+ * An LZ4 stream decodes at the speed of its own command loop, so its rate
+ * follows the AVERAGE RUN LENGTH between LZ4 sequences.
  * Measured on this corpus, in bytes of output per command: 5.6 -> 0.6 GB/s
  * (prose), 9 -> 1.2 (json), 17 -> 2.9 (var strings), 64 -> 8.8 (sparse),
  * 128 -> 8.4 (geo), 246 -> 24 (zeros). A tile stream decodes at 5-13 GB/s
@@ -2574,10 +2486,10 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * on text and pays for it in decode rate, which is what the fastest and
  * default levels are being asked for now.
  *
- * Measured with every level set to each value in turn, on the four text
- * cases and a repetitive one, against the tile stream's own 1.09:1 at
- * ~14 GB/s (encode falls to ~100 MB/s on the cases that take the form,
- * because the match finder is a full pass):
+ * The levels were swept with every value in turn, on the four text cases and
+ * a repetitive one, against the tile stream's own 1.09:1 at ~14 GB/s. The
+ * numbers quoted below are those historical measurements (the codec has since
+ * been replaced by LZ4); the ladder's ordering is what they settled:
  *
  *   A=2  (48 B/cmd)  no text case moves; the shipped rule before this knob.
  *   A=4  (24 B/cmd)  no text case moves either: var_string, the longest-run
@@ -2861,22 +2773,14 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
 #endif
 }
 
-/* The match table the screen samples with.
+/* The match table the screen used to sample with.
  *
- * The screen runs the finder over 512 bytes on a page and 1 KiB on a larger
- * block, but it was handed the page's 2^13-entry table: clearing 16 KiB to
- * look at 512 bytes, twice per page, before either pass. The knob exists so
- * the table can be sized to the sample instead of to the block; 13 is the
- * table as it was.
- *
- * Smaller was measured and refused: 2^11, 2^10 and 2^9 all write MORE bytes
- * (dumps level 6 +16K/+39K/+77K, Silesia +197K/+197K/+442K, and the hex pages
- * move the same way) for no rate the host can resolve, because a table too
- * small to hold the sample changes which blocks the screen convicts. Bigger is
- * not available and would not pay: the sample is 512 bytes on a page, so 2^13
- * already has sixteen slots per byte and nothing left to collide, and the
- * 2^15 table the sweep's own passes use does not fit in the page's 16 KiB
- * region -- a build with 15 wrote past it and crashed. Hence the ceiling. */
+ * The screen samples 512 bytes on a page and 1 KiB on a larger block. This
+ * knob (and the 2^13 ceiling) comes from the old caller-supplied match table,
+ * where a table sized to the sample instead of the block was worth measuring;
+ * the measurements are in docs/HISTORY.md. src/lz4block.c now owns its own
+ * match search, so the screens call zpse_lz4_encode_sample with no table at
+ * all and the knob is retained only for the level ladder's sizing. */
 #ifndef ZPSE_LZ_SCREEN_HASH_BITS
 #define ZPSE_LZ_SCREEN_HASH_BITS ZPSE_LZ_HASH_BITS
 #endif
@@ -2946,8 +2850,9 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  *
  * The 1 KiB above is tuned on 64 KiB blocks, where it is a sixty-fourth of
  * the block; a 4 KiB page hands the same sample a quarter of its bytes, and
- * the screen runs twice per page (token form, then fast form) before either
- * pass. At 4 KiB level 6, over four interleaved passes, a 512-byte sample
+ * the screen runs twice per page (the finder screen, then the final LZ
+ * screen) before either pass. At 4 KiB level 6, over four interleaved passes,
+ * a 512-byte sample
  * writes FEWER bytes than the 1 KiB one on the dumps (87 026 427 against
  * 87 463 512, 0.21 of a ratio point) and on the mixed corpus (55 671 320
  * against 56 016 700), costs Silesia 123 368 bytes (0.058 of a point), and
@@ -3058,7 +2963,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                 int have_best, uint32_t best_total,
                                 uint32_t cache[2])
 {
-    uint32_t lvl = zpse_enc_speed(speed);
+    (void)speed; /* LZ4 screens are level-independent; see ZPSE_LZ4_SCREEN_NUM. */
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
                       ? n
                       : (uint32_t)ZPSE_LZ_SCREEN_BYTES;
@@ -3089,9 +2994,9 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
 #endif
     /* The head sample and its tile price are a pure function of (in, n, tid,
-     * sc, mb, meta_len, speed): a sample LZ encode clears every hash slot it
-     * can touch and reinitializes its output state, and the tile price is the
-     * encoder's own cost model over the same window. The full-size screen at
+     * sc, mb, meta_len): the sample LZ4 encode reinitializes its output state
+     * on every call, and the tile price is the encoder's own cost model over
+     * the same window. The full-size screen at
      * the top of the sweep asks that exact question about slot 0 with no
      * winner; cache[2] carries its answer here so this screen only re-asks the
      * part that depends on the real best_total. Sentinel {0, UINT32_MAX} means
@@ -3100,16 +3005,11 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (sn < ZPSE_LZ_MIN_MATCH + 1u) {
         return 1;
     }
-    /* Priced with the token form, deliberately, even though the pass below
-     * writes the fast one. The thresholds this verdict is compared against
-     * (ZPSE_LZ_SCREEN_DEN, the slack ratio, the samples the ladder adds)
-     * were swept with these estimates, and the fast form codes the same
-     * sample smaller, which moves every verdict toward "run the finder" --
-     * measured as a level ladder that no longer holds: on sparse_mix the
-     * balanced level wrote 8520 bytes and the deeper one 8687, because the
-     * deeper screen accepted a block whose finder stream the tiles beat.
-     * Keeping the token form here keeps every verdict where it was, so the
-     * only thing the swap changes is the stream the finder writes. */
+    /* The screen samples with the same LZ4 encoder the writer stage uses, so
+     * its estimate and the stream it guards cannot disagree about the codec.
+     * The thresholds it is compared against (ZPSE_LZ_SCREEN_DEN, the slack
+     * ratio, the samples the ladder adds) keep the values they were swept
+     * with, which is what holds the level ladder's ordering. */
     if (use_cache) {
         /* The full-size screen already measured this same slot-0 shape on
          * the same head sample. Only the second-sample question below depends
@@ -3117,12 +3017,8 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         lz_s = cache[0];
         tile_s = cache[1];
     } else {
-        lz_s = zpse_lz_encode_sample(in, sn, e->cand,
-                                     (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                                     lvl == 1u
-                                         ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                         : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
-                                     sn);
+        lz_s = zpse_lz4_encode_sample(in, sn, e->cand,
+                                      (uint32_t)ZPSE_E_SZ_CAND);
         if (lz_s == 0u) {
             return 1;
         }
@@ -3174,12 +3070,8 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (ZPSE_LZ4_SCREEN_SAMPLES > 1u && have_best &&
         !zpse_block_lz_sample_can_win(lz_s, sn, n, best_total)) {
         uint32_t off = (n - sn) / 2u;
-        uint32_t lz_m = zpse_lz_encode_sample(in + off, sn, e->cand,
-                                              (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                                              lvl == 1u
-                                                  ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                                  : (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
-                                              sn);
+        uint32_t lz_m = zpse_lz4_encode_sample(in + off, sn, e->cand,
+                                               (uint32_t)ZPSE_E_SZ_CAND);
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -3189,28 +3081,22 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return 1;
 }
 
-/* The fast form's own screen: the same question zpse_block_lz_screen asks,
- * asked with the form that is going to write the stream.
+/* The final LZ stage's own screen: the same question zpse_block_lz_screen
+ * asks, asked again with the same LZ4 encoder that writes the stream. Both
+ * screens now price the one canonical LZ4 payload, so the second question is
+ * a separate decision point (the last stage, run after the LZ+tile stage)
+ * rather than a second codec's estimator.
  *
- * The token form's screen prices its sample with zpse_lz_encode, and on the
- * two forms' own sample sizes the two answers disagree -- a fixed 16-bit
- * distance is the cheaper code exactly when matches are short and fresh (a
- * page of heap data, a struct array), and the token form's varint is the
- * cheaper one when they are long and near (columnar text, prose off the
- * gate). A screen priced with the wrong form therefore refuses passes the
- * other form would win. That is measurable on the dumps, where this form's
- * whole stream is smaller than the sweep's winner AND arrives at half the
- * encode cost, so the verdict that matters has to be taken with it.
- *
- * Everything else is the token screen's: the same sample size, the same
+ * Everything else is the first screen's: the same sample size, the same
  * level margin (so the ladder's monotonicity is the ladder's, not this
  * function's), the same tile price of the same shape, and the same second
- * sample for a block the first one convicts. The two minimum payloads are
- * both 10 bytes, so the sample-scaled estimate is the token one unchanged. */
-static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
-                                 uint8_t tid, uint8_t sc, const uint8_t *mb,
-                                 uint16_t meta_len, uint32_t speed,
-                                 int have_best, uint32_t best_total)
+ * sample for a block the first one convicts. Both stages budget the same
+ * minimum LZ payload, so the sample-scaled estimate is the same one. */
+static int zpse_block_lz_final_screen(ZpseEncoder *e, const uint8_t *in,
+                                      uint32_t n, uint8_t tid, uint8_t sc,
+                                      const uint8_t *mb, uint16_t meta_len,
+                                      uint32_t speed, int have_best,
+                                      uint32_t best_total)
 {
     (void)speed; /* LZ4 encoding is level-independent; see ZPSE_LZ4_SCREEN_NUM. */
     uint32_t sn = n < (uint32_t)ZPSE_LZ_SCREEN_BYTES
@@ -3242,18 +3128,16 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         sn = n < pb ? n : pb;
     }
 #endif
-    if (sn < ZPSE_LZ2_MIN_MATCH + 1u || e->cand == 0) {
+    if (sn < ZPSE_LZ_MIN_MATCH + 1u || e->cand == 0) {
         return 1;
     }
     /* A short block's sample is a larger fraction of the block, and the pass
-     * it guards is the expensive one (see ZPSE_LZ2_SHORT_N). */
-    if (n < (uint32_t)ZPSE_LZ2_SHORT_N) {
-        num = num * (uint32_t)ZPSE_LZ2_SHORT_MARGIN_NUM /
-              (uint32_t)ZPSE_LZ2_SHORT_MARGIN_DEN;
+     * it guards is the expensive one (see ZPSE_LZ_FINAL_SHORT_N). */
+    if (n < (uint32_t)ZPSE_LZ_FINAL_SHORT_N) {
+        num = num * (uint32_t)ZPSE_LZ_FINAL_SHORT_MARGIN_NUM /
+              (uint32_t)ZPSE_LZ_FINAL_SHORT_MARGIN_DEN;
     }
-    lz_s = zpse_lz2_encode_sample(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND,
-                                  e->lz,
-                                  (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS, sn);
+    lz_s = zpse_lz4_encode_sample(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND);
     if (lz_s == 0u) {
         return 1;
     }
@@ -3273,10 +3157,8 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     }
     if (ZPSE_LZ4_SCREEN_SAMPLES > 1u && have_best) {
         uint32_t off = (n - sn) / 2u;
-        uint32_t lz_m = zpse_lz2_encode_sample(in + off, sn, e->cand,
-                                               (uint32_t)ZPSE_E_SZ_CAND, e->lz,
-                                               (uint32_t)ZPSE_LZ_SCREEN_HASH_BITS,
-                                               sn);
+        uint32_t lz_m = zpse_lz4_encode_sample(in + off, sn, e->cand,
+                                               (uint32_t)ZPSE_E_SZ_CAND);
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -3289,78 +3171,72 @@ static int zpse_block_lz2_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 /* Is this LZ stream worth taking? Smaller than the tile winner (or the
  * sweep found nothing at all, in which case there is no tile stream to
  * compare against), inside the level's acceleration factor, and smaller by
- * enough to pay for the decode it gives up. `lz_cmds == 0` cannot happen
- * from zpse_lz_encode (its stream always ends in a command) but is kept as
- * "no evidence either way" rather than a division by zero.
+ * enough to pay for the decode it gives up. The count is walked lazily in
+ * the body, once the size gate has passed; it cannot be zero from the walker
+ * (which returns at least one), but the division guard is kept as "no
+ * evidence either way" rather than a division by zero.
  *
  * The margin is the format's size-only one: the nine-level table is the sole
  * authority for a block over a page, and the page path is FLAT. */
-static int zpse_block_lz_wins(uint32_t n, uint32_t lz_cmds, uint32_t lz_total,
+static int zpse_block_lz_wins(uint32_t n, uint8_t *stream, uint32_t lz_total,
                               int have_best, uint32_t best_total,
                               uint32_t speed)
 {
+    uint32_t lz_cmds;
+    uint32_t raw_len;
+
     if (have_best &&
         (lz_total >= best_total ||
          best_total - lz_total <
              best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u)) {
         return 0;
     }
+    /* [block header][u32 n][u32 cmds][raw LZ4 block]. try_lz always writes
+     * the full 32-byte envelope. The count walk is the sole consumer of the
+     * stream and happens only after the cheap size margin above passes. */
+    raw_len = lz_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE - 8u;
+    lz_cmds = zpse_lz_cmd_count(
+        stream + (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 8u, raw_len);
+    /* Commit the real count word before the caller copies the stream out.
+     * The encoder leaves a nonzero placeholder so discarded streams need no
+     * walk; a winning stream must carry the same bytes as before. */
+    zpse_store_u32le(stream + (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 4u, lz_cmds);
     if (lz_cmds != 0u && n / lz_cmds < zpse_lz_min_bpc(speed)) {
         return 0;
     }
     return 1;
 }
 
-/* The level from which a PAGE takes the hexadecimal LZ encoding instead of the
- * fast one (see zpse_block_try_lz2).
- *
- * 7, and not 5 or 6, because the form is a ratio trade rather than a win on
- * both axes: at 4 KiB over the dumps and Silesia it is 0.07 and 0.59 of a
- * ratio point smaller than the fast form, for 11 to 15% of the Silesia page
- * encode and 30% of its decode. The default level is the one whose rate this
- * whole format is measured on, so it keeps the fast form and is byte-identical
- * to the build before this pass (88 600 950 over the dumps, 116 268 437 over
- * Silesia). The rungs from 7 up are where size is the point: level 9 goes
- * 41.29 -> 40.86% over the dumps and 53.27 -> 52.57% over Silesia. */
-#ifndef ZPSE_LZH_PAGE_LEVEL
-#define ZPSE_LZH_PAGE_LEVEL 7u
-#endif
+/* A candidate that is committed without passing through zpse_block_lz_wins
+ * still needs its count word filled in: the encoder only writes a placeholder,
+ * and a later Huffman wrap codes every payload byte, so a wrong count would
+ * change the output bytes. Called only after the caller's size gate has
+ * accepted the stream. */
+static void zpse_block_lz_finish_count(uint8_t *stream, uint32_t total)
+{
+    uint32_t raw_len = total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE - 8u;
 
-/* The block size from which the sweep's own finder pass uses the encoder's
- * spare 64 KiB staging region as a 2^15-entry hash table instead of the 16
- * KiB e->lz, and the reason it is not every size.
- *
- * A 64 KiB block has 65536 positions and a 13-bit table has 8192 slots, so the
- * direct-mapped finder overwrites seven of every eight candidates before it
- * can look at them; the 64 KiB region holds 32768 slots, one per two
- * positions. Measured on the finder alone (same parse, same writers, one
- * pinned core, best of three passes over the three dumps and twelve Silesia
- * files), 13 bits against 15 at 64 KiB: dumps 76,665,796 -> 75,727,522 bytes,
- * Silesia 100,690,345 -> 99,817,619, for 2.4 and 2.6% of the pass's rate. At
- * 16 KiB the table also pays: dumps 82,251,876 -> 82,127,429 with the hex
- * writer, 83,501,138 -> 83,300,437 with the fast one, and Silesia 106,838,855
- * -> 106,447,280 / 107,001,086 -> 106,371,923, and there it is 6 to 10%
- * FASTER as well as smaller, because 32 KiB of table fits L2 beside the block
- * while the 16 KiB table does not stay resident in L1.
- *
- * A page is the exception, and it is why this is a floor rather than the
- * default: at 4 KiB the 64 KiB region is sixteen times the block, and
- * clearing it costs more than the collisions it removes (dumps 455.4 ->
- * 388.3 MB/s at 15 bits, and 41.209 -> 41.178% of bytes -- the bigger table
- * is SLOWER there). So the table grows where the block is big enough to pay
- * for clearing it, and pages keep ZPSE_LZ_HASH_BITS.
+    zpse_store_u32le(
+        stream + (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 4u,
+        zpse_lz_cmd_count(stream + (uint32_t)ZPSE_BLOCK_HEADER_SIZE + 8u,
+                          raw_len));
+}
+
+/* The block size from which the block layer hands the encoder's spare 64 KiB
+ * staging region to the LZ4 pass instead of the 16 KiB e->lz. Historically
+ * this was the floor at which a wider caller-supplied hash table paid for
+ * itself in the old match finders (the measurements are in docs/HISTORY.md);
+ * src/lz4block.c now owns its own match search and ignores the table pointer,
+ * so the knob is retained only for the ladder's sizing and the screens.
  *
  * The region is free at every point this is used: it is the trials' transform
- * staging, and the finder runs after the last trial. The one caller that
- * writes a stream INTO tstage -- the lazy-window second pass, which only
- * exists above a page and up to ZPSE_LZ_LAZY_MAX -- is passed the old table
- * explicitly, and each pass clears its own table on entry, so the two never
- * overlap. */
+ * staging, and the LZ4 pass runs after the last trial. */
 #ifndef ZPSE_LZ_TABLE_BIG_MIN
 #define ZPSE_LZ_TABLE_BIG_MIN 16384u
 #endif
-/* The fast LZ form's block: same header, same 'is_last' and CRC handling as
- * zpse_block_try_lz, different payload codec. */
+/* The final LZ4 block: the canonical ZPSE_B_LZ form, with the same header,
+ * 'is_last' and CRC handling as zpse_block_try_lz. It is the second LZ
+ * decision point -- priced after the LZ+tile stage -- not a second codec. */
 static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                               uint32_t in_crc, int is_last, uint32_t seq,
                               uint8_t *dst, uint32_t cap, uint32_t *total_out,
@@ -3370,79 +3246,15 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     uint8_t flags;
     uint32_t payload;
     uint32_t total;
-    int hex_form;
 
     if (e->lz == 0 || dst == 0 || total_out == 0) {
         return ZPSE_BAD_ARG;
     }
-    if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ2_MIN_PAYLOAD) {
+    if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ_MIN_PAYLOAD) {
         return ZPSE_OUTPUT_OVERFLOW;
     }
-    /* One decision, read by both the writer and the header. They have to agree
-     * or the decoder dispatches to the other codec: the first version of the
-     * page rule switched the encoder here and left the header saying LZ2, and
-     * every page it wrote was an LZ2 header over a hex payload. */
-    hex_form = ((e->enc_flags & ZPSE_ENC_LZ_HEX) != 0u ||
-                (n <= (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
-                 zpse_enc_speed(e->enc_flags) >= ZPSE_LZH_PAGE_LEVEL))
-                   ? 1
-                   : 0;
-    {
-        /* Which table the finder uses depends on who asked for it.
-         *
-         * A caller outside the sweep that is holding the candidate staging
-         * for something else has its 64 KiB free: 2^15 entries instead of
-         * 2^13, which is both faster and smaller -- 128 KiB still fits L2
-         * while 16 KiB of it does not fit L1 beside a 64 KiB block streaming
-         * past. A caller inside the sweep keeps e->lz and the 13 bits the
-         * format has always used. */
-        void *tab = e->lz;
-        uint32_t hb = (uint32_t)ZPSE_LZ_HASH_BITS;
-
-        if (dst != e->cand) {
-            /* The caller is holding the candidate staging for something
-             * else, so its 64 KiB are free: 2^15 entries instead of 2^13.
-             * The bigger table is both faster and smaller -- 128 KiB still
-             * fits L2 while 16 KiB of it does not fit L1 beside a 64 KiB
-             * block streaming past, and it misses less -- which is the same
-             * measurement that made the F form use it. Only the gated path
-             * reaches this: the sweep's candidates all write into e->cand.
-             */
-            tab = e->cand;
-            hb = 15u;
-        } else if (n >= (uint32_t)ZPSE_LZ_TABLE_BIG_MIN) {
-            /* The sweep's own candidate, big enough to pay for the table:
-             * the trials are over, so their 64 KiB staging region is free.
-             * See ZPSE_LZ_TABLE_BIG_MIN for what the bigger table is worth
-             * and why a page keeps the small one. */
-            tab = e->tstage;
-            hb = 15u;
-        }
-        /* A page gets the hexadecimal encoding; anything larger keeps the fast
-         * one. (Pages normally take the FLAT path; this is the long-header
-         * fall-through for a checksum-requesting page.)
-         *
-         * The split is a measurement, not a preference. On the same finder
-         * pass at 4 KiB the hex form is 2.51% smaller over the dumps and 2.10%
-         * over Silesia -- its distance code leaves only the top sixteen codes
-         * for the repeat cache, so a page's 1..224 distances cost one byte
-         * where the fast form's cost two -- and at level 6 that turns into
-         * -146,139 bytes over the dumps and -1,265,654 over Silesia (0.60 of a
-         * ratio point) for 9.4% of the Silesia page rate. At 64 KiB the same
-         * distance code pays three bytes above 4320, which is a distance a
-         * 64 KiB block reaches routinely: Silesia grows 1.27 MB and the dumps
-         * 301 bytes. So the short blocks take the smaller stream and the long
-         * ones keep the faster decoder. */
-        if (hex_form != 0) {
-            payload = zpse_lzh_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                                      cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE,
-                                      tab, hb);
-        } else {
-            payload = zpse_lz2_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                                      cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE,
-                                      tab, hb);
-        }
-    }
+    payload = zpse_lz4_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                              cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE);
     if (payload == 0u) {
         return ZPSE_OUTPUT_OVERFLOW;
     }
@@ -3450,9 +3262,7 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
     }
     total = (uint32_t)ZPSE_BLOCK_HEADER_SIZE + payload;
-    flags = (uint8_t)((hex_form != 0 ? (uint8_t)ZPSE_B_LZ_HEX
-                                     : (uint8_t)ZPSE_B_LZ2) |
-                      ZPSE_B_RESET |
+    flags = (uint8_t)(ZPSE_B_LZ | ZPSE_B_RESET |
                       (((e->enc_flags & ZPSE_ENC_CHECKSUM) != 0u)
                            ? ZPSE_B_CRC : 0u));
     if (is_last) {
@@ -3464,60 +3274,10 @@ static int zpse_block_try_lz2(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     return ZPSE_OK;
 }
 
-/* ---- Which of the two LZ forms writes the block --------------------- *
- *
- * The ASCII gate has already answered this by the time the finder runs. A
- * block it convicts is one whose tiles lose to the seven-bit pack, which is
- * text, and text is the shape the fast form was built for: matches of five
- * or six bytes at a fresh distance are cheaper as a fixed 16-bit field plus
- * a one-byte repeat code than as the token form's 7-bit varints, which is
- * why it codes prose smaller AND decodes it at roughly twice the rate.
- * Everywhere else the token form keeps the ground it held -- on the blocks
- * where matches are short and far its codes are the cheaper ones, and on
- * sparse_mix it codes 8441 bytes where the fast form writes 8687.
- *
- * The first version of this priced the two forms against each other on a
- * four-kilobyte head sample instead, and the measurement is why it is not
- * that. The sample alone cost 7.3% of the default level's encode rate (369.0
- * to 341.9 MB/s over five Silesia files, best of two, one pinned core),
- * because it runs on every block that reaches the finder -- and it still
- * chose the token form on blocks the fast form codes smaller. The gate is
- * free, the block having paid for it already, and on the same five files it
- * wrote 61,923,050 bytes against the sample's 62,538,610, at 366.5 MB/s
- * against 347.9, decoding at 1739.6 MB/s against 1514.7. The two tests agree
- * on almost every block; where they disagree the gate is right more often,
- * and it costs nothing.
- *
- * The verdict is level-independent -- the gate reads the block, not the
- * ladder -- so every level makes the same choice on the same block, which is
- * what keeps the ladder's ordering (tests/suites/test_levels.c) a property
- * of the screens and the win rule rather than of which form happened to win.
- * That is also why this is not the earlier experiment of swapping the fast
- * form in as the finder outright: that one made the deeper levels write
- * LARGER blocks than the balanced level on sparse_mix (8687 against 8520),
- * because a stream that is smaller on one block is not smaller on every one.
- */
-
-/* The match-finder candidate: the token form.
- *
- * The fast form was tried here in its place and reverted, and the measurement
- * is why.
- * Swapped in -- with its backward walk and its lazy probe -- it codes the
- * twelve Silesia files 3.0% smaller than the token form does at the 13-bit
- * table this path is restricted to, and the default level goes from
- * 104,474,009 bytes to 102,102,403 at the same encode rate. What it also does
- * is write a LARGER block than the token form on the sparse columnar cases:
- * sparse_mix costs 8687 bytes from the fast form and 8441 from the token one,
- * and because levels 7-9 take this pass's stream without a trial (see the
- * early finder in zpse_block_encode), the deeper levels then wrote more than
- * the shallower ones -- 8687 against the balanced level's 8520, which is the
- * ordering tests/suites/test_levels.c pins and the reason the swap is not
- * shipped. The fast form is still offered where nothing is skipped by taking
- * it: the last candidate at MAX, competing on size alone.
- *
- * The table is e->lz and not e->cand on purpose: this runs inside the sweep,
- * where e->cand and e->best are the encoder's own staging (see
- * zpse_block_try_lz2). */
+/* The match-finder candidate: the one canonical LZ4 form. The table, hash
+ * width and lazy-window arguments are kept in the signature for the call
+ * sites, which price the second decision point with them; src/lz4block.c
+ * ignores them because LZ4 owns the match search. */
 static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              uint32_t in_crc, int is_last, uint32_t seq,
                              uint8_t *dst, uint32_t cap, void *tab,
@@ -3535,34 +3295,15 @@ static int zpse_block_try_lz(ZpseEncoder *e, const uint8_t *in, uint32_t n,
     if (cap <= (uint32_t)ZPSE_BLOCK_HEADER_SIZE + ZPSE_LZ_MIN_PAYLOAD) {
         return ZPSE_OUTPUT_OVERFLOW;
     }
-    /* The gate's verdict chooses the form: a text block is written by the
-     * fast one, everything else by this one. See the measurement above. */
-    if (n > ZPSE_LZ_MIN_MATCH + 1u && e->ascii_gate != 0u) {
-        return zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, dst, cap,
-                                  total_out, cmds_out);
-    }
-    /* The table is the caller's choice, because the caller is what knows
-     * which 64 KiB of staging this block has already spent. `tab`/`hb` name
-     * a buffer the CALLER has proved free at this point in the block's
-     * encode; the 16 KiB e->lz is the fallback for a caller that is inside
-     * the sweep, where cand and best are the trial's staging and the
-     * winner. See the call sites for which is which.
-     *
-     * A bigger table is both smaller and faster here for the reason the fast
-     * form's is: 16 KiB does not stay resident beside a 64 KiB block
-     * streaming past it, so the table pays L2 latency either way, and the
-     * bigger one misses less often. */
-    payload = zpse_lz_encode_ex(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
-                                cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE, tab,
-                                zpse_enc_speed(e->enc_flags) == 1u
-                                    ? (uint32_t)ZPSE_LZ_HASH_BITS_FAST
-                                    : hb,
-                                lazy_max);
+    (void)tab;
+    (void)hb;
+    (void)lazy_max;
+    payload = zpse_lz4_encode(in, n, dst + ZPSE_BLOCK_HEADER_SIZE,
+                              cap - (uint32_t)ZPSE_BLOCK_HEADER_SIZE);
     if (payload == 0u) {
         return ZPSE_OUTPUT_OVERFLOW;
     }
-    /* The payload header carries the count: the token stream is variable
-     * length, so the payload length does not divide into commands. */
+    /* The payload header carries the command count. */
     if (cmds_out != 0) {
         *cmds_out = zpse_load_u32le(dst + ZPSE_BLOCK_HEADER_SIZE + 4u);
     }
@@ -3805,7 +3546,7 @@ static uint32_t zpse_block_ascii_total(uint32_t n)
 }
 
 /* Remember which tile shape won, so the next block of this context can try
- * it first. Only tile forms are remembered: RAW and the two LZ forms say
+ * it first. Only tile forms are remembered: RAW, the LZ4 forms and HUF say
  * nothing about which transform the data wants, and a predictor that carried
  * them back would spend its next first trial re-learning that.
  *
@@ -3825,7 +3566,7 @@ static void zpse_block_hist_set(ZpseEncoder *e, uint8_t block_flags,
 {
     if ((block_flags &
          (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
-                   ZPSE_B_LZ2)) != 0u) {
+                   ZPSE_B_HUF)) != 0u) {
         e->hist_valid = 0u;
         e->hist_streak = 0u;
         return;
@@ -3850,8 +3591,8 @@ static void zpse_block_hist_set(ZpseEncoder *e, uint8_t block_flags,
  * designs were built and measured on this tree, and neither is here.
  *
  * The first put two cheap questions in front of the sweep -- sixteen spread
- * tiles all near-random by the encoder's own rule, and a fast-LZ pass over
- * the head kilobyte finding no repeat -- and wrote RAW when both said so. It
+ * tiles all near-random by the encoder's own rule, and an LZ pass over the
+ * head kilobyte finding no repeat -- and wrote RAW when both said so. It
  * is ratio-safe and useless: it fires on 91 blocks of the shared-library
  * dump's 29 297 (0.3%), because the pages that go raw are not noise, they
  * are simply not compressible by any shape the sweep prices, and that is
@@ -4293,8 +4034,8 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         return ZPSE_BAD_BLOCK_SIZE;
     }
 
-    /* ZPSE_ENC_LZ_FAST: the whole decision is the match finder. One pass
-     * writes the fast LZ form, and a block that pass cannot beat a verbatim
+    /* ZPSE_ENC_LZ_FAST: the whole decision is the LZ4 pass. One pass writes
+     * the canonical LZ4 form, and a block that pass cannot beat a verbatim
      * copy on goes RAW. No probe, no candidate list, no trial -- the point
      * is to spend the block's encode budget on one LZ parse. */
     if ((e->enc_flags & ZPSE_ENC_LZ_FAST) != 0u && e->lz != 0) {
@@ -4310,9 +4051,12 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         (void)f_cmds;
         if (lrc == ZPSE_OK &&
             f_total < (uint32_t)ZPSE_BLOCK_HEADER_SIZE + n) {
+            /* The stream ships; fill its count word before the page shrink
+             * (and any later wrap) reads the payload. */
+            zpse_block_lz_finish_count(out, f_total);
             f_total = zpse_block_shrink_page(out, n, f_total);
-            /* try_lz2's header carries ZPSE_B_LZ2 (or LZ_HEX): invalidate. */
-            zpse_block_hist_set(e, ZPSE_B_LZ2, 0u, 1u);
+            /* The writer's header carries ZPSE_B_LZ: invalidate. */
+            zpse_block_hist_set(e, ZPSE_B_LZ, 0u, 1u);
             return (int)f_total;
         }
         if (lrc != ZPSE_OK && lrc != ZPSE_OUTPUT_OVERFLOW) {
@@ -5524,7 +5268,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (e->lz != 0 && atotal > lz_floor &&
             zpse_block_lz_level(lz_speed, e->ascii_gate)) {
             uint32_t lz_total = 0u;
-            uint32_t lz_cmds = 0u;
             uint32_t lz_cap = (uint32_t)ZPSE_E_SZ_CAND;
             uint32_t win = atotal / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u;
             int lz_screen_win;
@@ -5583,14 +5326,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                     rc = zpse_block_try_lz(
                         e, in, n, in_crc, is_last, seq, e->best, lz_cap,
                         e->cand, 15u, (uint32_t)ZPSE_BLOCK_SHORT_MAX,
-                        &lz_total, &lz_cmds);
+                        &lz_total, 0);
 #if defined(ZPSE_BLOCK_STATS)
                     zpse_block_lz_passes++;
                     zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
 #endif
                 }
                 if (rc == ZPSE_OK &&
-                    zpse_block_lz_wins(n, lz_cmds, lz_total, 1, atotal,
+                    zpse_block_lz_wins(n, e->best, lz_total, 1, atotal,
                                        lz_speed)) {
                     /* ---- The gate's total is arithmetic, so the trial is
                      * not needed to settle it ---------------------------
@@ -5607,10 +5350,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                      * block's encode spent on a stream that cannot win:
                      * `dickens` 174 -> 587 MB/s and `webster` 199 -> 246 once
                      * this returned here instead (screen at 4 KiB, one
-                     * pinned core). The exception is MAX, which offers the
-                     * fast LZ2 form after the sweep: the trial is that
-                     * candidate's `have_best`, so the deepest rung keeps it
-                     * and its stream is unchanged. */
+                     * pinned core). The exception is the deepest rung, which
+                     * offers the final LZ4 pass after the sweep: the trial is
+                     * that candidate's `have_best`, so that rung keeps it and
+                     * its stream is unchanged. */
                     /* When the cheap sample already said TEXT cannot win,
                      * the early TEXT return above handled the block. Here the
                      * finder's stream is the smaller one against the identity
@@ -5753,7 +5496,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                              e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK, 0,
                              0u, lz_cache)) {
         uint32_t lz_total = 0u;
-        uint32_t lz_cmds = 0u;
         int lrc;
 
 #if defined(ZPSE_BLOCK_STATS)
@@ -5763,15 +5505,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                     (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
                                     (uint32_t)ZPSE_BLOCK_SHORT_MAX,
-                                    &lz_total, &lz_cmds);
+                                    &lz_total, 0);
             zpse_block_lz_passes++;
             zpse_block_lz_pass_cycles += blk_rdtsc() - t_cyc;
         }
 #else
         lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                 (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
-                                (uint32_t)ZPSE_BLOCK_SHORT_MAX, &lz_total,
-                                &lz_cmds);
+                                (uint32_t)ZPSE_BLOCK_SHORT_MAX, &lz_total, 0);
 #endif
 
         /* ...and only when the block is not one the tiles own outright.
@@ -5785,7 +5526,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * above it -- and it keeps the size suite's contract exact. */
         if (lrc == ZPSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
             lz_total <= out_cap && lz_total >= n / 64u &&
-            zpse_block_lz_wins(n, lz_cmds, lz_total, 0, 0u,
+            zpse_block_lz_wins(n, e->cand, lz_total, 0, 0u,
                                e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
             memcpy(out, e->cand, lz_total);
             lz_total = zpse_block_shrink_page(out, n, lz_total);
@@ -6107,7 +5848,6 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                      (uint32_t)ZPSE_ENC_SPEED_MASK,
                                  have_best, best_total, lz_cache)) {
             uint32_t lz_total = 0u;
-            uint32_t lz_cmds = 0u;
             uint32_t lz_speed = e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK;
 
             /* Cap the pass at the size it could still win at. `lz_wins`
@@ -6146,50 +5886,44 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 rc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
                                        lz_cap, ltab, lhb,
                                        (uint32_t)ZPSE_BLOCK_SHORT_MAX,
-                                       &lz_total, &lz_cmds);
+                                       &lz_total, 0);
             }
             /* ---- The lazy window above a page -------------------------
              *
-             * The length-measured lazy step is worth 0.31 of a point at a page
-             * on the dumps, 0.23 on Silesia and 0.09 on the generated mixed
-             * corpus, whose matches are shorter. It is not offered at 8
-             * or 16 KiB because it is a heuristic, not a
-             * proof: at those sizes it sometimes gives up a byte for a later
-             * match that codes longer, and the level ladder (a deeper level
-             * never writes a larger block) is then a property of the data
-             * rather than of the encoder. Above a page there is no ladder to
-             * break by taking the smaller of two streams, and the scratch is
-             * free: the LZ+tile stage below is the next thing to want
-             * e->tstage, so the plain stream stays where it was written and
-             * the lazy one is written beside it. Only a strictly smaller
-             * stream replaces it, so enabling this window can cost encode
-             * time and cannot cost a byte. */
+             * Historically this second LZ pass fed a length-measured lazy
+             * match finder a wider table (ZPSE_LZ_HASH_BITS_WIDE) and a
+             * longer lookahead (ZPSE_LZ_LAZY_MAX) than the first pass; the
+             * numbers that justified it are in docs/HISTORY.md. LZ4 now owns
+             * the match search and ignores all of those arguments, so the two
+             * calls write the same stream and the second one is a decision
+             * point kept in place rather than a different parse. The call
+             * sites and their arguments stay as they are to avoid churn in
+             * the level ladder; only a strictly smaller stream replaces the
+             * first one. */
             if (rc == ZPSE_OK && e->ascii_gate == 0u &&
                 n > (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
                 n <= (uint32_t)ZPSE_LZ_LAZY_MAX &&
                 lz_total <= (uint32_t)ZPSE_E_SZ_TSTAGE) {
                 uint32_t lz_lazy = 0u;
-                uint32_t lz_lazy_cmds = 0u;
 
                 if (zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
                                       e->tstage, lz_cap, e->lz,
                                       (uint32_t)ZPSE_LZ_HASH_BITS_WIDE,
                                       (uint32_t)ZPSE_LZ_LAZY_MAX, &lz_lazy,
-                                      &lz_lazy_cmds) == ZPSE_OK &&
+                                      0) == ZPSE_OK &&
                     lz_lazy < lz_total) {
                     memcpy(e->cand, e->tstage, lz_lazy);
                     lz_total = lz_lazy;
-                    lz_cmds = lz_lazy_cmds;
                 }
             }
-            /* Smaller is not enough: the two forms decode at speeds that
-             * have nothing to do with their ratio, so the win also has to be
-             * big enough to pay for the decode it gives up and the command
-             * loop has to be inside this level's acceleration factor. Both
-             * tests are in zpse_block_lz_wins, with the measurements they
-             * came from. */
+            /* Smaller is not enough: an LZ4 stream and a tile stream decode
+             * at speeds that have nothing to do with their ratio, so the win
+             * also has to be big enough to pay for the decode it gives up and
+             * the LZ4 command loop has to be inside this level's acceleration
+             * factor. Both tests are in zpse_block_lz_wins, with the
+             * measurements they came from. */
             if (rc == ZPSE_OK &&
-                zpse_block_lz_wins(n, lz_cmds, lz_total, have_best,
+                zpse_block_lz_wins(n, e->cand, lz_total, have_best,
                                    best_total, lz_speed)) {
                 if (direct_out) {
                     /* In direct_out mode, `out` is the caller's buffer with
@@ -6246,26 +5980,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 ZPSE_OK &&
             (wh.block_flags &
              (uint8_t)(ZPSE_B_RAW | ZPSE_B_LZ | ZPSE_B_LZ_TILE |
-                       ZPSE_B_LZ2)) == 0u) {
+                       ZPSE_B_HUF)) == 0u) {
             uint32_t blen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
-            /* The table is the candidate staging, which this stage does not
-             * use: the winner is in e->best and the body is written to
-             * tstage. A body big enough to pay for the 64 KiB table gets it
-             * (ZPSE_LZ_TABLE_BIG_MIN); a page keeps the small one. */
-            void *btab = e->lz;
-            uint32_t bhb = (uint32_t)ZPSE_LZ_HASH_BITS;
-
-            if (blen >= (uint32_t)ZPSE_LZ_TABLE_BIG_MIN) {
-                btab = e->cand;
-                bhb = 15u;
-            }
 #if defined(ZPSE_BLOCK_STATS)
             uint64_t t_v2 = blk_rdtsc();
 #endif
-            uint32_t pl = zpse_lz_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
-                                         blen, e->tstage,
-                                         (uint32_t)ZPSE_E_SZ_TSTAGE, btab,
-                                         bhb);
+            uint32_t pl = zpse_lz4_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
+                                          blen, e->tstage,
+                                          (uint32_t)ZPSE_E_SZ_TSTAGE);
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_v2_cycles += blk_rdtsc() - t_v2;
 #endif
@@ -6281,10 +6003,14 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             if (pl != 0u && tot + tot / (uint32_t)ZPSE_LZ_TILE_DIV <=
                                 best_total &&
                 tot <= out_cap) {
+                /* e->tstage holds [u32 n][u32 cmds][raw LZ4 block], with no
+                 * block header. Fill the count word now, after the size gate
+                 * and before the payload is copied to `out`. */
+                zpse_store_u32le(e->tstage + 4u,
+                                 zpse_lz_cmd_count(e->tstage + 8u, pl - 8u));
                 wh.block_flags = (uint8_t)((wh.block_flags &
                                             ~(uint8_t)(ZPSE_B_RAW |
-                                                       ZPSE_B_LZ |
-                                                       ZPSE_B_LZ2)) |
+                                                       ZPSE_B_LZ)) |
                                            ZPSE_B_LZ_TILE);
                 wh.compressed_block_size = tot;
                 zpse_block_header_serialize(out, &wh);
@@ -6296,97 +6022,43 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
     }
 
-    /* ---- The fast LZ form, priced last ------------------------------ *
+    /* ---- The final LZ4 pass, priced last ------------------------------ *
      *
-     * Same envelope and same screen as the form above, a different command
-     * encoding: fixed 16-bit distances with a one-byte repeat code for the
-     * four most recent, a backward walk into the pending literals and a lazy
-     * probe at the next position (all three added since this form was first
-     * priced against the token one -- without them it was 2.9% of the corpus
-     * worse, with them it is 4.8% better on the same finder passes). It is not
-     * always the loser against the other form -- a
-     * fixed-width distance is cheaper than that one's codes when matches are
-     * short and far -- so it is offered as a candidate and kept only when its
-     * total is strictly smaller. The size corpus measures that: 577 of its
-     * 768 cases shrank and none grew.
+     * A second LZ4 decision point, run after the finder pass and the LZ+tile
+     * stage. Both write the same canonical raw-LZ4 block; keeping the second
+     * screen and pass is a deliberate decision-point split, not a second
+     * codec (the measurements behind it are in docs/HISTORY.md).
      *
      * Placement is the whole of the correctness here. This has to run after
      * the LZ-and-tiles stage, because that stage compresses the tile body and
-     * on periodic data it reaches a size neither LZ form can touch (a 300-byte
-     * period codes to 400 bytes against 1264 here); committing a merely
+     * on periodic data reaches a size LZ cannot touch; committing a merely
      * smaller stream before it would skip the better one. Committing last, the
      * candidate can only be reached when every other stage has had its say,
      * and `t2 < best_total` makes it a strict improvement over whatever they
      * produced.
      *
      * That stage can also write its winner straight into `out` (`direct_out`),
-     * and it is not always the better stream either: on a float column the
-     * same block comes out 20,501 bytes from here against its 21,092. So the
-     * candidate competes in that mode too, and overwrites the block already
-     * in `out` when it is strictly smaller -- which it can only be by
-     * `t2 < best_total`, and `t2 <= out_cap` keeps it inside the buffer.
+     * and it is not always the better stream. So the candidate competes in
+     * that mode too, and overwrites the block already in `out` when it is
+     * strictly smaller -- which it can only be by `t2 < best_total`, and
+     * `t2 <= out_cap` keeps it inside the buffer.
      *
-     * Offered from level 5 up it once took 915 bytes off the whole of Silesia
-     * and cost 19% of the default level's encode rate (275.6 to 223.5 MB/s,
-     * same corpus, same host, same two runs each), which is why it used to be
-     * offered at MAX only. That experiment kept the token form's screen (see
-     * below): it paid a second full pass on the blocks the first screen had
-     * already accepted, and reached none of the blocks this form wins.
-     * * The rungs below cannot take it at all. Levels 1-4 hold zero in the
- * ladder's screen columns, which the screen reads as "accept everything":
- * the pass would run on every block, including the ones level 5 then
- * refuses -- a level-4 block of 20,501 bytes against a level-5 block of
- * 21,092 on a float column, which is exactly the ordering
- * tests/suites/test_levels.c pins. The screen's columns are what hold
- * that ordering: its margin only loosens with depth and its sample count
- * only rises, so a deeper rung accepts a superset of what the rung below
- * accepts.
- *
- * Every rung that pays a match finder offers it (ZPSE_LZ2_MIN_LEVEL), and
- * the screen in front of it is its own (zpse_block_lz2_screen). The earlier
- * experiment that offered it from level 5 up kept the token form's screen,
- * and that is what made it a bad trade: on the blocks where the tile shapes
- * beat the token sample the candidate never ran, so the whole change bought
- * 915 bytes over Silesia for 19% of the default level's encode rate. Asking
- * the question with the form that writes the stream is what lets the
- * candidate reach the blocks it wins -- and the sizes can only fall, because
- * the stage is last and commits on a strict improvement.
- *
- * One finder pass instead of two was tried too, on levels 5-7: ask this
- * form's screen first and skip the token pass on a block it convicts. There
- * is no pass to skip -- the token form has its own screen over the same block
- * and already refuses those pages -- so it moved the 4 KiB dump total by
- * 15 918 bytes (+0.02 points) for nothing measurable. At 16 KiB it was 0.32
- * points SMALLER at 6% less encode, and that is not the win it looks like: it
- * is the second screen seeing a larger `best_total` and so convicting blocks
- * into this form that the token pass would have beaten. What it describes is
- * the token screen being too eager at that page size, not a missing saving,
- * and the fix for that is not a second screen call per block.
- *
- * Measured on this tree, 4 KiB pages over three process dumps: 89 074 160 ->
- * 88 254 342 bytes (41.77 -> 41.38%, and on the C-heap dump alone 8.93 ->
- * 6.82%, where this form goes from 0.0 to 6.3% of the raw bytes), 16 KiB
- * 83 112 979 -> 82 238 691, 64 KiB page totals within 36 bytes of 80 644 276,
- * and Silesia at 64 KiB unchanged to the byte at levels 6 and 9. It is paid
- * for in encode time: 73.1 -> 60.3 MB/s on the 4 KiB dump total at level 6,
- * with decode 1964 -> 2689 MB/s on the C heap, where a command loop over
- * fixed-width distances beats the tile reconstruction it replaces. This is
- * the one trade here that buys size with encode time instead of the other
- * way round, and on this corpus it is the right one: the form is the
- * cheapest way to code a page of pointers, and level 6 without it wrote a
- * C-heap page 24% larger than one greedy pass.
- *
- * Levels 1-4 still cannot take it: they write no LZ form at all, and offering
- * one would make a shallow rung write smaller blocks than the rung above it.
- */
-#ifndef ZPSE_LZ2_MIN_LEVEL
-#define ZPSE_LZ2_MIN_LEVEL ZPSE_ENC_SPEED_LZ_MIN
+     * Levels 1-4 cannot take it: they write no LZ form at all, and offering
+     * one would make a shallow rung write smaller blocks than the rung above
+     * it. Every rung that pays a match finder offers it (ZPSE_LZ_FINAL_MIN_LEVEL),
+     * and the screen in front of it is its own (zpse_block_lz_final_screen).
+     * Asking the question with the encoder that writes the stream is what lets
+     * the candidate reach the blocks it wins -- and the sizes can only fall,
+     * because the stage is last and commits on a strict improvement.
+     */
+#ifndef ZPSE_LZ_FINAL_MIN_LEVEL
+#define ZPSE_LZ_FINAL_MIN_LEVEL ZPSE_ENC_SPEED_LZ_MIN
 #endif
     if (have_best && e->lz != 0 &&
         zpse_enc_speed(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK) >=
-            (uint32_t)ZPSE_LZ2_MIN_LEVEL &&
+            (uint32_t)ZPSE_LZ_FINAL_MIN_LEVEL &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE +
-                                ZPSE_LZ2_MIN_PAYLOAD)) {
+                                ZPSE_LZ_MIN_PAYLOAD)) {
         /* The screen prices its sample under ONE candidate's transform, and
          * which one must not depend on the order the sweep attempted them in:
          * both orders are required to write identical streams (test_fuzz
@@ -6407,13 +6079,13 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 wi = wj;
             }
         }
-        if (!zpse_block_lz2_screen(e, in, n, tids[wi], scounts[wi],
-                                   meta_lens[wi] > 0 ? meta_bufs[wi] : in,
-                                   meta_lens[wi],
-                                   e->enc_flags &
-                                       (uint32_t)ZPSE_ENC_SPEED_MASK,
-                                   1, best_total)) {
-            goto lz2_done;
+        if (!zpse_block_lz_final_screen(e, in, n, tids[wi], scounts[wi],
+                                        meta_lens[wi] > 0 ? meta_bufs[wi] : in,
+                                        meta_lens[wi],
+                                        e->enc_flags &
+                                            (uint32_t)ZPSE_ENC_SPEED_MASK,
+                                        1, best_total)) {
+            goto lz_final_done;
         }
         uint32_t t2 = 0u;
         uint32_t cmds2 = 0u;
@@ -6423,6 +6095,11 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                 ZPSE_OK &&
             t2 < best_total &&
             (!direct_out || t2 <= out_cap)) {
+            /* This path commits without zpse_block_lz_wins; fill the count
+             * word now, after the strict size gate and before the copy. The
+             * Huffman wrap below codes the payload, so it must see the same
+             * bytes as the old eager count wrote. */
+            zpse_block_lz_finish_count(e->cand, t2);
             if (direct_out) {
                 memcpy(out, e->cand, t2);
             } else {
@@ -6433,29 +6110,30 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             have_best = 1;
         }
     }
-lz2_done:
+lz_final_done:
     /* ---- Huffman coding of the winning LZ payload -------------------- *
      *
      * The last thing the sweep does, and the only stage that runs after the
      * decision rather than as part of it: it wraps the stream that already
-     * won. That placement is the whole of the design. Wrapping inside
-     * zpse_block_try_lz would be wrong twice -- that path delegates to the
-     * fast form on an ASCII-gated block, so the payload it returns is not
-     * always the token form's, and both LZ stages can still be overwritten by
-     * a later candidate, so a Huffman stream built there could be thrown
-     * away after its cost was paid.
+     * won. That placement is the whole of the design. Wrapping inside either
+     * LZ writer would be wrong: both stages can still be overwritten by a
+     * later candidate, so a Huffman stream built there could be thrown away
+     * after its cost was paid.
      *
      * Nothing above can see it, so it cannot change what the sweep chooses.
      * A block it takes is the same block with the same inner stream inside
      * it, gated by ZPSE_HUF_DIV: the decode pays a Huffman pass before the LZ
      * pass, and a few bytes is not worth a second pass over the payload.
      *
-     * Only the three pure LZ forms are wrapped. The tile form's transform and
+     * Only the single pure LZ4 form is wrapped. The tile form's transform and
      * segment count live in the block header, and this form's envelope is the
-     * LZ forms' own -- transform 0, one segment, no metadata -- so a tile body
+     * LZ form's own -- transform 0, one segment, no metadata -- so a tile body
      * has nowhere to put them. The RAW form is not wrapped either: it is the
      * fallback for bytes that did not compress, and coding it would make a
-     * block that had already lost try again with a pass that cannot win. */
+     * block that had already lost try again with a pass that cannot win.
+     *
+     * ZPSE_B_HUF is bit 7 on its own, and the payload's inner_form is fixed to
+     * ZPSE_B_LZ, so the block header needs no combined LZ+HUF pattern. */
     if (have_best && zpse_block_huf_level(e->enc_flags) &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + ZPSE_HUF_MIN_PAYLOAD)) {
         uint8_t *win = direct_out ? out : e->best;
@@ -6463,12 +6141,9 @@ lz2_done:
 
         if (zpse_block_header_parse(&wh, win, ZPSE_BLOCK_HEADER_SIZE) ==
             ZPSE_OK) {
-            uint8_t form = (uint8_t)(wh.block_flags &
-                                     (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE |
-                                               ZPSE_B_LZ2));
+            uint8_t form = (uint8_t)(wh.block_flags & (uint8_t)ZPSE_B_LZ);
 
-            if (form == (uint8_t)ZPSE_B_LZ || form == (uint8_t)ZPSE_B_LZ2 ||
-                form == (uint8_t)ZPSE_B_LZ_HEX) {
+            if (form == (uint8_t)ZPSE_B_LZ) {
                 uint32_t plen = best_total - (uint32_t)ZPSE_BLOCK_HEADER_SIZE;
 #if defined(ZPSE_BLOCK_STATS)
                 uint64_t t_huf = blk_rdtsc();
@@ -6490,9 +6165,7 @@ lz2_done:
                     uint8_t nh[ZPSE_BLOCK_HEADER_SIZE];
 
                     wh.block_flags =
-                        (uint8_t)((wh.block_flags &
-                                   ~(uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE |
-                                              ZPSE_B_LZ2)) |
+                        (uint8_t)((wh.block_flags & ~(uint8_t)ZPSE_B_LZ) |
                                   (uint8_t)ZPSE_B_HUF);
                     wh.compressed_block_size =
                         (uint32_t)ZPSE_BLOCK_HEADER_SIZE + hl;
@@ -6516,7 +6189,7 @@ lz2_done:
      * The gate has already done the expensive work of proving this is text,
      * and zpse_text_price above already measured the token stream. Require a
      * 1/32 win over the LZ stream before paying for a second decode pass at
-     * read time. The writer stages into e->cand (the LZ2 path's buffer) and
+     * read time. The writer stages into e->cand (the LZ path's buffer) and
      * the copy below puts the bytes wherever the common copy-out expects the
      * winner -- `out` in direct_out mode, e->best otherwise. best_idx = 15 is
      * the sentinel the other non-candidate forms use. */
@@ -6566,7 +6239,7 @@ lz2_done:
      *
      * The winner's three history fields are read straight out of the final
      * header: LONG keeps them at [3]/[12]/[13], SHORT at [2]/[3]/[4]. This is
-     * the one site where they are not in a local -- the LZ_TILE / LZ2 / HUF
+     * the one site where they are not in a local -- the LZ_TILE / HUF
      * stages can rewrite the flags after the trial that won -- so read the
      * three bytes (no CRC, no validation) rather than the full header parse
      * the old hist_set ran over this same just-serialized header. */
