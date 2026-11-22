@@ -30,14 +30,6 @@
 #include "lz4.h"
 #include "lz4hc.h"
 
-/* ZPSE_ENC_PAGE_INSTANT is being added to the public header. This harness
- * must keep building before that lands, so supply the bit value here when
- * the installed header does not define it yet. It is bit 13, next to the
- * other page-profile bits (PAGE_TURBO is bit 10). */
-#ifndef ZPSE_ENC_PAGE_INSTANT
-#define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
-#endif
-
 #define PAGE 4096u
 #define COMP_CAP (PAGE * 2u)
 
@@ -110,8 +102,7 @@ static int all_zero(const unsigned char *p)
 }
 
 /* kind: 0 zpse level, 9 zpse FLAT (default level flags, no flag bit),
- * 1 zpse PAGE_FAST, 5 zpse LZ_FAST, 6 zpse LZ_HEX, 7 zpse PAGE_TURBO,
- * 8 zpse PAGE_INSTANT, 3 lz4hc, 4 lz4 default. */
+ * 5 zpse LZ_FAST, 3 lz4hc, 4 lz4 default. */
 static int run_codec(const char *name, const unsigned char *in,
                      const unsigned char *skip, size_t npages,
                      int kind, int param, int reps)
@@ -143,29 +134,9 @@ static int run_codec(const char *name, const unsigned char *in,
             dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                         (uint32_t)param << 1, enc_arena);
             break;
-        case 1:
-            dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                        ((uint32_t)param << 1) | ZPSE_ENC_PAGE_FAST,
-                                        enc_arena);
-            break;
         case 5:
             dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                         ((uint32_t)param << 1) | ZPSE_ENC_LZ_FAST,
-                                        enc_arena);
-            break;
-        case 6:
-            dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                        ((uint32_t)param << 1) | ZPSE_ENC_LZ_HEX,
-                                        enc_arena);
-            break;
-        case 7:
-            dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                        ((uint32_t)param << 1) | ZPSE_ENC_PAGE_TURBO,
-                                        enc_arena);
-            break;
-        case 8:
-            dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                        ((uint32_t)param << 1) | ZPSE_ENC_PAGE_INSTANT,
                                         enc_arena);
             break;
         case 3:
@@ -217,29 +188,9 @@ static int run_codec(const char *name, const unsigned char *in,
                 zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                        (uint32_t)param << 1, enc_arena);
                 break;
-            case 1:
-                zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                       ((uint32_t)param << 1) | ZPSE_ENC_PAGE_FAST,
-                                       enc_arena);
-                break;
             case 5:
                 zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                        ((uint32_t)param << 1) | ZPSE_ENC_LZ_FAST,
-                                       enc_arena);
-                break;
-            case 6:
-                zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                       ((uint32_t)param << 1) | ZPSE_ENC_LZ_HEX,
-                                       enc_arena);
-                break;
-            case 7:
-                zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                       ((uint32_t)param << 1) | ZPSE_ENC_PAGE_TURBO,
-                                       enc_arena);
-                break;
-            case 8:
-                zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                       ((uint32_t)param << 1) | ZPSE_ENC_PAGE_INSTANT,
                                        enc_arena);
                 break;
             case 3:
@@ -325,7 +276,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: bench_pages_static [--exclude-zero] [--no-lz4] "
                 "[--reps=N] [--modes=KEY,KEY,...] FILE...\n"
-                "  modes: level1 level6 level9 flat fast lzf lzh turbo instant "
+                "  modes: level1 level6 level9 flat lzf "
                 "lz4 hc4 hc9 hc12\n");
         return 2;
     }
@@ -371,11 +322,7 @@ int main(int argc, char **argv)
         emit("level6",  "zpse 6 (default)",   in, skip, npages, 0, 6, reps);
         emit("level9",  "zpse 9 MAX",         in, skip, npages, 0, 9, reps);
         emit("flat",    "zpse FLAT (default)", in, skip, npages, 9, 6, reps);
-        emit("fast",    "zpse 6 PAGE_FAST",   in, skip, npages, 1, 6, reps);
         emit("lzf",     "zpse 6 LZ_FAST",     in, skip, npages, 5, 6, reps);
-        emit("lzh",     "zpse 6 LZ_HEX",      in, skip, npages, 6, 6, reps);
-        emit("turbo",   "zpse 6 TURBO",       in, skip, npages, 7, 6, reps);
-        emit("instant", "zpse 6 PAGE_INSTANT", in, skip, npages, 8, 6, reps);
         emit("lz4",     "lz4 1",              in, skip, npages, 4, 1, reps);
         emit("hc4",     "lz4hc 4",            in, skip, npages, 3, 4, reps);
         emit("hc9",     "lz4hc 9",            in, skip, npages, 3, 9, reps);

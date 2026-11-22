@@ -36,7 +36,6 @@
 #include "tile.h"
 #include "segment.h"
 #include "lz.h"
-#include "lz2.h"
 #include "huf.h"
 #include "block.h"
 #include "frame.h"
@@ -48,20 +47,10 @@
 
 /* Retired page encoder flags (ZPSE_ENC_*). The page path no longer selects a
  * form by flag: every level picks the same page form for the same bytes, so
- * these defines are kept for source compatibility and are otherwise ignored.
- * Their values live in constants.h (TURBO, HUF) and api.h (INSTANT); collected
- * here so a caller including the umbrella sees what each one used to trade.
- *
- * ZPSE_ENC_PAGE_TURBO    Page rate profile: one cheap LZ pass behind the page
- *                        decode-first margin, skipping the multi-candidate
- *                        decision -- lz4-class encode rate at page size, with
- *                        a stream the decoder reads faster than raw LZ.
- * ZPSE_ENC_PAGE_HUF      Page entropy: allow the Huffman wrapper on a 4 KiB
- *                        page at any LZ level, trading an extra entropy pass
- *                        on both sides for a smaller page payload.
- * ZPSE_ENC_PAGE_INSTANT  No-decision classifier: write a page in one shot
- *                        from a cheap classifier, with no probe, trial or
- *                        sweep -- the fastest page encode, paid for in ratio.
+ * the old page-form flags are gone. ZPSE_ENC_PAGE_FAST, ZPSE_ENC_PAGE_TURBO,
+ * ZPSE_ENC_PAGE_HUF and ZPSE_ENC_PAGE_INSTANT are no longer defined, and the
+ * API refuses them rather than treating them as no-ops. ZPSE_ENC_HUF remains
+ * the one flag that wraps an LZ payload in Huffman streams at any level.
  */
 
 #endif /* ZPSE_H */

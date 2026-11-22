@@ -67,9 +67,8 @@ static void reference_pred(const uint8_t *plane, uint32_t nt, uint8_t literal,
 
         switch (pred) {
         case ZPSE_P_CONST_ZERO:
-            ph = 0u;
-            break;
-        case ZPSE_P_TILE_CONSTANT:
+            /* CONST_ZERO's prediction is the fill in byte 4 of the dense
+             * header, not an implicit zero. */
             ph = c;
             break;
         case ZPSE_P_LANE_PREVIOUS:
@@ -200,9 +199,6 @@ static int decode(uint32_t payload_len, uint8_t *got, uint32_t *got_len)
     if (rc != ZPSE_OK) {
         return rc;
     }
-    lanes.order1 = d.order1;
-    lanes.o2 = d.o2;
-    lanes.gen = 0u;
     return zpse_segment_decode(&d, &lanes, seg, payload_len, got,
                                ZPSE_DENSE_MAX_LEN, got_len);
 }
@@ -227,9 +223,6 @@ static int decode_guarded(uint32_t payload_len, uint32_t guard_from,
     if (rc != ZPSE_OK) {
         return rc;
     }
-    lanes.order1 = d.order1;
-    lanes.o2 = d.o2;
-    lanes.gen = 0u;
     rc = zpse_segment_decode(&d, &lanes, seg, payload_len, outguard,
                              (uint32_t)sizeof outguard, got_len);
     for (i = guard_from; i < (uint32_t)sizeof outguard; i++) {
@@ -367,9 +360,6 @@ static void sequence_case(void)
         ZpseLaneState lanes;
 
         rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
-        lanes.order1 = d.order1;
-        lanes.o2 = d.o2;
-        lanes.gen = 0u;
         if (rc == ZPSE_OK) {
             rc = zpse_segment_decode(&d, &lanes, seg, ZPSE_SEGMENT_HEADER_SIZE + len_a + len_b,
                                      seqout, (uint32_t)sizeof seqout, &got_len);
@@ -416,9 +406,6 @@ static void sequence_case(void)
             memcpy(want2 + 4096, e, 700u);
             got_len = 0u;
             rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
-            lanes.order1 = d.order1;
-            lanes.o2 = d.o2;
-            lanes.gen = 0u;
             if (rc == ZPSE_OK) {
                 rc = zpse_segment_decode(&d, &lanes, seg, ZPSE_SEGMENT_HEADER_SIZE + l1 + l2,
                                          seqout, (uint32_t)sizeof seqout,
@@ -438,9 +425,6 @@ static void sequence_case(void)
         uint32_t gl = 0u;
 
         rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
-        lanes.order1 = d.order1;
-        lanes.o2 = d.o2;
-        lanes.gen = 0u;
         if (rc == ZPSE_OK) {
             rc = zpse_segment_decode(&d, &lanes, seg, ZPSE_SEGMENT_HEADER_SIZE + len_a + len_b - 1u,
                                      seqout, (uint32_t)sizeof seqout, &gl);
@@ -478,10 +462,17 @@ static void hostile(void)
     CHECK(decode(len, out, &got_len) != ZPSE_OK, "reserved header byte");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 5] = 0u;
 
-    /* ORDER1 prediction is reserved inside a dense record. */
+    /* Predictor id 3 is a reserved gap inside a dense record. Old streams
+     * naming it must be refused, never decoded as a surviving family. */
     save = seg[ZPSE_SEGMENT_HEADER_SIZE + 3];
-    seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = ZPSE_P_ORDER1;
-    CHECK(decode(len, out, &got_len) != ZPSE_OK, "ORDER1 rejected in dense");
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = ZPSE_P_RESERVED_3;
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "predictor 3 rejected in dense");
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = save;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = ZPSE_P_RESERVED_4;
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "predictor 4 rejected in dense");
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = save;
+    seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = ZPSE_P_RESERVED_9;
+    CHECK(decode(len, out, &got_len) != ZPSE_OK, "predictor 9 rejected in dense");
     seg[ZPSE_SEGMENT_HEADER_SIZE + 3] = save;
 
     /* Predictor out of range. */
@@ -739,9 +730,6 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
     memset(&lanes, 0, sizeof lanes);
     rc = zpse_encoder_init(&e, EARENA, sizeof EARENA);
     CHECK(rc == ZPSE_OK, "encoder arena init");
-    lanes.order1 = e.order1;
-    lanes.o2 = e.o2;
-    lanes.gen = 0u;
     len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, n, literal, seg,
                                         (uint32_t)sizeof seg, 0u, 0u);
     cases++;
@@ -755,22 +743,20 @@ static void emitter_segment(uint32_t n, uint8_t v, uint8_t literal)
     if (want) {
         CHECK(len == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 12u * ((n + 4095u) / 4096u),
               "dense constant payload is a header per 4 KiB");
-        /* 0 needs no byte, the segment literal none, anything else the
-         * TILE_CONSTANT byte. */
-        CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 3] == (v == 0u ? ZPSE_P_CONST_ZERO
-                            : v == literal ? ZPSE_P_STRIDE_1
-                                           : ZPSE_P_TILE_CONSTANT),
+        /* STRIDE_1's fixed point is the segment literal, so that case needs
+         * no byte; every other one-value plane is CONST_ZERO with the fill
+         * carried in byte 4. */
+        CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 3] ==
+                  (v == literal ? ZPSE_P_STRIDE_1 : ZPSE_P_CONST_ZERO),
               "constant plane picks the cheapest predictor");
-        if (seg[ZPSE_SEGMENT_HEADER_SIZE + 3] == ZPSE_P_TILE_CONSTANT) {
-            CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 4] == v, "TILE_CONSTANT carries the byte");
+        if (v != literal) {
+            CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 4] == v,
+                  "CONST_ZERO carries the fill byte");
         }
     }
     memset(&d, 0, sizeof d);
     memset(&dlanes, 0, sizeof dlanes);
     rc = zpse_decoder_init(&d, DARENA, sizeof DARENA);
-    dlanes.order1 = d.order1;
-    dlanes.o2 = d.o2;
-    dlanes.gen = 0u;
     if (rc == ZPSE_OK) {
         rc = zpse_segment_decode(&d, &dlanes, seg, len, big,
                                  (uint32_t)sizeof big, &got_len);
@@ -800,9 +786,6 @@ static void emitter_palette(void)
     memset(&lanes, 0, sizeof lanes);
     CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == ZPSE_OK,
           "encoder arena init (palette)");
-    lanes.order1 = e.order1;
-    lanes.o2 = e.o2;
-    lanes.gen = 0u;
 
     /* Sixteen values, four bits each: the shape lowentropy has. */
     for (i = 0; i < ZPSE_DENSE_MAX_LEN; i++) {
@@ -821,8 +804,8 @@ static void emitter_palette(void)
         CHECK(seg[7] == ZPSE_S_LEN_PREFIX, "palette segment keeps flag 0x01");
         CHECK((((uint32_t)seg[4] | ((uint32_t)seg[5] << 8)) == 1u),
               "palette segment reports one record");
-        CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 3] == ZPSE_P_TILE_CONSTANT,
-              "palette record is constant-predicted");
+        CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 3] == ZPSE_P_CONST_ZERO,
+              "palette record is CONST_ZERO-predicted");
         CHECK((seg[ZPSE_SEGMENT_HEADER_SIZE + 2] & 7u) == (uint8_t)ZPSE_M_ALL_EXCEPTION,
               "palette record is all-exception");
         CHECK(((seg[ZPSE_SEGMENT_HEADER_SIZE + 2] >> 3) & 7u) == (uint8_t)ZPSE_R_PALETTE_BITS,
@@ -925,8 +908,8 @@ static void emitter_palette(void)
     if ((int)len > 0) {
         CHECK((seg[ZPSE_SEGMENT_HEADER_SIZE + 2] & ZPSE_DENSE_MARKER) != 0,
               "palette plane with 255 is dense");
-        CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 3] == ZPSE_P_TILE_CONSTANT,
-              "palette plane with 255 is constant-predicted");
+        CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 3] == ZPSE_P_CONST_ZERO,
+              "palette plane with 255 is CONST_ZERO-predicted");
         CHECK(seg[ZPSE_SEGMENT_HEADER_SIZE + 4] == 254u, "fill is the largest byte the plane lacks");
         CHECK(len == (uint32_t)ZPSE_SEGMENT_HEADER_SIZE + 2u + 10u + 1u + 16u + 2048u,
               "palette plane with 255 is one palette stream");
@@ -975,9 +958,6 @@ static void emitter_not_constant(void)
     memset(&lanes, 0, sizeof lanes);
     CHECK(zpse_encoder_init(&e, EARENA, sizeof EARENA) == ZPSE_OK,
           "encoder arena init (per-tile)");
-    lanes.order1 = e.order1;
-    lanes.o2 = e.o2;
-    lanes.gen = 0u;
     len = (uint32_t)zpse_segment_encode(&e, &lanes, plane, 4096u, plane[0],
                                         seg, (uint32_t)sizeof seg, 0u, 0u);
     cases++;
@@ -1036,7 +1016,7 @@ static void emitter_block(uint32_t n, uint8_t v)
             CHECK(clen == (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
                   "block: one-value token size");
         } else if ((bh.block_flags &
-                    (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ2 | ZPSE_B_LZ_TILE)) != 0) {
+                    (uint8_t)(ZPSE_B_LZ | ZPSE_B_LZ_TILE)) != 0) {
             CHECK(clen < 32u + 8u + ZPSE_SEGMENT_HEADER_SIZE + 10u * ((n + 255u) / 256u),
                   "block: a compressed form beats the tiles on a constant "
                   "block");
@@ -1074,7 +1054,8 @@ static void emitter(void)
             emitter_segment(sizes[si], vals[vi], vals[vi]);
             emitter_block(sizes[si], vals[vi]);
         }
-        /* Segment literal different from the plane: TILE_CONSTANT. */
+        /* Segment literal different from the plane: CONST_ZERO with the fill
+         * in byte 4. */
         emitter_segment(sizes[si], 0x77u, 0x11u);
     }
     emitter_not_constant();
@@ -1086,8 +1067,7 @@ int main(void)
     static const uint8_t preds[] = {
         ZPSE_P_CONST_ZERO,     ZPSE_P_LANE_PREVIOUS, ZPSE_P_LANE_DELTA,
         ZPSE_P_LANE_AVERAGE,   ZPSE_P_STRIDE_1,     ZPSE_P_STRIDE_2,
-        ZPSE_P_STRIDE_3,       ZPSE_P_STRIDE_4,     ZPSE_P_STRIDE_8,
-        ZPSE_P_TILE_CONSTANT};
+        ZPSE_P_STRIDE_3,       ZPSE_P_STRIDE_4,     ZPSE_P_STRIDE_8};
     static const uint32_t sizes[] = {1u, 2u, 7u, 8u, 12u, 17u, 256u, 1000u,
                                      4096u};
     static const uint8_t masks[] = {ZPSE_M_ALL_HIT, ZPSE_M_RAW_BITMAP,

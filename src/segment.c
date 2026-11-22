@@ -106,12 +106,10 @@ static uint64_t seg_load_u64(const uint8_t *p)
     return w;
 }
 
-/* The predictor ids the batched all-hit run accepts: every id except
- * ORDER1 (3), ORDER2 (4) and TILE_CONSTANT (9) -- the three whose tile is
- * not a pure prediction from the segment literal. One range test and one
- * shift-and-test, where the chain it replaces was up to five compares on
- * every tile that reached this point (i.e. on every tile of a stream whose
- * records are not eight-byte all-hit ones). */
+/* The predictor ids the batched all-hit run accepts: every id except the
+ * reserved gaps 3, 4 and 9 -- the three whose tile is not a pure prediction
+ * from the segment literal. Kept as the same 0xDE7 mask so the live ids keep
+ * their wire values; a stream naming a gap is rejected before it gets here. */
 static int seg_all_hit_pred(uint8_t pid)
 {
     return pid < 12u && ((UINT32_C(0xDE7) >> pid) & 1u) != 0u;
@@ -150,11 +148,12 @@ ZPSE_ALWAYS_INLINE void seg_fill_256(uint8_t *dst, uint8_t c)
  *
  * The dominant record on a sparse plane -- and the shape of every tile of
  * a constant one -- is a full 256-byte tile whose prediction is a single
- * byte: CONST_ZERO or TILE_CONSTANT, any mask mode, any residual mode but
- * SIGNED_DELTA (whose payload decodes through a private helper in
- * tile.c), at most 24 exceptions. Such a tile is a memset, one store per
- * exception in mask order, and the two-load history epilogue. The general
- * entry point reaches exactly that code, but only after it has parsed the
+ * byte: CONST_ZERO with its fill in byte 4 of the dense header, any mask
+ * mode, any residual mode but SIGNED_DELTA (whose payload decodes through a
+ * private helper in tile.c), at most 24 exceptions. Such a tile is a
+ * memset, one store per exception in mask order, and the two-load history
+ * epilogue. The general entry point reaches exactly that code, but only after
+ * it has parsed the
  * header a second time, re-derived the sizes, taken the family dispatch,
  * tested the all-hit case and checked for AVX2, and its frame carries the
  * delta buffer and every family's loop.
@@ -192,8 +191,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     if (rsz < (uint16_t)ZPSE_TILE_HEADER_SIZE) {
         return 0;
     }
-    if (rec[1] != (uint8_t)ZPSE_P_CONST_ZERO &&
-        rec[1] != (uint8_t)ZPSE_P_TILE_CONSTANT) {
+    if (rec[1] != (uint8_t)ZPSE_P_CONST_ZERO) {
         return 0;
     }
     mask_mode = zpse_tile_mask_mode(rec[0]);
@@ -217,7 +215,6 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
      * after its own validate call -- without it a record whose payload
      * sizes do not add up would be decoded here instead of rejected. */
     if ((uint32_t)rsz != (uint32_t)ZPSE_TILE_HEADER_SIZE +
-            (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? 1u : 0u) +
             (uint32_t)th.mask_payload_size +
             (uint32_t)th.residual_payload_size) {
         return 0;
@@ -230,10 +227,6 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
     }
 
     mp = rec + ZPSE_TILE_HEADER_SIZE;
-    if (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
-        c = mp[0];
-        mp++;
-    }
 
     /* ---- Sparse mask, direct residuals --------------------------- *
      * The two sparse mask modes ARE an ascending position list, and the
@@ -333,8 +326,7 @@ static int seg_tile_decode_const(ZpseLaneState *lanes, const uint8_t *rec,
         return 1;
     }
 
-    /* CONST reads no table, so a reset is the histories only (this is what
-     * zpse_lane_reset_for does for predictor 0 and 9). */
+    /* CONST_ZERO reads no table, so a reset is the histories only. */
     if (tile_reset != 0) {
         zpse_lane_reset_hist(lanes, literal);
     }
@@ -404,8 +396,6 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
     uint32_t seg_size;
     uint8_t literal;
     uint16_t t;
-    int o1_seed;
-    int o2_seed;
     /* Repeated-record shortcut (see the block in the tile loop). The
      * previous tile's record, its length and whether it was a reset tile
      * this path may copy the output of. */
@@ -459,26 +449,14 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
         return ZPSE_BAD_TILE_SIZE;
     }
 
-    /* First tile of the segment always re-seeds lane state,
-     * regardless of that tile's reset bit (Sec. 6.2 / 7). What is
-     * established here is the HISTORIES: they are what every tile reads
-     * as its entry state, and they are 16 bytes. The ORDER1/ORDER2
-     * tables are 66 KiB of memset that only predictors 3 and 4 read, and
-     * a resetting tile re-seeds the tables it reads itself (inside
-     * zpse_tile_decode -> zpse_lane_reset_for), so a segment whose tiles
-     * all reset -- which is every segment the encoder emits, and the only
-     * shape the format's own encoder produces -- never touches them. A
-     * tile that does NOT reset reads the state the segment start
-     * establishes, so that state is seeded below, lazily, before the
-     * first such tile that can read a table: same values, same order of
-     * observations as the eager reset, without the 66 KiB for tables no
-     * tile in the segment reads. */
+    /* First tile of the segment always establishes the lane histories,
+     * regardless of that tile's reset bit (Sec. 6.2 / 7): every surviving
+     * predictor reads only last[]/second_last[], so those 16 bytes are the
+     * whole entry state. There are no tables left to seed or reset. */
     zpse_lane_reset_hist(lanes, h.initial_literal);
 
     pos = ZPSE_SEGMENT_HEADER_SIZE;
     produced = 0u;
-    o1_seed = 0;
-    o2_seed = 0;
     tile_count = (uint32_t)h.tile_count;
     seg_size = h.segment_decoded_size;
     literal = h.initial_literal;
@@ -488,9 +466,6 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
         const uint8_t *rec;
         int tile_reset;
         int got;
-
-        /* Once a tile, on both sides: see the encoder's loop. */
-        lanes->gen++;
 
         if ((uint32_t)t + 1u < tile_count) {
             nt_exp = 256u;
@@ -535,8 +510,8 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
          * the same position with the same status.
          *
          * The predictor byte is tested FIRST because it is the selective
-         * one: an ORDER1/ORDER2/TILE_CONSTANT tile fails it on the first
-         * (or third) compare, instead of after eight byte comparisons for
+         * one: a record naming a reserved gap (3, 4 or 9) fails it on the
+         * first compare, instead of after eight byte comparisons for
          * the fields that only an all-hit record has.
          *
          * The STRIDE family (ids 5..8) is batched here too, and it is the
@@ -742,8 +717,8 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
          * Nothing is skipped that a hostile stream could notice: the bytes
          * compared are at the same length and already passed validation at
          * this position, so any rejection they earn has already happened.
-         * ORDER1/ORDER2 are excluded (stateful tables, and predictors this
-         * encoder never writes), as are tiles that are not full length. */
+         * The reserved gaps 3, 4 and 9 are excluded, as are tiles that
+         * are not full length. */
         if (prev_ok && rsz == prev_rsz &&
             rsz >= (uint16_t)ZPSE_TILE_HEADER_SIZE) {
             uint64_t key;
@@ -761,8 +736,7 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
             if (key == prev_key && nt_exp == (uint16_t)256u &&
                 produced >= 264u &&
                 (rec[0] & ZPSE_TILE_FLAG_RESET) != 0u &&
-                rec[1] != (uint8_t)ZPSE_P_ORDER1 &&
-                rec[1] != (uint8_t)ZPSE_P_ORDER2 &&
+                rec[1] != 3u && rec[1] != 4u && rec[1] != 9u &&
                 /* A record that matches the previous one's header reaches
                  * the full compare below; on a plane whose tiles repeat
                  * (the copy path is the whole of a homogeneous block's
@@ -837,9 +811,6 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
                 }
                 memcpy(lanes->last, decoded_out + o - 8u, 8u);
                 memcpy(lanes->second_last, decoded_out + o - 16u, 8u);
-                /* One advance per tile, as the per-tile loop does; this
-                 * iteration already counted the first one. */
-                lanes->gen = (uint16_t)(lanes->gen + (uint16_t)(run - 1u));
                 produced = o;
                 pos = at;
                 t = (uint16_t)(t + (uint16_t)(run - 1u));
@@ -875,31 +846,6 @@ static int seg_decode_body(ZpseDecoder *d, ZpseLaneState *lanes,
                 memcpy(&prev_key, rec, sizeof prev_key);
                 prev_ok = (tile_reset != 0) ? 1 : 0;
                 continue;
-            }
-        }
-        /* Lazy table seeding (see the reset above). A tile that reads a
-         * table it does not reset reads this segment's initial state for
-         * it, so seed exactly that table here, once. rec[1] is the
-         * predictor byte and is read only when the record has one; a
-         * predictor that is not 3 or 4 reads no table, and an invalid
-         * predictor byte fails validation below whatever this does. */
-        if (rsz >= 2u) {
-            uint8_t pid = rec[1];
-
-            if (pid == (uint8_t)ZPSE_P_ORDER1) {
-                if (o1_seed == 0) {
-                    if (tile_reset == 0) {
-                        zpse_lane_seed_table(lanes, literal, pid);
-                    }
-                    o1_seed = 1;
-                }
-            } else if (pid == (uint8_t)ZPSE_P_ORDER2) {
-                if (o2_seed == 0) {
-                    if (tile_reset == 0) {
-                        zpse_lane_seed_table(lanes, literal, pid);
-                    }
-                    o2_seed = 1;
-                }
             }
         }
         got = zpse_tile_decode(lanes, rec, (uint32_t)rsz,
@@ -1003,11 +949,8 @@ int zpse_segment_decode_preparsed(ZpseDecoder *d, ZpseLaneState *lanes,
  * encode-and-measured, so the per-tile cost is a fixed handful of
  * passes instead of ~50.
  *
- * Predictors 3/4 (ORDER1/ORDER2) are not trial candidates: theirs are
- * the only resets that cost 2 KiB / 64 KiB of table memset, and they
- * lose to STRIDE and the lane-history family on essentially every input
- * this format targets. They stay fully decodable (tile.c) so foreign
- * and hostile streams remain conformant.
+ * Ids 3, 4 and 9 are reserved gaps, not trial candidates. A stream
+ * naming one is refused by the decoder, never silently decoded.
  */
 
 /* Exact K for the closed-form families. ks[] is indexed by predictor
@@ -2223,19 +2166,18 @@ static int seg_dense_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
         return 0;
     }
 
-    /* STRIDE_1's fixed point is the segment's initial literal, so it needs
-     * no constant byte; CONST_ZERO needs none either; anything else needs
-     * TILE_CONSTANT and its byte. */
-    pred = (v == 0u) ? (uint8_t)ZPSE_P_CONST_ZERO
-           : (v == initial_literal) ? (uint8_t)ZPSE_P_STRIDE_1
-                                    : (uint8_t)ZPSE_P_TILE_CONSTANT;
+    /* STRIDE_1's fixed point is the segment's initial literal, so its fill
+     * is implicit; every other one-value plane uses CONST_ZERO with byte 4
+     * carrying the value. The record layout is unchanged. */
+    pred = (v == initial_literal) ? (uint8_t)ZPSE_P_STRIDE_1
+                                  : (uint8_t)ZPSE_P_CONST_ZERO;
     q = payload_out + ZPSE_SEGMENT_HEADER_SIZE;
     for (c = 0u; c < chunks; c++) {
         zpse_store_u16le(q, (uint16_t)(ZPSE_DENSE_HEADER_SIZE - 2u));
         q[2] = (uint8_t)(ZPSE_DENSE_MARKER |
                          ((uint8_t)ZPSE_R_EXCLUSION_U8 << 3));
         q[3] = pred;
-        q[4] = (pred == (uint8_t)ZPSE_P_TILE_CONSTANT) ? v : 0u;
+        q[4] = v; /* CONST_ZERO's fill; 0 for the STRIDE_1 case */
         q[5] = 0u;
         zpse_store_u16le(q + 6u, 0u);
         zpse_store_u16le(q + 8u, 0u);
@@ -2579,10 +2521,10 @@ static uint32_t seg_dense_palette_cost(uint32_t plane_len, uint32_t m)
  * palette plus indices, so it is both smaller and, at decode, one palette
  * expansion for 4 KiB instead of a predictor chain per tile (dense.c).
  *
- * The record uses predictor TILE_CONSTANT, mask ALL_EXCEPTION and residual
+ * The record uses predictor CONST_ZERO, mask ALL_EXCEPTION and residual
  * PALETTE_BITS. ALL_EXCEPTION makes every position an exception, so the
  * record codes every byte and the decoder runs no prediction at all; the
- * constant predictor only has to supply the value exceptions are measured
+ * fill in byte 4 of the header is only the value exceptions are measured
  * against, and that value is chosen to be one the plane does NOT contain
  * -- otherwise the exclusion mapping would have no residual for the bytes
  * equal to it. 255 is preferred when absent because the exclusion residual
@@ -2707,8 +2649,8 @@ static int seg_dense_palette_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
         payload_out[at + 2u] = (uint8_t)(ZPSE_DENSE_MARKER |
                                          (uint8_t)ZPSE_M_ALL_EXCEPTION |
                                          ((uint8_t)ZPSE_R_PALETTE_BITS << 3));
-        payload_out[at + 3u] = (uint8_t)ZPSE_P_TILE_CONSTANT;
-        payload_out[at + 4u] = (uint8_t)fill;
+        payload_out[at + 3u] = (uint8_t)ZPSE_P_CONST_ZERO;
+        payload_out[at + 4u] = (uint8_t)fill; /* the CONST_ZERO fill */
         payload_out[at + 5u] = 0u;
         zpse_store_u16le(payload_out + at + 6u, (uint16_t)ns);
         zpse_store_u16le(payload_out + at + 8u, 0u);
@@ -2783,10 +2725,9 @@ static int seg_dense_literal_emit(ZpseSegmentHeader *h, uint8_t *payload_out,
         payload_out[at + 2u] = (uint8_t)(ZPSE_DENSE_MARKER |
                                          (uint8_t)ZPSE_M_ALL_EXCEPTION |
                                          ((uint8_t)ZPSE_R_RAW_ACTUAL << 3));
-        /* TILE_CONSTANT is the predictor the ALL_EXCEPTION path accepts, and
-         * its constant is unused: RAW_ACTUAL supplies every byte, so the
-         * decoder never resolves a prediction for this record. */
-        payload_out[at + 3u] = (uint8_t)ZPSE_P_TILE_CONSTANT;
+        /* CONST_ZERO with RAW_ACTUAL: every byte comes from the residual,
+         * so the fill byte is unused. The layout is unchanged. */
+        payload_out[at + 3u] = (uint8_t)ZPSE_P_CONST_ZERO;
         payload_out[at + 4u] = 0u;
         payload_out[at + 5u] = 0u;
         zpse_store_u16le(payload_out + at + 6u, (uint16_t)ns);
@@ -2879,13 +2820,6 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
             (uint32_t)best_k * 8u < (uint32_t)nt * 7u) {
             cand[ncand++] = second_p;
         }
-        /* A generation no real tile uses, so the entries this pass
-         * leaves behind read as unlearned to the tile that follows. The
-         * lane state's own generation is put back afterwards: the
-         * pricing pass is not a tile. */
-        uint16_t gen_save = lanes->gen;
-
-        lanes->gen = 0xFFFFu;
         for (ci = 0u; ci < ncand; ci++) {
             uint8_t pred = cand[ci];
             ZpseTileClass cl;
@@ -2939,7 +2873,6 @@ static uint32_t seg_tile_price(ZpseEncoder *e, ZpseLaneState *lanes,
                 tile_len = n;
             }
         }
-        lanes->gen = gen_save;
         if (tile_len < 0) {
             return UINT32_MAX;
         }
@@ -3208,14 +3141,9 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     tmp_cap = 4096u;
 
     /* Reset-first lane discipline; the per-tile reset bit is always 1
-     * (simplest legal choice, keeps every tile independent). Only the
-     * histories need establishing here: every tile below is classified
-     * with tile_reset == 1, so zpse_tile_classify calls
-     * zpse_lane_reset_for for it (histories + the table its predictor
-     * reads), and no predictor this encoder ever classifies -- the nine
-     * in seg_screen_pred[] -- reads a table at all. The 66 KiB table
-     * memset zpse_lane_reset would do for ORDER1/ORDER2 here was for a
-     * classification this encoder never asks for. */
+     * (simplest legal choice, keeps every tile independent). Every
+     * surviving predictor reads only the 16-byte history state, so this
+     * is the whole entry state, and no table work is needed anywhere. */
     zpse_lane_reset_hist(lanes, initial_literal);
 
     /* Constant-plane tracking, which lets the dense form
@@ -3317,13 +3245,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
         uint16_t nt =
             (uint16_t)((t + 1u < tc) ? 256u : (plane_len - seg_pos));
         const uint8_t *actual = plane + seg_pos;
-
-        /* The generation advances once a tile, on both sides, over the
-         * same tiles in the same order: the encoder's winning trial and
-         * the decoder's block. An ORDER2 entry is learned only if its
-         * generation is this one, so this is the reset that replaced the
-         * table wipe. */
-        lanes->gen++;
 
         if (pal_len != 0u && pos >= pal_len) {
             int dn = seg_dense_palette_emit(&h, payload_out, plane, plane_len,
@@ -3548,32 +3469,6 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                     cand[ncand++] = second_p;
                 }
             }
-            /* ORDER1 and ORDER2 are the two predictors that read a
-             * table (order1, and o2), and they are not in the
-             * prescreen's candidate list, so they can never win a tile.
-             * They can be tried when the screened predictors do badly.
-             *
-             * At most ONE of them may be in the list. A classify leaves
-             * the table it reads in the state its own chain produced, and
-             * the table is only re-seeded for the predictor the NEXT
-             * classify is for. So with both in the list, the loser's
-             * classify leaves the winner's table dirty -- and the
-             * decoder, which applies only the winner, never dirties it.
-             * The two sides then disagree about the table, and the block
-             * decodes to different bytes (measured: the decimal8 corpus
-             * failed to round-trip, the differing bytes at the tail of
-             * the tiles of the later segments).
-             *
-             * One table user with anything else is fine: the other
-             * candidates read no table, and the history fixup at the end
-             * of a tile depends on the bytes, not on the predictor. */
-#if defined(ZPSE_TRIAL_ORDER1)
-            if (bk * 2u > (uint32_t)nt) {
-                if (ncand < 4u) {
-                    cand[ncand++] = (uint8_t)ZPSE_P_ORDER1;
-                }
-            }
-#endif
             /* Near-random tile (every cheap predictor misses almost
              * everywhere): one trial is enough. A second classification
              * plus its mode search would cost the same again for a
@@ -3793,12 +3688,11 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
                 best_len = n;
                 best_p = pred;
             }
-            /* A record of just the 8-byte tile header (9 with the
-             * predictor-9 mode byte) carries no mask and no residual
-             * payload at all, so it is the global floor for this tile:
-             * nothing left to try can be smaller. This is the case for
-             * every fully predicted tile. */
-            if (best_len <= 8 + (best_p == 9u ? 1 : 0)) {
+            /* A record of just the 8-byte tile header carries no mask and
+             * no residual payload at all, so it is the global floor for
+             * this tile: nothing left to try can be smaller. This is the
+             * case for every fully predicted tile. */
+            if (best_len <= 8) {
                 break;
             }
         }

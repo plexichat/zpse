@@ -2,7 +2,7 @@
 #
 #  - every suite in tests/runners/run.sh (roundtrip, hostile, units,
 #    stride3, dense, decide, sizes) under gcc 15 and clang;
-#  - the parity/fuzz/lseed corpora in three builds each (runtime SIMD
+#  - the parity/fuzz corpora in three builds each (runtime SIMD
 #    dispatch, -DZPSE_FORCE_SCALAR, -DZPSE_FORCE_TRIAL_SWAP), whose digests
 #    must match -- that is what proves the SIMD kernels are bit-exact
 #    replacements and that the encoder's candidate order cannot change a

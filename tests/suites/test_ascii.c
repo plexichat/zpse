@@ -38,8 +38,6 @@ static uint8_t frcomp[220000];
 static uint8_t frout[200000];
 static uint8_t rec[4096];
 static uint8_t back[512];
-static uint8_t o1[8 * 256];
-static uint8_t o2[8 * 4096 * 4];
 static uint8_t comb[8192];
 
 static long checks;
@@ -138,8 +136,6 @@ static void prose_fill(uint8_t *p, uint32_t n, uint32_t seed)
 static void lane_init(ZpseLaneState *lanes, uint8_t literal)
 {
     memset(lanes, 0, sizeof *lanes);
-    lanes->order1 = o1;
-    lanes->o2 = o2;
     zpse_lane_reset_hist(lanes, literal);
 }
 

@@ -19,8 +19,9 @@
 /* Whole-frame codec flags. These five bits are defined here rather than in a
  * public header because this translation unit is the only consumer; the header
  * owner can promote them verbatim without changing any behaviour. They sit
- * above every allocated ZPSE_ENC_* bit (12 is PAGE_HUF, 13 is PAGE_INSTANT,
- * 11 stays reserved), so no existing caller's flags change meaning.
+ * above every allocated ZPSE_ENC_* bit (the highest live one is HUF at 8;
+ * bits 9-13 are free or reserved), so no existing caller's flags change
+ * meaning.
  *
  * Bits 14-16 (REPACK / RLEFAST / F64FAST) are still pure opt-ins: no bit means
  * no attempt. Bits 17-18 (DPCM1 / MRD) are DEPRECATED NO-OPs: the two 16-bit
@@ -194,13 +195,12 @@ const char *zpse_version_string(void)
     return ZPSE_VERSION_STRING;
 }
 
-/* Encoder options are ZPSE_ENC_CHECKSUM, ZPSE_ENC_LZ_FAST, ZPSE_ENC_PAGE_FAST,
- * ZPSE_ENC_LZ_HEX, ZPSE_ENC_HUF, ZPSE_ENC_DECODE_FAST, ZPSE_ENC_PAGE_TURBO,
- * ZPSE_ENC_PAGE_HUF and ZPSE_ENC_PAGE_INSTANT, plus one of the nine levels in
- * bits 1-4 (an empty level field means the default level). The five frame-level
- * flags (ZPSE_ENC_REPACK / ZPSE_ENC_RLEFAST / ZPSE_ENC_F64FAST /
- * ZPSE_ENC_DPCM1 / ZPSE_ENC_MRD, bits 14-18) are all accepted here so a caller
- * may pass them without a BAD_ARG. Only zpse_compress_frame_ex acts on them:
+/* Encoder options are ZPSE_ENC_CHECKSUM, ZPSE_ENC_LZ_FAST and ZPSE_ENC_HUF,
+ * plus one of the nine levels in bits 1-4 (an empty level field means the
+ * default level). The five frame-level flags (ZPSE_ENC_REPACK /
+ * ZPSE_ENC_RLEFAST / ZPSE_ENC_F64FAST / ZPSE_ENC_DPCM1 / ZPSE_ENC_MRD, bits
+ * 14-18) are all accepted here so a caller may pass them without a BAD_ARG.
+ * Only zpse_compress_frame_ex acts on them:
  * bits 14-16 are genuine opt-ins; bits 17-18 are deprecated no-ops because
  * those codecs now run by default. Anything else is a bad argument rather than
  * a silent round to a neighbour:
@@ -213,10 +213,7 @@ static int enc_flags_ok(uint32_t enc_flags)
 
     if ((enc_flags &
          ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK |
-                     ZPSE_ENC_LZ_FAST | ZPSE_ENC_PAGE_FAST |
-                     ZPSE_ENC_LZ_HEX | ZPSE_ENC_HUF |
-                     ZPSE_ENC_DECODE_FAST | ZPSE_ENC_PAGE_TURBO |
-                     ZPSE_ENC_PAGE_HUF | ZPSE_ENC_PAGE_INSTANT |
+                     ZPSE_ENC_LZ_FAST | ZPSE_ENC_HUF |
                      ZPSE_ENC_REPACK | ZPSE_ENC_RLEFAST |
                       ZPSE_ENC_F64FAST | ZPSE_ENC_DPCM1 |
                       ZPSE_ENC_MRD)) != 0u) {

@@ -320,22 +320,6 @@ if "$work/corpus_write" "$mixed" 167772160 --mixed && [ -s "$mfile" ]; then
     row encode 2 " MB/s" "${all[@]}"
     row decode 3 " GB/s" "${all[@]}"
 
-    # The PAGE_FAST row alone: the other rows of that table are the host
-    # corpora, which this tree cannot regenerate.
-    say "mixed PAGE_FAST row"
-    echo "| 4 KiB pages | plain L1 | plain L2 | plain BALANCED | \`PAGE_FAST\` L1 | \`PAGE_FAST\` L2 |"
-    echo "| --- | ---: | ---: | ---: | ---: | ---: |"
-    pf=""
-    for spec in "-l 1" "-l 2" "-l 5" "-l 1 -P" "-l 2 -P"; do
-        # The spec is a pair of bench options and is meant to split here.
-        pf="$pf $("$cli" bench -q -b 4096 $spec -r "$REPS" "$mfile" |
-            awk '/TOTAL/ {printf "%.2f%%|%.0f", 100.0*$3/$2, $5}')"
-    done
-    pfr=""
-    for c in $pf; do
-        pfr="$pfr $(printf '%s' "$c" | cut -d'|' -f1) at $(printf '%s' "$c" | cut -d'|' -f2) MB/s |"
-    done
-    printf '| mixed |%s\n' "$pfr"
 else
     missing "mixed corpus (corpus_write --mixed)"
 fi
@@ -415,20 +399,6 @@ if "$work/corpus_write" "$prob" 67108864 --probe && [ -s "$pfile" ]; then
     prow encode 2 " MB/s" "${pp[@]}"
     prow decode 3 " GB/s" "${pp[@]}"
 
-    say "probe PAGE_FAST rows"
-    echo "| 4 KiB pages | plain L1 | plain L6 | \`PAGE_FAST\` L1 | \`PAGE_FAST\` L6 |"
-    echo "| --- | ---: | ---: | ---: | ---: |"
-    pf=""
-    for spec in "-l 1" "-l 6" "-l 1 -P" "-l 6 -P"; do
-        # The spec is a pair of bench options and is meant to split here.
-        pf="$pf $("$cli" bench -q -b 4096 $spec -r "$REPS" "$pfile" |
-            awk '/TOTAL/ {printf "%.2f%%|%.0f", 100.0*$3/$2, $5}')"
-    done
-    pfr=""
-    for c in $pf; do
-        pfr="$pfr $(printf '%s' "$c" | cut -d'|' -f1) at $(printf '%s' "$c" | cut -d'|' -f2) MB/s |"
-    done
-    printf '| probe |%s\n' "$pfr"
 else
     missing "probe corpus (corpus_write --probe)"
 fi
@@ -452,15 +422,15 @@ if [ -s "$pfile" ]; then
     khdr="| arm |"
     ksep="| --- |"
     if [ -n "$kd" ]; then
-        khdr="$khdr pages L6 | pages \`PAGE_FAST\` L6 |"
-        ksep="$ksep ---: | ---: |"
+        khdr="$khdr pages L6 |"
+        ksep="$ksep ---: |"
     fi
     if [ -n "$ks" ]; then
-        khdr="$khdr Silesia L6 | Silesia \`PAGE_FAST\` L6 |"
-        ksep="$ksep ---: | ---: |"
+        khdr="$khdr Silesia L6 |"
+        ksep="$ksep ---: |"
     fi
-    khdr="$khdr probe L6 | probe \`PAGE_FAST\` L6 |"
-    ksep="$ksep ---: | ---: |"
+    khdr="$khdr probe L6 |"
+    ksep="$ksep ---: |"
     if [ -n "$km" ]; then
         khdr="$khdr mixed L6 |"
         ksep="$ksep ---: |"
@@ -471,12 +441,6 @@ if [ -s "$pfile" ]; then
         local b="$1"
         shift
         "$b" bench -q -b 4096 -l 6 -r "$REPS" "$@" |
-            awk '/TOTAL/ {printf "%.2f%% at %.0f MB/s", 100.0*$3/$2, $5}'
-    }
-    knob_fast() { # binary, file...
-        local b="$1"
-        shift
-        "$b" bench -q -b 4096 -l 6 -P -r "$REPS" "$@" |
             awk '/TOTAL/ {printf "%.2f%% at %.0f MB/s", 100.0*$3/$2, $5}'
     }
     while IFS='|' read -r label def; do
@@ -494,12 +458,12 @@ if [ -s "$pfile" ]; then
         krow="|"
         if [ -n "$kd" ]; then
             # The corpus lists split into words here on purpose.
-            krow="$krow $(knob_cells "$bin" $kd) | $(knob_fast "$bin" $kd) |"
+            krow="$krow $(knob_cells "$bin" $kd) |"
         fi
         if [ -n "$ks" ]; then
-            krow="$krow $(knob_cells "$bin" $ks) | $(knob_fast "$bin" $ks) |"
+            krow="$krow $(knob_cells "$bin" $ks) |"
         fi
-        krow="$krow $(knob_cells "$bin" "$pfile") | $(knob_fast "$bin" "$pfile") |"
+        krow="$krow $(knob_cells "$bin" "$pfile") |"
         if [ -n "$km" ]; then
             krow="$krow $(knob_cells "$bin" "$km") |"
         fi

@@ -1,7 +1,6 @@
-/* The v1.1 page forms: the one-value sync token and the three page-profile
- * encoder options.
+/* The v1.1 page forms: the one-value sync token.
  *
- * This suite is the round-trip and wire-layout guard for the additions the
+ * This suite is the round-trip and wire-layout guard for the addition the
  * public header gained in v1.1:
  *
  *   - ZPSE_BLOCK_SYNC_TOKEN: a constant 4 KiB page is one 16-byte header and
@@ -9,10 +8,9 @@
  *     short-header size (16) at [8], the sequence at [10] and a 16-bit CRC
  *     over the first 14 bytes at [14]. zpse_block_retag must rewrite only
  *     seq / LAST and refresh that CRC, leaving the fill and sizes alone.
- *   - ZPSE_ENC_PAGE_TURBO (bit 10), ZPSE_ENC_PAGE_HUF (bit 12) and
- *     ZPSE_ENC_PAGE_INSTANT (bit 13) are accepted by zpse_compress_block_ex
- *     and every form they can pick still decodes byte-for-byte. Bit 11 stays
- *     unassigned and is refused.
+ *   - The old page-profile bits (TURBO bit 10, PAGE_HUF bit 12, INSTANT bit
+ *     13) are gone from the public header; bit 11 stays unassigned and is
+ *     still refused.
  *
  * The 12 inputs model the non-zero page classes of corpus_write.c (code,
  * rodata, pointer heaps, records, text, blobs, mixed pages, ...): each is a
@@ -26,13 +24,6 @@
 #include "zpse/zpse.h"
 #include "zpse/constants.h"
 #include "zpse/text.h"
-
-/* INSTANT is bit 13, next to PAGE_TURBO (bit 10). Keep building until the
- * definition lands in the public header, the same fallback the page harness
- * uses. */
-#ifndef ZPSE_ENC_PAGE_INSTANT
-#define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
-#endif
 
 /* The TEXT page form (sync 0x50BA) is the latest wire addition. Keep the
  * fallback so this suite preprocesses before constants.h lands it. */
@@ -175,15 +166,13 @@ static uint32_t le32(const uint8_t *b)
     return le16(b) | (le16(b + 2u) << 16);
 }
 
-/* Every page shape, at level 6, under each new profile bit. */
+/* Every page shape, at level 6, with no profile bit: the three bits this
+ * sweep used to try are gone, so the sweep now pins the one path that is
+ * still public. */
 static void test_roundtrips(void)
 {
-    static const uint32_t new_flags[] = {
-        (uint32_t)ZPSE_ENC_PAGE_TURBO,
-        (uint32_t)ZPSE_ENC_PAGE_HUF,
-        (uint32_t)ZPSE_ENC_PAGE_INSTANT
-    };
-    static const char *const flag_names[] = { "TURBO", "HUF", "INSTANT" };
+    static const uint32_t new_flags[] = { 0u };
+    static const char *const flag_names[] = { "default" };
     unsigned f, s;
 
     for (f = 0; f < sizeof new_flags / sizeof new_flags[0]; f++) {
@@ -222,9 +211,9 @@ static void test_roundtrips(void)
                   "shape %s + %s: round-trip (%s)",
                   shape_name((int)s), flag_names[f], zpse_status_name(rc));
 
-            /* A constant page takes the token under every profile: none of
-             * the three bits sets CHECKSUM, which is the one thing that
-             * pushes a constant page onto the long-header path. */
+            /* A constant page takes the token with the default options:
+             * CHECKSUM is off, and that is the one thing that pushes a
+             * constant page onto the long-header path. */
             if (s == 0u || s == 1u) {
                 CHECK(clen == TOKLEN &&
                           comp[0] == (uint8_t)ZPSE_BLOCK_SYNC_TOKEN &&
@@ -673,41 +662,13 @@ static void test_flat_property(void)
     }
 }
 
-/* The new option bits are legal; bit 11 is still unassigned. */
+/* The old page-profile bits are gone; bit 11 is still unassigned. */
 static void test_flags(void)
 {
-    static const uint32_t accepted[] = {
-        (uint32_t)ZPSE_ENC_PAGE_TURBO,
-        (uint32_t)ZPSE_ENC_PAGE_HUF,
-        (uint32_t)ZPSE_ENC_PAGE_INSTANT
-    };
-    static const char *const names[] = { "PAGE_TURBO", "PAGE_HUF",
-                                          "PAGE_INSTANT" };
     const uint32_t reserved11 = UINT32_C(1) << 11;
     uint32_t clen = 0u;
-    unsigned f;
-
-    CHECK(((uint32_t)ZPSE_ENC_PAGE_TURBO & reserved11) == 0u &&
-              ((uint32_t)ZPSE_ENC_PAGE_HUF & reserved11) == 0u &&
-              ((uint32_t)ZPSE_ENC_PAGE_INSTANT & reserved11) == 0u,
-          "the new profile bits do not overlap reserved bit 11");
 
     make_page(src, 2); /* a ramp: a real encode, not the token shortcut */
-    for (f = 0; f < sizeof accepted / sizeof accepted[0]; f++) {
-        uint32_t clen = 0u, olen = 0u;
-        uint32_t flags = (uint32_t)ZPSE_ENC_SPEED_L6 | accepted[f];
-        int rc = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &clen,
-                                        0u, 1u, flags, ea);
-
-        CHECK(rc == ZPSE_OK, "%s accepted by compress_block_ex (%s)",
-              names[f], zpse_status_name(rc));
-        if (rc != ZPSE_OK) continue;
-        memset(dec, 0, sizeof dec);
-        rc = zpse_decompress_block(comp, clen, dec, sizeof dec, &olen, da);
-        CHECK(rc == ZPSE_OK && olen == PAGE && memcmp(dec, src, PAGE) == 0,
-              "%s stream round-trips (%s)", names[f], zpse_status_name(rc));
-    }
-
     clen = 0u;
     CHECK(zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &clen,
                                  0u, 1u,

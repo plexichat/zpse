@@ -25,8 +25,8 @@
  * Usage: enc_profile [-b BYTES] [-m MODE] [reps] [pattern ...]
  *   -b BYTES   block size, 256..65536 (default 65536; use 4096 for pages)
  *   -m MODE    encoder mode: a level L1..L9 (or 1..9) and/or flags joined
- *              by '+', ',', '|': TURBO, INSTANT, HUF, FAST, LZFAST, LZHEX,
- *              DFAST, CRC (default: level 6, i.e. the library default)
+ *              by '+', ',', '|': HUF, LZFAST, CRC
+ *              (default: level 6, i.e. the library default)
  *   reps       best-of-N timing repetitions (default 5)
  *   pattern    any of the ten names below; no names runs all ten.
  *
@@ -36,8 +36,8 @@
  *   /tmp/enc_profile 5 zeros random
  *   cc -std=c11 -O2 -DZPSE_BLOCK_STATS -Iinclude \
  *      tests/tools/enc_profile.c src/zpse_unity.c -o /tmp/enc_profile_stats
- *   /tmp/enc_profile_stats -b 4096 -m TURBO
- *   /tmp/enc_profile_stats -b 4096 -m L6+TURBO -m INSTANT zeros
+ *   /tmp/enc_profile_stats -b 4096 -m HUF
+ *   /tmp/enc_profile_stats -b 4096 -m L6+HUF -m LZFAST zeros
  *
  * Every line is best-of-reps, in microseconds (encode) or nanoseconds and
  * rdtsc cycles per block (decode). Deterministic formatting: no timing
@@ -100,8 +100,7 @@ static ALIGN64 unsigned char E[ZPSE_ENC_ARENA_SIZE];
 static uint8_t in[65536];
 static uint8_t comp[200000];
 static uint8_t plane[65536];
-/* ORDER2 state: 8 x 4096 {value, confidence, generation} entries. */
-static uint8_t o1[8 * 256], o2[8 * 4096 * 4];
+
 static uint8_t rec[2048];
 static uint8_t scratch[8192];
 
@@ -414,9 +413,6 @@ static void profile_one(int idx, int reps)
 
     make_pattern(idx);
     zpse_encoder_init(&e, E, sizeof E);
-    lanes.order1 = o1;
-    lanes.o2 = o2;
-    lanes.gen = 0u;
 
     stage_snapshot(&s0);
     block = time_block(reps, &clen);
@@ -537,20 +533,10 @@ static int parse_mode(const char *s, uint32_t *out)
             int v = atoi(tok);
             if (v < 1 || v > 9) return -1;
             lvl = (uint32_t)v;
-        } else if (ci_equal(tok, "TURBO")) {
-            flags |= ZPSE_ENC_PAGE_TURBO;
-        } else if (ci_equal(tok, "INSTANT")) {
-            flags |= ZPSE_ENC_PAGE_INSTANT;
         } else if (ci_equal(tok, "HUF")) {
-            flags |= ZPSE_ENC_PAGE_HUF;
-        } else if (ci_equal(tok, "FAST")) {
-            flags |= ZPSE_ENC_PAGE_FAST;
+            flags |= ZPSE_ENC_HUF;
         } else if (ci_equal(tok, "LZFAST")) {
             flags |= ZPSE_ENC_LZ_FAST;
-        } else if (ci_equal(tok, "LZHEX")) {
-            flags |= ZPSE_ENC_LZ_HEX;
-        } else if (ci_equal(tok, "DFAST")) {
-            flags |= ZPSE_ENC_DECODE_FAST;
         } else if (ci_equal(tok, "CRC")) {
             flags |= ZPSE_ENC_CHECKSUM;
         } else {
@@ -568,8 +554,7 @@ static void usage(void)
     fprintf(stderr,
             "usage: enc_profile [-b BYTES] [-m MODE] [reps] [pattern ...]\n"
             "  -b BYTES  256..65536 (default 65536; 4096 for pages)\n"
-            "  -m MODE   L1..L9 and/or TURBO, INSTANT, HUF, FAST, LZFAST,"
-            " LZHEX, DFAST, CRC, joined by '+'\n"
+            "  -m MODE   L1..L9 and/or HUF, LZFAST, CRC, joined by '+'\n"
             "  patterns  zeros incr random sparse strided const5A alt00FF"
             " sawtooth lowentropy sparse2\n");
 }

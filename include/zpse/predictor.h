@@ -11,97 +11,46 @@ typedef enum ZpsePredictorId {
     ZPSE_P_CONST_ZERO     = 0,
     ZPSE_P_LANE_PREVIOUS  = 1,
     ZPSE_P_LANE_DELTA     = 2,
-    ZPSE_P_ORDER1         = 3,
-    ZPSE_P_ORDER2         = 4,
+    /* 3 and 4 are reserved gaps. Old streams naming them are refused, never
+     * decoded: no live predictor may be assigned either number. */
+    ZPSE_P_RESERVED_3     = 3,
+    ZPSE_P_RESERVED_4     = 4,
     ZPSE_P_STRIDE_1       = 5,
     ZPSE_P_STRIDE_2       = 6,
     ZPSE_P_STRIDE_4       = 7,
     ZPSE_P_STRIDE_8       = 8,
-    ZPSE_P_TILE_CONSTANT  = 9,
+    /* 9 is a reserved gap too: the dense form's byte 4 is now the fill for
+     * CONST_ZERO ALL_EXCEPTION records, so the old constant predictor has
+     * no wire representation. */
+    ZPSE_P_RESERVED_9     = 9,
     ZPSE_P_LANE_AVERAGE   = 10,
     ZPSE_P_STRIDE_3       = 11  /* x_hat = out[p-3]; interleaved RGB etc. */
 } ZpsePredictorId;
 
-/* Live lane histories (kept in registers/stack, <= 16 bytes). Tables
- * themselves live in the arena; this struct only borrows pointers. */
+/* Live lane histories (kept in registers/stack, <= 16 bytes). Every tile
+ * reads these as its entry state. The two arrays MUST stay adjacent: the
+ * hot reset writes both with one 16-byte memset from last[]. */
 typedef struct ZpseLaneState {
     uint8_t last[8];
     uint8_t second_last[8];
-    uint8_t *order1; /* 8 x 256, arena */
-    /* ORDER2's state: 8 x 4096 entries of {value, confidence,
-     * generation}, interleaved so the three bytes a prediction needs are
-     * in one cache line. Two separate tables meant two misses a byte,
-     * one of them to a line that held nothing the other wanted.
-     *
-     * The generation is what makes the per-tile reset O(1): an entry
-     * whose generation is not the current one was not learned by this
-     * tile, so it reads as unlearned. The old table was wiped instead,
-     * which cost 64 KiB of memset a tile. */
-    uint8_t *o2;     /* 8 x 4096 x 4, arena */
-    /* The generation this tile's ORDER2 entries carry. An entry whose
-     * generation is not this one was not learned by this tile and reads
-     * as unlearned -- which is what the per-tile wipe used to arrange,
-     * at the price of 64 KiB of memset. The counter is advanced once a
-     * tile by both sides, over the same tiles in the same order, so the
-     * two agree on which entries are current. */
-    uint16_t gen;
-    /* Set once the ORDER2 table has been wiped for the block or trial this
-     * lane state belongs to; cleared where the wipe used to be done. See
-     * zpse_lane_o2_use. */
-    int o2_ready;
 } ZpseLaneState;
-
-/* Wipe the ORDER2 table if this block or trial has not needed it yet.
- *
- * Entries carry a generation stamp and the stamp restarts with every block,
- * so a table left over from the previous block could make its first tiles
- * read entries they never wrote. Wiping at every block start is correct but
- * unconditional: 128 KiB of memset for a block whose tiles may never name
- * ORDER2, which on a one-value or stride block was the largest fixed cost
- * in the whole path. Every caller that is about to touch the table calls
- * this first, so the wipe happens exactly when it is needed and once.
- *
- * Handing the generation out from the encoder context, so that only the
- * 16-bit wrap needs the table cleared, was implemented and measured and is
- * not worth its code: the streams came out byte-identical (same corpus
- * sizes to the byte) and the encode rate did not move -- Python heap 73.9
- * against 73.5 MB/s at 4 KiB blocks, 609 against 580 MB/s at 64 KiB. So
- * this clear is not the fixed per-block cost that dominates small-block
- * encode; it is rare enough to be free, and the counter stays in the lane
- * state. */
-void zpse_lane_o2_use(ZpseLaneState *s);
 
 void zpse_lane_reset(ZpseLaneState *s, uint8_t initial_literal);
 
-/* Selective reset: histories always; tables only if predictor reads them
- * (ORDER1 iff pid==3; O2VAL/O2CONF iff pid==4; neither otherwise).
- * Same values as zpse_lane_reset. Saves ~66 KB memset on most tiles. */
+/* Entry-state reset used by every tile. The predictor id is part of the
+ * signature because callers already have it at hand; no live predictor
+ * reads a table, so the reset no longer depends on it. */
 void zpse_lane_reset_for(ZpseLaneState *s, uint8_t initial_literal,
                          uint8_t predictor_id);
 
 /* The history half of the reset on its own: last[]/second_last[] set to
  * the literal, 16 bytes, no tables. This is the entry state every tile
- * reads, and it is the only part of zpse_lane_reset that every tile
- * depends on. */
+ * reads, and it is the whole of zpse_lane_reset now. */
 void zpse_lane_reset_hist(ZpseLaneState *s, uint8_t initial_literal);
 
-/* The table half of the reset on its own: exactly the memsets
- * zpse_lane_reset_for performs for the same predictor_id (order1 for
- * ORDER1; nothing for ORDER2, whose table the generation makes stale
- * instead). 2 KiB, so a caller should only reach for it when the
- * predictor it names is really about to read one of those tables. */
-void zpse_lane_seed_table(ZpseLaneState *s, uint8_t initial_literal,
-                          uint8_t predictor_id);
-
-/* ORDER2 index: ((second*251) ^ (last*17)) & 0xFFF. */
-static inline uint16_t zpse_order2_index(uint8_t second_last, uint8_t last) {
-    return (uint16_t)(((uint16_t)((uint16_t)second_last * 251u) ^
-                       (uint16_t)((uint16_t)last * 17u)) & 0xFFFu);
-}
-
 /* zpse_predict_block and zpse_predict_update were removed: no callers in
- * src/ or tests/. The snapshot-semantics note worth keeping is that
- * stateful predictors (1-4, 10) require the online predict/update loop in
+ * src/ or tests/. The snapshot-semantics note worth keeping is that the
+ * stateful predictors (1, 2, 10) require the online predict/update loop in
  * tile.c for tile reconstruction; bit-exact SIMD formulas live in vector.h. */
 
 #endif /* ZPSE_PREDICTOR_H */

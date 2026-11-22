@@ -71,14 +71,12 @@ static void comb_arena(void)
         return;
     }
     if (d.comb == 0 || d.recon == 0 || d.out_stage == 0 ||
-        d.order1 == 0 || d.o2 == 0 || d.shuf == 0 || d.lzbuf == 0) {
+        d.shuf == 0 || d.lzbuf == 0) {
         printf("FAIL comb: decoder region is null\n");
         fails++;
     }
     if (ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.recon, ZPSE_D_SZ_RECON) ||
         ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.out_stage, ZPSE_D_SZ_OUT) ||
-        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.order1, ZPSE_D_SZ_ORDER1) ||
-        ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.o2, ZPSE_D_SZ_O2) ||
         ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.shuf, ZPSE_D_SZ_SHUF) ||
         ranges_overlap(d.comb, ZPSE_D_SZ_COMB, d.lzbuf, ZPSE_D_SZ_LZBUF)) {
         printf("FAIL comb: decoder comb overlaps another region\n");
@@ -90,14 +88,12 @@ static void comb_arena(void)
         fails++;
         return;
     }
-    if (e.comb == 0 || e.input == 0 || e.order1 == 0 || e.o2 == 0 ||
+    if (e.comb == 0 || e.input == 0 ||
         e.hist == 0 || e.shuf == 0 || e.lz == 0) {
         printf("FAIL comb: encoder region is null\n");
         fails++;
     }
     if (ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.input, ZPSE_E_SZ_INPUT) ||
-        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.order1, ZPSE_E_SZ_ORDER1) ||
-        ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.o2, ZPSE_E_SZ_O2) ||
         ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.hist, ZPSE_E_SZ_HIST) ||
         ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.shuf, ZPSE_E_SZ_SHUF) ||
         ranges_overlap(e.comb, ZPSE_E_SZ_COMB, e.lz, ZPSE_E_SZ_LZ)) {
@@ -145,7 +141,7 @@ int main(void)
     for (i = 0; i < 65536u; i++) {
         in[i] = (uint8_t)((i & 1u) ? 0xFF : 0x00);
     }
-    check("alt00FF", 65536u, 97u);
+    check("alt00FF", 65536u, 98u);
 
     memset(in, 0, sizeof in);
     for (i = 0; i < 65536u; i += 256u) {
@@ -165,7 +161,7 @@ int main(void)
     check("4-bit noise", 65536u, 33280u);
 
     memset(in, 0, sizeof in);
-    check("zeros", 65536u, 78u);
+    check("zeros", 65536u, 79u);
 
     if (fails != 0) {
         printf("DECIDE: %d FAILED\n", fails);

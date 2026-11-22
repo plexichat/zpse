@@ -19,8 +19,9 @@
  * That is why this compares the classification itself rather than a stream
  * digest.
  *
- * Also checks the documented refusals: ORDER1/ORDER2 return
- * ZPSE_BAD_PREDICTOR, and a STRIDE fill without seg_base is ZPSE_BAD_ARG.
+ * Also checks the documented refusals: the reserved predictor ids 3, 4 and
+ * 9 return ZPSE_BAD_PREDICTOR, and a STRIDE fill without seg_base is
+ * ZPSE_BAD_ARG.
  *
  * Exit 0 with "FILLPRED: ALL OK (n checks)"; exits 1 on any mismatch.
  */
@@ -34,8 +35,6 @@
 #include "zpse/tile.h"
 
 static uint8_t plane[1024 + 64];
-static uint8_t o1[8 * 256];
-static uint8_t o2[8 * 4096 * 4];
 
 /* Buffers for the hostile tile-record checks below. */
 static uint8_t tile[256];
@@ -55,10 +54,10 @@ static uint32_t rnd(void)
     return rng >> 8;
 }
 
-/* The ten predictors the encoder's prescreen can name. ORDER1/ORDER2 are
- * deliberately absent: they are not trial candidates (see segment.c) and
- * the fill refuses them. */
-static const uint8_t preds[10] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 9u, 10u, 11u };
+/* The nine live predictors the encoder's prescreen can name. Ids 3, 4 and 9
+ * are reserved gaps (see predictor.h): they are not trial candidates and
+ * every fill gate refuses them. */
+static const uint8_t preds[] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u, 11u };
 static const uint16_t lens[9] = { 256u, 200u, 137u, 64u, 33u, 32u, 17u, 8u,
                                   1u };
 static const uint32_t offs[2] = { 0u, 100u };
@@ -93,7 +92,7 @@ static int cmp_cl(const char *what, const ZpseTileClass *a,
 
     if (a->k != b->k || a->nu != b->nu || a->rmax != b->rmax ||
         a->dmin != b->dmin || a->dmax != b->dmax ||
-        a->act_valid != b->act_valid || a->constant_C != b->constant_C) {
+        a->act_valid != b->act_valid) {
         printf("FAIL %s: scalars differ (k %u/%u nu %u/%u)\n", what,
                (unsigned)a->k, (unsigned)b->k, (unsigned)a->nu,
                (unsigned)b->nu);
@@ -147,9 +146,6 @@ static void hostile_tile_records(uint32_t *checks_out, uint32_t *fails_out)
         tile[i] = (i % 32u == 0u) ? (uint8_t)(i + 1u) : 0u;
     }
     memset(tcomb, 0, sizeof tcomb);
-    memset(o1, 0, sizeof o1);
-    memset(o2, 0, sizeof o2);
-
     /* 8-byte header: flags (mask mode 1, residual 0), CONST_ZERO, nt-1=255,
      * K=8, mask_len=32 (256/8), residual_len=8 (one unit per exception). */
     memset(trec, 0, sizeof trec);
@@ -166,9 +162,6 @@ static void hostile_tile_records(uint32_t *checks_out, uint32_t *fails_out)
     n = 8 + 32 + 8; /* 48-byte record */
 
     memset(&lanes, 0, sizeof lanes);
-    lanes.order1 = o1;
-    lanes.o2 = o2;
-    lanes.gen = 0u;
     memset(tout, 0xA5, sizeof tout);
     rc = zpse_tile_decode(&lanes, trec, (uint32_t)n, 0u, 1, tile, 0u,
                           tout, (uint32_t)sizeof tout, tcomb);
@@ -233,8 +226,6 @@ int main(void)
     /* 16 bytes of lead-in so a tile can start mid-buffer, plus 32 bytes of
      * tail so a full-tile read past a short tile stays in bounds. */
     memset(plane, 0, sizeof plane);
-    memset(o1, 0, sizeof o1);
-    memset(o2, 0, sizeof o2);
 
     for (si = 0; si < 4u; si++) {
         for (pi = 0; pi < sizeof preds; pi++) {
@@ -258,10 +249,7 @@ int main(void)
 
                         memset(&ref_cl, 0xA5, sizeof ref_cl);
                         memset(&lean_cl, 0x5A, sizeof lean_cl);
-                        a.order1 = o1;
-                        a.o2 = o2;
-                        a.gen = 0u;
-                        a.gen = 0u;
+                        memset(&a, 0, sizeof a);
                         b = a;
                         rc = zpse_tile_classify(&a, plane + off, nt, pid, lit,
                                                 1, plane, off, &ref_cl);
@@ -310,18 +298,27 @@ int main(void)
         }
     }
 
-    /* Documented refusals. */
+    /* Documented refusals: the three reserved ids are gaps, never decoded
+     * as one of the surviving families. Tile fill has no CONST_ZERO-with-fill
+     * case for id 9 -- the fill byte belongs to the DENSE header, not a tile
+     * record -- so id 9 is refused here just like 3 and 4. */
     memset(&lean_cl, 0, sizeof lean_cl);
-    if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_ORDER1, plane, 256u,
+    if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_RESERVED_3, plane, 256u,
                                      plane, 16u, 0u, &lean_cl) !=
         ZPSE_BAD_PREDICTOR) {
-        printf("FAIL ORDER1 fill was not refused\n");
+        printf("FAIL predictor 3 fill was not refused\n");
         fails++;
     }
-    if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_ORDER2, plane, 256u,
+    if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_RESERVED_4, plane, 256u,
                                      plane, 16u, 0u, &lean_cl) !=
         ZPSE_BAD_PREDICTOR) {
-        printf("FAIL ORDER2 fill was not refused\n");
+        printf("FAIL predictor 4 fill was not refused\n");
+        fails++;
+    }
+    if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_RESERVED_9, plane, 256u,
+                                     plane, 16u, 0u, &lean_cl) !=
+        ZPSE_BAD_PREDICTOR) {
+        printf("FAIL predictor 9 fill was not refused\n");
         fails++;
     }
     if (zpse_tile_fill_at_pred_reset((uint8_t)ZPSE_P_STRIDE_1, plane, 256u, 0,
@@ -329,7 +326,7 @@ int main(void)
         printf("FAIL STRIDE fill without seg_base was not refused\n");
         fails++;
     }
-    checks += 3u;
+    checks += 4u;
     hostile_tile_records(&checks, &fails);
 
     if (fails != 0) {

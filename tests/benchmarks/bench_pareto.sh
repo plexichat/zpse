@@ -188,9 +188,10 @@ for l in $ZPSE_LEVELS; do tools+=("zpse:$l"); done
 enc_cmd() { # tool in out
     case "${1%%:*}" in
     zpse)
-        # "F" is ZPSE_ENC_LZ_FAST: one match-finder pass and the fast LZ
-        # form, with no shape decision. It is an option rather than a level,
-        # so it has a row of its own here and ZPSE_LEVELS may name it.
+        # "F" is ZPSE_ENC_LZ_FAST: a live encoder option that favours the
+        # single LZ4 form; it is not a separate wire form. It is an option
+        # rather than a level, so it has a row of its own here and
+        # ZPSE_LEVELS may name it.
         if [ "${1##*:}" = "F" ]; then
             "$cli" c -F "$2" "$3"
         else

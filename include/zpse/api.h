@@ -10,14 +10,6 @@
 #include "arena.h"
 #include "constants.h"
 
-/* Retired: PAGE_INSTANT was the no-decision page classifier (see the umbrella
- * header's flag notes). The define stays for source compatibility; the flag no
- * longer changes which page form is written. Guarded so this public definition
- * and src/block.c's own agree. */
-#ifndef ZPSE_ENC_PAGE_INSTANT
-#define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif

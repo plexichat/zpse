@@ -143,7 +143,7 @@ int zpse_block_token_build(ZpseBlockHeader *out, const uint8_t *buf,
     if ((flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET)) !=
             (uint8_t)(ZPSE_B_RAW | ZPSE_B_RESET) ||
         (flags & (uint8_t)(ZPSE_B_CRC | ZPSE_B_HAS_META | ZPSE_B_LZ |
-                           ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                           ZPSE_B_LZ_TILE | ZPSE_B_HUF |
                            ZPSE_B_RESERVED_MASK)) != 0u ||
         scount != 1u || meta8 != 0u ||
         comp != (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT ||
@@ -211,7 +211,7 @@ int zpse_block_header_parse_flat(ZpseBlockHeader *out, const uint8_t *buf,
      * other bit names a form or feature this header has no room for. */
     if ((flags & (uint8_t)ZPSE_B_RESET) == 0u ||
         (flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_CRC | ZPSE_B_HAS_META |
-                           ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                           ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_HUF |
                            ZPSE_B_RESERVED_MASK)) != 0u) {
         return ZPSE_BAD_HEADER;
     }
@@ -286,7 +286,7 @@ int zpse_block_header_parse_text(ZpseBlockHeader *out, const uint8_t *buf,
      * other bit names a form or feature this header has no room for. */
     if ((flags & (uint8_t)ZPSE_B_RESET) == 0u ||
         (flags & (uint8_t)(ZPSE_B_RAW | ZPSE_B_CRC | ZPSE_B_HAS_META |
-                           ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2 |
+                           ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_HUF |
                            ZPSE_B_RESERVED_MASK)) != 0u) {
         return ZPSE_BAD_HEADER;
     }

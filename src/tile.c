@@ -23,32 +23,29 @@ struct ZpseTileHeader;
 
 /* Tile framing + reconstruct path.
  * Record layout (record_len == tile_record_size):
- *   [8-B header][1-B C iff predictor==9][mask][residual]
+ *   [8-B header][mask][residual]
  *
  * The hot loops are organised by predictor *family* so the per-position
  * predictor dispatch happens once per tile, not once per byte:
  *
  *   FAM_CONST    0            x_hat == 0
- *   FAM_CONSTC   9            x_hat == C
  *   FAM_LANEHIST 1, 2, 10     x_hat from 8 lane histories (stateful)
- *   FAM_STRIDE   5, 6, 7, 8   x_hat == stream[abs - S]
- *   FAM_ORDER1   3            x_hat == order1[lane][last] (stateful)
- *   FAM_ORDER2   4            x_hat == o2[lane][hash].value (stateful)
+ *   FAM_STRIDE   5, 6, 7, 8, 11  x_hat == stream[abs - S]
  *
- * FAM_CONST, FAM_CONSTC and FAM_STRIDE never read the lane histories or
- * the ORDER tables, so their loops carry no cross-position state: the
- * history update is applied by an O(8) epilogue
- * (tile_history_fixup) instead of an O(Nt) in-loop update. Every family
- * produces bit-identical predictions to the scalar formulas in Sec. 7.1.
+ * FAM_CONST and FAM_STRIDE never read the lane histories, so their loops
+ * carry no cross-position state: the history update is applied by an O(8)
+ * epilogue (tile_history_fixup) instead of an O(Nt) in-loop update. Every
+ * family produces bit-identical predictions to the scalar formulas in
+ * Sec. 7.1. Ids 3, 4 and 9 are reserved gaps, rejected at every gate
+ * before this dispatch -- tile_family's default arm must never see them.
  */
 
-/* Predictor families. */
+/* Predictor families. The numeric values of the live three are fixed:
+ * the AVX2 dispatch below keys off them. */
 enum {
     TILE_FAM_CONST = 0,
     TILE_FAM_LANEHIST,
-    TILE_FAM_STRIDE,
-    TILE_FAM_ORDER1,
-    TILE_FAM_ORDER2
+    TILE_FAM_STRIDE
 };
 
 static int tile_family(uint8_t predictor_id)
@@ -60,15 +57,17 @@ static int tile_family(uint8_t predictor_id)
     case ZPSE_P_LANE_DELTA:
     case ZPSE_P_LANE_AVERAGE:
         return TILE_FAM_LANEHIST;
-    case ZPSE_P_ORDER1:
-        return TILE_FAM_ORDER1;
-    case ZPSE_P_ORDER2:
-        return TILE_FAM_ORDER2;
-    case ZPSE_P_TILE_CONSTANT:
-        return TILE_FAM_CONST; /* handled with constant_C */
     default:
-        return TILE_FAM_STRIDE; /* 5..8, 11 */
+        return TILE_FAM_STRIDE; /* 5..8, 11; gaps rejected by the gates */
     }
+}
+
+/* Every predictor gate refuses the reserved numeric ids before any family
+ * dispatch: an unguarded 3 would fall through tile_family to STRIDE and
+ * silently decode as STRIDE_8. */
+static int tile_pred_reserved(uint8_t predictor_id)
+{
+    return predictor_id == 3u || predictor_id == 4u || predictor_id == 9u;
 }
 
 void zpse_tile_read_header(const uint8_t *record, struct ZpseTileHeader *th)
@@ -87,13 +86,16 @@ static int tile_parse_header(const uint8_t *record, uint32_t record_len,
     if (record_len < (uint32_t)ZPSE_TILE_HEADER_SIZE)
         return ZPSE_BAD_TILE_SIZE;
     zpse_tile_read_header(record, th);
+    /* Reject the reserved gaps here, before anything can dispatch on the
+     * predictor family. */
+    if (tile_pred_reserved(th->predictor_id))
+        return ZPSE_BAD_PREDICTOR;
     return ZPSE_OK;
 }
 
 static uint32_t tile_record_need(const struct ZpseTileHeader *th)
 {
     return (uint32_t)8 +
-        (th->predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? (uint32_t)1 : (uint32_t)0) +
         (uint32_t)th->mask_payload_size +
         (uint32_t)th->residual_payload_size;
 }
@@ -101,66 +103,6 @@ static uint32_t tile_record_need(const struct ZpseTileHeader *th)
 static uint16_t tile_cap16(uint32_t n)
 {
     return n > (uint32_t)0xFFFF ? (uint16_t)0xFFFF : (uint16_t)n;
-}
-
-/* Are all Nt bytes the same value? Eight bytes at a time, so a tile
- * that is one value costs a third of the compares a byte-at-a-time loop
- * would. */
-static int tile_all_equal(const uint8_t *a, uint16_t nt)
-{
-    uint64_t w;
-    uint16_t i;
-
-    if (nt == 0u) {
-        return 1;
-    }
-    w = UINT64_C(0x0101010101010101) * (uint64_t)a[0];
-    for (i = 0; i + 8u <= nt; i += 8u) {
-        uint64_t v;
-
-        memcpy(&v, a + i, 8u);
-        if ((v ^ w) != 0u) {
-            return 0;
-        }
-    }
-    for (; i < nt; i++) {
-        if (a[i] != a[0]) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-/* Encoder-side choice of C for TILE_LOCAL_CONSTANT: most frequent byte
- * (first-max wins ties). Any C is decodable; this maximizes hits.
- *
- * The common case for this predictor is a tile that IS one value, and
- * that case is a compare-and-exit, not a histogram: the 256-entry
- * histogram below (512 bytes of counting, one store per byte) was most
- * of the cost of a TILE_CONSTANT classify -- 810 ns a tile, for a
- * predictor that won none of them, because it was too expensive to be
- * worth trying. The mode is only worth computing when the tile is not
- * one value, and then it is rare enough not to matter. */
-static uint8_t tile_pick_constant(const uint8_t *actual, uint16_t nt)
-{
-    uint16_t hist[256];
-    uint16_t i;
-    uint16_t best = 0;
-
-    if (nt == 0u) {
-        return 0u;
-    }
-    if (tile_all_equal(actual, nt)) {
-        return actual[0];
-    }
-    memset(hist, 0, sizeof hist);
-    for (i = 0; i < nt; i++)
-        hist[actual[i]]++;
-    for (i = 1; i < 256; i++) {
-        if (hist[i] > hist[best])
-            best = i;
-    }
-    return (uint8_t)best;
 }
 
 /* ---- ASCII pack form --------------------------------------------- *
@@ -1013,6 +955,10 @@ int zpse_tile_validate(const struct ZpseTileHeader *th, uint16_t nt_expected,
         return ZPSE_BAD_MASK;
     if (res_mode > (uint8_t)ZPSE_R_SIGNED_DELTA)
         return ZPSE_BAD_RESIDUAL; /* modes 5..7 reserved */
+    /* Explicit gate: ids 3, 4 and 9 are reserved gaps, not aliases. A tile
+     * naming one must be refused, never decoded as a live family. */
+    if (tile_pred_reserved(th->predictor_id))
+        return ZPSE_BAD_PREDICTOR;
     if (th->predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return ZPSE_BAD_PREDICTOR;
     /* The ASCII form is one exact shape; every other combination with this
@@ -1255,7 +1201,7 @@ static unsigned tile_ctz32(uint32_t w)
 #include <immintrin.h>
 
 /* The families whose prediction is a pure function of the plane bytes.
- * ORDER1/ORDER2 read lane-indexed tables, so they stay scalar. */
+ * All three live families are vectorisable. */
 static int tile_fam_is_vectorisable(int fam)
 {
     return fam == TILE_FAM_CONST || fam == TILE_FAM_LANEHIST ||
@@ -1897,8 +1843,8 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
 /* Classify one vectorisable tile: fills cl->words / cl->k / cl->at_pred /
  * cl->res_at_exc / cl->seen / cl->rmax / cl->dmin / cl->dmax / cl->nu and
  * advances the lane state to exactly the state the scalar path leaves.
- * Caller has already reset the lanes, zeroed words/seen and set
- * constant_C, and has captured ent_last/ent_second from AFTER that reset.
+ * Caller has already reset the lanes, zeroed words/seen and captured
+ * ent_last/ent_second from AFTER that reset.
  * Requires nt >= 32, and for the STRIDE family seg_pos >= 16.
  *
  * The whole tile is one pass over a staging buffer, so there is no scalar
@@ -1974,10 +1920,7 @@ static ZPSE_TILE_AVX2P void tile_classify_avx2(ZpseLaneState *lanes,
 
     (void)seg_base;
 
-    if (fam == TILE_FAM_CONST) {
-        c = (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-                ? cl->constant_C : 0u;
-    } else if (fam == TILE_FAM_STRIDE) {
+    if (fam == TILE_FAM_STRIDE) {
         s = tile_stride_of(predictor_id);
     }
 
@@ -2237,8 +2180,8 @@ uint32_t zpse_stats_literal_emits;
 uint32_t zpse_stats_modes[64];
 #endif
 
-/* Classify one tile: fill cl->words / cl->k / cl->at_pred / constant_C
- * and advance the lane state exactly as the decoder will. */
+/* Classify one tile: fill cl->words / cl->k / cl->at_pred and advance the
+ * lane state exactly as the decoder will. */
 static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                          uint16_t nt, uint8_t predictor_id,
                          uint8_t initial_literal, int tile_reset,
@@ -2248,6 +2191,9 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     uint32_t *words = cl->words;
     uint16_t k = 0;
     uint16_t p;
+
+    if (tile_pred_reserved(predictor_id))
+        return ZPSE_BAD_PREDICTOR;
 #if defined(ZPSE_TRIAL_STATS)
     zpse_trial_calls[predictor_id]++;
 #endif
@@ -2272,9 +2218,6 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
     cl->rmax = 0;
     cl->dmin = 255u;
     cl->dmax = 0u;
-    cl->constant_C = 0;
-    if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-        cl->constant_C = tile_pick_constant(actual, nt);
 
     fam = tile_family(predictor_id);
     if (fam == TILE_FAM_CONST || fam == TILE_FAM_STRIDE)
@@ -2302,80 +2245,36 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
 
     switch (fam) {
     case TILE_FAM_CONST:
-        if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
-            uint8_t c = cl->constant_C;
 #if defined(__SSE2__)
-            if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
-                nt >= 16u) {
-                uint32_t p = 0u;
-                __m128i cvec = _mm_set1_epi8((char)c);
-                for (; p + 16u <= (uint32_t)nt; p += 16u) {
-                    __m128i v = _mm_loadu_si128(
-                        (const __m128i *)(const void *)(actual + p));
-                    __m128i eq = _mm_cmpeq_epi8(v, cvec);
-                    unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
+        if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
+            nt >= 16u) {
+            uint32_t p = 0u;
+            __m128i zero = _mm_setzero_si128();
+            for (; p + 16u <= (uint32_t)nt; p += 16u) {
+                __m128i v = _mm_loadu_si128(
+                    (const __m128i *)(const void *)(actual + p));
+                __m128i eq = _mm_cmpeq_epi8(v, zero);
+                unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
 
-                    /* Walk the set bits, not the sixteen positions: a
-                     * bit-at-a-time shift is sixteen iterations of shift,
-                     * test and increment per sixteen bytes whatever the
-                     * mask holds, and this is the classify's inner loop on
-                     * every family without a dense kernel (measured: 9% of
-                     * dict_u8's encode, the slowest row of the corpus).
-                     * ctz jumps straight to the next exception and the
-                     * clear-lowest walks it in ascending order, which is
-                     * the order the shift loop produced. */
-                    while (mm != 0u) {
-                        unsigned b = zpse_ctz32(mm);
+                while (mm != 0u) {
+                    unsigned b = zpse_ctz32(mm);
 
-                        TILE_TAKE_EXC((uint16_t)(p + b), c,
-                                      actual[p + b]);
-                        mm &= mm - 1u;
-                    }
+                    TILE_TAKE_EXC((uint16_t)(p + b), 0u,
+                                  actual[p + b]);
+                    mm &= mm - 1u;
                 }
-                for (; p < (uint32_t)nt; p++) {
-                    if (actual[p] != c)
-                        TILE_TAKE_EXC(p, c, actual[p]);
-                }
-                tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
-                break;
             }
-#endif
-            for (p = 0; p < nt; p++) {
-                if (actual[p] != c)
-                    TILE_TAKE_EXC(p, c, actual[p]);
-            }
-        } else {
-#if defined(__SSE2__)
-            if ((ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_SSE2) != 0u &&
-                nt >= 16u) {
-                uint32_t p = 0u;
-                __m128i zero = _mm_setzero_si128();
-                for (; p + 16u <= (uint32_t)nt; p += 16u) {
-                    __m128i v = _mm_loadu_si128(
-                        (const __m128i *)(const void *)(actual + p));
-                    __m128i eq = _mm_cmpeq_epi8(v, zero);
-                    unsigned mm = (unsigned)~_mm_movemask_epi8(eq) & 0xFFFFu;
-
-                    while (mm != 0u) {
-                        unsigned b = zpse_ctz32(mm);
-
-                        TILE_TAKE_EXC((uint16_t)(p + b), 0u,
-                                      actual[p + b]);
-                        mm &= mm - 1u;
-                    }
-                }
-                for (; p < (uint32_t)nt; p++) {
-                    if (actual[p] != 0u)
-                        TILE_TAKE_EXC(p, 0u, actual[p]);
-                }
-                tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
-                break;
-            }
-#endif
-            for (p = 0; p < nt; p++) {
+            for (; p < (uint32_t)nt; p++) {
                 if (actual[p] != 0u)
                     TILE_TAKE_EXC(p, 0u, actual[p]);
             }
+            tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
+            break;
+        }
+#endif
+        for (p = 0; p < nt; p++) {
+            if (actual[p] != 0u)
+                TILE_TAKE_EXC(p, 0u, actual[p]);
         }
         tile_history_fixup(lanes, actual, nt, ent_last, ent_second);
         break;
@@ -2483,60 +2382,8 @@ static int tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
         }
         break;
 
-    case TILE_FAM_ORDER1: {
-        uint8_t *o1 = lanes->order1;
-        for (p = 0; p < nt; p++) {
-            size_t lane = (size_t)p & 7u;
-            uint8_t last = lanes->last[lane];
-            uint8_t xhat = o1[lane * 256u + (size_t)last];
-            uint8_t x = actual[p];
-            if (x != xhat)
-                TILE_TAKE_EXC(p, xhat, x);
-            lanes->second_last[lane] = last;
-            lanes->last[lane] = x;
-            o1[lane * 256u + (size_t)last] = x;
-        }
-        break;
-    }
-
-    default: { /* TILE_FAM_ORDER2 */
-        uint8_t *tab;
-
-        zpse_lane_o2_use(lanes);
-        tab = lanes->o2;
-        for (p = 0; p < nt; p++) {
-            size_t lane = (size_t)p & 7u;
-            uint8_t last = lanes->last[lane];
-            uint8_t second = lanes->second_last[lane];
-            size_t off = (lane * 4096u +
-                          (size_t)zpse_order2_index(second, last)) * 4u;
-            uint8_t *val = &tab[off];
-            uint8_t *conf = &tab[off + 1u];
-            /* An entry is learned only if this tile wrote it: the
-             * generation says so. An entry nobody has learned predicts
-             * the initial literal. */
-            int learned = (uint16_t)tab[off + 2u] == (uint16_t)(lanes->gen & 0xFFu) &&
-                          (uint16_t)tab[off + 3u] == (uint16_t)(lanes->gen >> 8);
-            uint8_t xhat = learned ? *val : initial_literal;
-            uint8_t x = actual[p];
-            if (x != xhat)
-                TILE_TAKE_EXC(p, xhat, x);
-            if (!learned) {
-                *val = x;
-                *conf = 1u;
-                tab[off + 2u] = (uint8_t)(lanes->gen & 0xFFu);
-                tab[off + 3u] = (uint8_t)(lanes->gen >> 8);
-            } else if (x == *val) {
-                if (*conf < 255u)
-                    (*conf)++;
-            } else {
-                (*conf)--;
-            }
-            lanes->second_last[lane] = last;
-            lanes->last[lane] = x;
-        }
-        break;
-    }
+    default:
+        return ZPSE_BAD_PREDICTOR; /* reserved gate above should catch this */
     }
 
     cl->k = k;
@@ -2578,6 +2425,10 @@ static int tile_classify_entry(ZpseLaneState *lanes, const uint8_t *actual,
         return ZPSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
         return ZPSE_BAD_TILE_SIZE;
+    /* Explicit gate before family dispatch: 3 would otherwise fall through
+     * tile_family's default to STRIDE and silently decode as STRIDE_8. */
+    if (tile_pred_reserved(predictor_id))
+        return ZPSE_BAD_PREDICTOR;
     if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return ZPSE_BAD_PREDICTOR;
     if (tile_family(predictor_id) == TILE_FAM_STRIDE && seg_base == 0)
@@ -2704,24 +2555,22 @@ int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
         return ZPSE_BAD_ARG;
     if (nt == 0u || nt > ZPSE_MAX_TILE_LEN)
         return ZPSE_BAD_TILE_SIZE;
+    /* Explicit gate before family dispatch. */
+    if (tile_pred_reserved(predictor_id))
+        return ZPSE_BAD_PREDICTOR;
     if (predictor_id > (uint8_t)ZPSE_P_STRIDE_3)
         return ZPSE_BAD_PREDICTOR;
     fam = tile_family(predictor_id);
-    if (fam == TILE_FAM_ORDER1 || fam == TILE_FAM_ORDER2)
-        return ZPSE_BAD_PREDICTOR;
     if (fam == TILE_FAM_STRIDE) {
         if (seg_base == 0)
             return ZPSE_BAD_ARG;
         s = tile_stride_of(predictor_id);
     }
-    if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-        c = cl->constant_C;
-    /* A CONST tile predicts c at every exception: 0 for CONST_ZERO,
-     * constant_C for TILE_CONSTANT. The dense at_pred array holds exactly
-     * cl->k such predictions in ascending position order, and the staging
-     * buffer is unread for this family. Skip both the 304-byte stage and
-     * the vector/scalar prediction walk -- a memset of k bytes is the
-     * whole job, byte-identically. */
+    /* A CONST_ZERO tile predicts 0 at every exception. The dense at_pred
+     * array holds exactly cl->k such predictions in ascending position
+     * order, and the staging buffer is unread for this family. Skip both
+     * the 304-byte stage and the vector/scalar prediction walk -- a memset
+     * of k bytes is the whole job, byte-identically. */
     if (fam == TILE_FAM_CONST) {
         memset(cl->at_pred, c, cl->k);
         return ZPSE_OK;
@@ -2992,8 +2841,8 @@ ZPSE_HOT void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
 uint32_t zpse_tile_record_len(const ZpseTileClass *cl, uint8_t predictor_id,
                               uint16_t nt, uint8_t mask_mode, uint8_t res_mode)
 {
-    uint32_t n = (uint32_t)ZPSE_TILE_HEADER_SIZE +
-                 (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? 1u : 0u);
+    (void)predictor_id; /* all live ids cost the same; kept for callers */
+    uint32_t n = (uint32_t)ZPSE_TILE_HEADER_SIZE;
     uint16_t k;
 
     if (cl == 0)
@@ -3117,9 +2966,7 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
      * same order, only without walking the tile again. */
     if (k == 0u && mask_mode == (uint8_t)ZPSE_M_ALL_HIT &&
         res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8) {
-        uint32_t total = (uint32_t)ZPSE_TILE_HEADER_SIZE +
-                         (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT
-                              ? 1u : 0u);
+        uint32_t total = (uint32_t)ZPSE_TILE_HEADER_SIZE;
 
         if (total > record_cap)
             return ZPSE_OUTPUT_OVERFLOW;
@@ -3132,15 +2979,11 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
         record_out[3] = 0u; /* ec: neither ALL_HIT nor ALL_EXCEPTION */
         zpse_store_u16le(record_out + 4, 0u); /* mask payload */
         zpse_store_u16le(record_out + 6, 0u); /* residual payload */
-        if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-            record_out[ZPSE_TILE_HEADER_SIZE] = cl->constant_C;
         return (int)total;
     }
     if (k == nt && mask_mode == (uint8_t)ZPSE_M_ALL_EXCEPTION &&
         res_mode == (uint8_t)ZPSE_R_EXCLUSION_U8) {
-        uint32_t base = (uint32_t)ZPSE_TILE_HEADER_SIZE +
-                        (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT
-                             ? 1u : 0u);
+        uint32_t base = (uint32_t)ZPSE_TILE_HEADER_SIZE;
         uint32_t total = base + (uint32_t)k;
         int rrc;
 
@@ -3166,8 +3009,6 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
         record_out[3] = 0u;
         zpse_store_u16le(record_out + 4, 0u);
         zpse_store_u16le(record_out + 6, (uint16_t)rrc);
-        if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-            record_out[ZPSE_TILE_HEADER_SIZE] = cl->constant_C;
         return (int)total;
     }
 
@@ -3206,9 +3047,7 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
         }
     }
 
-    off = (uint32_t)ZPSE_TILE_HEADER_SIZE +
-        (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT ? (uint32_t)1
-                                                       : (uint32_t)0);
+    off = (uint32_t)ZPSE_TILE_HEADER_SIZE;
     if (off > record_cap)
         return ZPSE_OUTPUT_OVERFLOW;
     mrc = zpse_mask_encode(mask_mode, words, nt, k, record_out + off,
@@ -3238,8 +3077,6 @@ ZPSE_HOT int zpse_tile_pack(uint8_t predictor_id, const ZpseTileClass *cl,
     record_out[3] = ec;
     zpse_store_u16le(record_out + 4, (uint16_t)mrc);
     zpse_store_u16le(record_out + 6, (uint16_t)rrc);
-    if (predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-        record_out[8] = cl->constant_C;
     return (int)off;
 }
 
@@ -4433,7 +4270,6 @@ static ZPSE_TILE_AVX2 __m128i tile_unit_index(__m128i bits, __m128i bitv,
  * are the first two "groups" the recurrence needs. */
 static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
                                               int fam, uint8_t predictor_id,
-                                              uint8_t constant_C,
                                               const uint32_t words[8],
                                               const uint8_t *units,
                                               uint8_t res_mode,
@@ -4447,7 +4283,7 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_avx2(uint8_t *out, uint16_t nt,
     const __m128i bitv = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)0x80,
                                        0, 0, 0, 0, 0, 0, 0, 0);
     const __m128i one = _mm_set1_epi8((char)1);
-    const __m128i cvec = _mm_set1_epi8((char)constant_C);
+    const __m128i cvec = _mm_setzero_si128();
     __m128i prev1 = _mm_loadl_epi64((const __m128i *)(const void *)ent_last);
     __m128i prev2 =
         _mm_loadl_epi64((const __m128i *)(const void *)ent_second);
@@ -4689,10 +4525,10 @@ static ZPSE_TILE_AVX2 __m256i tile_unit_index32(__m256i v1)
     return _mm256_slli_si256(x, 1);
 }
 
-/* Reconstruct a whole CONST tile 32 positions at a time.
+/* Reconstruct a whole CONST_ZERO tile 32 positions at a time.
  *
- * A CONST tile has no recurrence at all: every prediction is the same
- * byte (0 for CONST_ZERO, constant_C for TILE_CONSTANT), so unlike the
+ * A CONST_ZERO tile has no recurrence at all: every prediction is zero,
+ * so unlike the
  * lane-history kernel above there is nothing to chain and a full AVX2
  * register can be produced per step. The 256 positions are eight steps of
  * the loop below with no dependency between them.
@@ -4706,7 +4542,6 @@ static ZPSE_TILE_AVX2 __m256i tile_unit_index32(__m256i v1)
  * nt % 32 positions are finished positionally below so the units keep
  * their order. */
 static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
-                                                     uint8_t constant_C,
                                                      const uint32_t words[8],
                                                      const uint8_t *units,
                                                      uint8_t res_mode)
@@ -4735,7 +4570,7 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
         2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
     const __m256i one = _mm256_set1_epi8((char)1);
-    const __m256i xhat = _mm256_set1_epi8((char)constant_C);
+    const __m256i xhat = _mm256_setzero_si256();
     uint16_t consumed = 0u;
     uint32_t at = 0u;
     uint32_t full = ((uint32_t)nt / 32u) * 32u;
@@ -4888,7 +4723,7 @@ static ZPSE_TILE_AVX2 uint16_t tile_recon_const_avx2(uint8_t *out, uint16_t nt,
     /* Tail: the same order of units, position by position, mirroring the
      * scalar CONST branch rather than duplicating its masking rules. */
     while (at < (uint32_t)nt) {
-        uint8_t c = constant_C;
+        uint8_t c = 0u;
         uint8_t x;
 
         if (((mw[at >> 5u] >> (at & 31u)) & 1u) == 0u) {
@@ -4965,7 +4800,6 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
 {
     uint8_t mask_mode;
     uint8_t res_mode;
-    uint8_t constant_C = 0;
     const uint8_t *mask_ptr;
     const uint8_t *res_ptr;
     uint32_t mw;
@@ -4976,14 +4810,13 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
     int fam;
 
     (void)out_cap; /* bounded by the caller before this body is entered */
+    /* Decode-side guard: no reserved id may reach family dispatch. */
+    if (tile_pred_reserved(th.predictor_id))
+        return ZPSE_BAD_PREDICTOR;
     mask_mode = zpse_tile_mask_mode(th.tile_flags);
     res_mode = zpse_tile_res_mode(th.tile_flags);
 
     mask_ptr = record + ZPSE_TILE_HEADER_SIZE;
-    if (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
-        constant_C = mask_ptr[0];
-        mask_ptr += 1;
-    }
     res_ptr = mask_ptr + th.mask_payload_size;
 
     fresh = (tile_reset || (th.tile_flags & ZPSE_TILE_FLAG_RESET)) ? 1 : 0;
@@ -5037,7 +4870,7 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
             int f = tile_family(th.predictor_id);
 
             if (f == TILE_FAM_CONST || f == TILE_FAM_STRIDE ||
-                (fresh && f != TILE_FAM_ORDER1 && f != TILE_FAM_ORDER2)) {
+                (fresh && f == TILE_FAM_LANEHIST)) {
                 uint8_t ent_last[8];
                 uint8_t ent_second[8];
 
@@ -5059,8 +4892,6 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
                     }
                 } else if (th.predictor_id == (uint8_t)ZPSE_P_CONST_ZERO) {
                     memset(out, 0, nt);
-                } else if (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
-                    memset(out, constant_C, nt);
                 } else {
                     /* FAM_LANEHIST: a freshly reset state is a fixed point. */
                     memset(out, initial_literal, nt);
@@ -5076,8 +4907,7 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
         /* Every position is an exception. With RAW_ACTUAL the residual
          * payload IS the output; for the stateless families and LANEHIST
          * the end lane state is a function of those bytes alone, so the
-         * O(8) fixup reproduces it. ORDER1/ORDER2 update their tables per
-         * byte and keep the general path. */
+         * O(8) fixup reproduces it. */
         if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL && k == nt &&
             th.mask_payload_size == 0u && th.residual_payload_size == k) {
             int f = tile_family(th.predictor_id);
@@ -5121,22 +4951,20 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
                 words[v >> 5u] |= (uint32_t)1u << (v & 31u);
             }
             if (ok && f == TILE_FAM_CONST) {
-                uint8_t c = (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-                                ? constant_C : 0u;
                 uint8_t ent_last[8];
                 uint8_t ent_second[8];
                 uint16_t wi;
                 uint16_t jj = 0;
 
                 tile_capture_hist(lanes, ent_last, ent_second);
-                memset(out, c, nt);
+                memset(out, 0, nt);
                 for (wi = 0; wi < 8u && jj < k; wi++) {
                     uint32_t w = words[wi];
 
                     while (w != 0u) {
                         uint16_t pos = (uint16_t)(wi * 32u +
                                                  (uint32_t)tile_ctz32(w));
-                        out[pos] = zpse_exclusion_inverse(res_ptr[jj++], c);
+                        out[pos] = zpse_exclusion_inverse(res_ptr[jj++], 0u);
                         w &= w - 1u;
                     }
                 }
@@ -5191,7 +5019,7 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
     if (k == 0u) {
         fam = tile_family(th.predictor_id);
         if (fam == TILE_FAM_CONST || fam == TILE_FAM_STRIDE ||
-            (fresh && fam != TILE_FAM_ORDER1 && fam != TILE_FAM_ORDER2)) {
+            (fresh && fam == TILE_FAM_LANEHIST)) {
             uint8_t ent_last[8];
             uint8_t ent_second[8];
             if (fam == TILE_FAM_STRIDE) {
@@ -5219,8 +5047,6 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
                 }
             } else if (th.predictor_id == (uint8_t)ZPSE_P_CONST_ZERO) {
                 memset(out, 0, nt);
-            } else if (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT) {
-                memset(out, constant_C, nt);
             } else {
                 /* FAM_LANEHIST: a freshly reset state is a fixed point. */
                 memset(out, initial_literal, nt);
@@ -5247,14 +5073,12 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
      * `x-ray`, whose dense tiles the 32-wide kernel handles better than a
      * scatter ever will, so the crossover stays at the sparse end. */
     if (fam == TILE_FAM_CONST && (uint32_t)k <= 24u) {
-        uint8_t c = (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-                        ? constant_C : 0u;
         uint8_t ent_last[8];
         uint8_t ent_second[8];
         uint16_t wi;
 
         tile_capture_hist(lanes, ent_last, ent_second);
-        memset(out, c, nt);
+        memset(out, 0, nt);
         j = 0;
         for (wi = 0; wi < 8u && j < k; wi++) {
             uint32_t w = words[wi];
@@ -5267,9 +5091,9 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
                 if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
                     e = resid[j];
                 } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
-                    e = (uint8_t)(((unsigned)c + (int)deltas[j]) & 0xFFu);
+                    e = (uint8_t)((int)deltas[j] & 0xFFu);
                 } else {
-                    e = zpse_exclusion_inverse(resid[j], c);
+                    e = zpse_exclusion_inverse(resid[j], 0u);
                 }
                 out[pos] = e;
                 j++;
@@ -5290,9 +5114,9 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
      * produced are untouched, and the j != k test below is this path's
      * version of the scalar loops' own residual-consumption check, taken
      * only once the output bytes for the whole tile have been produced --
-     * exactly as the scalar loops leave it. ORDER1/ORDER2 (stateful
-     * tables), STRIDE (a lane-crossing recurrence), Nt < 32 and every
-     * machine without AVX2 fall through to the scalar loops. */
+     * exactly as the scalar loops leave it. STRIDE (a lane-crossing
+     * recurrence), Nt < 32 and every machine without AVX2 fall through
+     * to the scalar loops. */
     if ((uint32_t)nt >= 32u &&
         (fam == TILE_FAM_CONST || fam == TILE_FAM_LANEHIST) &&
         (ZPSE_CPU_CAPS_FAST() & (uint32_t)ZPSE_CPU_AVX2) != 0u) {
@@ -5312,10 +5136,9 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
          * lane-history family needs the 8-lane one, whose step is the
          * recurrence's own width. */
         j = (fam == TILE_FAM_CONST)
-                ? tile_recon_const_avx2(out, nt, constant_C, words, units,
-                                        res_mode)
-                : tile_recon_avx2(out, nt, fam, th.predictor_id, constant_C,
-                                  words, units, res_mode, ent_last,
+                ? tile_recon_const_avx2(out, nt, words, units, res_mode)
+                : tile_recon_avx2(out, nt, fam, th.predictor_id, words,
+                                  units, res_mode, ent_last,
                                   ent_second, 0u);
         tile_history_fixup(lanes, out, nt, ent_last, ent_second);
         if (j != k)
@@ -5329,9 +5152,7 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
         uint8_t ent_second[8];
         tile_capture_hist(lanes, ent_last, ent_second);
         if (fam == TILE_FAM_CONST) {
-            uint8_t c = (th.predictor_id == (uint8_t)ZPSE_P_TILE_CONSTANT)
-                            ? constant_C : 0u;
-            ZPSE_CONST_STRIDE_LOOP(c);
+            ZPSE_CONST_STRIDE_LOOP(0u);
         } else {
             uint32_t s = tile_stride_of(th.predictor_id);
 #if ZPSE_TILE_HAVE_AVX2
@@ -5355,7 +5176,7 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
                     el[l] = (seg_pos + l < 8u) ? initial_literal
                                                : seg_base[seg_pos + l - 8u];
                 j = tile_recon_avx2(out, nt, TILE_FAM_LANEHIST,
-                                    (uint8_t)ZPSE_P_LANE_PREVIOUS, 0u, words,
+                                    (uint8_t)ZPSE_P_LANE_PREVIOUS, words,
                                     units, res_mode, el, el, 0u);
                 done = 1;
             }
@@ -5463,75 +5284,9 @@ ZPSE_ALWAYS_INLINE int tile_decode_core(
         return (int)nt;
     }
 
-    /* ORDER1 / ORDER2: table-updating online loop. */
-    j = 0;
-    if (fam == TILE_FAM_ORDER1) {
-        uint8_t *o1 = lanes->order1;
-        for (p = 0; p < nt; p++) {
-            size_t lane = (size_t)p & 7u;
-            uint8_t last = lanes->last[lane];
-            uint8_t xhat = o1[lane * 256u + (size_t)last];
-            uint8_t x;
-            if (((words[p >> 5] >> (p & 31u)) & 1u) == 0u) {
-                x = xhat;
-            } else if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
-                x = resid[j++];
-            } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
-                x = (uint8_t)(((unsigned)xhat + (int)deltas[j++]) & 0xFFu);
-            } else {
-                x = zpse_exclusion_inverse(resid[j++], xhat);
-            }
-            out[p] = x;
-            lanes->second_last[lane] = last;
-            lanes->last[lane] = x;
-            o1[lane * 256u + (size_t)last] = x;
-        }
-    } else {
-        uint8_t *tab;
-
-        zpse_lane_o2_use(lanes);
-        tab = lanes->o2;
-        for (p = 0; p < nt; p++) {
-            size_t lane = (size_t)p & 7u;
-            uint8_t last = lanes->last[lane];
-            uint8_t second = lanes->second_last[lane];
-            size_t off = (lane * 4096u +
-                          (size_t)zpse_order2_index(second, last)) * 4u;
-            uint8_t *val = &tab[off];
-            uint8_t *conf = &tab[off + 1u];
-            /* An entry is learned only if this tile wrote it. */
-            int learned = (uint16_t)tab[off + 2u] == (uint16_t)(lanes->gen & 0xFFu) &&
-                          (uint16_t)tab[off + 3u] == (uint16_t)(lanes->gen >> 8);
-            uint8_t xhat = learned ? *val : initial_literal;
-            uint8_t x;
-            if (((words[p >> 5] >> (p & 31u)) & 1u) == 0u) {
-                x = xhat;
-            } else if (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL) {
-                x = resid[j++];
-            } else if (res_mode == (uint8_t)ZPSE_R_SIGNED_DELTA) {
-                x = (uint8_t)(((unsigned)xhat + (int)deltas[j++]) & 0xFFu);
-            } else {
-                x = zpse_exclusion_inverse(resid[j++], xhat);
-            }
-            out[p] = x;
-            if (!learned) {
-                *val = x;
-                *conf = 1u;
-                tab[off + 2u] = (uint8_t)(lanes->gen & 0xFFu);
-                tab[off + 3u] = (uint8_t)(lanes->gen >> 8);
-            } else if (x == *val) {
-                if (*conf < 255u)
-                    (*conf)++;
-            } else {
-                (*conf)--;
-            }
-            lanes->second_last[lane] = last;
-            lanes->last[lane] = x;
-        }
-    }
-    if (j != k)
-        return ZPSE_BAD_MASK;
-    return (int)nt;
+    /* All live families returned above; the reserved ids were rejected at
+     * the top of this function. */
+    return ZPSE_BAD_PREDICTOR;
 }
 
 /* Single-tile callers: own the scratch (once per call, as before). */

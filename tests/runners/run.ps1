@@ -1,7 +1,7 @@
 # Expects gcc on PATH. Run from anywhere; builds each test against
 # src/zpse_unity.c and executes it. Fails on first failing suite.
 #
-# Also builds tests/test_parity.c, tests/test_fuzz.c and tests/test_lseed.c
+# Also builds tests/test_parity.c and tests/test_fuzz.c
 # in three modes -- default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
 # -DZPSE_FORCE_TRIAL_SWAP -- and requires every mode's digest and per-case
 # output to match. The first two modes prove the SIMD paths are bit-exact
@@ -14,7 +14,7 @@ $unity = Join-Path $repo "src/zpse_unity.c"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "opencode/zpse-tests"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $fail = 0
-foreach ($t in @("test_roundtrip", "test_transforms", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_lzh", "test_huf", "test_ascii", "test_levels", "test_frame", "test_sizes", "test_colref", "test_colcorpus", "test_pageforms")) {
+foreach ($t in @("test_roundtrip", "test_transforms", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_huf", "test_ascii", "test_levels", "test_frame", "test_sizes", "test_colref", "test_colcorpus", "test_pageforms")) {
     $src = Join-Path $repo "tests/suites/$t.c"
     $exe = Join-Path $tmp "$t.exe"
     Write-Output "=== build $t ==="
@@ -26,12 +26,10 @@ foreach ($t in @("test_roundtrip", "test_transforms", "test_hostile", "test_unit
 
 Write-Output "=== scalar/SIMD/order parity ==="
 # `parity` compares whole compressed corpora; `fuzz` does the same over a
-# randomized corpus; `lseed` decodes hand-built foreign segments whose
-# ORDER tiles do not reset, against a reference that hardcodes the
-# documented segment-start state. Each prints one summary line (DIGEST / FUZZ
-# cases= / LSEED:) that must match across the three builds, and the rest of
-# their output must match too, so a divergence names the case that caused it.
-foreach ($suite in @("parity", "fuzz", "lseed")) {
+# randomized corpus. Each prints one summary line (DIGEST / FUZZ cases=)
+# that must match across the three builds, and the rest of their output must
+# match too, so a divergence names the case that caused it.
+foreach ($suite in @("parity", "fuzz")) {
     $src = Join-Path $repo "tests/suites/test_$suite.c"
     $built = $true
     foreach ($mode in @("def", "scalar", "swap")) {
@@ -54,7 +52,7 @@ foreach ($suite in @("parity", "fuzz", "lseed")) {
         if ($rc -ne 0) { Write-Output "SUITE FAILED: $suite ($mode)"; $fail = 1 }
     }
 
-    $key = if ($suite -eq "fuzz") { '^FUZZ cases=' } elseif ($suite -eq "lseed") { '^LSEED:' } else { '^DIGEST' }
+    $key = if ($suite -eq "fuzz") { '^FUZZ cases=' } else { '^DIGEST' }
     $digDef = ($logs["def"] | Select-String $key).Line
     $bodyDef = $logs["def"] | Where-Object { $_ -notmatch $key }
     foreach ($mode in @("scalar", "swap")) {
@@ -77,8 +75,8 @@ Write-Output "=== page kernels without AVX2 (ZPSE_AVX2_ABI_OK=0) ==="
 # kernel sources). Build test_pageforms with the kernels compiled out and
 # require every byte of its output to match the default build, so the SIMD
 # path cannot drift from the scalar reference on the new page forms. This is
-# the same kind of guard the parity/fuzz/lseed loop applies to the older
-# kernels; it is kept separate so those three digest checks stay unchanged.
+# the same kind of guard the parity/fuzz loop applies to the older
+# kernels; it is kept separate so those two digest checks stay unchanged.
 $pfSrc = Join-Path $repo "tests/suites/test_pageforms.c"
 $pfBuilt = $true
 $pfLogs = @{}

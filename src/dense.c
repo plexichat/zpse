@@ -374,10 +374,10 @@ static int dense_check_mask(uint8_t mask_mode, const uint8_t *mask,
  *   CONST (already a memset between exceptions -- left alone),
  *   LANE_* (8-byte lane history, period 8), and
  *   STRIDE_* (out[p] = out[p-s]).
- * ORDER1 / ORDER2 are rejected by dense_record before reconstruction (their
- * tables are per tile, not per segment), so there is no table-chained family
- * to vectorize here; the STRIDE family is the one whose prediction is not
- * lane-local. See src/tile.c for the table-chained 8-lane kernels. */
+ * ids 3, 4 and 9 are reserved gaps, rejected by dense_record before
+ * reconstruction, so there is no table-chained family to vectorize here;
+ * the STRIDE family is the one whose prediction is not lane-local. See
+ * src/tile.c for the lane-history kernels. */
 
 #if ZPSE_DENSE_HAVE_AVX2 && ZPSE_DENSE_AVX2
 
@@ -802,8 +802,10 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
     if (pred > (uint8_t)ZPSE_P_STRIDE_3) {
         return ZPSE_BAD_PREDICTOR;
     }
-    if (pred == (uint8_t)ZPSE_P_ORDER1 || pred == (uint8_t)ZPSE_P_ORDER2) {
-        return ZPSE_UNSUPPORTED_FEATURE;
+    /* Reserved gaps: old streams naming these must be refused, never
+     * silently decoded as one of the surviving families. */
+    if (pred == 3u || pred == 4u || pred == 9u) {
+        return ZPSE_BAD_PREDICTOR;
     }
 
     mask = payload + base + ZPSE_DENSE_HEADER_SIZE;
@@ -836,9 +838,12 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
      * the mask already happened above, and ALL_EXCEPTION forces K == nt. */
     if (mask_mode == (uint8_t)ZPSE_M_ALL_EXCEPTION &&
         (res_mode == (uint8_t)ZPSE_R_RAW_ACTUAL ||
-         pred == (uint8_t)ZPSE_P_CONST_ZERO ||
-         pred == (uint8_t)ZPSE_P_TILE_CONSTANT)) {
-        uint8_t fill = (pred == (uint8_t)ZPSE_P_CONST_ZERO) ? 0u : constant_c;
+         pred == (uint8_t)ZPSE_P_CONST_ZERO)) {
+        /* CONST_ZERO's fill is byte 4 of the dense header, read
+         * unconditionally above. The zero-plane path still works: 0 -> add
+         * one, 255 (a palette fill the plane does not contain) -> identity,
+         * anything else -> the byte-wide exclusion map. */
+        uint8_t fill = constant_c;
 
         rc = zpse_residual_decode(res_mode, res, (uint16_t)res_len,
                                   (uint16_t)k, 0, out, out);
@@ -871,17 +876,15 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
     }
 
     /* A record with no exceptions is pure prediction, and every
-     * predictor's fixed point from the entry state is the literal: CONST
-     * gives 0 or C, the lane histories stay at the literal (2L - L = L,
-     * (L + L + 1) >> 1 = L) and STRIDE reads the literal it just wrote.
-     * So the whole record is one fill, which is what makes the form cheap
-     * to decode as well as to encode. */
+     * predictor's fixed point from the entry state is its fill: CONST_ZERO
+     * gives byte 4 of the dense header, the lane histories stay at the
+     * literal (2L - L = L, (L + L + 1) >> 1 = L) and STRIDE reads the
+     * literal it just wrote. So the whole record is one fill, which is what
+     * makes the form cheap to decode as well as to encode. */
     if (k == 0u) {
         uint8_t fill = (pred == (uint8_t)ZPSE_P_CONST_ZERO)
-                           ? 0u
-                           : (pred == (uint8_t)ZPSE_P_TILE_CONSTANT)
-                                 ? constant_c
-                                 : literal;
+                           ? constant_c
+                           : literal;
 
         memset(out, fill, (size_t)nt);
         /* This record reconstructed one byte value end to end; the
@@ -899,9 +902,9 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
     j = 0u;
     next = dense_next(mask_mode, mask, nt, 0u, 0u);
 
-    if (pred == (uint8_t)ZPSE_P_CONST_ZERO ||
-        pred == (uint8_t)ZPSE_P_TILE_CONSTANT) {
-        uint8_t fill = (pred == (uint8_t)ZPSE_P_CONST_ZERO) ? 0u : constant_c;
+    if (pred == (uint8_t)ZPSE_P_CONST_ZERO) {
+        /* Byte 4 of the header is this record's fill. */
+        uint8_t fill = constant_c;
         uint32_t at = 0u;
 
         /* The prediction is the same byte everywhere, so the record is that
@@ -935,7 +938,7 @@ ZPSE_HOT static int dense_record(uint32_t nt, const uint8_t *payload,
 #if ZPSE_DENSE_HAVE_AVX2 && ZPSE_DENSE_AVX2
     } else if (use_avx2) {
         /* The three lane-history predictors and the stride family are the
-         * only remaining shapes (ORDER1/ORDER2 were rejected above). Both
+         * only remaining shapes (the reserved gaps were rejected above). Both
          * kernels consume exactly K units in ascending position order; a
          * mismatch is the same ZPSE_BAD_MASK the scalar loops' own j != k
          * test would have returned. The caller's scratch already holds the

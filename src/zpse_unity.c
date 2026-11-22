@@ -13,7 +13,7 @@
 #include "mask.c"
 #include "residual.c"
 #include "dense.c"
-/* Vendored LZ4 1.10.0 supplies every intra-block LZ codec. lz4block.c keeps
+/* Vendored LZ4 1.10.0 supplies the single LZ4 codec. lz4block.c keeps
  * the existing block-form API but routes it through LZ4_compress_default /
  * LZ4_decompress_safe. */
 #include "vendor/lz4.c"

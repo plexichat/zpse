@@ -191,10 +191,6 @@ int zpse_f64fast_encode(const uint8_t *in, uint32_t n,
     e.enc_flags = 0u;
     e.const_plane = 0;
     e.ascii_gate = 0u;
-    lanes.order1 = e.order1;
-    lanes.o2 = e.o2;
-    lanes.gen = 0u;
-    lanes.o2_ready = 0u;
 
     fb = out + ZPSE_F64FAST_HEADER_SIZE;
     fcap = out_cap - ZPSE_F64FAST_HEADER_SIZE;

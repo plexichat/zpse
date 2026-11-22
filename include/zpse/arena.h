@@ -18,11 +18,10 @@
 #define ZPSE_ENC_ARENA_SIZE (464u * 1024u) /* 0x74000 */
 #define ZPSE_ARENA_ALIGN    64u
 
-/* Decoder offsets. */
+/* Decoder offsets. 0x21000..0x41800 is a reserved hole where the ORDER1
+ * and ORDER2 tables used to live; the live regions keep their offsets. */
 #define ZPSE_D_OFF_RECON    0x01000u
 #define ZPSE_D_OFF_OUT      0x11000u
-#define ZPSE_D_OFF_ORDER1   0x21000u
-#define ZPSE_D_OFF_O2       0x21800u
 #define ZPSE_D_OFF_COMB     0x41800u
 #define ZPSE_D_OFF_SHUF     0x43800u
 /* Where a ZPSE_B_LZ_TILE block's body is unpacked: the tile path reads it
@@ -33,8 +32,6 @@
 
 #define ZPSE_D_SZ_RECON     0x10000u
 #define ZPSE_D_SZ_OUT       0x10000u
-#define ZPSE_D_SZ_ORDER1    0x00800u
-#define ZPSE_D_SZ_O2        0x20000u
 /* 8 KiB generic scratch for dense/tile exception buffers. */
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
@@ -56,8 +53,7 @@
 #define ZPSE_E_OFF_TSTAGE   0x11000u
 #define ZPSE_E_OFF_CAND     0x21000u
 #define ZPSE_E_OFF_BEST     0x31000u
-#define ZPSE_E_OFF_ORDER1   0x41000u
-#define ZPSE_E_OFF_O2       0x41800u
+/* 0x41000..0x61800 is a reserved hole (the old ORDER1/ORDER2 tables). */
 #define ZPSE_E_OFF_COMB     0x61800u
 #define ZPSE_E_OFF_HIST     0x63800u
 #define ZPSE_E_OFF_SHUF     0x64800u
@@ -67,8 +63,6 @@
 #define ZPSE_E_SZ_TSTAGE    0x10000u
 #define ZPSE_E_SZ_CAND      0x10000u
 #define ZPSE_E_SZ_BEST      0x10000u
-#define ZPSE_E_SZ_ORDER1    0x00800u
-#define ZPSE_E_SZ_O2        0x20000u
 /* 8 KiB generic scratch, as in the decoder arena (see ZPSE_D_SZ_COMB). */
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
@@ -86,8 +80,6 @@ typedef struct ZpseDecoder {
     uint8_t *arena;       /* base, 64-B aligned, 384 KiB (incl. 64 KiB lzbuf) */
     uint8_t *recon;       /* transformed reconstruction (64 KiB) */
     uint8_t *out_stage;   /* output staging (64 KiB) */
-    uint8_t *order1;      /* 2 KiB */
-    uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
     uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *shuf;        /* 4 KiB shuffle/CRC consts */
     uint8_t *lzbuf;       /* 64 KiB: unpacked body of an LZ_TILE block */
@@ -107,8 +99,6 @@ typedef struct ZpseEncoder {
     uint8_t *tstage;      /* 64 KiB */
     uint8_t *cand;        /* 64 KiB candidate staging */
     uint8_t *best;        /* 64 KiB best staging */
-    uint8_t *order1;      /* 2 KiB */
-    uint8_t *o2;          /* 128 KiB: 8 x 4096 {value, confidence, gen} */
     uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */

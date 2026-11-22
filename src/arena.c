@@ -51,20 +51,17 @@ int zpse_decoder_init(ZpseDecoder *d, void *arena_mem, size_t arena_len)
      * is re-initialised at the point of use instead --
      *   recon      fully written by the per-segment decodes before
      *              zpse_transform_inverse reads it (SUM(seg_len) == N)
-     *   order1/o2            reset by zpse_lane_reset() at every segment
-     *              start, and by the selective per-tile reset
      *   comb       written by the dense/tile exception decoder
      *              (zpse_residual_decode) before it is read
      *   out_stage  written before it is read: block decode puts the last
      *              eight planes of a 16-wide interleave here, skewed (see
      *              ZPSE_D_PLANE_SKEW), and the inverse transform reads
      *              them back; no other block shape touches it
-     * The control-cushion region is reserved and never read. */
+     * The control-cushion region is reserved and never read, as is the
+     * hole where the ORDER1/ORDER2 tables used to live. */
     d->arena = base;
     d->recon = base + ZPSE_D_OFF_RECON;
     d->out_stage = base + ZPSE_D_OFF_OUT;
-    d->order1 = base + ZPSE_D_OFF_ORDER1;
-    d->o2 = base + ZPSE_D_OFF_O2;
     d->comb = base + ZPSE_D_OFF_COMB;
     d->shuf = base + ZPSE_D_OFF_SHUF;
     d->lzbuf = base + ZPSE_D_OFF_LZBUF;
@@ -95,8 +92,6 @@ int zpse_encoder_init(ZpseEncoder *e, void *arena_mem, size_t arena_len)
     e->tstage = base + ZPSE_E_OFF_TSTAGE;
     e->cand = base + ZPSE_E_OFF_CAND;
     e->best = base + ZPSE_E_OFF_BEST;
-    e->order1 = base + ZPSE_E_OFF_ORDER1;
-    e->o2 = base + ZPSE_E_OFF_O2;
     e->comb = base + ZPSE_E_OFF_COMB;
     e->hist = base + ZPSE_E_OFF_HIST;
     e->shuf = base + ZPSE_E_OFF_SHUF;

@@ -72,14 +72,14 @@ Three forms were added when the tile model was structurally the wrong answer:
 * A **seven-bit ASCII** form for text, which stores eight characters in seven
   bytes and is decided before the sweep.
 * **Intra-block LZ**, a literal-and-command stream whose distances stay inside
-  the block. It is offered as one more candidate at the deeper levels and is
+  the block. It was offered as one more candidate at the deeper levels and was
   the difference between raw and compression on high-cardinality text.
 * **LZ over the tile body**, which compresses the body the tile path would
   have written and then reconstructs it through the ordinary tile decoder.
 * A fixed-distance **fast LZ** form (LZ4's shape) for the cases where the
-  variable-length distance costs more than it saves.
+  variable-length distance costs more than it saves (later removed).
 * A **hexadecimal LZ** form for page-sized blocks, which packs common
-  literal/length pairs into a nibble and shortens fresh distances.
+  literal/length pairs into a nibble and shortens fresh distances (later removed).
 
 The LZ work forced a second rule into the design: a form is kept only when it
 is strictly smaller than everything already tried, so a level never pays for a
@@ -132,16 +132,18 @@ page work therefore changed decisions rather than the format:
   format and the checksum field dropped rather than spent.
 * A lazy step that measures the current match and the next position instead of
   asking only whether an eight-byte match starts one byte on.
-* `ZPSE_ENC_PAGE_FAST`, which cuts the candidate list to the identity on the
-  cheap rungs and removes the pricing pass, the sample and the trial cap.
+* `ZPSE_ENC_PAGE_FAST` (later removed), which cut the candidate list to the
+  identity on the cheap rungs and removed the pricing pass, the sample and the
+  trial cap.
 * A candidate cap on the levels that price every plane, chosen because the
   cap's ratio cost crosses the one-point line only there.
 * Shorter ASCII and match-finder samples at page size, and pricing a page
   whole once every plane is priced.
-* The noise abort extended to pages, but only under the fast flag, because a
-  page has no sweep behind its trial to repair a wrong verdict.
-* The hexadecimal LZ form from level 7 up, where distances above 4320 are
-  rare enough that its shorter distance codes win.
+* The noise abort extended to pages, but only under the fast flag (later
+  removed), because a page has no sweep behind its trial to repair a wrong
+  verdict.
+* The hexadecimal LZ form (later removed) from level 7 up, where distances
+  above 4320 were rare enough that its shorter distance codes won.
 * A page-sized hash table for `ZPSE_ENC_LZ_FAST`. The fast form's 2^16 entries
   were chosen on 64 KiB blocks, where they hold a load factor of one; on a
   page that cannot insert 4,092 positions the same table is 128 KiB of clear,
@@ -222,9 +224,10 @@ so the full 1..65535 distance range is usable.
 The LZ forms left a residue that was easy to see and hard to take: the command
 stream is bytes, and on a page of heap pointers the distribution of those bytes
 is nothing like flat. Huffman coding the payload is the oldest answer to that.
-It went in as a block form of its own -- flag pattern 110 -- rather than as
-another LZ encoder, so it wraps a stream the match finder already won and never
-has to re-decide a match.
+It went in as a block form of its own -- the old flag pattern 110, later
+replaced by the single bit-7 `ZPSE_B_HUF` form -- rather than as another LZ
+encoder, so it wraps a stream the match finder already won and never has to
+re-decide a match.
 
 Three of its choices were settled by measurement, and two of them by being
 wrong first.
@@ -407,7 +410,7 @@ the loop has just filed for the current position, which happens when the bytes
 at pos and pos + 1 hash alike, i.e. in a run. It is not faster (`dickens` 285
 -> 276 MB/s, `webster` 332 -> 324) and it does not hold the ratio: `mozilla`
 grows 190 bytes, which is exactly the distance-one run the probe was taking.
-`ZPSE_LZ2_PROBE_SELF` stays 1.
+`ZPSE_LZ2_PROBE_SELF` (later removed) stayed at 1.
 
 The second is the full-size trial cap applied to the tied-free rows as well --
 levels 8 and 9, whose whole design is to encode every survivor their price
@@ -460,8 +463,8 @@ nothing) and the second (a bad predecessor: no single predecessor reproduced
 it). The two differing bytes were the block's first two, which is what a
 neighbour's overrun leaves.
 
-The reserve is `ZPSE_LZ2_FAST_ROOM`, 38, with the arithmetic written down
-beside it. After the fix: zero overruns across every block of a 16 MiB frame,
+The reserve was `ZPSE_LZ2_FAST_ROOM` (later removed), 38, with the arithmetic
+written down beside it. After the fix: zero overruns across every block of a 16 MiB frame,
 zero bad blocks in forward, shuffled and fresh-decoder order, and identical
 frames and decode output at 2, 3, 4, 5 and 6 workers. The two other decoders
 were checked for the same shape and are not affected: the token form reserves
@@ -531,12 +534,12 @@ from a second compiler on a second OS, not a claim about it. An A/B that is
 close to the host's noise band is run on both, and the quieter one decides;
 the fast-form lookahead below is one of those, and it agreed on both.
 
-## The fast form's finder, the same lookahead
+## The fast form's finder, the same lookahead (later removed)
 
-The token form's finder (`src/lz.c`) got its next-key lookahead first. This is
-the same lever in the fast form (`src/lz2.c`), which is the one text blocks
-actually run, and it paid twice over because the lazy probe asks about the
-same position the lookahead reads.
+The token form's finder (`src/lz.c`, later removed) got its next-key lookahead
+first. This was the same lever in the fast form (`src/lz2.c`, later removed),
+which was the one text blocks actually ran, and it paid twice over because the
+lazy probe asked about the same position the lookahead reads.
 
 The loop files `pos` and then tests the candidate at `pos`. On a miss the
 cursor steps a single byte -- four iterations in five on prose, where the
@@ -711,9 +714,10 @@ word as the length, which is where the byte loop would have stopped, so `l1`,
 the decision and the stream are unchanged. `ZPSE_LZ_LAZY_WIDE 0` puts the byte
 loop back for re-measuring the two.
 
-`ZPSE_LZ2_BLOCK=4096 bench_lz2 FILE...` now measures the page path (the lz1
-column passes the block size as the lazy ceiling, which is the rule the block
-encoder applies; the default is still the fast form's 64 KiB). Two runs per arm
+`ZPSE_LZ2_BLOCK=4096 bench_lz2 FILE...` (the harness and switch were later
+removed) then measured the page path (the lz1 column passed the block size as
+the lazy ceiling, which is the rule the block encoder applied; the default was
+still the fast form's 64 KiB). Two runs per arm
 -- each run best-of-three passes over the file, arms alternated in both orders
 -- LZ encode MB/s, 4 KiB blocks then 16 KiB: `dickens` 256.6 -> 274.4 and 217.4
 -> 246.3, `mozilla` 383.3 -> 433.1 and 336.2 -> 373.7, `nci` 514.7 -> 666.4 and
@@ -750,8 +754,8 @@ and 670.8 -> 653.4 at 16 KiB; the 16 MiB page corpus 605.0 -> 576.5. The walk
 is bounded by `anchor`, the end of the previous match, so on prose it takes one
 or two steps and the word loop almost never runs -- and its two bounds plus the
 loop setup are paid on every match. `ZPSE_LZ_BACK_WIDE`, `ZPSE_LZ2_BACK_WIDE`
-and `ZPSE_LZH_BACK_WIDE` stay in the tree at 0 so the measurement can be
-repeated.
+and `ZPSE_LZH_BACK_WIDE` stayed in the tree at 0 so the measurement could be
+repeated (the LZ2 and LZH knobs were later removed).
 
 **A full-size block now spends one trial, not two.** The cap was two, on the
 argument that a full block's price window is a fifth of the block and the two
@@ -835,8 +839,9 @@ skips all three for tiles whose cheap proof holds, which is why the cost is
 where it is rather than higher.
 
 On the page path the finder is the whole of a `LZ_FAST` page and a fraction of
-the rest. The finder measured alone (`bench_lz2`, `ZPSE_LZ2_BLOCK=4096`) reads
-576-600 MB/s over the page corpus after the lazy probe's wide measurement,
+the rest. The finder measured alone (`bench_lz2`, `ZPSE_LZ2_BLOCK=4096`, both
+later removed) read 576-600 MB/s over the page corpus after the lazy probe's
+wide measurement,
 with the 16 KiB table clear, the per-position hash and the probe's dependent
 chain accounting for what is left. The clear is 16 KiB per 4 KiB page at
 thirteen bits, but shrinking it means fewer hash bits and therefore different
@@ -1071,15 +1076,17 @@ real change to the block encoder's decision order, not a switch, and it
 belongs in its own diff with its own measurements -- which is why this one
 stays parked.
 
-**The fast form is already a flag; the only open question is its default.**
-`ZPSE_ENC_LZ_FAST` is the option, and the diff's block-level wiring is what
-made the default level take its trade implicitly. The trade is real and it
+**The fast form was already a flag; the only open question was its default.**
+The fast wire form was later removed; `ZPSE_ENC_LZ_FAST` remains a live option.
+The diff's block-level wiring was what made the default level take its trade
+implicitly. The trade is real and it
 is large on prose: `dickens` 8 560 336 -> 9 109 041 bytes at 878 -> 1240
 MB/s (one run each on this host, level 6, 64 KiB), i.e. +6.4% of bytes for
 1.4x the rate on the one file the gate owns. `webster` is the other side:
 19 772 044 -> 19 897 137 and slower in the same run (346 -> 300 MB/s). Until
-the ladder and the stage order above are settled, the default level keeps
-the token form and the fast form stays behind its flag.
+the ladder and the stage order above were settled, the default level kept
+the token form and the fast form stayed behind its flag (both wire forms were
+later removed).
 
 The diff itself is unchanged and still parked: the gate fix and the stage
 probes used here were scratch and are not landed.
@@ -1276,11 +1283,11 @@ cores -- 7.4 GB/s of tile and command-loop decode -- and the file figure is
 the read plus the process, as the `bench` numbers in the other direction have
 been all along.
 
-The other addition is `ZPSE_ENC_DECODE_FAST`, the decode-first preset: an LZ
-form is kept only when it is an eighth smaller than the tile stream, and the
-stage that wraps a tile body in LZ has to clear the same margin. Over the
-whole Silesia corpus at level 6 it moves blocks in four of the twelve files
-(`tests/benchmarks/bench_decode_first.c`):
+The other addition was `ZPSE_ENC_DECODE_FAST` (later removed), the decode-first
+preset: an LZ form was kept only when it was an eighth smaller than the tile
+stream, and the stage that wrapped a tile body in LZ had to clear the same
+margin. Over the whole Silesia corpus at level 6 it moved blocks in four of the
+twelve files (`tests/benchmarks/bench_decode_first.c`, later removed):
 
 | file | blocks | changed | level 6 | -D | delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1307,9 +1314,9 @@ every file. The flag is for a caller whose only metric is decode, not a
 default.
 
 The preset was subsequently removed from the encoder, so the table above
-records what the flag once did, not what any current build does. The bit is
-still accepted at the API and CLI but no encoder path reads it; the per-block
-decode-first trade it describes is not available today.
+records what the flag once did, not what any current build does. The bit and
+its `-D` CLI option were later removed outright; the per-block decode-first
+trade it describes is not available today.
 
 ### Pricing the wrapped tile by its payload
 
@@ -1330,7 +1337,8 @@ the comment beside it records why.
 ### Pages in a batch
 
 The same in-memory measurement on 4 KiB pages (`ZPSE_BD_PAGE=1`: level 6 with
-`PAGE_FAST`, the shape a page frame has) covers the same 202 MiB:
+`PAGE_FAST`, later removed, the shape a page frame had then) covers the same
+202 MiB:
 
 | workers | 64 KiB blocks | 4 KiB pages |
 | ---: | ---: | ---: |
@@ -1454,19 +1462,21 @@ already known exactly from the classifier's residual count and the mask mode's
 arithmetic, so the pack is gone and the stream is byte-identical. The LZ screen
 cleared a 16 KiB hash table to price a 512-byte sample, as many as four times a
 page; it now clears the slots that sample can hash to. The page candidate list
-built all ten transposes before cutting itself to one, so the flag that asks
-for one shape is now read before the list is built. On the generated page
+built all ten transposes before cutting itself to one, so the flag that asked
+for one shape (`PAGE_FAST`, later removed) was read before the list was built.
+On the generated page
 corpus these together buy about a quarter of FASTEST's encode and a twentieth
 of the default level's, with the packed bytes unchanged to the byte.
 
-Two other forms were tried and refused with measurements. Predictor 9 as an
-extra trial on tiles the cheap screen misses wrote about 900 fewer bytes over
-16 MiB of pages but halved the PAGE_FAST encode rate (715 to 355 MB/s), because
-a page has mostly noisy tiles and each one paid a second classify. The
-generation-stamped hash table replaced the per-page memset with an epoch
-compare and was slower still (418 against 476 MB/s at LZ_FAST): the clear is
-16 KiB that stays in L1, and the extra array costs more than it saves. Both
-knobs are left in the tree, defaulted off, with the numbers beside them.
+Two other forms were tried and refused with measurements. Predictor 9 (later
+removed from the format) as an extra trial on tiles the cheap screen misses
+wrote about 900 fewer bytes over 16 MiB of pages but halved the PAGE_FAST encode
+rate (715 to 355 MB/s), because a page has mostly noisy tiles and each one paid
+a second classify. The generation-stamped hash table replaced the per-page
+memset with an epoch compare and was slower still (418 against 476 MB/s at
+LZ_FAST): the clear is 16 KiB that stays in L1, and the extra array costs more
+than it saves. Both knobs were left in the tree, defaulted off, with the
+numbers beside them (and were later removed).
 
 Decode lost two CRC passes on every block: the header parse already validates
 the header, and the page's single segment directory entry was read three times
@@ -1484,8 +1494,9 @@ rate on the repeat corpus rises from about 18 to about 19.5% with the packed
 stream unchanged.
 
 The remaining gap to lz4 is not a missed micro-optimization. On this corpus
-lz4 1 writes 2.03:1 at roughly 981 MB/s and our cheapest page mode
-(`PAGE_FAST`) writes 1.52:1 at 995, while the default writes 2.40:1 at 175. A
+lz4 1 writes 2.03:1 at roughly 981 MB/s and our cheapest page mode at the time
+(`PAGE_FAST`, later removed) wrote 1.52:1 at 995, while the default writes
+2.40:1 at 175. A
 page's decision is still a larger bill than one greedy match pass, and beating
 lz4 on encode, ratio and decode at once needs a cheaper shape decision than
 the sweep -- not a faster version of it.
@@ -1556,9 +1567,10 @@ because most content pages take the ladder, the stream decodes at about 1.9
 GB/s. Reaching 5 GB/s on those pages would need a compressible codec that is
 also one SIMD pass, which FLAT's four fixed-width forms are not. lz4 1 still
 has a faster mixed-corpus decode loop (3.8 GB/s). The retired `PAGE_FAST`,
-`LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags were the old way of buying page
-rate with a cruder shape decision; folding them into the level ladder removes
-four near-identical modes without changing what any level writes.
+`TURBO`, `PAGE_INSTANT`, `DECODE_FAST` and `LZ_HEX` flags were the old way of
+buying page rate with a cruder shape decision; folding them into the level
+ladder removes near-identical modes without changing what any level writes.
+`ZPSE_ENC_LZ_FAST` (`-F`) remains a live encoder option.
 
 
 ## What a wave of small speedups bought on the ladder
@@ -1654,10 +1666,11 @@ it a caller should land on.
 Removing the repeat-distance cache from the fast form settled a debate that had
 run through the page work: the cache coded a recent distance as one byte, but
 the test for it sat on every command and its escape had to be carved out of the
-low byte's 1..65535 range. With it gone the fast form is one LZ4-style command
+low byte's 1..65535 range. With it gone the fast form was one LZ4-style command
 -- a token, its literals and a fixed two-byte distance -- written at every
-level that offers it, from the explicit LZ_FAST option to the deepest level's
-last candidate. Over twelve 64 KiB Silesia blocks decode went 2.31 -> 2.93
+level that offered it, from the explicit LZ_FAST option to the deepest level's
+last candidate (the form was later removed). Over twelve 64 KiB Silesia blocks
+decode went 2.31 -> 2.93
 GB/s (+26.5%), encode +12.8% and packed size +1.366%; seven files stayed within
 0.2% of their old size and the cost landed on the spike-pattern cases where a
 recent distance was worth a byte often enough to miss it. That change is
@@ -1682,14 +1695,15 @@ B kept because a hostile escape must not break the guard. Precise A/B rates for
 these mirrors live in the temp harness logs, not in a script under
 tests/benchmarks/, so they are not quoted here as project figures.
 
-Beside the block LZ forms, five whole-input fast paths now sit outside the
-ladder, each with a gate and a magic of its own, and each declining back to the
-ordinary codec. FLAT7 (F7P1) is the finder-free 8-to-7 ASCII pack described
-above: its 1.143:1 ratio is a ceiling, so the redundancy gate keeps repetitive
-ASCII on the ladder. lzfast is the smallest useful finder -- the fast form's
-command shape with the lazy probe, backward walk and repeat slots removed -- and
-it trades a little ratio for a cheaper encode; the 13-bit table is the default
-because it was the faster of the two sizes tried. repack (ZRPK) maps a
+Beside the block LZ forms, four whole-input fast paths now sit outside the
+ladder (a fifth, lzfast, was later removed), each with a gate and a magic of its
+own, and each declining back to the ordinary codec. FLAT7 (F7P1) is the
+finder-free 8-to-7 ASCII pack described above: its 1.143:1 ratio is a ceiling,
+so the redundancy gate keeps repetitive ASCII on the ladder. lzfast was the
+smallest useful finder (later removed) -- the fast form's command shape with the
+lazy probe, backward walk and repeat slots removed -- and it traded a little
+ratio for a cheaper encode; the 13-bit table was the default because it was the
+faster of the two sizes tried. repack (ZRPK) maps a
 low-alphabet ASCII buffer to dense w-bit codes for w = 1..7, uses a 16-byte
 inverse map at w <= 4 and a 128-byte one above that, and at w = 7 is
 byte-for-byte the FLAT7 pack; non-ASCII input is declined. rlefast (RLE1)
@@ -1778,7 +1792,7 @@ other, which means that pass is deciding the block's form on a rounding error --
 and the token LZ form it committed there was the mistake. When two forms are
 that close, committing the one whose decoder is a command loop instead of the
 tile kernel pays a large decode bill for almost no ratio. The experiment
-committed LZ2, the fixed-distance fast form, in that pass instead, on the theory
+committed LZ2, the fixed-distance fast form (later removed), in that pass instead, on the theory
 that a form already priced inside the noise could be swapped for the one that
 decodes about twice as fast at no ratio cost.
 

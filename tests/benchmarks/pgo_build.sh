@@ -6,7 +6,7 @@
 #
 # SIZE is the bytes written per corpus class by tests/corpus/corpus_write.c
 # (default 4 MiB, must be a multiple of 64 KiB). --verify additionally builds
-# the parity, fuzz and lseed suites with the PGO flags in the default,
+# the parity and fuzz suites with the PGO flags in the default,
 # forced-scalar and swapped-attempt-order modes, and requires each mode to
 # print the same digest and the same per-case output as a plain build and as
 # its two siblings.
@@ -54,7 +54,7 @@ trap cleanup EXIT
 mkdir -p "$work/src" "$work/corpus" "$work/prof" || exit 1
 
 # The unity file #includes its siblings by relative name, so copy the whole
-# src/ directory, not just the amalgamation. The CLI, the three parity suites
+# src/ directory, not just the amalgamation. The CLI, the two parity suites
 # and the corpus writer are copied too, so every compiled source path is
 # relative to $work (gcc embeds that path in its .gcda file name and resolves
 # a relative -fprofile-dir against the run's current directory).
@@ -62,7 +62,7 @@ cp "$repo"/src/* "$work/src/" || exit 1
 cp "$repo/tests/tools/zpse_cli.c" "$work/src/cli.c" || exit 1
 cp "$repo/tests/corpus/corpus_write.c" "$work/src/corpus_write.c" || exit 1
 cp "$repo/tests/corpus/columnar_gen.h" "$work/src/columnar_gen.h" || exit 1
-for s in parity fuzz lseed; do
+for s in parity fuzz; do
     cp "$repo/tests/suites/test_$s.c" "$work/src/test_$s.c" || exit 1
 done
 
@@ -273,10 +273,9 @@ if [ "$verify" -eq 1 ]; then
     echo "what is checked here is byte identity, not a second rate table."
     echo
     fail=0
-    for suite in parity fuzz lseed; do
+    for suite in parity fuzz; do
         key='^DIGEST'
         [ "$suite" = fuzz ] && key='^FUZZ cases='
-        [ "$suite" = lseed ] && key='^LSEED:'
 
         build_suite "$suite" ref "ref.$suite$exe" ||
             { echo "BUILD FAILED: $suite (plain)"; fail=1; continue; }

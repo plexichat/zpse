@@ -21,8 +21,8 @@
  *   ZPSE_BD_REPS  timed runs per row, best of (default 3)
  *   ZPSE_BD_MB    generated corpus size in MiB when there are no files
  *   ZPSE_BD_LEVEL block level to pack with (default 6)
- *   ZPSE_BD_PAGE  pack 4 KiB pages with ZPSE_ENC_PAGE_FAST instead of
- *                 64 KiB blocks, the shape a page frame has
+ *   ZPSE_BD_PAGE  pack 4 KiB pages instead of 64 KiB blocks, the shape a
+ *                 page frame has
  *
  * Prints a markdown table. Links src/zpse_unity.c; build with -DZPSE_MT for
  * more than one worker, or every row decodes on the caller.
@@ -133,7 +133,7 @@ int main(int argc, char **argv)
     unsigned level = env_u("ZPSE_BD_LEVEL", 6u);
     unsigned page = env_u("ZPSE_BD_PAGE", 0u);
     uint32_t blk = page != 0u ? PAGE : BLK;
-    uint32_t enc_flags = page != 0u ? (uint32_t)ZPSE_ENC_PAGE_FAST : 0u;
+    uint32_t enc_flags = 0u;
     size_t cap = (size_t)env_u("ZPSE_BD_MB", 64u) * 1024u * 1024u;
     size_t total = 0;
     uint32_t nblk, i, poff = 0;
@@ -260,10 +260,9 @@ int main(int argc, char **argv)
                (double)total / 1e6 / (best / 1e9), base / best);
     }
     fprintf(stderr,
-            "bench_batch_decode: %u blocks of %u B, %.1f MiB, level %u%s, "
+            "bench_batch_decode: %u blocks of %u B, %.1f MiB, level %u, "
             "%u rep(s)\n",
-            nblk, blk, (double)total / 1048576.0, level,
-            page != 0u ? " + PAGE_FAST" : "", reps);
+            nblk, blk, (double)total / 1048576.0, level, reps);
 #if !defined(ZPSE_MT)
     fprintf(stderr, "bench_batch_decode: built without ZPSE_MT; every row "
                     "decoded on the caller\n");

@@ -86,14 +86,14 @@ echo "## table: page corpus, per class"
 echo
 echo "Decode MB/s (best of $REPS) per corpus class:"
 echo
-echo "| class | zpse 6 | zpse FLAT | zpse 6 INSTANT | lz4 1 | lz4hc 12 |"
+echo "| class | zpse 6 | zpse FLAT | zpse 6 LZ_FAST | lz4 1 | lz4hc 12 |"
 echo "| --- | ---: | ---: | ---: | ---: | ---: |"
 for f in "$work"/pages/page-*.bin; do
     name=$(basename "$f" .bin); name=${name#page-}
     out=$($pin "$work/bench_pages_static" --reps="$REPS" "$f")
     zp=$(printf '%s\n' "$out" | awk -F'|' '/zpse 6 \(default\)/ {gsub(/ /,"",$5); print $5}')
     zf=$(printf '%s\n' "$out" | awk -F'|' '/zpse FLAT \(default\)/ {gsub(/ /,"",$5); print $5}')
-    zi=$(printf '%s\n' "$out" | awk -F'|' '/zpse 6 PAGE_INSTANT/ {gsub(/ /,"",$5); print $5}')
+    zi=$(printf '%s\n' "$out" | awk -F'|' '/zpse 6 LZ_FAST/ {gsub(/ /,"",$5); print $5}')
     l1=$(printf '%s\n' "$out" | awk -F'|' '/lz4 1 / {gsub(/ /,"",$5); print $5}')
     lh=$(printf '%s\n' "$out" | awk -F'|' '/lz4hc 12 / {gsub(/ /,"",$5); print $5}')
     printf '| `%s` | %s | %s | %s | %s | %s |\n' "$name" "$zp" "$zf" "$zi" "$l1" "$lh"

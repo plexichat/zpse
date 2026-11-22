@@ -1,5 +1,8 @@
-/* Standalone benchmark for zpse_lz_encode -- the intra-block LZ match
- * finder by itself, not the full encoder. Links zpse_unity.c.
+/* Standalone benchmark for zpse_lz4_encode -- the single intra-block LZ4
+ * block encoder by itself, not the full encoder. Links zpse_unity.c.
+ *
+ * The timing narrative below describes the old custom match finder that this
+ * entry point replaced; the call now measures vendored LZ4 instead.
  *
  * Usage: bench_lz.exe [iters] [pattern ...]
  *
@@ -48,7 +51,6 @@
 static unsigned char E[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static uint8_t in[65536];
 static uint8_t payload[140000];
-static uint16_t tab[ZPSE_LZ_TABLE_ENTRIES];
 
 static double now_ns(void)
 {
@@ -169,19 +171,16 @@ int main(int argc, char **argv)
     for (rep = 0; rep < reps; rep++) {
         for (j = 0; j < nord; j++) {
             make_pattern(order[j]);
-            memset(tab, 0xFF, sizeof tab);
 
             /* warmup */
-            (void)zpse_lz_encode(in, sizeof in, payload, sizeof payload,
-                                 tab, ZPSE_LZ_HASH_BITS);
+            (void)zpse_lz4_encode(in, sizeof in, payload, sizeof payload);
 
             {
                 double t0 = now_ns();
                 uint32_t pl = 0u;
                 for (k = 0; k < iters; k++) {
-                    memset(tab, 0xFF, sizeof tab);
-                    pl = zpse_lz_encode(in, sizeof in, payload, sizeof payload,
-                                        tab, ZPSE_LZ_HASH_BITS);
+                    pl = zpse_lz4_encode(in, sizeof in, payload,
+                                         sizeof payload);
                 }
                 double t1 = now_ns();
                 double ns = (t1 - t0) / iters;

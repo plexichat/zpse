@@ -739,15 +739,15 @@ static void test_text_hostile(void)
     text_fix_crc(tb);
     text_reject("LZ_TILE flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
     text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
-    tb[2] |= ZPSE_B_LZ2;
+    tb[2] |= ZPSE_B_HUF;
     text_fix_crc(tb);
-    text_reject("LZ2 flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
+    text_reject("HUF flag set", tb, sizeof tb, ZPSE_BAD_HEADER);
     /* ZPSE_B_RESERVED_MASK is empty: there is no reserved FLAG bit left to
      * set, the reserved BYTES are [3..6) and covered below. Still refuse a
      * byte with every forbidden bit set at once. */
     text_make(tb, 64u, (uint8_t)ZPSE_B_RESET, 23u);
     tb[2] = (uint8_t)(ZPSE_B_RAW | ZPSE_B_CRC | ZPSE_B_HAS_META |
-                      ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_LZ2);
+                      ZPSE_B_LZ | ZPSE_B_LZ_TILE | ZPSE_B_HUF);
     text_fix_crc(tb);
     text_reject("all forbidden flag bits", tb, sizeof tb, ZPSE_BAD_HEADER);
 

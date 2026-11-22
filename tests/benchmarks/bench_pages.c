@@ -107,8 +107,8 @@ static void *load_tools(void)
     return NULL;
 }
 
-/* One codec's page loop. `kind`: 0 zpse level, 1 zpse PAGE_FAST, 2 zstd,
- * 3 lz4hc, 4 lz4 default, 5 zpse with LZ_FAST, 6 zpse with LZ_HEX.
+/* One codec's page loop. `kind`: 0 zpse level, 2 zstd, 3 lz4hc,
+ * 4 lz4 default, 5 zpse with LZ_FAST.
  * `param`: level or flag. */
 static int run_codec(const char *name, const unsigned char *in, size_t npages,
                      int kind, int param, int reps)
@@ -143,19 +143,9 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
             dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                         (uint32_t)param << 1, enc_arena);
             break;
-        case 1:
-            dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                        ((uint32_t)param << 1) | ZPSE_ENC_PAGE_FAST,
-                                        enc_arena);
-            break;
         case 5:
             dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                         ((uint32_t)param << 1) | ZPSE_ENC_LZ_FAST,
-                                        enc_arena);
-            break;
-        case 6:
-            dl = zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
-                                        ((uint32_t)param << 1) | ZPSE_ENC_LZ_HEX,
                                         enc_arena);
             break;
         case 2:
@@ -182,7 +172,7 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
             i += stored;
         }
 
-        if (kind == 0 || kind == 1 || kind == 5 || kind == 6) {
+        if (kind == 0 || kind == 5) {
             uint32_t ol = 0;
             if (zpse_decompress_block(comp, cl, out, PAGE, &ol, dec_arena) != 0 ||
                 ol != PAGE || memcmp(out, src, PAGE) != 0) ok = 0;
@@ -214,12 +204,10 @@ static int run_codec(const char *name, const unsigned char *in, size_t npages,
 
             if (exclude_zero && all_zero(src)) continue;
             switch (kind) {
-            case 0: case 1: case 5: case 6:
+            case 0: case 5:
                 zpse_compress_block_ex(src, PAGE, comp, sizeof comp, &cl, 0, 1,
                                        ((uint32_t)param << 1) |
-                                           (kind == 1 ? ZPSE_ENC_PAGE_FAST :
-                                            kind == 5 ? ZPSE_ENC_LZ_FAST :
-                                            kind == 6 ? ZPSE_ENC_LZ_HEX : 0u),
+                                           (kind == 5 ? ZPSE_ENC_LZ_FAST : 0u),
                                        enc_arena);
                 break;
             case 2:
@@ -326,9 +314,7 @@ static int bench_file(const char *path)
     run_codec("zpse 1 FASTEST", in, npages, 0, 1, 3);
     run_codec("zpse 6 (default)", in, npages, 0, 6, 3);
     run_codec("zpse 9 MAX", in, npages, 0, 9, 3);
-    run_codec("zpse 6 PAGE_FAST", in, npages, 1, 6, 3);
     run_codec("zpse 6 LZ_FAST", in, npages, 5, 6, 3);
-    run_codec("zpse 6 LZ_HEX", in, npages, 6, 6, 3);
     if (z_compress) {
         run_codec("zstd 1", in, npages, 2, 1, 3);
         run_codec("zstd 6", in, npages, 2, 6, 3);

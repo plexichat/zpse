@@ -716,9 +716,9 @@ extern uint32_t zpse_stats_literal_emits;
 extern uint32_t zpse_stats_modes[64];
 
 static const char *const pred_names[12] = {
-    "CONST_ZERO", "LANE_PREVIOUS", "LANE_DELTA", "ORDER1",
-    "ORDER2", "STRIDE_1", "STRIDE_2", "STRIDE_4",
-    "STRIDE_8", "TILE_CONSTANT", "LANE_AVERAGE", "STRIDE_3"
+    "CONST_ZERO", "LANE_PREVIOUS", "LANE_DELTA", "reserved 3",
+    "reserved 4", "STRIDE_1", "STRIDE_2", "STRIDE_4",
+    "STRIDE_8", "reserved 9", "LANE_AVERAGE", "STRIDE_3"
 };
 
 static int run_trial_stats(const char *only)

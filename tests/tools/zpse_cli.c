@@ -18,8 +18,8 @@
  *
  * Options (c and bench):
  *   -l LEVEL   balanced (default) | faster | fastest | max
- *   -F         write the fast LZ form only (one match-finder pass, no
- *              shape decision); see ZPSE_ENC_LZ_FAST
+ *   -F         request ZPSE_ENC_LZ_FAST: favour the single LZ4 form; there
+ *              is no separate fast wire form
  *   -F7, -7    bench only: run an in-memory FLAT7 arm (fused gate, ASCII scan
  *              and 7-bit pack) beside the normal block arm on eligible input,
  *              and print both rates and ratios with the flat7/block speedup
@@ -29,13 +29,8 @@
  *              repack/block speedup. Replaces the -F7 A/B arm when both are
  *              given. c: try a ZRPK frame first, normal codec on decline;
  *              d: sniff ZRPK and call the repack decoder.
- *   -P         a page (block <= 4096) gets the identity tile stream and no
- *              shape decision; ignored above a page. See ZPSE_ENC_PAGE_FAST
  *   -c         emit the per-block payload CRC32-C (verified on decode)
  *   -b N       nominal block size, 1..65536 (default 65536)
- *   -D         decode-first: keep an intra-block LZ form only when it is at
- *              least 1/8 smaller than the best tile stream; see
- *              ZPSE_ENC_DECODE_FAST
  *   -x         append the FrameIndex (random access); bench also seeks
  *   -t N       use N worker threads (default 1: the single-core path every
  *              figure in the README was measured on). On decode the blocks
@@ -2115,9 +2110,8 @@ static int cmd_codec(int argc, char **argv)
             }
             break;
         case 'F':
-            /* The fast LZ form and nothing else: one match-finder pass per
-             * block, no shape decision. The stream is the one MAX offers as
-             * its last candidate, so any decoder reads it. */
+            /* Favour the single LZ4 block form. This is an encoder option,
+             * not a separate wire form, so any decoder reads the stream. */
             enc_flags |= ZPSE_ENC_LZ_FAST;
             break;
         case 'R':
@@ -2125,27 +2119,6 @@ static int cmd_codec(int argc, char **argv)
              * on compress. On decompress the magic is sniffed from the
              * header below, so -R is not needed to read a ZRPK frame. */
             repack_opt = 1;
-            break;
-        case 'P':
-            /* One shape per page: the identity tile stream, compared with a
-             * verbatim copy and nothing else priced or tried. Ignored above
-             * a page, where the flag has no meaning. */
-            enc_flags |= ZPSE_ENC_PAGE_FAST;
-            break;
-        case 'D':
-            /* Decode-first: an LZ form has to be 1/8 smaller than the tile
-             * stream to be written at all. The streams are the sweep's own,
-             * so every decoder reads them. */
-            enc_flags |= ZPSE_ENC_DECODE_FAST;
-            break;
-        case 'T':
-            /* Page turbo: one shape and the page decode-first margin, with
-             * the LZ stages still armed behind that margin. */
-            enc_flags |= ZPSE_ENC_PAGE_TURBO;
-            break;
-        case 'H':
-            /* Huffman-wrap the LZ payload on a 4 KiB page at any LZ level. */
-            enc_flags |= ZPSE_ENC_PAGE_HUF;
             break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;
@@ -2594,7 +2567,7 @@ static int cmd_bench(int argc, char **argv)
             }
             break;
         case 'F':
-            /* -F7 is the FLAT7 A/B arm, not the fast LZ form: it selects a
+            /* -F7 is the FLAT7 A/B arm, not the LZ_FAST option: it selects a
              * second codec path for this bench and leaves the level bits (and
              * therefore the normal block arm) untouched. Every other -F still
              * means ZPSE_ENC_LZ_FAST, as in `c`. */
@@ -2603,27 +2576,6 @@ static int cmd_bench(int argc, char **argv)
             } else {
                 enc_flags |= ZPSE_ENC_LZ_FAST;
             }
-            break;
-        case 'P':
-            /* One shape per page: the identity tile stream, compared with a
-             * verbatim copy and nothing else priced or tried. Ignored above
-             * a page, where the flag has no meaning. */
-            enc_flags |= ZPSE_ENC_PAGE_FAST;
-            break;
-        case 'D':
-            /* Decode-first: an LZ form has to be 1/8 smaller than the tile
-             * stream to be written at all. The streams are the sweep's own,
-             * so every decoder reads them. */
-            enc_flags |= ZPSE_ENC_DECODE_FAST;
-            break;
-        case 'T':
-            /* Page turbo: one shape and the page decode-first margin, with
-             * the LZ stages still armed behind that margin. */
-            enc_flags |= ZPSE_ENC_PAGE_TURBO;
-            break;
-        case 'H':
-            /* Huffman-wrap the LZ payload on a 4 KiB page at any LZ level. */
-            enc_flags |= ZPSE_ENC_PAGE_HUF;
             break;
         case 'c':
             enc_flags |= ZPSE_ENC_CHECKSUM;
@@ -2750,10 +2702,9 @@ static int cmd_bench(int argc, char **argv)
         }
     }
     if (!quiet) {
-        printf("level %s%s%s, block %u, %s, %u thread%s%s\n",
+        printf("level %s%s, block %u, %s, %u thread%s%s\n",
                level_name(enc_flags),
                (enc_flags & ZPSE_ENC_CHECKSUM) ? ", crc" : "",
-               (enc_flags & ZPSE_ENC_PAGE_FAST) ? ", page-fast" : "",
                (unsigned)block, indexed ? "indexed" : "no index",
                threads, threads == 1u ? "" : "s",
                repack_bench

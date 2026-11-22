@@ -462,11 +462,9 @@ uint32_t zpse_huf_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
     if (cap < (uint32_t)ZPSE_HUF_MIN_PAYLOAD) {
         return 0u;
     }
-    /* The inner form is the caller's business, but a payload that names no LZ
-     * form is one the decoder would refuse, so it is not written. */
-    if (inner_form != (uint8_t)ZPSE_B_LZ &&
-        inner_form != (uint8_t)ZPSE_B_LZ2 &&
-        inner_form != (uint8_t)ZPSE_B_LZ_HEX) {
+    /* There is one LZ form: a raw LZ4 stream. A payload that names anything
+     * else is one the decoder would refuse, so it is not written. */
+    if (inner_form != (uint8_t)ZPSE_B_LZ) {
         return 0u;
     }
 
@@ -820,8 +818,7 @@ static int huf_parse(const uint8_t *in, uint32_t in_len, uint32_t out_cap,
     if (*tid >= (uint32_t)ZPSE_HUF_TABLES) {
         return ZPSE_BAD_HUF;
     }
-    if (*form != (uint8_t)ZPSE_B_LZ && *form != (uint8_t)ZPSE_B_LZ2 &&
-        *form != (uint8_t)ZPSE_B_LZ_HEX) {
+    if (*form != (uint8_t)ZPSE_B_LZ) {
         return ZPSE_BAD_HEADER;
     }
     if (*inner_len < (uint32_t)ZPSE_HUF_MIN_INNER ||

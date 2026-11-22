@@ -4,10 +4,10 @@
  * Usage: huf_train [-o OUT.inc] FILE...
  *
  * The input is any corpus -- the files are read whole and cut into blocks the
- * way the encoder cuts them. Each block is compressed with all three LZ
- * codecs and the smallest payload is kept, because that is the stream a block
- * at the deepest level would actually have won with, and the form only ever
- * wraps a payload that won. Its bytes go into a 256-bucket histogram.
+ * way the encoder cuts them. Each block is compressed with the single LZ4
+ * block codec and its payload is kept, because that is the stream a block at
+ * the deepest level would actually have won with, and the form only ever wraps
+ * a payload that won. Its bytes go into a 256-bucket histogram.
  *
  * The tables are then fitted rather than invented: k-means (k=4, L1 distance
  * on the normalised histograms) partitions the payloads into four families,
@@ -37,8 +37,6 @@
 
 #include "zpse/constants.h"
 #include "zpse/lz.h"
-#include "zpse/lz2.h"
-#include "zpse/lzh.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,14 +59,12 @@ typedef struct Blk {
 static Blk *g_blk;
 static uint32_t g_nblk;
 
-static uint8_t g_lzbuf[ZPSE_LZ_TABLE_BYTES + 64];
 static uint8_t g_out[65568];
 
 /* ---- Corpus -> payload histograms --------------------------------------- */
 
 static void add_block(const uint8_t *p, uint32_t n)
 {
-    uint32_t a, b, c;
     uint32_t best;
     uint32_t i;
     uint32_t sum;
@@ -76,28 +72,12 @@ static void add_block(const uint8_t *p, uint32_t n)
     if (g_nblk >= MAX_BLK || n < MIN_TRAIN) {
         return;
     }
-    /* The three codecs write to the same buffer, so the comparison is on
-     * lengths and the winner is re-encoded below. Two passes over one block
-     * is nothing here; the trainer runs once per table set. */
-    a = zpse_lz_encode(p, n, g_out, (uint32_t)sizeof g_out, g_lzbuf, 13u);
-    b = zpse_lz2_encode(p, n, g_out, (uint32_t)sizeof g_out, g_lzbuf, 13u);
-    c = zpse_lzh_encode(p, n, g_out, (uint32_t)sizeof g_out, g_lzbuf, 13u);
-    best = a;
-    if (b != 0u && (best == 0u || b < best)) {
-        best = b;
-    }
-    if (c != 0u && (best == 0u || c < best)) {
-        best = c;
-    }
+    /* One LZ4 block form now, so the winning payload is the one this call
+     * writes. All the old LZ selectors produced the same raw LZ4 bytes, so
+     * the histograms collected here are unchanged. */
+    best = zpse_lz4_encode(p, n, g_out, (uint32_t)sizeof g_out);
     if (best == 0u || best < MIN_TRAIN) {
         return;
-    }
-    if (a == best) {
-        (void)zpse_lz_encode(p, n, g_out, (uint32_t)sizeof g_out, g_lzbuf, 13u);
-    } else if (b == best) {
-        (void)zpse_lz2_encode(p, n, g_out, (uint32_t)sizeof g_out, g_lzbuf, 13u);
-    } else {
-        (void)zpse_lzh_encode(p, n, g_out, (uint32_t)sizeof g_out, g_lzbuf, 13u);
     }
 
     memset(g_blk[g_nblk].c, 0, sizeof g_blk[g_nblk].c);

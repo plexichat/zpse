@@ -3,7 +3,7 @@
  *
  * Three things are pinned here:
  *
- *   - zpse_lz_encode / zpse_lz_decode round-trip every shape a block can
+ *   - zpse_lz4_encode / zpse_lz4_decode round-trip every shape a block can
  *     hold, from the five-byte minimum to a full 64 KiB, including the
  *     shapes that split a run across several commands (a literal run past
  *     255 bytes, a match past 259) and the ones a match finder has to
@@ -24,7 +24,6 @@
 
 static unsigned char ea[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
-static uint16_t tab[ZPSE_LZ_TABLE_ENTRIES];
 
 static uint8_t plain[65536];
 static uint8_t payload[140000];
@@ -102,8 +101,7 @@ static void roundtrip_cases(void)
             uint32_t pl;
 
             make_shape(kind, n);
-            pl = zpse_lz_encode(plain, n, payload, sizeof payload, tab,
-                                 ZPSE_LZ_HASH_BITS);
+            pl = zpse_lz4_encode(plain, n, payload, sizeof payload);
             CHECK(pl > 0u, "shape %d size %u: no payload", kind, n);
             if (pl == 0u) {
                 continue;
@@ -136,8 +134,8 @@ static void hostile_cases(void)
 
     /* A real payload round-trips, and the LZ4 block inside it is what
      * carries the bytes -- the eight-byte header is only accounting. */
-    pl = zpse_lz_encode(seed, sizeof seed, payload, sizeof payload, tab,
-                        ZPSE_LZ_HASH_BITS);
+    pl = zpse_lz4_encode(seed, (uint32_t)sizeof seed, payload,
+                         (uint32_t)sizeof payload);
     CHECK(pl > 0u, "seed payload");
     if (pl == 0u) {
         return;
@@ -168,8 +166,7 @@ static void hostile_cases(void)
      * it goes, so only the return code is checked -- and that it does not
      * run off the end of the buffers. */
     make_shape(7, 65536);
-    pl = zpse_lz_encode(plain, 65536, payload, sizeof payload, tab,
-                         ZPSE_LZ_HASH_BITS);
+    pl = zpse_lz4_encode(plain, 65536u, payload, (uint32_t)sizeof payload);
     CHECK(pl > 0u, "fuzz payload");
     for (n = 0; n < pl; n = (n < 64u ? n + 1u : n + 37u)) {
         int rc = zpse_lz_decode(payload, n, out, 65536);
@@ -250,51 +247,6 @@ static void block_cases(void)
     }
 }
 
-/* The table size is a parameter of the encode, so an effort level can
- * pick one. Two properties have to hold for every size: the same table
- * gives the same bytes, and every size round-trips. */
-static void table_size_cases(void)
-{
-    static const uint32_t bits[] = { 8u, 10u, 11u, 12u, 13u };
-    int kind;
-    unsigned bi;
-
-    for (kind = 0; kind < 8; kind++) {
-        uint32_t first = 0u;
-
-        for (bi = 0; bi < sizeof bits / sizeof bits[0]; bi++) {
-            uint32_t n = 8192u;
-            uint32_t pl;
-
-            make_shape(kind, n);
-            memset(tab, 0xFF, sizeof tab);
-            pl = zpse_lz_encode(plain, n, payload, sizeof payload, tab,
-                                 bits[bi]);
-            CHECK(pl > 0u, "shape %d bits %u: no payload", kind, bits[bi]);
-            if (pl == 0u) {
-                continue;
-            }
-            CHECK(pl <= sizeof payload, "shape %d bits %u: payload %u", kind,
-                  bits[bi], pl);
-            memset(out, 0xA5, sizeof out);
-            CHECK(zpse_lz_decode(payload, pl, out, n) == ZPSE_OK,
-                  "shape %d bits %u: decode refused", kind, bits[bi]);
-            CHECK(memcmp(out, plain, n) == 0,
-                  "shape %d bits %u: bytes differ", kind, bits[bi]);
-            if (bi == 0u) {
-                first = pl;
-            } else {
-                /* A different table size is allowed to find different
-                 * matches, so the payload may differ -- but the block it
-                 * decodes to must not. */
-                CHECK(pl > 0u, "shape %d bits %u: no payload", kind,
-                      bits[bi]);
-            }
-        }
-        (void)first;
-    }
-}
-
 /* A block with no repeated four bytes anywhere is coded as literals:
  * the form still produces a payload (a little larger than the block),
  * and the caller rejects it on size. What must hold is that the payload
@@ -312,9 +264,7 @@ static void no_match_cases(void)
         x ^= x << 5;
         plain[i] = (uint8_t)(x >> 24);
     }
-    memset(tab, 0xFF, sizeof tab);
-    pl = zpse_lz_encode(plain, 65536u, payload, sizeof payload, tab,
-                         ZPSE_LZ_HASH_BITS);
+    pl = zpse_lz4_encode(plain, 65536u, payload, (uint32_t)sizeof payload);
     CHECK(pl > 0u, "no-match block: no payload");
     if (pl > 0u) {
         memset(out, 0xA5, sizeof out);
@@ -326,7 +276,7 @@ static void no_match_cases(void)
 
     /* ZPSE_ENC_LZ_FAST: the option that spends the block on one pass and
      * writes this form whatever level was asked for. It has to produce the
-     * form's own envelope -- bit 7, transform 0, one segment -- and the block
+     * form's own envelope -- bit 5, transform 0, one segment -- and the block
      * has to read back, because this is the one path that reaches a decoder
      * without a sweep having priced it first. */
     {
@@ -347,9 +297,9 @@ static void no_match_cases(void)
         CHECK(cl < 65568u, "LZ_FAST: fell back to a verbatim copy (%u B)", cl);
         CHECK(zpse_block_header_parse(&h, comp, cl) == ZPSE_OK,
               "LZ_FAST: the header does not parse");
-        CHECK((h.block_flags & ZPSE_B_LZ2) != 0 && h.segment_count == 1u &&
+        CHECK((h.block_flags & ZPSE_B_LZ) != 0 && h.segment_count == 1u &&
                   h.transform_id == 0u,
-              "LZ_FAST: not the fast LZ form (flags 0x%02x)",
+              "LZ_FAST: not the LZ form (flags 0x%02x)",
               (unsigned)h.block_flags);
         CHECK(h.compressed_block_size == cl, "LZ_FAST: size in header");
         CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
@@ -359,97 +309,16 @@ static void no_match_cases(void)
     }
 }
 
-/* ZPSE_ENC_PAGE_FAST is retired: page blocks now take the one-pass FLAT
- * fast path for the shapes it packs (constants, low-alphabet, pointer lanes)
- * and the level ladder for the rest, regardless of this option bit. What is
- * still pinned here is that the bit is harmless -- the page round-trips and
- * the header parses at both the fastest and deepest level -- and that above
- * a page the sweep still chooses as it always did. */
-static void page_fast_cases(void)
-{
-    uint32_t cl = 0u;
-    uint32_t got = 0u;
-    ZpseBlockHeader h;
-    uint32_t i;
-
-    for (i = 0; i < 4096u; i++) {
-        plain[i] = (uint8_t)(i / 16u);
-    }
-    CHECK(zpse_compress_block_ex(plain, 4096u, comp, sizeof comp, &cl, 0u, 1,
-                                 (uint32_t)ZPSE_ENC_PAGE_FAST |
-                                     (uint32_t)ZPSE_ENC_SPEED_FASTEST,
-                                 ea) == ZPSE_OK,
-          "PAGE_FAST: the page did not compress");
-    CHECK(cl < 4096u + 64u, "PAGE_FAST: fell back to a verbatim copy (%u B)",
-          cl);
-    CHECK(zpse_block_header_parse(&h, comp, cl) == ZPSE_OK,
-          "PAGE_FAST: the header does not parse");
-    CHECK(h.compressed_block_size == cl, "PAGE_FAST: size in header");
-    CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &got, da) ==
-                  ZPSE_OK &&
-              got == 4096u && memcmp(out, plain, 4096u) == 0,
-          "PAGE_FAST: round-trip");
-
-    /* The contract is "one shape" at every level: the LZ forms and the
-     * LZ-over-tiles stage are decisions too, and a level deep enough to offer
-     * them must not offer them to a page under this flag. */
-    {
-        uint32_t cl6 = 0u;
-        uint32_t got6 = 0u;
-
-        for (i = 0; i < 4096u; i++) {
-            plain[i] = (uint8_t)(i / 16u);
-        }
-        CHECK(zpse_compress_block_ex(plain, 4096u, payload, sizeof payload,
-                                     &cl6, 0u, 1,
-                                     (uint32_t)ZPSE_ENC_PAGE_FAST |
-                                         (uint32_t)ZPSE_ENC_SPEED_MAX,
-                                     ea) == ZPSE_OK,
-              "PAGE_FAST level 9: the page did not compress");
-        CHECK(zpse_block_header_parse(&h, payload, cl6) == ZPSE_OK,
-              "PAGE_FAST level 9: the header does not parse");
-        CHECK(zpse_decompress_block(payload, cl6, out, sizeof out, &got6,
-                                    da) == ZPSE_OK &&
-                  got6 == 4096u && memcmp(out, plain, 4096u) == 0,
-              "PAGE_FAST level 9: round-trip");
-    }
-
-    /* Above a page the flag must change nothing: the fastest level's own
-     * bytes, to the byte. */
-    {
-        uint32_t a = 0u;
-        uint32_t b = 0u;
-
-        for (i = 0; i < 8192u; i++) {
-            plain[i] = (uint8_t)(i % 251u);
-        }
-        CHECK(zpse_compress_block_ex(plain, 8192u, comp, sizeof comp, &a, 0u,
-                                     1, (uint32_t)ZPSE_ENC_SPEED_FASTEST,
-                                     ea) == ZPSE_OK,
-              "PAGE_FAST: the 8 KiB reference block did not compress");
-        CHECK(zpse_compress_block_ex(plain, 8192u, payload, sizeof payload,
-                                     &b, 0u, 1,
-                                     (uint32_t)(ZPSE_ENC_PAGE_FAST |
-                                                ZPSE_ENC_SPEED_FASTEST),
-                                     ea) == ZPSE_OK,
-              "PAGE_FAST: the 8 KiB block did not compress");
-        CHECK(a == b && memcmp(comp, payload, a) == 0,
-              "PAGE_FAST changed a block above a page (%u vs %u bytes)", a, b);
-    }
-}
-
-/* Above a page: the length-measured lazy step, at the window sizes the block
- * encoder arms it for (see ZPSE_LZ_LAZY_MAX).
+/* Above a page: the sizes that used to arm the length-measured lazy step.
  *
- * Nothing covered this before a 16 KiB block of mozilla decoded 78 bytes of
- * the wrong history. roundtrip_cases() goes through zpse_lz_encode, whose
- * lazy window is a page, so no case ever ran the step with `lazy_max >= n`
- * -- and that step is the one place the finder stops being strictly forward:
- * it can move the cursor back onto a position whose slot already holds the
- * later one, which is how a candidate ahead of the cursor reached the emit.
- * A stream it writes has to round-trip at every size it is offered, whatever
- * it costs in ratio. */
-static void lazy_window_cases(void)
+ * These used to go through zpse_lz_encode_ex with `lazy_max >= n`, which was
+ * the one path where the old finder stopped being strictly forward. That
+ * step is gone -- LZ4 owns the match search and takes no caller-supplied
+ * window -- so these are now plain round-trips at 8-16 KiB. They are kept
+ * because this size band is where the old ahead-of-cursor bug showed up, and
+ * a payload has to round-trip at every size it is offered whatever it costs
+ * in ratio. */
+static void large_block_cases(void)
 {
     static const uint32_t win[] = { 8192u, 12288u, 16384u };
     unsigned wi;
@@ -462,24 +331,22 @@ static void lazy_window_cases(void)
             uint32_t pl;
 
             make_shape(kind, n);
-            pl = zpse_lz_encode_ex(plain, n, payload, sizeof payload, tab,
-                                   ZPSE_LZ_HASH_BITS, n);
-            CHECK(pl > 0u, "lazy shape %d size %u: no payload", kind, n);
+            pl = zpse_lz4_encode(plain, n, payload, (uint32_t)sizeof payload);
+            CHECK(pl > 0u, "large shape %d size %u: no payload", kind, n);
             if (pl == 0u) {
                 continue;
             }
             memset(out, 0xA5, sizeof out);
             CHECK(zpse_lz_decode(payload, pl, out, n) == ZPSE_OK,
-                  "lazy shape %d size %u: decode refused", kind, n);
+                  "large shape %d size %u: decode refused", kind, n);
             CHECK(memcmp(out, plain, n) == 0,
-                  "lazy shape %d size %u: bytes differ", kind, n);
+                  "large shape %d size %u: bytes differ", kind, n);
         }
     }
 
-    /* The same window over segment soups: runs of one value beside structured
-     * and noisy segments, which is the shape that makes the finder come back
-     * to a position it has already inserted. The seeds are constants, so a
-     * failure names its own case. */
+    /* The same size band over segment soups: runs of one value beside
+     * structured and noisy segments. The seeds are constants, so a failure
+     * names its own case. */
     {
         uint32_t seed;
 
@@ -522,25 +389,26 @@ static void lazy_window_cases(void)
                 }
                 pos += len;
             }
-            pl = zpse_lz_encode_ex(plain, 16384u, payload, sizeof payload, tab,
-                                   ZPSE_LZ_HASH_BITS, 16384u);
-            CHECK(pl > 0u, "lazy soup seed %u: no payload", seed);
+            pl = zpse_lz4_encode(plain, 16384u, payload,
+                                 (uint32_t)sizeof payload);
+            CHECK(pl > 0u, "large soup seed %u: no payload", seed);
             if (pl == 0u) {
                 continue;
             }
             memset(out, 0xA5, sizeof out);
             CHECK(zpse_lz_decode(payload, pl, out, 16384u) == ZPSE_OK,
-                  "lazy soup seed %u: decode refused", seed);
+                  "large soup seed %u: decode refused", seed);
             CHECK(memcmp(out, plain, 16384u) == 0,
-                  "lazy soup seed %u: bytes differ", seed);
+                  "large soup seed %u: bytes differ", seed);
         }
     }
 }
 
-/* The block that exposed the ahead-of-cursor candidate: 16 KiB of mozilla at
- * offset 50,823,168. With the lazy window armed it decoded 78 bytes of the
- * wrong history on the unfixed finder, and it does not shrink -- every
- * prefix and suffix under 16 KiB round-trips -- so it is kept whole.
+/* The golden input that exposed the ahead-of-cursor candidate: 16 KiB of
+ * mozilla at offset 50,823,168. It does not shrink -- every prefix and suffix
+ * under 16 KiB round-trips -- so it is kept whole as a round-trip case. The
+ * lazy window that once singled it out is gone with the old finder; the
+ * fixture stays because it is a useful shape regardless.
  *
  * Located relative to this source file rather than the process's directory:
  * the runners compile from the tree and run the binary from anywhere. A
@@ -578,8 +446,8 @@ static void fixture_cases(void)
         return;
     }
     {
-        uint32_t pl = zpse_lz_encode_ex(plain, 16384u, payload, sizeof payload,
-                                        tab, ZPSE_LZ_HASH_BITS, 16384u);
+        uint32_t pl = zpse_lz4_encode(plain, 16384u, payload,
+                                      (uint32_t)sizeof payload);
 
         CHECK(pl > 0u, "lazy fixture: no payload");
         if (pl == 0u) {
@@ -599,13 +467,11 @@ int main(void)
         return 1;
     }
     roundtrip_cases();
-    lazy_window_cases();
+    large_block_cases();
     fixture_cases();
     hostile_cases();
     block_cases();
-    table_size_cases();
     no_match_cases();
-    page_fast_cases();
     if (fails == 0) {
         printf("LZ: ALL OK (%d checks)\n", checks);
         return 0;

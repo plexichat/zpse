@@ -148,9 +148,10 @@
 #define ZPSE_B_CRC              (UINT8_C(1) << 2)
 #define ZPSE_B_RESET            (UINT8_C(1) << 3)
 #define ZPSE_B_HAS_META         (UINT8_C(1) << 4)
-/* The block payload is the intra-block LZ form (include/zpse/lz.h)
- * rather than transform + segments + tiles. Mutually exclusive with
- * ZPSE_B_RAW; transform_id 0, segment_count 1, no transform metadata. */
+/* The block payload is the single raw-LZ4 block form (include/zpse/lz.h)
+ * rather than transform + segments + tiles: [u32 uncompressed][u32 cmds]
+ * followed by the raw LZ4 block. Mutually exclusive with ZPSE_B_RAW;
+ * transform_id 0, segment_count 1, no transform metadata. */
 #define ZPSE_B_LZ               (UINT8_C(1) << 5)
 /* v2: LZ *and* tiles, in one block. The payload is
  *   [u32 body_len][intra-block LZ stream]
@@ -165,76 +166,35 @@
  * compatibility shim -- a v1 reader sees bit 6 in the reserved mask and
  * refuses the block, which is what the reserved bits were for. */
 #define ZPSE_B_LZ_TILE          (UINT8_C(1) << 6)
-/* The fast LZ form. It is still a selector in the level ladder, but its
- * payload is now a raw LZ4 block like every other LZ form (src/lz4block.c).
- * Bit 7 was the reserved mask and is now the last form, so the mask is empty
- * rather than wrong. */
-#define ZPSE_B_LZ2              (UINT8_C(1) << 7)
-/* The two LZ bits are one two-bit form id, not two independent flags: 1 (bit 5
- * alone), 2 (bit 7 alone) and 3 (both) are the three LZ selectors. All three
- * now carry the same raw LZ4 payload; the old token, fast and hexadecimal
- * codecs were removed. */
-#define ZPSE_B_LZ_HEX           (UINT8_C(ZPSE_B_LZ) | UINT8_C(ZPSE_B_LZ2))
-/* The entropy-coded LZ form: an intra-block LZ stream, Huffman coded. Its
- * payload is
+/* The entropy-coded LZ form: the raw LZ4 payload, Huffman coded. Its payload
+ * is
  *   [u8 table_id][u8 inner_form][u32 inner_len][u16 seg0][u16 seg1][u16 seg2]
  *   [four Huffman streams]
- * and `inner_form` names which of the three LZ forms above it decodes to
- * (ZPSE_B_LZ, ZPSE_B_LZ2 or ZPSE_B_LZ_HEX). The tables are fixed in the
- * format (src/huf_tables.inc), so a block costs 12 bytes of overhead and no
- * table; see include/zpse/huf.h.
+ * and `inner_form` is a fixed tag: it must be ZPSE_B_LZ (0x20), the only LZ
+ * form left in the format. The tables are fixed in the format
+ * (src/huf_tables.inc), so a block costs 12 bytes of overhead and no table;
+ * see include/zpse/huf.h.
  *
- * It is spelled with the flag pattern bit 6 (the tile bit) plus bit 7 (the
- * fast-LZ bit) set -- 110, read from bit 7 down to bit 5 -- which is free
- * until now: the hex form is 101 (bit 5 plus bit 7) and refuses the tile bit,
- * and the two plain forms each refuse the other's bit, so a block whose flags
- * are 110 cannot have been written by any earlier version. A reader that
- * predates this form sees bit 6 in what was the reserved mask and refuses
- * the block, which is exactly what a reserved bit is for. The envelope is
- * the LZ forms' own -- transform 0, one segment, no metadata -- because the
- * tile form's transform and segment count live in the header, and a Huffman
- * payload only ever wraps a pure LZ stream. */
-#define ZPSE_B_HUF              (UINT8_C(ZPSE_B_LZ_TILE) | UINT8_C(ZPSE_B_LZ2))
+ * This is a fresh single-bit encoding: ZPSE_B_HUF alone. Bit 7 was reserved
+ * by v1, so a block with it set is refused by an old reader -- which is what
+ * makes the bit available to select this form. There is no combined pattern:
+ * 0xA0 (ZPSE_B_LZ | ZPSE_B_HUF) and 0xC0 (ZPSE_B_LZ_TILE | ZPSE_B_HUF) are
+ * invalid combinations and must be rejected. The envelope is the LZ form's
+ * own -- transform 0, one segment, no metadata -- because the tile form's
+ * transform and segment count live in the header, and a Huffman payload only
+ * ever wraps a pure LZ stream. */
+#define ZPSE_B_HUF              (UINT8_C(1) << 7)
 #define ZPSE_B_RESERVED_MASK    (UINT8_C(0x00))
 
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 
 /* Write an LZ block and nothing else: no probe, no trial, no candidate list,
- * no decision. With LZ4-backed LZ forms the payload is the same raw LZ4 block
- * the deepest level offers, so a decoder needs to know nothing about the
- * option. What the caller gives up is the tile forms, and with them the ratio
- * on typed columns, where a transpose plus a predictor beats any LZ parse;
- * what it gets is one LZ4 pass per block with no decision machinery. */
+ * no decision. The payload is the same raw LZ4 block the deepest level offers,
+ * so a decoder needs to know nothing about the option. What the caller gives
+ * up is the tile forms, and with them the ratio on typed columns, where a
+ * transpose plus a predictor beats any LZ parse; what it gets is one LZ4 pass
+ * per block with no decision machinery. */
 #define ZPSE_ENC_LZ_FAST        (UINT32_C(1) << 5)
-
-/* Write the page with ONE shape, chosen by measurement rather than by the
- * sweep: a page block (n <= ZPSE_BLOCK_SHORT_MAX) is coded as the identity
- * tile stream and compared with a verbatim copy, and nothing else is priced,
- * staged or tried. This is the shape that level 1 and 2 pick on 4 KiB pages:
- * the LZ forms are 0.0% of the bytes at both levels over the dump corpus (see
- * the census in the README's page section), so the forms the sweep decides
- * between are not the ones a cheap rung writes -- what a cheap rung spends is
- * the decision itself. The probe is 68% of level 1's sweep cycles at a page
- * and prices nine or ten candidates to choose a stream that costs about a
- * third of that to write, so skipping the choice is worth more than any
- * candidate in it.
- *
- * It is an option rather than a level for the reason ZPSE_ENC_LZ_FAST is: it
- * gives up the predictors instead of trading against them, and on a page of
- * typed data a width-16 transpose is where the ratio is (16.2% of the
- * Python heap's page bytes at level 1). A caller who wants the rate and can
- * afford the ratio asks for this; every existing level is unchanged. */
-#define ZPSE_ENC_PAGE_FAST      (UINT32_C(1) << 6)
-
-/* Force the hexadecimal LZ form wherever this encoder would write the fast
- * one: the same finder and the same screen, a different command encoding
- * (src/lzh.c). From ZPSE_LZH_PAGE_LEVEL up a page takes the hex form without
- * this bit, because it is the smaller stream there (see zpse_block_try_lz2);
- * the option is what makes the two encodings measurable against each other at
- * any block size, and it is how the 64 KiB cells in the README's table were
- * taken. A decoder needs to know nothing about it: the form is named in the
- * block header. */
-#define ZPSE_ENC_LZ_HEX         (UINT32_C(1) << 7)
 
 /* Also Huffman code the winning LZ payload (include/zpse/huf.h). Off by
  * default; the deepest level turns it on for itself, because it is the rung
@@ -243,27 +203,6 @@
  * decoder option, so a caller who does not ask for it never sees one.
  * Levels 1-4 write no LZ form, so the bit has nothing to act on there. */
 #define ZPSE_ENC_HUF            (UINT32_C(1) << 8)
-
-/* Reserved: the decode-first preset that once used this bit was removed from
- * the encoder. The flag is still accepted by the API and the CLI, but no
- * encoder path reads it, so setting it does not change the stream. Kept for
- * source compatibility; see docs/HISTORY.md for the old preset's numbers. */
-#define ZPSE_ENC_DECODE_FAST    (UINT32_C(1) << 9)
-
-/* Page turbo: a fixed, cheap page profile that skips the multi-candidate
- * decision entirely. It asks for one LZ pass (the fast form) and keeps it
- * only when it clearly beats a verbatim copy, and it applies the page
- * decode-first margin so a page that barely compresses is written raw.
- * It is the rung for a zram store that wants the encode rate of lz4 with a
- * stream a decoder reads faster; it changes no wire form and needs no
- * decoder option. Requires a page-sized block (n <= ZPSE_BLOCK_SHORT_MAX). */
-#define ZPSE_ENC_PAGE_TURBO     (UINT32_C(1) << 10)
-
-/* Allow the Huffman wrapper on a 4 KiB page at any LZ level, not just at
- * level 9. The wrapper is more effective on page payloads (an 11.3% cut in
- * the wrapped bytes against 6.9% on Silesia) but costs an extra entropy pass
- * on both sides, so it is opt-in rather than the default page profile. */
-#define ZPSE_ENC_PAGE_HUF       (UINT32_C(1) << 12)
 
 /* Encoder effort (ZPSE_ENC_* bits 1-4). Nine levels, 1 = FASTEST ... 9 =
  * MAX. Stored as level << ZPSE_ENC_SPEED_SHIFT, so the raw field value is

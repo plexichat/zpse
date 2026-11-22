@@ -16,10 +16,11 @@
  *     half-decoded. Every truncation and every single-byte corruption goes
  *     through the decoder, because this is a new wire form and nothing in it
  *     may walk off a buffer.
- *   - The block form: the deepest level names it with flag pattern 110 and
- *     the LZ envelope (transform 0, one segment, no metadata), the ordinary
- *     decoder reads it back, and the form is never written at a level that
- *     did not ask for it.
+ *   - The block form: the deepest level names it with ZPSE_B_HUF (bit 7)
+ *     alone and the LZ envelope (transform 0, one segment, no metadata), the
+ *     ordinary decoder reads it back, and the form is never written at a
+ *     level that did not ask for it. Bit 6 (LZ_TILE) or bit 5 (LZ) together
+ *     with bit 7 is an invalid combination and is refused.
  *
  * The encoder does NOT refuse to code a payload it cannot shrink -- the
  * decision to keep the form belongs to the block encoder (ZPSE_HUF_DIV), and
@@ -40,7 +41,6 @@
 
 static unsigned char ea[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static unsigned char da[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
-static uint16_t tab[ZPSE_LZ_TABLE_ENTRIES];
 
 static uint8_t plain[65536];
 static uint8_t inner[70000];
@@ -133,8 +133,7 @@ static void make_shape(uint32_t kind, uint32_t n)
 static uint32_t make_inner(uint32_t kind, uint32_t n)
 {
     make_shape(kind, n);
-    return zpse_lz_encode(plain, n, inner, (uint32_t)sizeof inner, tab,
-                          (uint32_t)ZPSE_LZ_HASH_BITS);
+    return zpse_lz4_encode(plain, n, inner, (uint32_t)sizeof inner);
 }
 
 static void codec_roundtrip(void)
@@ -209,10 +208,18 @@ static void refusals(void)
                           (uint32_t)sizeof huf2,
                           (uint8_t)ZPSE_B_LZ) == 0u,
           "a payload under the minimum was coded");
-    /* A form the decoder does not know is not written. */
+    /* inner_form is a form tag, not a predictor id: only ZPSE_B_LZ is
+     * accepted. The tile form and arbitrary other bytes (4 and 9 here) are
+     * all refused. */
     CHECK(zpse_huf_encode(inner, nl, huf2, (uint32_t)sizeof huf2,
                           (uint8_t)ZPSE_B_LZ_TILE) == 0u,
           "the tile form was accepted as an inner form");
+    CHECK(zpse_huf_encode(inner, nl, huf2, (uint32_t)sizeof huf2,
+                          4u) == 0u,
+          "invalid form tag 4 was accepted as an inner form");
+    CHECK(zpse_huf_encode(inner, nl, huf2, (uint32_t)sizeof huf2,
+                          9u) == 0u,
+          "invalid form tag 9 was accepted as an inner form");
     /* A destination that cannot hold the payload is declined. */
     CHECK(zpse_huf_encode(inner, nl, huf2, 16u, (uint8_t)ZPSE_B_LZ) == 0u,
           "an undersized destination was used");
@@ -268,6 +275,9 @@ static int encode_form(const uint8_t *p, uint32_t n, uint32_t flags,
     return ZPSE_OK;
 }
 
+/* ZPSE_B_HUF is bit 7 alone, not a combination with bit 5 (LZ) or bit 6
+ * (LZ_TILE): 0xA0 and 0xC0 are invalid and the decoder refuses them. The
+ * block-form test below drives both combinations through the decoder. */
 #define IS_HUF(fl) (((fl) & (uint8_t)ZPSE_B_HUF) == (uint8_t)ZPSE_B_HUF)
 
 static void block_form(void)
@@ -327,16 +337,14 @@ static void block_form(void)
               (unsigned)h.transform_meta_size);
         CHECK(h.uncompressed_size == n, "Huffman block size word is %u",
               (unsigned)h.uncompressed_size);
-        /* What it wraps is named in the payload, and it has to be one of the
-         * three LZ forms -- never RAW and never a tile body. */
+        /* The payload names the form it wraps, and there is only one LZ form
+         * left: ZPSE_B_LZ. Never RAW, never a tile body. */
         {
             uint32_t hdr = zpse_block_header_size(work, saved_len);
             uint8_t iform = work[hdr + 1u];
 
-            CHECK(iform == (uint8_t)ZPSE_B_LZ ||
-                      iform == (uint8_t)ZPSE_B_LZ2 ||
-                      iform == (uint8_t)ZPSE_B_LZ_HEX,
-                  "inner form %02x is not an LZ form", (unsigned)iform);
+            CHECK(iform == (uint8_t)ZPSE_B_LZ,
+                  "inner form %02x is not the LZ form", (unsigned)iform);
         }
     }
 
@@ -345,6 +353,39 @@ static void block_form(void)
           "Huffman block did not decode");
     CHECK(olen == n && memcmp(back, plain, n) == 0,
           "Huffman block did not round-trip");
+
+    /* ZPSE_B_HUF is a single bit: adding either LZ bit makes an invalid
+     * combination (0xA0 and 0xC0). Re-seal the header CRC and require the
+     * decoder to refuse both. */
+    {
+        static const uint8_t bad_flags[] = {
+            (uint8_t)(ZPSE_B_LZ_TILE | ZPSE_B_HUF),
+            (uint8_t)(ZPSE_B_LZ | ZPSE_B_HUF)
+        };
+        uint32_t hdr = zpse_block_header_size(work, saved_len);
+        uint32_t b;
+
+        for (b = 0; b < (uint32_t)(sizeof bad_flags / sizeof bad_flags[0]);
+             b++) {
+            uint32_t fo = (hdr == 16u) ? 2u : 3u;
+
+            memcpy(comp, work, saved_len);
+            /* Keep RESET/LAST so the only change is the invalid form bit. */
+            comp[fo] = (uint8_t)(comp[fo] | bad_flags[b]);
+            if (hdr == 16u) {
+                zpse_store_u16le(
+                    comp + 14u,
+                    (uint16_t)(zpse_crc32c(comp, 14u) & UINT32_C(0xFFFF)));
+            } else {
+                zpse_store_u32le(comp + 28u, zpse_crc32c(comp, 28u));
+            }
+            CHECK(zpse_decompress_block(comp, saved_len, back,
+                                        (uint32_t)sizeof back, &olen,
+                                        da) < 0,
+                  "flag combination %02x was accepted",
+                  (unsigned)bad_flags[b]);
+        }
+    }
 
     /* Byte-identical on a second encode. */
     CHECK(encode_form(plain, n, (uint32_t)ZPSE_ENC_SPEED_MAX, &clen, &fl) ==
@@ -375,8 +416,8 @@ static void block_form(void)
      * payload that is not one -- needs the header CRC re-sealing, so it lives
      * in test_hostile.c beside the helper that does it.) */
     {
-        static const uint8_t bad[] = { 0x00u, 0x01u, 0x10u, 0x40u, 0xC0u,
-                                       0xFFu };
+        static const uint8_t bad[] = { 0x00u, 0x01u, 0x04u, 0x09u, 0x10u,
+                                       0x40u, 0xC0u, 0xFFu };
         uint32_t hdr = zpse_block_header_size(work, saved_len);
         uint32_t b;
 

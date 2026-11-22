@@ -2,7 +2,7 @@
 #define ZPSE_TILE_H
 
 /* Tile encode/decode. A tile is:
- * [u16 size][8-B hdr][C?][mask][residual]. This header covers framing,
+ * [u16 size][8-B hdr][mask][residual]. This header covers framing,
  * validation, mode extraction, and the scalar reconstruct path. */
 
 #include <stddef.h>
@@ -74,7 +74,6 @@ typedef struct ZpseTileClass {
                             * above 16 entries, so a larger exact count
                             * could not change any packed byte and the
                             * dense classify stops counting there. */
-    uint8_t  constant_C;   /* predictor 9 mode byte (encoder choice) */
     uint8_t  rmax;         /* largest exclusion residual seen */
     uint8_t  dmin;         /* signed-delta range, stored biased by +128 */
     uint8_t  dmax;
@@ -106,7 +105,7 @@ void zpse_tile_choose_modes(const ZpseTileClass *cl, uint16_t nt,
  * this (predictor, mask_mode, res_mode) triple, computed purely from the
  * classifier data -- no packing, no tile walk, no output buffer. This is the
  * size the pricing probe needs, and it is byte-for-byte the value pack returns:
- * 8-byte header, +1 for the predictor-9 constant byte, + mask payload
+ * 8-byte header, + mask payload
  * (ALL_HIT/ALL_EXCEPTION 0, RAW_BITMAP ceil(nt/8), SPARSE_U8 k, RUNS the run
  * count) + residual payload (tile_res_len). `mask_mode` must be one of the
  * modes zpse_tile_choose_modes produces; any other mode (or a NULL cl)
@@ -116,15 +115,7 @@ uint32_t zpse_tile_record_len(const ZpseTileClass *cl, uint8_t predictor_id,
 
   /* Predict + compare one tile against `actual`, filling cl and advancing
    * the lane state exactly as zpse_tile_decode will while decoding it.
-   * Does not touch the output buffer.
-   *
-   * ORDER2's table is reset by the generation in `lanes->gen`, not by a
-   * wipe, so a caller that classifies tiles in sequence must advance
-   * `lanes->gen` once a tile -- the encoder's tile loop and the
-   * decoder's do, over the same tiles in the same order, and that is
-   * what makes an entry learned by one tile read as unlearned to the
-   * next. A caller that drives the classify directly must do the same,
-   * or the table it reads is the one the last tile left. */
+   * Does not touch the output buffer. Reserved ids 3, 4 and 9 are refused. */
 int zpse_tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
                        uint16_t nt, uint8_t predictor_id,
                        uint8_t initial_literal, int tile_reset,
@@ -140,7 +131,7 @@ int zpse_tile_classify(ZpseLaneState *lanes, const uint8_t *actual,
  * ~66 cycles of a ~320-cycle exception pass, so skipping it is worth ~13%
  * of a classify on a dense tile.
  *
- * Everything else -- words, k, constant_C, res_at_exc, act_at_exc, seen,
+ * Everything else -- words, k, res_at_exc, act_at_exc, seen,
  * nu, rmax/dmin/dmax and the lane state -- is exactly what
  * zpse_tile_classify produces. at_pred is left untouched (not zeroed);
  * a caller that packs a mode which reads it must first call
@@ -163,10 +154,9 @@ int zpse_tile_classify_lean(ZpseLaneState *lanes, const uint8_t *actual,
  * bit is always 1). It is a separate call so the cost lands only on the
  * tiles whose packed mode reads the predictions.
  *
- * Predictors 0, 1, 2, 5, 6, 7, 8, 9, 10 and 11 are supported -- the ten
- * the encoder classifies. ORDER1/ORDER2 return ZPSE_BAD_PREDICTOR: they
- * would have to rebuild their tables byte by byte, and the encoder never
- * asks for them. */
+ * Predictors 0, 1, 2, 5, 6, 7, 8, 10 and 11 are supported -- the nine
+ * the encoder classifies. Ids 3, 4 and 9 are reserved gaps and return
+ * ZPSE_BAD_PREDICTOR. */
 int zpse_tile_fill_at_pred_reset(uint8_t predictor_id, const uint8_t *actual,
                                  uint16_t nt, const uint8_t *seg_base,
                                  uint32_t seg_pos, uint8_t initial_literal,

@@ -20,9 +20,6 @@ static int fails = 0;
     if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } \
 } while (0)
 
-static uint8_t o1[8 * 256];
-/* ORDER2 state: 8 x 4096 {value, confidence} pairs, interleaved. */
-static uint8_t o2[8 * 4096 * 4];
 static uint8_t comb[8192];
 
 int main(void) {
@@ -145,8 +142,8 @@ int main(void) {
                             (uint32_t)h.segment_count * 8u + (uint32_t)ZPSE_SEGMENT_HEADER_SIZE;
             CHECK((comp[rec0 + 2] & 0x40) != 0,
                   "const block uses dense records");
-            comp[rec0 + 3] = 9u;    /* TILE_CONSTANT */
-            comp[rec0 + 4] = 0x11u; /* its constant byte */
+            comp[rec0 + 3] = 0u;    /* CONST_ZERO */
+            comp[rec0 + 4] = 0x11u; /* CONST_ZERO fill: differs from the plane's 0x5A */
         }
         CHECK(zpse_decompress_block(comp, cl, out, sizeof out, &ol, da) ==
               ZPSE_BAD_PAYLOAD_CRC,
@@ -242,15 +239,13 @@ int main(void) {
         CHECK(e.comb == ea + 0x61800, "enc comb offset");
         /* The comb scratch is 8 KiB of arena, not a global table: its region
          * must stay clear of the neighbouring planes. Adjacent ends are fine
-         * (comb_end == shuf_start, o2_end == comb_start, comb_end == hist_start);
-         * an overlap is not. */
+         * (comb_end == shuf_start, comb_end == hist_start); an overlap is not. */
         CHECK(d.comb + ZPSE_D_SZ_COMB <= d.shuf &&
               d.recon + ZPSE_D_SZ_RECON <= d.comb,
               "dec comb clear of recon/shuf");
-        CHECK(e.o2 + ZPSE_E_SZ_O2 <= e.comb &&
-              e.comb + ZPSE_E_SZ_COMB <= e.hist &&
+        CHECK(e.comb + ZPSE_E_SZ_COMB <= e.hist &&
               e.comb + ZPSE_E_SZ_COMB <= e.lz,
-              "enc comb clear of o2/hist/lz");
+              "enc comb clear of hist/lz");
         CHECK(!zpse_arena_is_aligned(NULL) && zpse_arena_is_aligned(da), "aligned?");
     }
 
@@ -583,8 +578,8 @@ int main(void) {
                 int ok = 0, tried = 0;
                 const uint8_t mmodes[] = {1, 2, 3, 4, 5, 0, 6};
                 for (mm = 0; mm < 7; mm++) {
-                    ZpseLaneState le = {{0},{0},o1,o2,0,0};
-                    ZpseLaneState ld = {{0},{0},o1,o2,0,0};
+                    ZpseLaneState le = { .last = {0}, .second_last = {0} };
+                    ZpseLaneState ld = { .last = {0}, .second_last = {0} };
                     int wlen, got;
                     zpse_lane_reset(&le, data[0]);
                     wlen = zpse_tile_encode(&le, data, 256, (uint8_t)pid,
@@ -606,14 +601,15 @@ int main(void) {
         }
         /* Constant tile: K=0 / K=Nt paths. */
         {
-            ZpseLaneState le = {{0},{0},o1,o2,0,0};
-            ZpseLaneState ld = {{0},{0},o1,o2,0,0};
+            ZpseLaneState le = { .last = {0}, .second_last = {0} };
+            ZpseLaneState ld = { .last = {0}, .second_last = {0} };
             int wlen, got;
             memcpy(seg + 64, cdata, 256);
             zpse_lane_reset(&le, 0x41);
-            wlen = zpse_tile_encode(&le, cdata, 256, 9, 0, 0, 0x41, 1,
+            wlen = zpse_tile_encode(&le, cdata, 256, ZPSE_P_STRIDE_1,
+                                    ZPSE_M_ALL_HIT, 0, 0x41, 1,
                                     seg + 64, 0, rec, sizeof rec, comb);
-            CHECK(wlen > 0, "const tile encodes (pid9/mode0)");
+            CHECK(wlen > 0, "const tile encodes (STRIDE_1/mode0)");
             if (wlen > 0) {
                 zpse_lane_reset(&ld, 0x41);
                 got = zpse_tile_decode(&ld, rec, (uint32_t)wlen, 0x41, 1,

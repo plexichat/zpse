@@ -42,8 +42,10 @@
  *   2  u8   flags          bit 6 = marker; bits 0..2 = mask mode (0, 1,
  *                          2 or 6); bits 3..5 = residual mode (0..3);
  *                          bit 7 MUST be 0
- *   3  u8   predictor_id   0..11, not 3 (ORDER1) / 4 (ORDER2) in v1
- *   4  u8   constant_C     used iff predictor_id == 9
+ *   3  u8   predictor_id   0..11, excluding the reserved gaps 3, 4 and 9
+ *   4  u8   constant_C     the fill for CONST_ZERO (0) records: read
+ *                          unconditionally, but only used when the
+ *                          predictor is 0
  *   5  u8   reserved       MUST be 0
  *   6  u16  exception_count K
  *   8  u16  mask_len

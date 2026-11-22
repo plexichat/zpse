@@ -2,7 +2,7 @@
 # Expects a C compiler on PATH (CC, default gcc). POSIX twin of
 # tests/run.ps1: same suites, same flags, same checks, same exit
 # convention -- build each suite against src/zpse_unity.c and run it,
-# then build tests/test_parity.c, tests/test_fuzz.c and tests/test_lseed.c
+# then build tests/test_parity.c and tests/test_fuzz.c
 # in three modes (default (runtime SIMD dispatch), -DZPSE_FORCE_SCALAR and
 # -DZPSE_FORCE_TRIAL_SWAP) and require every mode's digest and per-case
 # output to match. The first two modes prove the SIMD paths are bit-exact
@@ -45,7 +45,7 @@ same() {
 
 fail=0
 
-for t in test_roundtrip test_transforms test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_lzh test_huf test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus test_pagedict test_pageforms test_flat7; do
+for t in test_roundtrip test_transforms test_hostile test_units test_stride3 test_dense test_decide test_fillpred test_lz test_huf test_ascii test_levels test_frame test_parallel test_sizes test_colref test_colcorpus test_pagedict test_pageforms test_flat7; do
     src="$repo/tests/suites/$t.c"
     bin="$tmp/$t$exe"
     echo "=== build $t ==="
@@ -77,12 +77,10 @@ done
 echo "=== scalar/SIMD/order parity ==="
 
 # `parity` compares whole compressed corpora; `fuzz` does the same over a
-# randomized corpus; `lseed` decodes hand-built foreign segments whose
-# ORDER tiles do not reset, against a reference that hardcodes the
-# documented segment-start state. Each prints one summary line (DIGEST / FUZZ
-# cases= / LSEED:) that must match across the three builds, and the rest of
-# their output must match too, so a divergence names the case that caused it.
-for suite in parity fuzz lseed; do
+# randomized corpus. Each prints one summary line (DIGEST / FUZZ cases=)
+# that must match across the three builds, and the rest of their output must
+# match too, so a divergence names the case that caused it.
+for suite in parity fuzz; do
     src="$repo/tests/suites/test_$suite.c"
     built=1
     for mode in def scalar swap; do
@@ -113,7 +111,6 @@ for suite in parity fuzz lseed; do
 
     key='^DIGEST'
     [ "$suite" = fuzz ] && key='^FUZZ cases='
-    [ "$suite" = lseed ] && key='^LSEED:'
     grep "$key" "$tmp/$suite.def.log" >"$tmp/$suite.def.dig" || :
     grep -v "$key" "$tmp/$suite.def.log" >"$tmp/$suite.def.body" || :
     for mode in scalar swap; do
@@ -158,8 +155,8 @@ fi
 # kernel sources). Build test_pageforms with the kernels compiled out and
 # require every byte of its output to match the default build, so the SIMD
 # path cannot drift from the scalar reference on the new page forms. This is
-# the same kind of guard the parity/fuzz/lseed loop applies to the older
-# kernels; it is kept separate so those three digest checks stay unchanged.
+# the same kind of guard the parity/fuzz loop applies to the older
+# kernels; it is kept separate so those two digest checks stay unchanged.
 echo "=== page kernels without AVX2 (ZPSE_AVX2_ABI_OK=0) ==="
 pf_src="$repo/tests/suites/test_pageforms.c"
 pf_built=1

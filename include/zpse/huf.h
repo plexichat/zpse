@@ -1,9 +1,9 @@
 #ifndef ZPSE_HUF_H
 #define ZPSE_HUF_H
 
-/* Huffman coding of an intra-block LZ payload (block flag ZPSE_B_HUF, flag
- * pattern 110). See the ZPSE_B_HUF comment in constants.h for the flag
- * choice; this header is the payload format and the codec's contract.
+/* Huffman coding of an intra-block LZ payload (block flag ZPSE_B_HUF, bit 7
+ * alone). See the ZPSE_B_HUF comment in constants.h for the flag choice;
+ * this header is the payload format and the codec's contract.
  *
  * ---------------------------------------------------------------------------
  * Why a Huffman form at all
@@ -23,7 +23,7 @@
  * Payload layout
  * ---------------------------------------------------------------------------
  *   u8  table_id             0..3: which of the four fixed tables
- *   u8  inner_form           ZPSE_B_LZ, ZPSE_B_LZ2 or ZPSE_B_LZ_HEX
+ *   u8  inner_form           must be ZPSE_B_LZ (0x20), the one raw-LZ4 form
  *   u32 inner_len            decoded length of the wrapped LZ payload
  *   u16 seg0, seg1, seg2     encoded byte lengths of streams 0, 1 and 2
  *   stream 0 .. stream 3     the four Huffman streams, back to back
@@ -33,10 +33,9 @@
  * inner_len's remainder and is not written down: the decoder knows the
  * payload runs to the end of the block.
  *
- * The block's envelope is the LZ forms' own -- transform_id 0, segment_count
- * 1, no transform metadata -- and the decoder requires it. `inner_form` says
- * which LZ decoder the unpacked payload belongs to; the flag byte says one
- * form and the payload says which stream is inside it.
+ * The block's envelope is the LZ form's own -- transform_id 0, segment_count
+ * 1, no transform metadata -- and the decoder requires it. `inner_form` is a
+ * fixed tag: the only payload this form wraps is the raw LZ4 stream.
  *
  * ---------------------------------------------------------------------------
  * The streams
@@ -184,7 +183,7 @@ uint32_t zpse_huf_encode(const uint8_t *in, uint32_t n, uint8_t *dst,
  *   ZPSE_BAD_HUF             the header, the stream lengths or the bit
  *                            accounting do not agree
  *   ZPSE_BAD_BLOCK_SIZE      the payload is too short to be one
- *   ZPSE_BAD_HEADER          inner_form is not an LZ form, or inner_len is
+ *   ZPSE_BAD_HEADER          inner_form is not ZPSE_B_LZ, or inner_len is
  *                            outside the range the encoder writes
  *   ZPSE_OUTPUT_OVERFLOW     inner_len would not fit in out_cap
  * out is only valid on ZPSE_OK. */

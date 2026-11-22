@@ -12,8 +12,8 @@
 #              changes, which is what a change under test is.
 #   reps       timed runs per file inside one bench call, default 1
 #   level      1-9, default the CLI's own default (6)
-#   flags      extra CLI option letters for both builds, e.g. "F" for the
-#              fast LZ form, "c" for the payload checksum, "Fc" for both
+#   flags      extra CLI option letters for both builds, e.g. "F" for
+#              ZPSE_ENC_LZ_FAST, "c" for the payload checksum, "Fc" for both
 #   SILESIA_DIR  an already-extracted corpus; downloaded when unset
 #   BLOCK      block size for both builds (`-b`), default the CLI's own
 #   CC         compiler for both builds, default cc

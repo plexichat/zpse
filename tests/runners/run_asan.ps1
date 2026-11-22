@@ -56,7 +56,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # Union of the suite lists parsed from run.ps1 and run.sh (run.sh is the
 # superset, adding test_parallel and test_pagedict).
-$suites = @("test_roundtrip", "test_transforms", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_lzh", "test_huf", "test_ascii", "test_levels", "test_frame", "test_parallel", "test_sizes", "test_colref", "test_colcorpus", "test_pagedict", "test_pageforms")
+$suites = @("test_roundtrip", "test_transforms", "test_hostile", "test_units", "test_stride3", "test_dense", "test_decide", "test_fillpred", "test_lz", "test_huf", "test_ascii", "test_levels", "test_frame", "test_parallel", "test_sizes", "test_colref", "test_colcorpus", "test_pagedict", "test_pageforms")
 
 $pass = 0
 $fail = 0

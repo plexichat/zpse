@@ -270,9 +270,10 @@ the TEXT form, and a stream of ASCII pages may take the FLAT7 whole-frame fast
 path, which packs eight characters into seven bytes and decodes in one spread
 pass. A redundancy gate keeps repetitive ASCII on the ladder, where the match
 finder earns its ratio; high-entropy printable ASCII takes the pack. The old
-`PAGE_FAST`, `LZ_FAST`, `TURBO` and `PAGE_INSTANT` flags are retired: every level
-now picks the same page form for the same bytes, so the ladder is monotonic on
-pages as it is elsewhere. The ratios above reflect that split -- level 9's
+`PAGE_FAST`, `TURBO`, `PAGE_INSTANT`, `DECODE_FAST` and `LZ_HEX` flags are gone:
+every level now picks the same page form for the same bytes, so the ladder is
+monotonic on pages as it is elsewhere. `LZ_FAST` (`-F`) and `ZPSE_ENC_HUF` remain
+live encoder options. The ratios above reflect that split -- level 9's
 entropy pass turns 2.28:1 into 2.42:1.
 
 The honest decode result: because most content pages take the ladder, the
@@ -421,36 +422,39 @@ a segment directory, then one payload per segment.
 
 A **segment** is one plane of the block -- 1, 2, 4, 8 or 16 of them, split by a
 coordinate transform -- coded as a sequence of 256-byte **tiles**. Each tile
-picks one of twelve predictors (`const zero`, lane previous, lane delta,
-order-1, order-2, stride 1/2/3/4/8, tile constant, lane average), records the
-bytes it failed to predict, and codes those positions with an enumerative rank
-and their residuals through an exclusion map. Seven mask modes and five
+picks one of nine predictors: `const zero` (id 0), lane previous (1), lane
+delta (2), stride 1/2/4/8 (ids 5-8), lane average (10) and stride 3 (11). Ids
+3, 4 and 9 are reserved gaps in the format, not live predictors. A tile records
+the bytes it failed to predict, and codes those positions with an enumerative
+rank and their residuals through an exclusion map. Seven mask modes and five
 residual modes are chosen per tile by a priced search.
 
 The transforms are identity, delta-8, xor-8, byte-transpose of width 2/4/8/16,
 delta-plus-transpose at the same widths, and a stride variant for interleaved
 data. A plane that is one value throughout has a dense form that codes 4 KiB in
-twelve bytes. An all-ASCII block has a seven-bit form that packs eight
+twelve bytes, with the value carried in the record.
+An all-ASCII block has a seven-bit form that packs eight
 characters into seven bytes.
 
-A block may instead be coded as **intra-block LZ**. Every LZ form is now a raw
-block from vendored **LZ4 1.10.0** (`src/vendor/lz4.c`, BSD-2, notice in
+A block may instead be coded as **intra-block LZ**. It is a raw block from
+vendored **LZ4 1.10.0** (`src/vendor/lz4.c`, BSD-2, notice in
 `src/vendor/LICENSE.lz4`): `LZ4_compress_default` on the way in and
 `LZ4_decompress_safe` on the way out, with the block's uncompressed size as the
-only parameter the decoder needs. The three block-form selectors (`ZPSE_B_LZ`,
-`ZPSE_B_LZ2`, `ZPSE_B_LZ_HEX`) and `ZPSE_ENC_LZ_FAST` are still accepted and
-still select an LZ block, but they all carry the same LZ4 payload; the old
-token, varint-distance, repeat-cache, hexadecimal and `lzfast` codecs are gone.
-An LZ block is kept only when it is smaller than everything already tried.
+only parameter the decoder needs. There is one LZ4 block form, named by
+`ZPSE_B_LZ` (bit 5); `ZPSE_ENC_LZ_FAST` (`-F`) is a live encoder option but does
+not name a second wire form. The old token, varint-distance, repeat-cache,
+hexadecimal and `lzfast` codecs are gone. An LZ block is kept only when it is
+smaller than everything already tried.
 
 At the deepest level a block's LZ4 payload may be coded a second time, by
 **Huffman**: four fixed ten-bit tables compiled in from `src/huf_tables.inc`,
-with each block naming the one it used. The payload is split into four
-independent bit streams and wraps a payload that already won, so it composes
-with the LZ4 form. It is offered from level 9 up, or at any level with
-`ZPSE_ENC_HUF`, and kept only when it saves at least a sixty-fourth of the
-payload it wraps. It is a size-only option: if the entropy layer does not pay
-for itself on an LZ4 stream the block stays as raw LZ4.
+with each block naming the one it used. The `ZPSE_B_HUF` form is bit 7 on its
+own; its 12-byte payload header carries a fixed `inner_form` of `ZPSE_B_LZ`.
+The payload is split into four independent bit streams and wraps a payload that
+already won, so it composes with the LZ4 form. It is offered from level 9 up,
+or at any level with `ZPSE_ENC_HUF`, and kept only when it saves at least a
+sixty-fourth of the payload it wraps. It is a size-only option: if the entropy
+layer does not pay for itself on an LZ4 stream the block stays as raw LZ4.
 
 All block forms carry the same header shape and decode independently. That is
 what makes a block the unit of random access, and an optional `FrameIndex` lets
@@ -527,9 +531,9 @@ configuration is tested on Linux.
 The suite is `tests/runners/run.sh`: parity, fuzz, sizes, levels, LZ, ASCII,
 frames, the page dictionary, the Huffman form, the parallel encoder, hostile
 inputs, fill prediction, page forms, FLAT7, the column reference and corpus
-cases, and the ORDER segment-state decoder. The `parity`, `fuzz` and `lseed`
-suites are each built in default, forced-scalar and trial-swap modes and must
-print the same digest in all three. The benchmarks are all under
+cases, and the ORDER segment-state decoder. The `parity` and `fuzz` suites are
+each built in default, forced-scalar and trial-swap modes and must print the
+same digest in all three. The benchmarks are all under
 `tests/benchmarks/`:
 
 | script | table |
@@ -537,7 +541,7 @@ print the same digest in all three. The benchmarks are all under
 | `bench.c` | 64 KiB byte patterns and machine ceilings |
 | `bench_levels.c` | nine levels over the 25-case columnar matrix |
 | `bench_columnar.c` | per-case transforms and cross-codec comparison |
-| `bench_lz2.c` | both intra-block LZ form entry points (now LZ4-backed): encode and decode rate |
+| `bench_lz.c` | the single intra-block LZ4 entry point: encode rate and payload size |
 | `bench_pareto.sh` | ratio/encode/decode frontier against lz4 and zstd |
 | `silesia.sh` | Silesia per-file table (downloads the corpus) |
 | `page_table.sh` | 4 KiB page corpus, zero pages separated, page dictionary |
@@ -545,8 +549,7 @@ print the same digest in all three. The benchmarks are all under
 | `bench_pagedict.c` | page-dictionary hit rate and encode rate on repeat pages |
 | `bench_parallel.c` | worker scaling and byte-identity |
 | `bench_batch_decode.c` | batch decode in memory, one worker to N, 64 KiB blocks or 4 KiB pages (codec only) |
-| `bench_decode_first.c` | which blocks `DECODE_FAST` moves, and the size delta |
-| `decode_round.sh` | the decode tables in one pass: batch scaling for blocks and pages, decode-first blocks, streaming decode |
+| `decode_round.sh` | the decode tables in one pass: batch scaling for blocks and pages, streaming decode |
 | `huf_train.c` | refits the four Huffman tables into `src/huf_tables.inc` |
 | `binary_size.sh` | compiled library size |
 | `refresh_tables.sh` | regenerates the reproducible tables in one pass |
@@ -574,8 +577,8 @@ Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
 pages), `-t N` workers (encode streams through the worker ring; decode reads a
 batch of blocks on one thread, decodes them side by side and writes them in
 order on another, so a frame is still never resident whole), `-x` writes an
-index, `-F` requests `LZ_FAST`, `-D` requests `DECODE_FAST`, `-F7` (or `-7`)
-adds an in-memory FLAT7 arm to `bench`, `-R` adds an in-memory ZRPK arm to
+index, `-F` requests `LZ_FAST`, `-F7` (or `-7`) adds an in-memory FLAT7 arm
+to `bench`, `-R` adds an in-memory ZRPK arm to
 `bench` (and tries a ZRPK frame first in `c`, sniffing it in `d`), and
 `-n BYTES` limits how much of each input `bench` reads.
 
@@ -599,9 +602,7 @@ adds an in-memory FLAT7 arm to `bench`, `-R` adds an in-memory ZRPK arm to
   at about 506 MB/s against lz4 1's ~830 MB/s in the same CLI harness.
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
-  is the only metric, level 4 is the lever. The per-block
-  `ZPSE_ENC_DECODE_FAST` (`-D`) bit is accepted but currently inert: no encoder
-  path reads it, so it does not change which form is written.
+  is the only metric, level 4 is the lever.
 * **The whole-frame paths are caller-driven.** Four paths sit outside the
   ladder. FLAT7 (`F7P1`), REPACK (`ZRPK`), RLE1 (`RLE1`) and f64fast (`F64F`)
   are self-delimiting containers with a magic and a narrow input gate; each

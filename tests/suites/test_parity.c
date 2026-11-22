@@ -52,9 +52,6 @@ static uint8_t tile_src[256];
 static uint8_t tile_plane[512];
 static uint8_t tile_rec[1024];
 static uint8_t tile_dec[256];
-static uint8_t tile_o1[8 * 256];
-/* ORDER2 state: 8 x 4096 {value, confidence} pairs, interleaved. */
-static uint8_t tile_o2[8 * 4096 * 4];
 static uint8_t tile_rec2[1024]; /* second record of the chained sweep */
 
 static uint64_t tile_rng;
@@ -167,13 +164,10 @@ static const uint16_t small_nts[SMALL_NT_N] = {
     95u, 96u, 127u, 128u, 129u, 159u, 191u, 223u, 224u, 255u, 256u
 };
 
-/* The eight predictors the encoder's prescreen can rank, i.e. the ids
- * zpse_tile_classify is ever called with on the encode side. */
-static const uint8_t sm_pids[8] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u };
-
-/* The three ids the prescreen never ranks: the stateful table loop of
- * ORDER1/ORDER2 and the TILE_CONSTANT id. */
-static const uint8_t tbl_pids[3] = { 3u, 4u, 9u };
+/* The live predictors the encoder's prescreen can rank, i.e. the ids
+ * zpse_tile_classify is ever called with on the encode side. Ids 3, 4 and 9
+ * are reserved gaps now, so none of them is a tile primitive. */
+static const uint8_t sm_pids[] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u, 10u, 11u };
 
 static void small_tile(int shape, uint16_t nt, uint8_t *dst)
 {
@@ -276,10 +270,6 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     memcpy(tile_plane + off, tile, (size_t)nt);
 
     memset(&L, 0, sizeof L);
-    L.order1 = tile_o1;
-    L.o2 = tile_o2;
-    L.gen = 0u;
-    L.gen = 0u;
     zpse_lane_reset(&L, lit);
     memset(&cl, 0, sizeof cl);
     rc = zpse_tile_classify(&L, tile_plane + off, nt, pid, lit, 1,
@@ -324,10 +314,6 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     /* decode(pack(classify(tile))) == tile, at this nt. */
     memset(&L2, 0, sizeof L2);
-    L2.order1 = tile_o1;
-    L2.o2 = tile_o2;
-    L2.gen = 0u;
-    L2.gen = 0u;
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 1, tile_plane, off,
@@ -345,7 +331,6 @@ static int small_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     emix_u32(acc, (uint32_t)cl.rmax);
     emix_u32(acc, (uint32_t)cl.dmin);
     emix_u32(acc, (uint32_t)cl.dmax);
-    emix_u32(acc, (uint32_t)cl.constant_C);
     for (wi = 0; wi < 8u; wi++) {
         emix_u32(acc, cl.words[wi]);
     }
@@ -391,10 +376,6 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     memcpy(tile_plane + off, tile, (size_t)nt);
 
     memset(&L, 0, sizeof L);
-    L.order1 = tile_o1;
-    L.o2 = tile_o2;
-    L.gen = 0u;
-    L.gen = 0u;
     zpse_lane_reset(&L, lit);
     memset(&cl, 0, sizeof cl);
     rc = zpse_tile_classify(&L, tile_plane + off, nt, pid, lit, 1,
@@ -431,10 +412,6 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
 
     for (d = 0; d < 2; d++) {
         memset(&L2, 0, sizeof L2);
-        L2.order1 = tile_o1;
-        L2.o2 = tile_o2;
-        L2.gen = 0u;
-        L2.gen = 0u;
         zpse_lane_reset(&L2, lit);
         memset(tile_dec, 0x5A, sizeof tile_dec);
         rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 1, tile_plane,
@@ -451,10 +428,6 @@ static int deep_case(const uint8_t *tile, uint16_t nt, uint8_t pid,
     }
 
     memset(&L2, 0, sizeof L2);
-    L2.order1 = tile_o1;
-    L2.o2 = tile_o2;
-    L2.gen = 0u;
-    L2.gen = 0u;
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc0 = zpse_tile_decode(&L2, tile_rec, (uint32_t)n, lit, 0, tile_plane, off,
@@ -643,23 +616,22 @@ static void run_text(const char *name, uint32_t shape, uint32_t n,
 /* Two tiles classified back to back on ONE lane state: the first with
  * tile_reset = 1 (what the encoder does for every tile, and what the
  * per-primitive sweep above does for its single tile), the second with
- * tile_reset = 0, so the second classification starts from the lane
- * histories AND the ORDER1/ORDER2 tables the first one left behind.
+ * tile_reset = 0, so the second classification starts from the two lane
+ * histories the first one left behind.
  *
  * The single-tile sweep can never see that end state: it builds a fresh
  * lane state per case and never reads one afterwards. Here it is made
- * observable twice over -- once as the state itself (both histories plus
- * every byte of the table the predictor reads, folded into the digest at
- * the end) and once through the round trip, because the second record is
- * decoded from a lane state this file re-derives by decoding the first
- * record with tile_reset = 0. So a classification that leaves the wrong
- * histories or writes the wrong table entries breaks the digest against
- * the -DZPSE_FORCE_SCALAR build, and a state the DECODER cannot
+ * observable twice over -- once as the state itself (both histories,
+ * folded into the digest at the end) and once through the round trip,
+ * because the second record is decoded from a lane state this file
+ * re-derives by decoding the first record with tile_reset = 0. So a
+ * classification that leaves the wrong histories breaks the digest
+ * against the -DZPSE_FORCE_SCALAR build, and a state the DECODER cannot
  * reproduce breaks as a decode mismatch here.
  *
- * pids 3 and 4 are the stateful tables the encoder's prescreen never
- * ranks (ORDER1, ORDER2); 0 and 1 are the controls. Returns 0 on
- * success, non-zero after incrementing `fails`, like small_case. */
+ * The pids are the live lane-history family (1, 2, 10) plus CONST_ZERO
+ * (0) as a control. Returns 0 on success, non-zero after incrementing
+ * `fails`, like small_case. */
 static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
                       uint64_t *acc)
 {
@@ -684,10 +656,6 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     memcpy(tile_plane + 256u, tile_src, 256u);
 
     memset(&L, 0, sizeof L);
-    L.order1 = tile_o1;
-    L.o2 = tile_o2;
-    L.gen = 0u;
-    L.gen = 0u;
     zpse_lane_reset(&L, lit);
     memset(&clA, 0, sizeof clA);
     memset(&clB, 0, sizeof clB);
@@ -737,13 +705,12 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
         return 1;
     }
 
-    /* The state the second classification left: histories + tables. */
+    /* The state the second classification left: the two lane histories. */
     emix_u32(acc, (uint32_t)clB.k);
     emix_u32(acc, (uint32_t)clB.nu);
     emix_u32(acc, (uint32_t)clB.rmax);
     emix_u32(acc, (uint32_t)clB.dmin);
     emix_u32(acc, (uint32_t)clB.dmax);
-    emix_u32(acc, (uint32_t)clB.constant_C);
     for (i = 0; i < 8u; i++) {
         emix_u32(acc, clB.words[i]);
     }
@@ -759,21 +726,12 @@ static int chain_case(int shape_a, int shape_b, uint8_t pid, uint8_t lit,
     emix(acc, tile_rec2, (size_t)nB);
     emix(acc, L.last, 8u);
     emix(acc, L.second_last, 8u);
-    if (pid == 3u) {
-        emix(acc, tile_o1, sizeof tile_o1);
-    } else if (pid == 4u) {
-        emix(acc, tile_o2, sizeof tile_o2);
-    }
 
     /* Decode both records in sequence: the first resets, the second
      * continues from the state the first decode leaves, which is the
      * decoder's own re-derivation of the state the encoder classified
      * the second tile against. */
     memset(&L2, 0, sizeof L2);
-    L2.order1 = tile_o1;
-    L2.o2 = tile_o2;
-    L2.gen = 0u;
-    L2.gen = 0u;
     zpse_lane_reset(&L2, lit);
     memset(tile_dec, 0xA5, sizeof tile_dec);
     rc = zpse_tile_decode(&L2, tile_rec, (uint32_t)nA, lit, 1, tile_plane, 0u,
@@ -931,9 +889,13 @@ int main(void)
      * exceptions. */
     {
         uint64_t group = 1469598103934665603ull; /* FNV-1a 64 */
+        /* The nine live ids; 3, 4 and 9 are reserved gaps and every tile
+         * gate refuses them, so there is no primitive to sweep there. */
+        static const uint8_t live_pids[] = { 0u, 1u, 2u, 5u, 6u, 7u, 8u,
+                                             10u, 11u };
         uint32_t pid;
 
-        for (pid = 0; pid <= 11u; pid++) {
+        for (pid = 0; pid < sizeof live_pids; pid++) {
             uint64_t acc = 1469598103934665603ull;
             uint32_t cases = 0;
             uint32_t tile_i, lit_i, rst_i, var_i;
@@ -965,20 +927,17 @@ int main(void)
                             memcpy(tile_plane + off, tile_src, 256u);
 
                             memset(&L, 0, sizeof L);
-                            L.order1 = tile_o1;
-                            L.o2 = tile_o2;
-                            L.gen = 0u;
-                            L.gen = 0u;
                             zpse_lane_reset(&L, lits[lit_i]);
                             memset(&cl, 0, sizeof cl);
                             rc = zpse_tile_classify(&L, tile_plane + off, 256u,
-                                                    (uint8_t)pid, lits[lit_i],
+                                                    live_pids[pid],
+                                                    lits[lit_i],
                                                     (int)rst_i, tile_plane,
                                                     (uint32_t)off, &cl);
                             if (rc != 0) {
                                 printf("FAIL tileclass pid=%u tile=%u lit=%u "
                                        "reset=%u off=%u rc=%d\n",
-                                       (unsigned)pid, (unsigned)tile_i,
+                                       (unsigned)live_pids[pid], (unsigned)tile_i,
                                        (unsigned)lit_i, (unsigned)rst_i,
                                        (unsigned)off, rc);
                                 fails++;
@@ -989,7 +948,7 @@ int main(void)
                             if ((uint32_t)cl.k !=
                                 popcount_positions(cl.words, 256u)) {
                                 printf("FAIL tileclass pid=%u tile=%u k=%u "
-                                       "mask=%u\n", (unsigned)pid,
+                                       "mask=%u\n", (unsigned)live_pids[pid],
                                        (unsigned)tile_i,
                                        (unsigned)cl.k,
                                        popcount_positions(cl.words, 256u));
@@ -999,7 +958,7 @@ int main(void)
                             if ((uint32_t)cl.nu !=
                                 popcount_positions(cl.seen, 256u)) {
                                 printf("FAIL tileclass pid=%u tile=%u nu=%u "
-                                       "distinct=%u\n", (unsigned)pid,
+                                       "distinct=%u\n", (unsigned)live_pids[pid],
                                        (unsigned)tile_i,
                                        (unsigned)cl.nu,
                                        popcount_positions(cl.seen, 256u));
@@ -1008,7 +967,7 @@ int main(void)
                             }
 
                             zpse_tile_choose_modes(&cl, 256u, &mm, &rm);
-                            n = zpse_tile_pack((uint8_t)pid, &cl, 256u,
+                            n = zpse_tile_pack(live_pids[pid], &cl, 256u,
                                                tile_plane + off, mm, rm,
                                                (int)rst_i, tile_rec,
                                                (uint32_t)sizeof tile_rec,
@@ -1016,7 +975,7 @@ int main(void)
                             if (n < 8) {
                                 printf("FAIL tilepack  pid=%u tile=%u "
                                        "mask=%u res=%u n=%d\n",
-                                       (unsigned)pid, (unsigned)tile_i,
+                                       (unsigned)live_pids[pid], (unsigned)tile_i,
                                        (unsigned)mm, (unsigned)rm, n);
                                 fails++;
                                 continue;
@@ -1024,10 +983,6 @@ int main(void)
 
                             /* decode(pack(classify(tile))) == tile */
                             memset(&L2, 0, sizeof L2);
-                            L2.order1 = tile_o1;
-                            L2.o2 = tile_o2;
-                            L2.gen = 0u;
-                            L2.gen = 0u;
                             zpse_lane_reset(&L2, lits[lit_i]);
                             memset(tile_dec, 0xA5, sizeof tile_dec);
                             rc = zpse_tile_decode(&L2, tile_rec,
@@ -1040,7 +995,7 @@ int main(void)
                                        256u) != 0) {
                                 printf("FAIL tileround pid=%u tile=%u "
                                        "mask=%u res=%u n=%d rc=%d\n",
-                                       (unsigned)pid, (unsigned)tile_i,
+                                       (unsigned)live_pids[pid], (unsigned)tile_i,
                                        (unsigned)mm, (unsigned)rm, n, rc);
                                 fails++;
                                 continue;
@@ -1051,7 +1006,6 @@ int main(void)
                             emix_u32(&acc, (uint32_t)cl.rmax);
                             emix_u32(&acc, (uint32_t)cl.dmin);
                             emix_u32(&acc, (uint32_t)cl.dmax);
-                            emix_u32(&acc, (uint32_t)cl.constant_C);
                             for (wi = 0; wi < 8u; wi++) {
                                 emix_u32(&acc, cl.words[wi]);
                             }
@@ -1071,7 +1025,7 @@ int main(void)
                 }
             }
 
-            printf("tileclass pid=%2u cases=%4u %016llX\n", (unsigned)pid,
+            printf("tileclass pid=%2u cases=%4u %016llX\n", (unsigned)live_pids[pid],
                    (unsigned)cases, (unsigned long long)acc);
             emix_u64(&group, acc);
         }
@@ -1104,7 +1058,7 @@ int main(void)
                     }
                     small_tile((int)si, nt, tile_src);
                     for (li = 0; li < (uint32_t)LIT_N; li++) {
-                        for (pi = 0; pi < 8u; pi++) {
+                        for (pi = 0; pi < sizeof sm_pids; pi++) {
                             if (small_case(tile_src, nt, sm_pids[pi],
                                            lits[li], off, &acc, &full) != 0) {
                                 cases++;
@@ -1115,43 +1069,6 @@ int main(void)
             }
 
             printf("tilesmall  cases=%4u full=%4u %016llX\n",
-                   (unsigned)cases, (unsigned)full,
-                   (unsigned long long)acc);
-            emix_u64(&group, acc);
-        }
-
-        /* ORDER1/ORDER2 and TILE_CONSTANT at the same boundaries. These
-         * are the ids the encoder's prescreen never ranks, so their
-         * classification is the stateful per-position table loop rather
-         * than the vector path -- and that loop has to survive a tile
-         * shorter than one chunk just as the vector path does. */
-        {
-            uint64_t acc = 1469598103934665603ull;
-            uint32_t cases = 0;
-            uint32_t full = 0u;
-            static const uint16_t tbl_nts[3] = { 32u, 64u, 256u };
-            uint32_t si;
-            uint32_t ni;
-            uint32_t pi;
-
-            for (si = 0; si < (uint32_t)SMALL_SHAPE_N; si++) {
-                for (ni = 0; ni < 3u; ni++) {
-                    uint16_t nt = tbl_nts[ni];
-
-                    if (si == 5u && nt < 2u) {
-                        continue;
-                    }
-                    small_tile((int)si, nt, tile_src);
-                    for (pi = 0; pi < 3u; pi++) {
-                        if (small_case(tile_src, nt, tbl_pids[pi], 0x00u,
-                                       256u, &acc, &full) != 0) {
-                            cases++;
-                        }
-                    }
-                }
-            }
-
-            printf("tiletable  cases=%4u full=%4u %016llX\n",
                    (unsigned)cases, (unsigned)full,
                    (unsigned long long)acc);
             emix_u64(&group, acc);
@@ -1200,15 +1117,16 @@ int main(void)
 
         /* ---- The state a classification leaves behind ------------ *
          * Two tiles back to back on one lane state, the second without a
-         * reset, over the two stateful predictors and two controls; the
-         * shape pairs are chosen so tile two starts from a warm table
-         * (all-hits then all-exceptions, low-nibble pseudorandom then
-         * full pseudorandom) and the literal sweep makes those warm
-         * entries non-trivial. See chain_case for what is compared. */
+         * reset, over the live lane-history predictors (1, 2, 10) and
+         * CONST_ZERO (0) as a control; the shape pairs are chosen so tile
+         * two starts from warm histories (all-hits then all-exceptions,
+         * low-nibble pseudorandom then full pseudorandom) and the literal
+         * sweep makes them non-trivial. See chain_case for what is
+         * compared. */
         {
             uint64_t acc = 1469598103934665603ull;
             uint32_t cases = 0;
-            static const uint8_t chain_pids[4] = { 0u, 1u, 3u, 4u };
+            static const uint8_t chain_pids[4] = { 0u, 1u, 2u, 10u };
             static const uint8_t chain_pair[3][2] = {
                 { 0u, 1u }, { 10u, 11u }, { 1u, 10u }
             };

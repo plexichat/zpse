@@ -17,11 +17,8 @@
 # bytes are not in the harness's stdout (it prints ratios and rates), so a
 # small dumper is compiled from each tree and its stdout hashed for every zpse
 # row the harness emits. Every row must match byte for byte or the script
-# stops before spending time on timing, except the three new opt-in page
-# profiles (TURBO, HUF, INSTANT): an older ref has no code behind their flag
-# bits, so its bytes for those rows say nothing about determinism. They are
-# reported but not gated. FLAT uses the default level flags (no flag bit), so
-# it is a normal gated row like the other non-opt-in modes.
+# stops before spending time on timing. FLAT and the LZ_FAST row use only live
+# flag bits, so they are gated like the default-level rows.
 #
 # Usage: bash tests/benchmarks/page_ab.sh [options] [A] [B]
 #   A          first build, a git ref (default HEAD). Built from git archive.
@@ -106,27 +103,6 @@ for f in lz4.c lz4hc.c lz4.h; do
     [ -f "$lz4lib/$f" ] || die "LZ4_DIR/lib/$f is missing"
 done
 
-# An older ref can predate the new page-profile flags the current harness
-# names. Their bit values are fixed by the format, so define any that are
-# missing before the tree's own header is read; both builds then compile the
-# same harness source. The flags have no effect on a ref that does not use
-# them, which is exactly what the gate measures.
-cat > "$work/compat.h" <<'CEOF'
-#ifndef ZPSE_PAGE_AB_COMPAT_H
-#define ZPSE_PAGE_AB_COMPAT_H
-#include <stdint.h>
-#ifndef ZPSE_ENC_PAGE_TURBO
-#define ZPSE_ENC_PAGE_TURBO (UINT32_C(1) << 10)
-#endif
-#ifndef ZPSE_ENC_PAGE_HUF
-#define ZPSE_ENC_PAGE_HUF (UINT32_C(1) << 12)
-#endif
-#ifndef ZPSE_ENC_PAGE_INSTANT
-#define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
-#endif
-#endif
-CEOF
-
 # A ref comes from the committed tree; WORKTREE is tarred out of the checkout
 # so uncommitted encoder changes are the ones under test.
 materialize() {  # ref dest
@@ -151,7 +127,7 @@ for nm in a b; do
 done
 
 build_harness() {  # tree out
-    "$CC" -std=c11 -O2 -include "$work/compat.h" -I"$1/include" -I"$lz4lib" \
+    "$CC" -std=c11 -O2 -I"$1/include" -I"$lz4lib" \
         "$1/tests/benchmarks/bench_pages_static.c" \
         "$lz4lib/lz4.c" "$lz4lib/lz4hc.c" "$1/src/zpse_unity.c" \
         -o "$2"
@@ -184,12 +160,6 @@ cat > "$work/dump_pages.c" <<'CEOF'
 #include <stdlib.h>
 #include <string.h>
 #include "zpse/zpse.h"
-#ifndef ZPSE_ENC_PAGE_INSTANT
-#define ZPSE_ENC_PAGE_INSTANT (UINT32_C(1) << 13)
-#endif
-#ifndef ZPSE_ENC_PAGE_HUF
-#define ZPSE_ENC_PAGE_HUF (UINT32_C(1) << 12)
-#endif
 #define PAGE 4096u
 #define CAP  (PAGE * 2u)
 static unsigned char arena[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
@@ -210,12 +180,7 @@ int main(int argc, char **argv)
         level = 6;  /* FLAT row uses the default level flags */
     } else if (sscanf(label, "zpse %u", &level) != 1) return 3;
     flags = (uint32_t)level << 1;
-    if (strstr(label, "PAGE_FAST")) flags |= ZPSE_ENC_PAGE_FAST;
     if (strstr(label, "LZ_FAST"))   flags |= ZPSE_ENC_LZ_FAST;
-    if (strstr(label, "LZ_HEX"))    flags |= ZPSE_ENC_LZ_HEX;
-    if (strstr(label, "TURBO"))     flags |= ZPSE_ENC_PAGE_TURBO;
-    if (strstr(label, "HUF"))       flags |= ZPSE_ENC_PAGE_HUF;
-    if (strstr(label, "INSTANT"))   flags |= ZPSE_ENC_PAGE_INSTANT;
 
     f = fopen(path, "rb");
     if (f == NULL) return 1;
@@ -246,7 +211,7 @@ int main(int argc, char **argv)
 CEOF
 for nm in a b; do
     tree="$work/$nm"
-    "$CC" -std=c11 -O2 -include "$work/compat.h" -I"$tree/include" \
+    "$CC" -std=c11 -O2 -I"$tree/include" \
         "$work/dump_pages.c" "$tree/src/zpse_unity.c" -o "$work/dump_$nm" ||
         die "byte dumper build failed for $nm"
 done
@@ -254,15 +219,12 @@ done
 extra=""
 [ "${WITH_LZ4:-0}" = "1" ] || extra="--no-lz4"
 
-# A new opt-in row has no code behind it in an older ref, so FAILED there is
-# expected. Any other FAILED row is a real fault and stops the run.
+# Every row uses live flags, so a FAILED row in either tree is a real fault
+# and stops the run.
 check_failed() {  # file
     local lbl bad=""
     while IFS= read -r lbl; do
-        case "$lbl" in
-        *TURBO*|*HUF*|*INSTANT*) ;;
-        *) bad="$bad $lbl" ;;
-        esac
+        bad="$bad $lbl"
     done < <(awk -F'|' '/FAILED/ { n=$2; gsub(/^ +| +$/,"",n); if (n!="") print n }' "$1")
     [ -z "$bad" ]
 }
@@ -286,10 +248,6 @@ gate_rc=0
 : > "$work/gate_rows.txt"
 while IFS= read -r label; do
     [ -n "$label" ] || continue
-    case "$label" in
-    *INSTANT*|*HUF*|*TURBO*) is_new=1 ;;
-    *) is_new=0 ;;
-    esac
     if "$work/dump_a" "$label" "$headfile" > "$work/packed.a.bin" 2> "$work/dump.a.err"; then
         ba=$(wc -c < "$work/packed.a.bin" | tr -d ' ')
         sa=$(sha256sum "$work/packed.a.bin" | awk '{print $1}')
@@ -302,9 +260,7 @@ while IFS= read -r label; do
     else
         bb="n/a"; sb="n/a"
     fi
-    if [ "$is_new" -eq 1 ]; then
-        verdict="opt-in (not gated)"
-    elif [ "$sa" = "n/a" ] || [ "$sb" = "n/a" ]; then
+    if [ "$sa" = "n/a" ] || [ "$sb" = "n/a" ]; then
         verdict="MISSING"; gate_rc=1
     elif [ "$sa" != "$sb" ]; then
         verdict="DIFFER"; gate_rc=1
