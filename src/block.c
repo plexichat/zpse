@@ -5908,34 +5908,10 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
                                        (uint32_t)ZPSE_BLOCK_SHORT_MAX,
                                        &lz_total, 0);
             }
-            /* ---- The lazy window above a page -------------------------
-             *
-             * Historically this second LZ pass fed a length-measured lazy
-             * match finder a wider table (ZPSE_LZ_HASH_BITS_WIDE) and a
-             * longer lookahead (ZPSE_LZ_LAZY_MAX) than the first pass; the
-             * numbers that justified it are in docs/HISTORY.md. LZ4 now owns
-             * the match search and ignores all of those arguments, so the two
-             * calls write the same stream and the second one is a decision
-             * point kept in place rather than a different parse. The call
-             * sites and their arguments stay as they are to avoid churn in
-             * the level ladder; only a strictly smaller stream replaces the
-             * first one. */
-            if (rc == ZPSE_OK && e->ascii_gate == 0u &&
-                n > (uint32_t)ZPSE_BLOCK_SHORT_MAX &&
-                n <= (uint32_t)ZPSE_LZ_LAZY_MAX &&
-                lz_total <= (uint32_t)ZPSE_E_SZ_TSTAGE) {
-                uint32_t lz_lazy = 0u;
-
-                if (zpse_block_try_lz(e, in, n, in_crc, is_last, seq,
-                                      e->tstage, lz_cap, e->lz,
-                                      (uint32_t)ZPSE_LZ_HASH_BITS_WIDE,
-                                      (uint32_t)ZPSE_LZ_LAZY_MAX, &lz_lazy,
-                                      0) == ZPSE_OK &&
-                    lz_lazy < lz_total) {
-                    memcpy(e->cand, e->tstage, lz_lazy);
-                    lz_total = lz_lazy;
-                }
-            }
+            /* The lazy window is gone with the old finder. LZ4 owns the match
+             * search and zpse_block_try_lz ignores its table/hash/lazy-window
+             * arguments, so the second pass used to re-encode the same bytes
+             * and could never produce a strictly smaller stream. */
             /* Smaller is not enough: an LZ4 stream and a tile stream decode
              * at speeds that have nothing to do with their ratio, so the win
              * also has to be big enough to pay for the decode it gives up and
