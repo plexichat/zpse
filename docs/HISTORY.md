@@ -653,14 +653,15 @@ frontier rather than a claim to beat general-purpose compressors everywhere.
 
 Three follow-ups were measured in one pass. Two changed the tree; one did not.
 
-**The 4-16 KiB lazy pass gets all fourteen bits.** The arena's LZ region was
+**The 4-16 KiB lazy pass got all fourteen bits (later removed).** The arena's LZ region was
 16 KiB -- a 2^13 table -- and the lazy second pass on blocks between 4 and
 16 KiB inserts up to 16,384 positions into it, a load factor of two. The region
-is now 32 KiB (`ZPSE_E_SZ_LZ 0x08000`, `ZPSE_LZ_HASH_BITS_WIDE 14`) and the
-arena is 464 KiB. Every other caller of the finder keeps 13 bits, so the
-screens and the page passes are byte-for-byte untouched -- only the lazy pass
-indexes all fourteen bits. Measured per file over two rounds at level 6 with
-`BLOCK=16384 bash tests/benchmarks/ab_silesia.sh`, the rounds agreeing on
+was widened to 32 KiB (`ZPSE_E_SZ_LZ 0x08000`, `ZPSE_LZ_HASH_BITS_WIDE 14`) and
+the arena to 464 KiB. Every other caller of the finder kept 13 bits, so the
+screens and the page passes were byte-for-byte untouched -- at the time only
+the lazy pass indexed all fourteen bits (that custom finder was later removed
+when LZ4 took over the search). Measured per file over two rounds at level 6
+with `BLOCK=16384 bash tests/benchmarks/ab_silesia.sh`, the rounds agreeing on
 every byte: the twelve files go 106,180,882 -> 106,079,560 bytes,
 -101,322 (-0.095%). mozilla -58,844, nci -13,251, ooffice -12,510, osdb -9,901,
 samba -6,371, sao -217, xml -124, dickens -92, mr and x-ray unchanged, and
@@ -788,9 +789,10 @@ digests.
 generated `pages-nonzero.bin` (16 MiB, sha256 `c9c0e860…`, `corpus_write
 --pages`) with the CLI at `-b 4096`, best of five, one process, median
 reported. Packed bytes are a property of the stream: 1.74:1, 2.40:1, 2.56:1
-for levels 1, 6 and 9, 1.52:1 for `PAGE_FAST` and 2.21:1 for `LZ_FAST`. The
-rates are 296/2879 for level 1, 175/1841 for level 6, 138/1323 for level 9,
-995/3365 for `PAGE_FAST` and 624/1967 for `LZ_FAST` (encode/decode MB/s). On
+for levels 1, 6 and 9, 1.52:1 for `PAGE_FAST` (later removed) and 2.21:1 for
+`LZ_FAST`. The rates are 296/2879 for level 1, 175/1841 for level 6, 138/1323
+for level 9, 995/3365 for `PAGE_FAST` (later removed) and 624/1967 for
+`LZ_FAST` (encode/decode MB/s). On
 the same stream with one zero page in eight, level 6 reads 2.67:1 and decodes
 at 1954 MB/s.
 
@@ -1695,9 +1697,9 @@ B kept because a hostile escape must not break the guard. Precise A/B rates for
 these mirrors live in the temp harness logs, not in a script under
 tests/benchmarks/, so they are not quoted here as project figures.
 
-Beside the block LZ forms, four whole-input fast paths now sit outside the
-ladder (a fifth, lzfast, was later removed), each with a gate and a magic of its
-own, and each declining back to the ordinary codec. FLAT7 (F7P1) is the
+Beside the block LZ forms, four whole-input fast paths sat outside the ladder
+at the time (a fifth, lzfast, was later removed), each with a gate and a magic
+of its own, and each declining back to the ordinary codec. FLAT7 (F7P1) is the
 finder-free 8-to-7 ASCII pack described above: its 1.143:1 ratio is a ceiling,
 so the redundancy gate keeps repetitive ASCII on the ladder. lzfast was the
 smallest useful finder (later removed) -- the fast form's command shape with the
@@ -1720,17 +1722,18 @@ rather than quoting rates as project figures.
 
 ## The token decoder gets a trusted region too
 
-The token form's decoder (`zpse_lz_decode`, `src/lz.c`) was the last command loop
-still written as a chain of per-field checks. Its earlier fast path was an
-escape-free region inside the careful loop: a command qualified only when both
-token nibbles were under fifteen, which fit in eighteen payload and thirty-two
+The token form's decoder (`zpse_lz_decode`, then in `src/lz.c`, later removed)
+was the last command loop still written as a chain of per-field checks. Its
+earlier fast path was an escape-free region inside the careful loop: a command
+qualified only when both token nibbles were under fifteen, which fit in
+eighteen payload and thirty-two
 output bytes, and even then it re-tested its room on every command. The fast
 form (`src/lz2.c`) had already shown the better shape a trusted region ahead of
 the checked loop, with two bounds tested once per command and a fully checked
 tail for everything the region cannot take; that change narrowed the gap to
 LZ4 and, with the fixed-distance command, made its decode markedly faster.
 
-The token decoder now has that shape. `op < n - 576` (RESERVE, room for the
+The token decoder was given that shape. `op < n - 576` (RESERVE, room for the
 widest command -- a 269-byte literal run and a 274-byte match plus store slack)
 bounds the output and `lp <= tend - 352` (BACK) bounds the speculative reads.
 A 255-escape continuation, a fourth distance group, or a run wider than the
@@ -1796,8 +1799,8 @@ committed LZ2, the fixed-distance fast form (later removed), in that pass instea
 that a form already priced inside the noise could be swapped for the one that
 decodes about twice as fast at no ratio cost.
 
-On `nci` it did what the theory said. On the current tree (HEAD 83217f7), in
-memory on core 7 with QPC, best of nine, arms alternating, and an A/A null
+On `nci` it did what the theory said. On the tree at that commit (HEAD 83217f7),
+in memory on core 7 with QPC, best of nine, arms alternating, and an A/A null
 comparison putting the noise floor at 0.12%: packed goes 6,184,688 -> 6,008,734
 bytes (-2.84%, a better ratio), encode +9.88% and decode +114.99% -- about
 2.15x. The round trip was byte-exact on all twelve Silesia files.

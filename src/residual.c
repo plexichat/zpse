@@ -288,8 +288,8 @@ static int residual_has_ff(const uint8_t *p, uint32_t n)
  * had written before it stopped; no caller can observe that, for the
  * reason recorded at the mode-0 branch of zpse_residual_decode (the status
  * is checked first, and `exc_out` is the tile's `resid[]` scratch, which
- * is never read after a rejection). `residual_has_ff` stays for the
- * encoder, which needs the answer without the copy. */
+ * is never read after a rejection). `residual_has_ff` stays for the mode-2
+ * palette check, which needs the answer without a copy. */
 static int residual_copy_u8_checked(uint8_t *dst, const uint8_t *src,
                                     uint32_t n)
 {
@@ -1619,12 +1619,12 @@ static int residual_decode_mode2(const uint8_t *payload,
         return ZPSE_BAD_RESIDUAL;
     }
     /* `payload[1 + i] > 254` on a byte is `== 255`, which is the question
-     * residual_has_ff already answers eight bytes at a time (the mode-0
-     * path uses it for the same reason). m is at most sixteen, so this is
-     * two word loads instead of m byte loads and compares, once per palette
-     * tile -- and a dense palette plane is 256 of them. The status and its
-     * order are unchanged: the first such byte still rejects the payload,
-     * and nothing has been written by the time the check runs. */
+     * residual_has_ff already answers eight bytes at a time. m is at most
+     * sixteen, so this is two word loads instead of m byte loads and
+     * compares, once per palette tile -- and a dense palette plane is 256
+     * of them. The status and its order are unchanged: the first such byte
+     * still rejects the payload, and nothing has been written by the time
+     * the check runs. */
     if (residual_has_ff(payload + 1, (uint32_t)m)) {
         return ZPSE_BAD_RESIDUAL;
     }

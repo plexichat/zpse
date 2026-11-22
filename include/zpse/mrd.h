@@ -16,8 +16,9 @@
  *
  * REGISTERED IN THE UNITY BUILD: src/mrd.c is included by src/zpse_unity.c.
  *
- * OPT-IN: nothing is emitted unless the caller sets ZPSE_ENC_MRD (bit 18) on
- * zpse_compress_frame_ex. The content gate accepts only data like "mr":
+ * ENABLED BY DEFAULT: the whole-frame attempt runs at every level under its
+ * own content gate; ZPSE_ENC_MRD (bit 18) is accepted but ignored, so passing
+ * it changes no byte. The gate accepts only data like "mr":
  * >=95% int8 deltas and mean |delta| in [4,14) (so x-ray at 25.4 declines),
  * plus a zero-delta floor.
  */

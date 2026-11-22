@@ -643,7 +643,7 @@ int zpse_block_decode(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     if ((h.block_flags & ZPSE_B_RAW) != 0) {
         uint32_t calc;
         if (h.transform_id != 0 || h.segment_count != 1 || meta_size != 0 ||
-            (h.block_flags & ZPSE_B_LZ_TILE) != 0) {
+            (h.block_flags & (ZPSE_B_LZ_TILE | ZPSE_B_LZ | ZPSE_B_HUF)) != 0) {
             return ZPSE_BAD_HEADER;
         }
         if (c != hdr + n) {
@@ -2464,7 +2464,7 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * not fit (which the caller reads as "this candidate lost", not as an
  * error). The block header is written last-to-first: the payload at
  * dst + 32, then the envelope around it. */
-/* ---- The LZ4 form's decode bill, as a per-level acceleration factor ---- *
+/* ---- The LZ4 form's decode bill, one global acceleration factor ---- *
  *
  * An LZ4 stream decodes at the speed of its own command loop, so its rate
  * follows the AVERAGE RUN LENGTH between LZ4 sequences.
@@ -2476,15 +2476,16 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  * question a block has to answer is how much decode speed it will trade for
  * size.
  *
- * That trade is the level's ACCELERATION FACTOR A -- the same idea as
- * zstd's -1/-2/-4, moved to the decode side: the form is taken when its
- * commands average at least ZPSE_LZ_BPC_CROSS / A output bytes, i.e. when
- * the LZ stream is expected to decode at least A times SLOWER than the tile
- * stream it replaces. A = 2 is the 48 bytes per command this rule used to
- * be hard-coded to (and it is nearly inert: it keeps LZ only for blocks
- * whose runs are long enough to out-decode the tiles); a large A buys ratio
- * on text and pays for it in decode rate, which is what the fastest and
- * default levels are being asked for now.
+ * That trade was historically expressed as an ACCELERATION FACTOR A -- the
+ * same idea as zstd's -1/-2/-4, moved to the decode side: the form was taken
+ * when its commands averaged at least ZPSE_LZ_BPC_CROSS / A output bytes,
+ * i.e. when the LZ stream was expected to decode at least A times SLOWER than
+ * the tile stream it replaces. A = 2 is the 48 bytes per command this rule
+ * used to be hard-coded to (and it is nearly inert: it keeps LZ only for
+ * blocks whose runs are long enough to out-decode the tiles); a large A buys
+ * ratio on text and pays for it in decode rate. Levels no longer name their
+ * own A: there is one global bill, taken from the default row's accel in
+ * zpse_lz_min_bpc below.
  *
  * The levels were swept with every value in turn, on the four text cases and
  * a repetitive one, against the tile stream's own 1.09:1 at ~14 GB/s. The
@@ -2502,16 +2503,15 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  *   A=16 (6 B/cmd)   unchanged from A=12: prose sits at 5.6 bytes per
  *                    command, just under the bar.
  *   A=24 (4 B/cmd)   + prose, at MAX only: text_en 1.09 -> 1.33 at 0.6 GB/s.
- *                    The default level does not take it because its sample
- *                    margin (1.25) rejects prose before this rule is asked;
- *                    MAX's (1.0625) does not. That is the whole difference
- *                    between the two levels' LZ behaviour.
+ *                    At the time the default level did not take it because
+ *                    its sample margin (1.25) rejected prose before this rule
+ *                    was asked; MAX's (1.0625) did not. Those per-level
+ *                    margins are historical -- the LZ4 screen is now shared.
  *
- * So A=12 is the setting that buys the structured-text cases while keeping a
- * GB/s decoder, and A=24 buys prose at a command-loop 0.6 GB/s. Each level
- * names its own; the levels must stay ordered by permissiveness -- a deeper
- * level that accepted LESS than the level before it would write a larger
- * block than that level, which tests/suites/test_levels.c fails on. */
+ * So A=12 was the setting that bought the structured-text cases while keeping
+ * a GB/s decoder, and A=24 bought prose at a command-loop 0.6 GB/s. Those
+ * per-level numbers are historical: levels 5-9 now share one decode bill and
+ * one LZ4 screen, and only trials and tie_field vary down the ladder. */
 #ifndef ZPSE_LZ_BPC_CROSS
 #define ZPSE_LZ_BPC_CROSS 96u
 #endif
@@ -2519,30 +2519,30 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
 #define ZPSE_LZ_ACCEL_MAX 24u
 #endif
 #ifndef ZPSE_LZ_ACCEL_BALANCED
-#define ZPSE_LZ_ACCEL_BALANCED 12u /* level 5: 8 bytes per command */
+#define ZPSE_LZ_ACCEL_BALANCED 12u /* historical: level 5, 8 bytes/command */
 #endif
 #ifndef ZPSE_LZ_ACCEL_L7
-#define ZPSE_LZ_ACCEL_L7 16u       /* levels 6-7: 6 bytes per command */
+#define ZPSE_LZ_ACCEL_L7 16u       /* historical: levels 6-7, 6 bytes/command */
 #endif
 #ifndef ZPSE_LZ_ACCEL_L8
-#define ZPSE_LZ_ACCEL_L8 20u       /* level 8: 4.8 bytes per command */
+#define ZPSE_LZ_ACCEL_L8 20u       /* historical: level 8, 4.8 bytes/command */
 #endif
 
 /* The sample margins, in sixteenths: the win on the sample a level will pay
- * a match-finder pass for is 16 / num. Smaller is looser, and the ladder
- * must never loosen upward (see the level table: a deeper level that
- * accepted less would write a larger block than the one above it). */
+ * a match-finder pass for is 16 / num. Smaller is looser. These per-level
+ * numbers are historical -- since raw LZ4 there is one fixed screen at every
+ * level (ZPSE_LZ4_SCREEN_NUM / ZPSE_LZ4_SCREEN_SAMPLES below). */
 #ifndef ZPSE_LZ_SCREEN_NUM_MAX
-#define ZPSE_LZ_SCREEN_NUM_MAX 17u /* 1.0625x, levels 8-9 */
+#define ZPSE_LZ_SCREEN_NUM_MAX 17u /* historical: 1.0625x, levels 8-9 */
 #endif
 #ifndef ZPSE_LZ_SCREEN_NUM_L7
-#define ZPSE_LZ_SCREEN_NUM_L7 18u      /* 1.125x, level 7 */
+#define ZPSE_LZ_SCREEN_NUM_L7 18u      /* historical: 1.125x, level 7 */
 #endif
 #ifndef ZPSE_LZ_SCREEN_NUM_L6
-#define ZPSE_LZ_SCREEN_NUM_L6 19u      /* 1.1875x, level 6 */
+#define ZPSE_LZ_SCREEN_NUM_L6 19u      /* historical: 1.1875x, level 6 */
 #endif
 #ifndef ZPSE_LZ_SCREEN_NUM_BALANCED
-#define ZPSE_LZ_SCREEN_NUM_BALANCED 20u /* 1.25x, level 5 */
+#define ZPSE_LZ_SCREEN_NUM_BALANCED 20u /* historical: 1.25x, level 5 */
 #endif
 
 /* The smallest win that pays for the LZ form's slower decode. A stream one
@@ -2585,11 +2585,13 @@ static void zpse_block_swap_cand(uint8_t tids[ZPSE_MAX_CAND],
  *               block's total, so the column is non-increasing down the
  *               ladder and the deeper row still chooses from a superset.
  *
- * Levels 1-4 write no LZ form, so their LZ columns are zero and unused.
- * The prescreen width (level 1 cheap, 2-9 full) and the every-plane pricing
- * (5-9) are not here: they are single thresholds shared by whole tiers of
- * the ladder, and they live in zpse_enc_speed's own comment in
- * include/zpse/constants.h. */
+ * Levels 1-4 write no LZ form, so their LZ columns are zero and unused. At
+ * levels 5-9 the LZ columns no longer differentiate levels either: one shared
+ * screen and one bill (the default row's accel), so only trials and tie_field
+ * vary by level. The prescreen width (level 1 cheap, 2-9 full) and the
+ * every-plane pricing (5-9) are not here: they are single thresholds shared
+ * by whole tiers of the ladder, and they live in zpse_enc_speed's own comment
+ * in include/zpse/constants.h. */
 typedef struct {
     uint8_t trials;
     uint8_t screen_num;
@@ -2674,24 +2676,26 @@ static const ZpseLevel zpse_level[10] = {
     { 3u, 0u, 0u, 0u, 0u },
     /* 4: four trials, still no match finder. */
     { (uint8_t)ZPSE_L4_TRIALS, 0u, 0u, 0u, 0u },
-    /* 5 BALANCED (default): every survivor, 1.25x screen, 8 B/command, and a
-     * guarded field cut to its best two on price. */
+    /* 5 BALANCED: every survivor, and a guarded field cut to its best two on
+     * price. The 1.25x screen and 8 B/command in the columns are historical;
+     * the LZ4 screen and bill are shared by every level. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_BALANCED, 2u,
       (uint8_t)ZPSE_LZ_ACCEL_BALANCED, 1u },
-    /* 6 (default): the screen loosened to 1.1875x and level 7's decode bill,
-     * 6 B/command. The bill is free on the encode side -- it only filters
-     * streams the pass has already produced, so it cannot make a block pay
-     * for a pass it would not have paid -- and on Silesia it is 0.64%
-     * smaller at the same encode rate (126,090,987 against 126,902,432
-     * bytes, 315 against 316 MB/s over six interleaved rounds). The default
-     * therefore takes it; the alternative was giving it up for nothing. */
+    /* 6 (default): the same trials and field cut as 5. The old 1.1875x screen
+     * and 6 B/command (0.64% smaller on Silesia at the time: 126,090,987
+     * against 126,902,432 bytes, 315 against 316 MB/s over six interleaved
+     * rounds) are historical -- the LZ4 screen and bill are shared. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L6, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7, 1u },
-    /* 7: the margin loosened to 1.125x, the decode bill unchanged. */
+    /* 7: the same trials and field cut as 5/6; the old 1.125x margin and
+     * unchanged bill are historical, since the LZ4 screen and bill are shared. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_L7, 2u, (uint8_t)ZPSE_LZ_ACCEL_L7, 1u },
-    /* 8: MAX's 1.0625x margin, two samples, 5 B/command. The deepest rungs
-     * keep every survivor the price could not separate. */
+    /* 8: every survivor, no tied-field cut. The old 1.0625x margin, two
+     * samples and 5 B/command are historical -- the LZ4 screen and bill are
+     * shared. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 2u, (uint8_t)ZPSE_LZ_ACCEL_L8, 0u },
-    /* 9 MAX: the head sample only, 4 B/command. */
+    /* 9 MAX: every survivor, no field cut; MAX adds Huffman (ZPSE_ENC_HUF).
+     * The old head-sample-only, 4 B/command numbers are historical: the LZ4
+     * screen and bill are shared by every level. */
     { 0u, (uint8_t)ZPSE_LZ_SCREEN_NUM_MAX, 1u,
       (uint8_t)ZPSE_LZ_ACCEL_MAX, 0u }
 };
@@ -2710,8 +2714,8 @@ static const ZpseLevel *zpse_level_row(uint32_t lvl)
  * stronger finder for a deeper level to buy. A level-dependent threshold
  * would therefore only let a deeper level ACCEPT a block a shallower one
  * refused, which makes the ladder invert instead of getting smaller. The
- * threshold is pinned to the balanced level's acceleration factor so the
- * LZ decision is the same at every level. */
+ * threshold is pinned to the default row's accel so the LZ decision is the
+ * same at every level. */
 #define ZPSE_LZ4_SCREEN_NUM 18u
 #define ZPSE_LZ4_SCREEN_SAMPLES 2u
 
@@ -2817,8 +2821,9 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  * Before the full pass, the same question is asked on the head of the
  * block: the match finder encodes ZPSE_LZ_SCREEN_BYTES of it, the shape the
  * sweep wants prices the same span with the probe's own machinery, and the
- * pass only goes ahead when the LZ form wins that sample by the level's
- * margin (ZPSE_LZ_SCREEN_*, in sixteenths). The screen is a lower bound on
+ * pass only goes ahead when the LZ form wins that sample by the shared
+ * screen (ZPSE_LZ4_SCREEN_NUM / ZPSE_LZ4_SCREEN_SAMPLES below; the per-level
+ * ZPSE_LZ_SCREEN_* margins are historical). The screen is a lower bound on
  * the win, so it can only cost a block the ratio a full pass would have
  * bought on a sample that lies -- and it is what makes the candidate
  * affordable outside MAX: a block with nothing to find never reaches the
@@ -2829,18 +2834,16 @@ static int zpse_block_lz_level(uint32_t speed, uint32_t ascii_gate)
  * MAX, zeros_burst's LZ form is taken at 12.23:1 with a 1 KiB sample, 11.55
  * with 2 KiB, 10.22 with 4 and 10.18 with 8, because a sample bigger than
  * the burst spacing describes the block no better while giving the tile side
- * a bigger span to win on. Prose's win on the sample lies between MAX's
- * margin (accepted) and the default level's (rejected), which is exactly
- * where a threshold should sit: the level that exists to buy ratio pays the
- * pass for it, the balanced level does not.
+ * a bigger span to win on. Historically prose's win on the sample lay between
+ * MAX's margin (accepted) and the default's (rejected), which is where the
+ * old per-level threshold sat; the LZ4 screen is now shared by every level.
  *
- * The margins differ per level because they are the encode side of the same
- * trade the acceleration factor makes on the decode side: the deeper the
- * level, the smaller the sample win it will pay a pass for. MAX's margin is
- * the smallest of the four (it is the level that exists to buy ratio) and it
- * must be, since a deeper level that accepted LESS than the one before it
- * would write a larger block than that level -- which is what
- * tests/suites/test_levels.c pins. */
+ * Those per-level margins are historical: they were the encode side of the
+ * same trade the acceleration factor made on the decode side -- a deeper
+ * level paid a pass for a smaller sample win, MAX's being the smallest of
+ * the four so the ladder could not invert (tests/suites/test_levels.c pins
+ * that). Levels 5-9 now share one LZ4 screen and one decode bill; only
+ * trials and tie_field differ down the ladder. */
 #ifndef ZPSE_LZ_SCREEN_BYTES
 /* 1 KiB, and a longer sample was tried and refused.
  *

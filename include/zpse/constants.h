@@ -148,10 +148,11 @@
 #define ZPSE_B_CRC              (UINT8_C(1) << 2)
 #define ZPSE_B_RESET            (UINT8_C(1) << 3)
 #define ZPSE_B_HAS_META         (UINT8_C(1) << 4)
-/* The block payload is the single raw-LZ4 block form (include/zpse/lz.h)
- * rather than transform + segments + tiles: [u32 uncompressed][u32 cmds]
- * followed by the raw LZ4 block. Mutually exclusive with ZPSE_B_RAW;
- * transform_id 0, segment_count 1, no transform metadata. */
+/* The block payload is a single raw-LZ4 block (include/zpse/lz.h), rather
+ * than transform + segments + tiles: [u32 uncompressed][u32 cmds] followed
+ * by the raw LZ4 block. Mutually exclusive with ZPSE_B_RAW; transform_id 0,
+ * segment_count 1, no transform metadata. This is the body-is-LZ4 form;
+ * ZPSE_B_LZ_TILE (bit 6) is the other one, which LZ4-compresses a tile body. */
 #define ZPSE_B_LZ               (UINT8_C(1) << 5)
 /* v2: LZ *and* tiles, in one block. The payload is
  *   [u32 body_len][intra-block LZ stream]
@@ -170,8 +171,8 @@
  * is
  *   [u8 table_id][u8 inner_form][u32 inner_len][u16 seg0][u16 seg1][u16 seg2]
  *   [four Huffman streams]
- * and `inner_form` is a fixed tag: it must be ZPSE_B_LZ (0x20), the only LZ
- * form left in the format. The tables are fixed in the format
+ * and `inner_form` is a fixed tag: it must be ZPSE_B_LZ (0x20), the raw-LZ4
+ * form selected by bit 5. The tables are fixed in the format
  * (src/huf_tables.inc), so a block costs 12 bytes of overhead and no table;
  * see include/zpse/huf.h.
  *
@@ -212,8 +213,14 @@
  * the shapes themselves are the same. What a level changes is how the sweep
  * decides which shape to write. The one exception is the intra-block LZ
  * form, which levels 5-9 may also pick: it decodes at the speed of its
- * command loop rather than the tile reconstruction, which is why the level
- * caps how many commands per output byte it will accept.
+ * command loop rather than the tile reconstruction, which is why one decode
+ * bill caps how many commands per output byte it will accept, the same at
+ * every level. Levels 5-9 also share one LZ4 screen (see
+ * ZPSE_LZ4_SCREEN_NUM in src/block.c); the per-level LZ margins and bills
+ * once listed in the ladder are historical, from before the raw-LZ4 codec.
+ * The bill is free on the encode side: it only filters streams the pass has
+ * already produced, so it can never make a block pay for a pass. Down the
+ * ladder only trials and tie_field vary.
  *
  *  1  ZPSE_ENC_SPEED_FASTEST  one trial per block: the probe's winner, on the
  *                              cheap prescreen that tries only the three
@@ -232,41 +239,30 @@
  *                              can order, where the best two are tried and
  *                              the rest dropped (see ZPSE_TIE_*, and the
  *                              tie_field column of the ladder). Also offer
- *                              the intra-block LZ form as one more candidate.
- *                              The match finder is a full pass at roughly a
+ *                              the intra-block LZ form as one more candidate:
+ *                              the match finder is a full pass at roughly a
  *                              quarter of the tile encoder's rate, so a sample
  *                              of the block is coded first and the pass is
- *                              paid for only when that sample shows the form
- *                              winning by 1.25x.
- *  6                          the LZ sample margin loosened to 1.1875x, and
- *                              the decode bill raised to an acceleration
- *                              factor of 16 (6 output bytes per command).
- *                              The bill is free on the encode side: it only
- *                              filters streams the pass has already produced,
- *                              so it can never make a block pay for a pass.
- *  7                          the margin loosened to 1.125x; the decode bill
- *                              unchanged from 6.
- *  8                          margin 1.0625x with an acceleration factor of
- *                              20 (4.8 bytes per command), and the field cut
- *                              back to a tied tail only: the deepest rungs
- *                              encode every survivor their price separated.
- *  9  ZPSE_ENC_SPEED_MAX      the same 1.0625x margin, one sample instead of
- *                              two (so more blocks pay for a pass), and an
- *                              acceleration factor of 24 (4 bytes per
- *                              command) -- the loosest decode bill any level
- *                              accepts
+ *                              paid for only when the shared screen shows the
+ *                              form winning.
+ *  6                          the same LZ screen and decode bill as 5
+ *  7                          the same LZ screen and decode bill as 5
+ *  8                          the same LZ screen and bill; the field cut is
+ *                              off: the deepest rungs encode every survivor
+ *                              their price separated
+ *  9  ZPSE_ENC_SPEED_MAX      the same LZ screen and decode bill as 5
  *
  * The ladder is a table in src/block.c (zpse_level): each level differs from
  * the one above it in at least one knob, and every knob moves in the
  * direction that can only add candidates to the choice, so a deeper level
  * cannot write a larger block than a shallower one (tests/suites/
- * test_levels.c pins that). The cheap rungs buy trials one at a time; the
- * deep rungs loosen the LZ screen one notch at a time. No level's LZ
- * candidate can cost it size -- the form is kept only when it is smaller than
- * the best tile stream -- and the trade it makes is decode speed: an LZ
- * stream decodes at the speed of its command loop, so the level's
- * acceleration factor (see ZPSE_LZ_ACCEL_*) decides how much slower than the
- * tile stream it is allowed to be.
+ * test_levels.c pins that). The cheap rungs buy trials one at a time; levels
+ * 5-9 all apply the same LZ4 screen and decode bill, not a notch looser per
+ * rung. No level's LZ candidate can cost it size -- the form is kept only when
+ * it is smaller than the best tile stream -- and the trade it makes is decode
+ * speed: an LZ stream decodes at the speed of its command loop, so the one
+ * global bill (see src/block.c) decides how much slower than the tile stream
+ * it is allowed to be.
  *
  * An unsupported level is rejected with ZPSE_BAD_ARG rather than rounded to
  * one of these. */
@@ -284,27 +280,29 @@
 #define ZPSE_ENC_SPEED_MAX      (UINT32_C(9) << ZPSE_ENC_SPEED_SHIFT)  /* level 9 */
 
 /* The level an options field with no level bits encodes at: the default is
- * level 6, one rung below BALANCED.
+ * level 6.
  *
- * BALANCED (5) was the default, and level 6 is a superset of its trade rather
- * than a step away from it: the screen margin goes from 1.25x to 1.1875x and
- * the decode bill from 8 to 6 bytes per command, and neither can refuse a
- * block BALANCED would have taken -- a stream the finder offers can only be
- * kept when it is smaller, and a bill that accepts shorter runs only admits
- * more of them. Measured over Silesia (202 MiB of real data, one pinned core,
- * `tests/benchmarks/silesia.sh`): 113,246,135 packed bytes at level 5 against
- * 106,140,388 at level 6, i.e. 6.3% smaller, for 6% of the encode rate (315
- * against 296 MB/s on the prose pair).
+ * Why 6 rather than BALANCED (5) or 7 is historical -- it was chosen for the
+ * old, pre-LZ4 ladder. Back then level 6 was a superset of level 5's trade
+ * rather than a step away from it: the screen margin went from 1.25x to
+ * 1.1875x and the decode bill from 8 to 6 bytes per command, and neither could
+ * refuse a block BALANCED would have taken -- a stream the finder offers can
+ * only be kept when it is smaller, and a bill that accepts shorter runs only
+ * admits more of them. Measured over Silesia (202 MiB of real data, one pinned
+ * core, `tests/benchmarks/silesia.sh`): 113,246,135 packed bytes at level 5
+ * against 106,140,388 at level 6, i.e. 6.3% smaller, for 6% of the encode rate
+ * (315 against 296 MB/s on the prose pair).
  *
- * The two knobs are not equal in cost, which is what the level table's row 6
- * is built from: raising the bill alone is free -- it only filters streams the
- * match-finder pass has already produced, so it cannot add a pass -- while
- * the margin costs one, because it offers the finder more blocks. So the
- * default takes the free knob and leaves the paid one to level 7.
+ * The two knobs were not equal in cost, which is what row 6 was built from:
+ * raising the bill alone was free -- it only filtered streams the match-finder
+ * pass had already produced, so it could not add a pass -- while the margin
+ * cost one, because it offered the finder more blocks. The default took the
+ * free knob and left the paid one to level 7; level 5 stayed as the cheapest
+ * rung for a caller who wanted its exact trade.
  *
- * What it costs is the ladder's cheapest rung below it: level 5 still exists
- * and still writes what it wrote, so a caller who wants that exact stream can
- * ask for it by number. */
+ * Those per-level margins and bills are historical now: levels 5-9 share one
+ * LZ4 screen and one decode bill, and only trials and tie_field vary by level
+ * (see ZPSE_LZ4_SCREEN_NUM in src/block.c). The default stays at 6. */
 #define ZPSE_ENC_SPEED_DEFAULT  (ZPSE_ENC_SPEED_L6 >> ZPSE_ENC_SPEED_SHIFT)
 
 /* Extract the level number (1-9) from the options field, normalising the
@@ -377,8 +375,7 @@ static inline uint32_t zpse_enc_speed(uint32_t enc_flags) {
 #define ZPSE_ENC_SPEED_CHEAP_PRESCREEN_MAX 1u
 /* Every level uses the ASCII gate, MAX included: it decides only what the
  * tile side of a convicted block costs, and the LZ candidate is offered
- * afterwards whatever it decided, so no level can lose its LZ trial to it.
- * (MAX used to opt out of it, for nothing; see src/block.c.) */
+ * afterwards whatever it decided, so no level can lose its LZ trial to it. */
 
 /* What a PRICE charges for a segment. The format writes eight bytes, and
  * that is what a price charges wherever the price decides: levels 1 to 4 rank

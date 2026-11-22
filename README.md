@@ -134,25 +134,26 @@ are the current figures; the stage breakdown was produced by a scratch tool
 that is not part of the suite and was not re-run for this change.
 
 That is the answer to "why is the whole path not 500 MB/s": on the text and
-executable files the block is one match-finder pass, and the finder runs at
-220-790 MB/s on them (measured standalone over whole 64 KiB blocks, best of
-three passes: `dickens` 219, `webster` 271, `mozilla` 309, `osdb` 326,
-`xml` 552, `nci` 787 MB/s). A pass at that rate cannot produce a block faster
-than that rate, and the rest of the pipeline cannot win back what the pass
-spends. The two files that are not finder-bound are bound by the trial loop
-instead -- `x-ray` (medical image) and `mr` spend 54% and 51% of a block in
-their one full shape trial. Raising the ceiling means either a faster finder
-or fewer finder passes, and fewer passes costs ratio: level 1 writes no LZ
-form at all and runs at 816 MB/s for 1.27:1, and `LZ_FAST` is one pass at
-2.19:1.
+executable files the block spends its time in the match search, and the rest
+of the pipeline cannot win back what those passes cost. Before LZ4 took over
+the search, the custom finder ran at 220-790 MB/s on those files (measured
+standalone over whole 64 KiB blocks, best of three passes: `dickens` 219,
+`webster` 271, `mozilla` 309, `osdb` 326, `xml` 552, `nci` 787 MB/s) -- a
+historical figure for the old finder, not the current path. The two files
+that were not finder-bound were bound by the trial loop instead -- `x-ray`
+(medical image) and `mr` spent 54% and 51% of a block in their one full shape
+trial. Raising the ceiling means a faster search or fewer passes, and fewer
+passes costs ratio: level 1 writes no LZ form at all and runs at 816 MB/s for
+1.27:1, and `LZ_FAST` is one pass at 2.19:1.
 
-The finder is one hash probe per position over a 2^15-entry table, with a
-one-byte lazy lookahead limited to short matches: the lookahead is a dependent
-chain of two loads, so past a dozen bytes it costs the same and buys nothing.
-The trial loop is the second ceiling. A full-size block's price window is a
-fifth of the block, so a block runs one full shape trial, and the survivors
-the sweep abandons after it are the ones the price could not separate by more
-than a sixteenth.
+That old finder was one hash probe per position over a 2^15-entry table, with
+a one-byte lazy lookahead limited to short matches: the lookahead is a
+dependent chain of two loads, so past a dozen bytes it cost the same and
+bought nothing. LZ4 now owns the match search in a single
+`LZ4_compress_default` call. The trial loop is the second ceiling. A
+full-size block's price window is a fifth of the block, so a block runs one
+full shape trial, and the survivors the sweep abandons after it are the ones
+the price could not separate by more than a sixteenth.
 
 The cross-tool comparison uses `tests/benchmarks/bench_pareto.sh`, which
 encodes one frame per tool with every output sent to `/dev/null`, round-trips
@@ -336,15 +337,19 @@ best of three):
 | 2 | 4.09:1 | 1472 | 13424 | full prescreen, two trials |
 | 3 `FASTER` | 4.09:1 | 1345 | 13619 | three trials |
 | 4 | 4.09:1 | 1304 | 12877 | four trials, still no match finder |
-| 5 `BALANCED` | 5.19:1 | 708 | 8427 | price every plane, guarded field cut, LZ at 1.25x |
-| 6 (default) | 5.24:1 | 719 | 8562 | margin 1.1875x, decode bill 6 bytes/command |
-| 7 | 5.24:1 | 739 | 7533 | margin 1.125x |
-| 8 | 5.25:1 | 716 | 8182 | margin 1.0625x, accel 20, tied-tail cut |
-| 9 `MAX` | 5.28:1 | 677 | 9128 | margin 1.0625x, one sample, accel 24, fast LZ candidate, Huffman over the LZ payload |
+| 5 `BALANCED` | 5.19:1 | 708 | 8427 | every plane priced, guarded tied-field cut, LZ form on |
+| 6 (default) | 5.24:1 | 719 | 8562 | same as 5 |
+| 7 | 5.24:1 | 739 | 7533 | same as 5 |
+| 8 | 5.25:1 | 716 | 8182 | tied-field cut off, all tied survivors kept |
+| 9 `MAX` | 5.28:1 | 677 | 9128 | same as 8 plus Huffman over the LZ payload |
 
-The jump from 4 to 5 is the match finder and the LZ form; the jump from 1 to 2
+The jump from 4 to 5 is the LZ4 search and the LZ form; the jump from 1 to 2
 is the full predictor prescreen. Levels 3-4 and 6-9 buy little on this corpus,
-because most cases have nothing the extra trial or margin can separate. The
+because most cases have nothing the extra trial can separate. The old LZ
+margin and acceleration rungs (1.25x down to 1.0625x, accel 12-24) no longer
+change a byte: LZ4 owns the search with one `LZ4_compress_default` call, so
+only the trial count, the tied-field cut and level 9's Huffman pass still
+vary down the ladder. The
 suite pins the ladder on its own sizes; on this 25-case corpus a few rows tie
 or differ by a handful of bytes rather than strictly shrinking, and four cases
 (`dict_u16le`, `rle_lens`, `uuid_mix`, `zeros_burst`) are a few bytes LARGER at
@@ -436,15 +441,19 @@ twelve bytes, with the value carried in the record.
 An all-ASCII block has a seven-bit form that packs eight
 characters into seven bytes.
 
-A block may instead be coded as **intra-block LZ**. It is a raw block from
-vendored **LZ4 1.10.0** (`src/vendor/lz4.c`, BSD-2, notice in
-`src/vendor/LICENSE.lz4`): `LZ4_compress_default` on the way in and
-`LZ4_decompress_safe` on the way out, with the block's uncompressed size as the
-only parameter the decoder needs. There is one LZ4 block form, named by
-`ZPSE_B_LZ` (bit 5); `ZPSE_ENC_LZ_FAST` (`-F`) is a live encoder option but does
-not name a second wire form. The old token, varint-distance, repeat-cache,
-hexadecimal and `lzfast` codecs are gone. An LZ block is kept only when it is
-smaller than everything already tried.
+A block may instead be coded as **intra-block LZ**, backed by vendored
+**LZ4 1.10.0** (`src/vendor/lz4.c`, BSD-2, notice in
+`src/vendor/LICENSE.lz4`). There are two live LZ wire forms. `ZPSE_B_LZ`
+(bit 5) is a raw LZ4 block: `LZ4_compress_default` on the way in and
+`LZ4_decompress_safe` on the way out, with the uncompressed size as the only
+parameter the decoder needs. `ZPSE_B_LZ_TILE` (bit 6) is an LZ4-compressed
+tile body: the decoder reads a 4-byte length, unpacks the LZ4 payload into its
+own buffer, then runs the ordinary tile path over the unpacked bytes. It is
+mutually exclusive with the raw form, and a v1 reader refuses its bit.
+`ZPSE_ENC_LZ_FAST` (`-F`) is a live encoder option but does not name a third
+wire form. The old token, varint-distance, repeat-cache, hexadecimal, `lzfast`
+and LZ2 codecs are gone. An LZ block is kept only when it is smaller than
+everything already tried.
 
 At the deepest level a block's LZ4 payload may be coded a second time, by
 **Huffman**: four fixed ten-bit tables compiled in from `src/huf_tables.inc`,
@@ -484,9 +493,13 @@ maximal runs of at least four values in 0..127.
 bytes come from a small dominant alphabet, wrapping a normal PSE1 frame; it is
 a library entry point with no CLI flag.
 
-None of these is a new block form: the ladder decoder never chooses them, and a
-caller opts in explicitly. The CLI's `-F7`/`-7` and `-R` arms time FLAT7 and
-REPACK against the block codec on the same input.
+These four are opt-in containers the ladder decoder never chooses: a caller
+asks for them explicitly. The CLI's `-F7`/`-7` and `-R` arms time FLAT7 and
+REPACK against the block codec on the same input. DPCM1 and MRD are two more
+whole-frame paths that need no flag: they auto-fire by default on gated 16-bit
+content at every level, and bits 17 and 18 are accepted as no-ops. None of the
+six is a new block form; each declines anything outside its gate back to the
+ordinary block codec.
 
 ## Building and testing
 
@@ -530,8 +543,8 @@ configuration is tested on Linux.
 
 The suite is `tests/runners/run.sh`: parity, fuzz, sizes, levels, LZ, ASCII,
 frames, the page dictionary, the Huffman form, the parallel encoder, hostile
-inputs, fill prediction, page forms, FLAT7, the column reference and corpus
-cases, and the ORDER segment-state decoder. The `parity` and `fuzz` suites are
+inputs, fill prediction, page forms, FLAT7, and the column reference and
+corpus cases. The `parity` and `fuzz` suites are
 each built in default, forced-scalar and trial-swap modes and must print the
 same digest in all three. The benchmarks are all under
 `tests/benchmarks/`:
@@ -603,14 +616,17 @@ to `bench`, `-R` adds an in-memory ZRPK arm to
 * **The default level trades decode speed for ratio.** A block the LZ form wins
   decodes at 1–4 GB/s instead of the tile path's 5–13 GB/s. If decode latency
   is the only metric, level 4 is the lever.
-* **The whole-frame paths are caller-driven.** Four paths sit outside the
-  ladder. FLAT7 (`F7P1`), REPACK (`ZRPK`), RLE1 (`RLE1`) and f64fast (`F64F`)
-  are self-delimiting containers with a magic and a narrow input gate; each
-  declines anything outside its gate back to the ordinary block codec. FLAT7
-  and REPACK have in-memory A/B arms in `bench` (`-F7`/`-7` and `-R`); RLE1 and
-  f64fast are library entry points with no CLI flag. None is a general-purpose
-  replacement for the ladder. REPACK is a ratio codec, not a speed path: its
-  decode is much slower than the ordinary block decoder.
+* **The whole-frame paths are mostly caller-driven.** Six paths sit outside
+  the ladder. FLAT7 (`F7P1`), REPACK (`ZRPK`), RLE1 (`RLE1`) and f64fast
+  (`F64F`) are opt-in self-delimiting containers with a magic and a narrow
+  input gate; each declines anything outside its gate back to the ordinary
+  block codec. FLAT7 and REPACK have in-memory A/B arms in `bench`
+  (`-F7`/`-7` and `-R`); RLE1 and f64fast are library entry points with no CLI
+  flag. DPCM1 and MRD are the other two: they are enabled at every level and
+  auto-fire on gated 16-bit content with no flag -- bits 17 and 18 are accepted
+  but ignored. None is a general-purpose replacement for the ladder. REPACK is
+  a ratio codec, not a speed path: its decode is much slower than the ordinary
+  block decoder.
 * **No column semantics.** The format does not know record boundaries or null
   meanings; the byte transpose recovers the split for fixed-width records by
   accident. A nullable column costs more than null suppression would.

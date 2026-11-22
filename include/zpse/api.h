@@ -36,12 +36,13 @@ int zpse_compress_block(const uint8_t *in, uint32_t n,
  * then verifies. The effort level trades compressed size for encode time:
  * The default is level 6 (ZPSE_ENC_SPEED_L6), levels 1-4 buy
  * trials one at a time and never run the match finder, and levels 5-9 also
- * offer the intra-block LZ form as one more candidate -- each rung above 5
- * screens it more loosely, and the deepest also accepts a slower decode,
- * which is what reaches prose. Levels run 1 = FASTEST ... 9 = MAX, and every
- * rung differs from its neighbour (see include/zpse/constants.h). No level changes the format: every level's stream is read by
- * the same decoder, and a block is only ever written in the form that came
- * out smallest. */
+ * offer the intra-block LZ4 form as one more candidate -- one screen and one
+ * decode bill shared by the whole tier, since LZ4 writes the same stream at
+ * every level. The deep rungs differ only in their sweep trial cap and
+ * tie_field cut, so adjacent rungs can tie. Levels run 1 = FASTEST ...
+ * 9 = MAX (see include/zpse/constants.h). No level changes the format:
+ * every level's stream is read by the same decoder, and a block is only
+ * ever written in the form that came out smallest. */
 int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
                            uint8_t *out, uint32_t out_cap,
                            uint32_t *out_len_out,

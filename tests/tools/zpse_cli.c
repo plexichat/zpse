@@ -2671,8 +2671,8 @@ static int cmd_bench(int argc, char **argv)
     }
     files = argc - i;
     if (files < 1) {
-        fprintf(stderr, "usage: zpse_cli bench [-l LEVEL] [-F7|-7|-R] [-F] [-P] "
-                        "[-D] [-T] [-H] [-c] [-b N] [-r N] [-t N] [-n N] "
+        fprintf(stderr, "usage: zpse_cli bench [-l LEVEL] [-F7|-7|-R] [-F] "
+                        "[-c] [-b N] [-r N] [-t N] [-n N] "
                         "[-x] [-q] FILE...\n"
                         "  -F7  add a FLAT7 arm beside the block arm on "
                         "eligible whole-ASCII input and print both rates,\n"

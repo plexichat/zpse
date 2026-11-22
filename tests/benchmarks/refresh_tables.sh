@@ -212,7 +212,7 @@ if "$CC" -std=c11 -O2 -DNDEBUG -I "$inc" \
     taskset -c 0 "$work/columnar" 1 1 all zpse 64 18 2>/dev/null |
         grep '| zpse default |' >"$work/max.txt"
     say "per-case LZ form (tile-only arm is level 4)"
-    echo "| case | \`ZPSE_ENC_SPEED_BALANCED\` | \`ZPSE_ENC_MAX\` | tile stream alone |"
+    echo "| case | \`ZPSE_ENC_SPEED_BALANCED\` | \`ZPSE_ENC_SPEED_MAX\` | tile stream alone |"
     echo "| --- | ---: | ---: | ---: |"
     cells() { # file -> case|ratio, one per line
         awk -F'|' '{
@@ -478,10 +478,7 @@ ZPSE_PROBE_PAGE_TILES=8|-DZPSE_PROBE_PAGE_TILES=8u
 ZPSE_PAGE_CAND_CAP=9|-DZPSE_PAGE_CAND_CAP=9u
 ZPSE_ASCII_PAGE_SAMPLE=512|-DZPSE_ASCII_PAGE_SAMPLE=512u
 ZPSE_ASCII_PAGE_SAMPLE=2048|-DZPSE_ASCII_PAGE_SAMPLE=2048u
-ZPSE_PAGE_NOISE_POINTS=0|-DZPSE_PAGE_NOISE_POINTS=0u
-ZPSE_PAGE_NOISE_POINTS=16|-DZPSE_PAGE_NOISE_POINTS=16u
 ZPSE_FLAT_TRIALS=3|-DZPSE_FLAT_TRIALS=3
-ZPSE_LZ_LAZY_LEN=2|-DZPSE_LZ_LAZY_LEN=2u
 ARMS
 else
     missing "probe corpus (corpus_write --probe)"

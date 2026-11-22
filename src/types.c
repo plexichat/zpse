@@ -9,6 +9,18 @@ static int zpse_is_valid_segment_count(uint8_t c)
     return c == 1 || c == 2 || c == 4 || c == 8 || c == 16;
 }
 
+/* RAW, LZ, LZ_TILE and HUF are four spellings of one block form. HUF is bit 7
+ * alone -- the wrapped LZ form lives in the payload's inner_form -- so a
+ * header naming two forms describes no payload this decoder can read. The
+ * reserved-flag mask is empty, so this is the mutual-exclusion check it used
+ * to stand in for. Zero form bits is legal: it selects the coded/tile form. */
+static int zpse_block_form_valid(uint8_t flags)
+{
+    uint8_t forms = (uint8_t)(flags & (ZPSE_B_RAW | ZPSE_B_LZ |
+                                       ZPSE_B_LZ_TILE | ZPSE_B_HUF));
+    return forms == 0u || (forms & (uint8_t)(forms - 1u)) == 0u;
+}
+
 uint32_t zpse_block_header_size(const uint8_t *buf, uint32_t len)
 {
     uint16_t sync;
@@ -70,6 +82,9 @@ static int zpse_block_header_parse_short(ZpseBlockHeader *out,
     }
     if ((flags & ZPSE_B_RESERVED_MASK) != 0u) {
         return ZPSE_UNSUPPORTED_FEATURE;
+    }
+    if (!zpse_block_form_valid(flags)) {
+        return ZPSE_BAD_HEADER;
     }
     if (uncomp < (uint32_t)ZPSE_MIN_BLOCK_SIZE ||
         uncomp > (uint32_t)ZPSE_BLOCK_SHORT_MAX) {
@@ -428,6 +443,9 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     }
     if ((flags & ZPSE_B_RESERVED_MASK) != 0) {
         return ZPSE_UNSUPPORTED_FEATURE;
+    }
+    if (!zpse_block_form_valid(flags)) {
+        return ZPSE_BAD_HEADER;
     }
 
     out->sync = sync;

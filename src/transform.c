@@ -21,12 +21,12 @@
 
 /* ------------------------------------------------------------------ *
  * SSE2 fast paths for the transform widths. For a block of 16 bytes or
- * more `zpse_block_encode` only ever forwards transform ids 0 (RAW_BYTES),
- * 6 (TRANSPOSE_16) and 1 (DELTA8), so the width `w` is 1 or 16 there; the
- * narrow widths (2, 4 and 8 -- the plain and delta transposes) are decoded
- * from streams other encoders produce, and they are the slowest shapes in
- * the format, so they get the same treatment: a parity split, or its
- * inverse merge, in place of one strided byte per load and per store.
+ * more `zpse_block_encode` forwards ten candidates: ids 0 (RAW_BYTES) and
+ * 1 (DELTA8) at width 1, plus the plain transposes 3-6 and the delta
+ * transposes 7-10 at widths 2, 4, 8 and 16. So every width in the format
+ * reaches these paths, including the narrow ones, which are the slowest
+ * shapes and get the same treatment: a parity split, or its inverse merge,
+ * in place of one strided byte per load and per store.
  * Every path below is byte-for-byte the scalar loops' output, which stay
  * the normative reference.
  *

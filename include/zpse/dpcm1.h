@@ -15,9 +15,10 @@
  * REGISTERED IN THE UNITY BUILD: src/dpcm1.c is included by
  * src/zpse_unity.c and built as part of the library.
  *
- * OPT-IN: nothing is emitted unless the caller sets ZPSE_ENC_DPCM1 (bit 17)
- * on zpse_compress_frame_ex. There is no runtime toggle. The content gate
- * accepts only data that looks like the measured x-ray: at least 90% of
+ * ENABLED BY DEFAULT: the whole-frame attempt runs at every level under its
+ * own content gate; ZPSE_ENC_DPCM1 (bit 17) is accepted but ignored, so
+ * passing it changes no byte. The gate accepts only data that looks like the
+ * measured x-ray: at least 90% of
  * sampled deltas fit int8 AND the mean sampled |delta| is at least 18 (smooth
  * data such as Silesia "mr" is already cheaper under PSE1 and must fall
  * through to the normal encoder).
@@ -48,7 +49,7 @@ extern "C" {
  *   16      p     the raw prefix, copied byte for byte from input[0..p)
  *   16+p    ns-1  signed int8 delta for samples 1..ns-1 after the prefix;
  *                 an escaped delta has a zero placeholder here
- *   16+p+n-1  6*ne escape table, sorted by strictly increasing position:
+ *   16+p+(ns-1)  6*ne escape table, sorted by strictly increasing position:
  *                 (delta index u32 LE, true delta i16 LE)
  *
  * ns = n/2 - prefix_len/2 is the sample count from the prefix onward, so the

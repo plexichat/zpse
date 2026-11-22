@@ -45,12 +45,6 @@
 #include "zpse/flat7.h"
 #include "zpse/text.h"
 
-/* Retired page encoder flags (ZPSE_ENC_*). The page path no longer selects a
- * form by flag: every level picks the same page form for the same bytes, so
- * the old page-form flags are gone. ZPSE_ENC_PAGE_FAST, ZPSE_ENC_PAGE_TURBO,
- * ZPSE_ENC_PAGE_HUF and ZPSE_ENC_PAGE_INSTANT are no longer defined, and the
- * API refuses them rather than treating them as no-ops. ZPSE_ENC_HUF remains
- * the one flag that wraps an LZ payload in Huffman streams at any level.
- */
+/* Retired page-form bits are rejected by the API rather than treated as no-ops. */
 
 #endif /* ZPSE_H */

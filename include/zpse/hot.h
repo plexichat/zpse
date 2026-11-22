@@ -6,21 +6,20 @@
  * Every build of this tree is -O2 -- the CI matrix, tests/runners/run.sh and
  * the release CLI all say so -- and the hot paths were tuned at that level.
  * This tag asks gcc for the -O3 passes on one function inside that -O2
- * build: on the 18 functions it marks it is worth a measured 1.053x of
+ * build: on the 17 functions it marks it is worth a measured 1.053x of
  * encode throughput on tests/benchmarks/bench_levels.c over the 25-case
  * corpus (three rotated rounds at 20 iterations x 3 repetitions per case,
  * against the same tree built with the macro empty), for a slightly
  * larger
  * binary, with every size in that corpus unchanged.  It is not a
  * substitute for building the amalgamation at -O3 -- +7% on the tree that
- * took that number, 0.99 on the current one (see README.md) -- and it
+ * took that number, 0.99 on the current one -- and it
  * cannot be: gcc runs its inliner and its interprocedural passes at the
  * compilation's own level, so a per-function
  * tag only reaches that function's passes, not the cross-function
  * decisions where a unity build spends its -O3 budget (the object file's
  * text grows 229 KB -> 245 KB under these tags, against 244 KB -> 344 KB
- * for -O3 on the whole translation unit).  See "Building and testing" in
- * README.md for the table.
+ * for -O3 on the whole translation unit).
  *
  * The tag is gcc-only, so it is guarded, and neither guard is incidental:
  *
@@ -40,12 +39,12 @@
  * middle of a hot call chain *costs* -- tagging zpse_transform_inverse
  * alone measured -7% encode while its callees were plain -O2 code, and
  * on this tree it is a wash: 1.000 against the untagged build, with the
- * transform module's five functions at 0.996 and the module plus the two
+ * transform module's six functions at 0.996 and the module plus the two
  * tile writers at 1.014.  One tagged function does not carry the set.  The tags below are a set that was measured together; adding one
  * to a function whose callees are untagged reproduces that mistake.  The
  * set is therefore leaves and functions that call only other tagged code;
  * the functions that are called from the middle of a chain (tile_classify,
- * zpse_segment_encode, seg_scan_best, zpse_mask_encode) are left untagged
+ * zpse_segment_encode, seg_scan_two, zpse_mask_encode) are left untagged
  * on that rule, and measuring them confirms it costs rather than gains.
  *
  * It also cannot be combined with a target attribute: gcc re-applies the

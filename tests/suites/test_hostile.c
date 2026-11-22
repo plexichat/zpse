@@ -1414,13 +1414,13 @@ int main(void) {
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc < 0, "LZ flag on a tile payload rejected");
 
-    /* The entropy-coded form (flag pattern 110) on a stream that is not one.
+    /* The entropy-coded form (bit 7 alone) on a stream that is not one.
      * Its envelope is the LZ forms' own, so a tile payload carrying the flag
      * is refused by the transform check before the entropy decoder sees a
      * byte of it -- and the decoder's own header is what has to agree with
      * the payload length, not the other way round. */
     memcpy(work, comp, clen);
-    work[hostile_short(work, clen) ? 2u : 3u] |= 0xC0;
+    work[hostile_short(work, clen) ? 2u : 3u] |= 0x80;
     hostile_fix_crc(work, clen);
     rc = zpse_decompress_block(work, clen, out, sizeof out, &olen, dec_arena);
     CHECK(rc < 0, "Huffman flag on a tile payload rejected");

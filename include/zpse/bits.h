@@ -53,8 +53,9 @@ static inline uint32_t zpse_min_u32(uint32_t a, uint32_t b) {
     return a < b ? a : b;
 }
 
-/* The same for a 64-bit word, which is the width the match finder compares
- * in: the lowest set bit of an xor is the first byte that differs. */
+/* The same for a 64-bit word: the lowest set bit of an xor is the first byte
+ * that differs. The match-finder use that motivated it is historical -- LZ4
+ * owns the search now and zpse_ctz64 is unused. */
 static inline uint32_t zpse_ctz64(uint64_t w) {
 #if defined(__GNUC__) || defined(__clang__)
     return (uint32_t)__builtin_ctzll(w);

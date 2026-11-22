@@ -43,7 +43,7 @@ typedef struct ZpseBlockHeader {
 
 typedef struct ZpseSegmentDirEntry {
     uint32_t payload_offset; /* relative to payloads area start */
-    uint32_t payload_size;   /* incl. 16-B segment header */
+    uint32_t payload_size;   /* incl. 8-B segment header */
 } ZpseSegmentDirEntry;
 
 typedef struct ZpseSegmentHeader {

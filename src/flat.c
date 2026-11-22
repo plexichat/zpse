@@ -169,7 +169,7 @@ static ZPSE_FLAT_AVX2_TARGET void flat_sublane_avx2(const uint8_t *sub,
                 uint32_t base_g = (at + 16u * h) / period;
 
                 /* One slice's sub bytes are contiguous in sub[]: all
-                 * groups16 groups of k bytes, from sub[base_g*k] onward,
+                 * of them, in groups of k bytes from sub[base_g*k] onward,
                  * for subn <= 16 bytes total. One copy replaces up to 16
                  * indexed byte stores. A paired A/B (12,226 sublane
                  * payloads, pinned core, clang AVX2) measured +34..37%

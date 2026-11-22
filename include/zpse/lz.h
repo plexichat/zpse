@@ -19,20 +19,13 @@
 
 #define ZPSE_LZ_MIN_MATCH       4u
 #define ZPSE_LZ_MAX_MATCH       259u   /* 4 + 255 */
-#define ZPSE_LZ_MAX_LITERALS    255u
-/* Finder, hash-table, lazy-step and token-budget constants are retained for
- * the block layer's screens, arena sizing and level ladder; src/lz4block.c
- * ignores them because LZ4 owns the match search and needs no caller-supplied
- * table. */
+/* LZ4 owns the match search and needs no caller-supplied table. Only the
+ * match/literal bounds used by the block-layer screens stay live here; the
+ * old table, hash-width and lazy-step constants are legacy and unused. The
+ * two hash-bit values below remain only as inert arguments at the old LZ
+ * pass call sites (src/block.c). */
 #define ZPSE_LZ_HASH_BITS       13u
-#define ZPSE_LZ_HASH_BITS_FAST 11u
-#define ZPSE_LZ_TABLE_ENTRIES   (1u << ZPSE_LZ_HASH_BITS)
-#define ZPSE_LZ_TABLE_BYTES     (ZPSE_LZ_TABLE_ENTRIES * 2u)
 #define ZPSE_LZ_HASH_BITS_WIDE  14u
-
-#ifndef ZPSE_LZ_FAST4K
-#define ZPSE_LZ_FAST4K 1
-#endif
 
 #define ZPSE_LZ_MIN_CMD         2u
 
@@ -68,8 +61,8 @@ int zpse_lz4_decode(const uint8_t *in, uint32_t in_len, uint8_t *out,
  * real value back before the stream is committed. */
 uint32_t zpse_lz_cmd_count(const uint8_t *payload, uint32_t len);
 
-/* Old call names, kept so the block layer can be updated in place; the later
- * cleanup may drop these macros and use the zpse_lz4_* names directly. */
+/* Permanent compatibility aliases for the pre-LZ4 call names. They are the
+ * stable spelling used by the block layer and by external callers. */
 #define zpse_lz_encode       zpse_lz4_encode
 #define zpse_lz_encode_sample zpse_lz4_encode_sample
 #define zpse_lz_decode       zpse_lz4_decode

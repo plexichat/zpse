@@ -67,12 +67,12 @@
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
 #define ZPSE_E_SZ_SHUF      0x01000u
-/* The intra-block LZ match finder's direct-mapped table, sized for the
- * widest pass that uses this region: 16,384 16-bit block positions, i.e.
- * a 2^14 table (ZPSE_LZ_HASH_BITS_WIDE). The screens and the page passes
- * still use the first 2^13 entries; only the 4-16 KiB lazy pass indexes
- * the whole region. Only the effort levels that write an LZ form touch
- * it, so it is the encoder arena that pays for it and the decoder never
+/* 32 KiB of spare staging for the LZ4 pass. LZ4 owns its own match search
+ * and ignores any caller-supplied table, so the old "2^14 direct-mapped
+ * match-finder table" description is historical: this is just a scratch
+ * region the pass borrows below 16 KiB (above that it borrows the 64 KiB
+ * trials' tstage instead). Only the effort levels that write an LZ form
+ * touch it, so only the encoder arena pays for it; the decoder never
  * carries it. */
 #define ZPSE_E_SZ_LZ        0x08000u
 
@@ -102,7 +102,7 @@ typedef struct ZpseEncoder {
     uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
-    uint8_t *lz;          /* 32 KiB LZ match-finder table (2^14 max) */
+    uint8_t *lz;          /* 32 KiB LZ scratch/staging (legacy table name) */
     /* Which optional fields this encoder emits (ZPSE_ENC_* in
      * constants.h). The one-shot API leaves it 0, i.e. no payload
      * checksum; zpse_compress_block_ex / zpse_compress_frame_ex set it
@@ -142,7 +142,7 @@ typedef struct ZpseEncoder {
     /* Consecutive blocks whose winner was the same tile shape as the block
      * before them: the run length of the homogeneous stretch the order-n
      * predictor is extrapolating. Reset by any block the history cannot
-     * describe (RAW, either LZ form) and by any change of shape. Saturates
+     * describe (RAW, any LZ form) and by any change of shape. Saturates
      * rather than wrapping. See the history-confident stop in
      * src/block.c. */
     uint8_t hist_streak;

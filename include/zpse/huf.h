@@ -8,10 +8,10 @@
  * ---------------------------------------------------------------------------
  * Why a Huffman form at all
  * ---------------------------------------------------------------------------
- * The LZ forms leave the last few percent of every block on the table. A
- * token stream is bytes: a match-length nibble of 0 and a literal nibble of
- * 3 are the same eight bits to a reader, and on prose the distribution of
- * those bytes is nothing like flat. Huffman coding the payload is the oldest
+ * The LZ forms leave the last few percent of every block on the table. The
+ * payload is LZ4, whose token bytes pack a literal length and a match length
+ * into each byte; on prose those lengths cluster, so the distribution of
+ * token bytes is nothing like flat. Huffman coding the payload is the oldest
  * answer to that, it costs one pass on each side, and it composes with any LZ
  * form because it wraps the stream rather than replacing it.
  *
