@@ -1241,6 +1241,13 @@ _next_match:
                 LZ4_putIndexOnHash(idx, h, cctx->hashTable, tableType);
         }   }
 
+        /* Prepare the next loop's hash here, ahead of the candidate lookup/compare
+         * below, so the dependent hash -> table-load -> candidate-load chain can
+         * overlap with that work. Byte-identical: this is exactly the value the
+         * original computed as LZ4_hashPosition(++ip) at the end of the loop;
+         * ip is not changed between here and the `ip++` down there. */
+        forwardH = LZ4_hashPosition(ip + 1, tableType);
+
         /* Test next position */
         if (tableType == byPtr) {
 
@@ -1294,8 +1301,8 @@ _next_match:
             }
         }
 
-        /* Prepare next loop */
-        forwardH = LZ4_hashPosition(++ip, tableType);
+        /* Prepare next loop : advance ip (forwardH was computed above) */
+        ip++;
 
     }
 
