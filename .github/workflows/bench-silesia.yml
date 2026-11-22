@@ -32,8 +32,8 @@ jobs:
       # twelve Silesia files at the default block size, no index or checksum,
       # one thread. The default row is ZPSE_ENC_SPEED_DEFAULT (level 6) and
       # MAX is -l 9; reps change timing only, never the packed size.
-      BASELINE_DEFAULT: 99836213
-      BASELINE_MAX: 96606926
+      BASELINE_DEFAULT: 99099878
+      BASELINE_MAX: 95891647
     steps:
       - uses: actions/checkout@v5
 

@@ -60,8 +60,19 @@ extern "C" {
  * A smaller `out_cap` is not an error: the call falls back to the serial
  * encoder, which writes the same bytes in less room.
  *
+ * Before any worker is started, an unindexed frame without CHECKSUM is offered
+ * to the same whole-frame ladder as zpse_compress_frame_ex(): the opt-in
+ * REPACK / RLEFAST / F64FAST forms (encoder flag bits 14-16) and the default,
+ * content-gated DPCM1 / MRD forms (bits 17-18, accepted but ignored). The first
+ * commit writes one indivisible frame, unaffected by `threads` or by the block
+ * size; if none commits, the block path below writes PSE1 as before. The
+ * attempt is made on the calling thread so the bytes are identical at one
+ * worker and at N. Bad option bits are refused with ZPSE_BAD_ARG, as in the
+ * serial encode.
+ *
  * `with_index` appends the FrameIndex, exactly as
- * zpse_compress_frame_indexed() does. Returns ZPSE_OK and sets
+ * zpse_compress_frame_indexed() does; an indexed request skips the whole-frame
+ * ladder, because those forms have no block index. Returns ZPSE_OK and sets
  * *out_len_out, or a negative status. */
 int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
                                  uint8_t *out, size_t out_cap,

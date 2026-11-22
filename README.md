@@ -68,9 +68,9 @@ and the lz4 *CLI* are not the same encoder.
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.12:1 | 506 | 3291 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.14:1 | 506 | 3291 |
 | | zpse 1 `FASTEST` | 1.27:1 | 991 | 3382 |
-| | zpse 9 `MAX` | 2.19:1 | 429 | 2454 |
+| | zpse 9 `MAX` | 2.21:1 | 429 | 2454 |
 | 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.24:1 | 719 | 8562 |
 | | zpse 1 `FASTEST` | 4.02:1 | 1716 | 14528 |
 | | zpse 9 `MAX` | 5.28:1 | 677 | 9128 |
@@ -108,7 +108,7 @@ pinned core, output written normally. These rows were regenerated with
 | --- | ---: | ---: | ---: | ---: |
 | `dickens` | 10,192,446 | 1.35:1 | 568 | 4046 |
 | `mozilla` | 51,220,480 | 1.92:1 | 494 | 3154 |
-| `mr` | 9,970,564 | 2.49:1 | 429 | 1360 |
+| `mr` | 9,970,564 | 2.60:1 | 429 | 1360 |
 | `nci` | 33,553,445 | 5.21:1 | 702 | 4632 |
 | `ooffice` | 6,152,192 | 1.47:1 | 406 | 3179 |
 | `osdb` | 10,085,684 | 1.90:1 | 502 | 4527 |
@@ -116,9 +116,9 @@ pinned core, output written normally. These rows were regenerated with
 | `samba` | 21,606,400 | 2.54:1 | 560 | 3772 |
 | `sao` | 7,251,944 | 1.09:1 | 471 | 4119 |
 | `webster` | 41,458,703 | 2.01:1 | 416 | 3343 |
-| `x-ray` | 8,474,240 | 1.71:1 | 587 | 2801 |
+| `x-ray` | 8,474,240 | 1.93:1 | 587 | 2801 |
 | `xml` | 5,345,280 | 3.91:1 | 714 | 4016 |
-| **total** | **211,938,580** | **2.12:1** | **506** | **3291** |
+| **total** | **211,938,580** | **2.14:1** | **506** | **3291** |
 
 Half of Silesia is English prose, the shape the tile model is weakest on.
 `sao` and `osdb` are close to the raw path doing a copy; `nci`, `samba` and

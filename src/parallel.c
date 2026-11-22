@@ -29,6 +29,49 @@
 #include "zpse/status.h"
 #include "zpse/types.h"
 
+#include "wf_internal.h"
+
+/* The private whole-frame option bits, mirroring the definitions in src/api.c
+ * (which are #ifndef-guarded for the same reason these are: the unity build
+ * includes both translation units). A parallel caller gets the same accepted
+ * flag set and the same whole-frame ladder as a serial one. */
+#ifndef ZPSE_ENC_REPACK
+#define ZPSE_ENC_REPACK (UINT32_C(1) << 14)
+#endif
+#ifndef ZPSE_ENC_RLEFAST
+#define ZPSE_ENC_RLEFAST (UINT32_C(1) << 15)
+#endif
+#ifndef ZPSE_ENC_F64FAST
+#define ZPSE_ENC_F64FAST (UINT32_C(1) << 16)
+#endif
+#ifndef ZPSE_ENC_DPCM1
+#define ZPSE_ENC_DPCM1 (UINT32_C(1) << 17)
+#endif
+#ifndef ZPSE_ENC_MRD
+#define ZPSE_ENC_MRD (UINT32_C(1) << 18)
+#endif
+
+/* Same options check as enc_flags_ok in src/api.c: whole-frame flags are
+ * accepted, junk bits and out-of-range levels are not. Without this a bad flag
+ * could decline the whole-frame ladder here and still be refused by the serial
+ * entry point, so the two calls would disagree about the same options. */
+static int mt_enc_flags_ok(uint32_t enc_flags)
+{
+    uint32_t lvl;
+
+    if ((enc_flags &
+         ~(uint32_t)(ZPSE_ENC_CHECKSUM | ZPSE_ENC_SPEED_MASK |
+                     ZPSE_ENC_LZ_FAST | ZPSE_ENC_HUF |
+                     ZPSE_ENC_REPACK | ZPSE_ENC_RLEFAST |
+                     ZPSE_ENC_F64FAST | ZPSE_ENC_DPCM1 |
+                     ZPSE_ENC_MRD)) != 0u) {
+        return 0;
+    }
+    lvl = (uint32_t)((enc_flags & ZPSE_ENC_SPEED_MASK) >>
+                     ZPSE_ENC_SPEED_SHIFT);
+    return lvl <= 9u;
+}
+
 #if defined(ZPSE_MT)
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -1226,7 +1269,21 @@ int zpse_compress_frame_parallel(const uint8_t *in, size_t n,
     if (arena_count == 0u) {
         return ZPSE_BAD_ARG;
     }
+    if (!mt_enc_flags_ok(enc_flags)) {
+        return ZPSE_BAD_ARG;
+    }
     *out_len_out = 0;
+    /* The whole-frame forms are indivisible and carry no block index, so only
+     * a plain frame request can use them. Try them here, on the calling thread
+     * and before any worker or output-layout calculation: a commit leaves a
+     * complete frame in `out`, and declining leaves it untouched for the block
+     * encoder below. Doing this in zpse_mt_serial instead would still let the
+     * workers emit PSE1 above it and break byte equality with one call and N
+     * calls. */
+    if (with_index == 0 &&
+        zpse_whole_frame_try(in, n, out, out_cap, out_len_out, enc_flags)) {
+        return ZPSE_OK;
+    }
     nblocks = n / (size_t)nominal_block_size +
               ((n % (size_t)nominal_block_size) != 0u ? 1u : 0u);
     if (nblocks == 0u || nblocks > (size_t)UINT32_MAX) {

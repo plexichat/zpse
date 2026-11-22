@@ -13,6 +13,8 @@
 #include "zpse/rlefast.h"
 #include "zpse/status.h"
 
+#include "wf_internal.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,11 +27,12 @@
  *
  * Bits 14-16 (REPACK / RLEFAST / F64FAST) are still pure opt-ins: no bit means
  * no attempt. Bits 17-18 (DPCM1 / MRD) are DEPRECATED NO-OPs: the two 16-bit
- * codecs are content-gated and run by default on every call to
- * zpse_compress_frame_ex without CHECKSUM, so passing either bit produces the
- * same bytes as passing none. The bits remain accepted so an older caller
- * still compiles and round-trips. All five are stripped before the block
- * encoder sees them, and only zpse_compress_frame_ex acts on them. */
+ * codecs are content-gated and run by default on every whole-frame attempt
+ * without CHECKSUM, so passing either bit produces the same bytes as passing
+ * none. The bits remain accepted so an older caller still compiles and
+ * round-trips. All five are stripped before the block encoder sees them.
+ * zpse_whole_frame_try() below is the single place that acts on them; both
+ * zpse_compress_frame_ex and the parallel frame encode call it. */
 #ifndef ZPSE_ENC_REPACK
 #define ZPSE_ENC_REPACK (UINT32_C(1) << 14)
 #endif
@@ -200,7 +203,8 @@ const char *zpse_version_string(void)
  * default level). The five frame-level flags (ZPSE_ENC_REPACK /
  * ZPSE_ENC_RLEFAST / ZPSE_ENC_F64FAST / ZPSE_ENC_DPCM1 / ZPSE_ENC_MRD, bits
  * 14-18) are all accepted here so a caller may pass them without a BAD_ARG.
- * Only zpse_compress_frame_ex acts on them:
+ * The parallel frame entry point accepts the same set and applies the same
+ * whole-frame ladder:
  * bits 14-16 are genuine opt-ins; bits 17-18 are deprecated no-ops because
  * those codecs now run by default. Anything else is a bad argument rather than
  * a silent round to a neighbour:
@@ -304,27 +308,14 @@ int zpse_compress_frame(const uint8_t *in, size_t n,
                                   nominal_block_size, 0u, enc_arena);
 }
 
-int zpse_compress_frame_ex(const uint8_t *in, size_t n,
-                           uint8_t *out, size_t out_cap,
-                           size_t *out_len_out,
-                           uint32_t nominal_block_size, uint32_t enc_flags,
-                           void *enc_arena)
+/* The whole-frame ladder, shared by the serial and parallel frame encodes.
+ * Returns 1 on a commit (with *out_len_out set) and 0 on a decline, leaving
+ * both `out` and *out_len_out untouched. The caller owns argument validation,
+ * so neither the pointer checks nor the flag check are repeated here. */
+int zpse_whole_frame_try(const uint8_t *in, size_t n, uint8_t *out,
+                         size_t out_cap, size_t *out_len_out,
+                         uint32_t enc_flags)
 {
-    ZpseEncoder enc;
-    int rc;
-
-    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena == 0) {
-        return ZPSE_BAD_ARG;
-    }
-    if (n == 0) {
-        return ZPSE_BAD_ARG;
-    }
-    if (nominal_block_size == 0 || nominal_block_size > 65536u) {
-        return ZPSE_BAD_ARG;
-    }
-    if (!enc_flags_ok(enc_flags)) {
-        return ZPSE_BAD_ARG;
-    }
     /* Opt-in whole-frame forms: only bits 14-16 still control an attempt.
      * With none of them set this block is skipped entirely. A checksum cannot
      * be carried by a whole-frame stream, so those requests fall through to
@@ -354,7 +345,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
         if (repack_on && (!use_gate || ascii_ok) &&
             zpse_repack_encode(in, n, out, out_cap, &repack_len) == 1) {
             *out_len_out = repack_len;
-            return ZPSE_OK;
+            return 1;
         }
         if (rle_on && (!use_gate || rle_ok) &&
             n <= (size_t)UINT32_MAX) {
@@ -365,7 +356,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
             if (zpse_rlefast_encode(in, (uint32_t)n, out, cap32,
                                     &rle_len) == 1) {
                 *out_len_out = (size_t)rle_len;
-                return ZPSE_OK;
+                return 1;
             }
         }
         /* Evaluate the lane probe last and only if this codec can still be
@@ -379,7 +370,7 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
             if (zpse_f64fast_encode(in, (uint32_t)n, out, cap32,
                                     &f64_len) == ZPSE_F64FAST_COMMIT) {
                 *out_len_out = (size_t)f64_len;
-                return ZPSE_OK;
+                return 1;
             }
         }
     }
@@ -402,13 +393,40 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
         if (zpse_dpcm1_encode(in, (uint32_t)n, out, cap32, &wf_len) ==
             ZPSE_DPCM1_COMMIT) {
             *out_len_out = (size_t)wf_len;
-            return ZPSE_OK;
+            return 1;
         }
         if (zpse_mrd_encode(in, (uint32_t)n, out, cap32, &wf_len) ==
             ZPSE_MRD_COMMIT) {
             *out_len_out = (size_t)wf_len;
-            return ZPSE_OK;
+            return 1;
         }
+    }
+    return 0;
+}
+
+int zpse_compress_frame_ex(const uint8_t *in, size_t n,
+                           uint8_t *out, size_t out_cap,
+                           size_t *out_len_out,
+                           uint32_t nominal_block_size, uint32_t enc_flags,
+                           void *enc_arena)
+{
+    ZpseEncoder enc;
+    int rc;
+
+    if (in == 0 || out == 0 || out_len_out == 0 || enc_arena == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (n == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (nominal_block_size == 0 || nominal_block_size > 65536u) {
+        return ZPSE_BAD_ARG;
+    }
+    if (!enc_flags_ok(enc_flags)) {
+        return ZPSE_BAD_ARG;
+    }
+    if (zpse_whole_frame_try(in, n, out, out_cap, out_len_out, enc_flags)) {
+        return ZPSE_OK;
     }
     rc = zpse_encoder_init(&enc, enc_arena, (size_t)ZPSE_ENC_ARENA_SIZE);
     if (rc != ZPSE_OK) {
