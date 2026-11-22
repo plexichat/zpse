@@ -367,10 +367,27 @@ int zpse_mrd_decode(const uint8_t *in, uint32_t in_len,
 
         /* A stretch of literal delta bytes; vectorise in 8-lane blocks. */
         {
-            uint32_t avail = 0u;
-            while (cp + avail < cend && avail < 8u &&
-                   cp[avail] != (uint8_t)MRD_MARKER) {
-                ++avail;
+            uint32_t avail;
+#ifdef MRD_SIMD
+            /* Find the first RLE marker in one 8-byte gather. A byte equal to
+             * 0x80 sets its movemask bit; ctz of that mask is the number of
+             * leading literal bytes, exactly what the old scalar scan counted.
+             * A zero mask means all eight are literals. The scalar fallback
+             * below still covers a tail shorter than eight bytes. */
+            if ((size_t)(cend - cp) >= 8u) {
+                __m128i raw = _mm_loadl_epi64((const __m128i *)cp);
+                __m128i eq = _mm_cmpeq_epi8(raw, _mm_set1_epi8((char)MRD_MARKER));
+                uint32_t mask = (uint32_t)_mm_movemask_epi8(eq) & 0xFFu;
+
+                avail = mask != 0u ? zpse_ctz32(mask) : 8u;
+            } else
+#endif
+            {
+                avail = 0u;
+                while (cp + avail < cend && avail < 8u &&
+                       cp[avail] != (uint8_t)MRD_MARKER) {
+                    ++avail;
+                }
             }
             /* Each of these bytes emits one sample, starting at didx+1. Even
              * with coff <= ns-1 an RLE token earlier in the stream can leave
