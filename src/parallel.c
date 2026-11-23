@@ -172,24 +172,6 @@ typedef struct ZpseMtArg {
     unsigned worker;
 } ZpseMtArg;
 
-/* The next unclaimed block index, or SIZE_MAX when there is none left.
- * One counter per job, incremented by whoever gets there first: no block can
- * be handed to two workers and no worker needs a lock. */
-static size_t zpse_mt_claim(volatile long *next, size_t nblocks)
-{
-    long v;
-
-#if defined(_WIN32)
-    v = InterlockedIncrement((volatile LONG *)next) - 1;
-#else
-    v = __atomic_fetch_add(next, 1, __ATOMIC_RELAXED);
-#endif
-    if (v < 0 || (size_t)v >= nblocks) {
-        return SIZE_MAX;
-    }
-    return (size_t)v;
-}
-
 /* Decode workers take a run of blocks per claim instead of one at a time. A
  * decoded block is independent and lands at its own offset in `out`, so the
  * run size cannot change a byte -- it only trades atomic operations for a
@@ -1386,8 +1368,11 @@ typedef struct ZpseMtBatchJob {
     uint32_t stride;
     uint32_t *out_lens;
     size_t count;
-    volatile long next;
-    volatile int failed;
+    /* `next` is the atomic every worker touches; `failed` is only written on
+     * an error. Sharing a line makes every claim invalidate the readers'
+     * copy of `failed`, so give each its own cache line. */
+    _Alignas(ZPSE_ARENA_ALIGN) volatile long next;
+    _Alignas(ZPSE_ARENA_ALIGN) volatile int failed;
 } ZpseMtBatchJob;
 
 typedef struct ZpseMtBatchArg {
@@ -1414,19 +1399,30 @@ static void zpse_mt_batch_worker(ZpseMtBatchJob *j, void *arena)
     }
     for (;;) {
         size_t i;
+        size_t end;
 
         if (j->failed != 0) {
             return;
         }
-        i = zpse_mt_claim(&j->next, j->count);
+        /* One atomic per run of blocks, as in the frame decoder: a decoded
+         * block lands at its own slot, so the run size cannot change a byte.
+         * `failed` is advisory -- it only stops workers early -- so reading
+         * it once per run is enough; the first error is still recorded. */
+        i = zpse_mt_claim_chunk(&j->next, j->count, ZPSE_MT_DEC_CHUNK);
         if (i == SIZE_MAX) {
             return;
         }
-        rc = zpse_mt_batch_one(j->in, j->offsets, j->lens, i, j->out,
-                               j->stride, j->out_lens, &d);
-        if (rc != ZPSE_OK) {
-            zpse_mt_batch_fail(j, rc);
-            return;
+        end = i + (size_t)ZPSE_MT_DEC_CHUNK;
+        if (end > j->count) {
+            end = j->count;
+        }
+        for (; i < end; i++) {
+            rc = zpse_mt_batch_one(j->in, j->offsets, j->lens, i, j->out,
+                                   j->stride, j->out_lens, &d);
+            if (rc != ZPSE_OK) {
+                zpse_mt_batch_fail(j, rc);
+                return;
+            }
         }
     }
 }
@@ -1636,7 +1632,10 @@ struct ZpseBatchPool {
     unsigned long gen;  /* bumped once per published batch */
     unsigned long seen[ZPSE_MT_MAX_THREADS];
     int stop;
-    volatile int failed;
+    /* `next` is claimed by every worker; `failed` is read on every claim.
+     * Keep them on separate lines so claims do not invalidate the readers'
+     * copy of the flag (same split as the one-shot batch job). */
+    _Alignas(ZPSE_ARENA_ALIGN) volatile int failed;
     const uint8_t *in;
     const uint32_t *offsets;
     const uint32_t *lens;
@@ -1644,7 +1643,7 @@ struct ZpseBatchPool {
     uint32_t stride;
     uint32_t *out_lens;
     size_t count;
-    volatile long next;
+    _Alignas(ZPSE_ARENA_ALIGN) volatile long next;
     ZpsePoolWorker w[ZPSE_MT_MAX_THREADS]; /* w[0] is the calling thread */
 };
 
@@ -1667,22 +1666,32 @@ static void zpse_pool_do_work(struct ZpseBatchPool *p, ZpseDecoder *d)
 {
     for (;;) {
         size_t i;
+        size_t end;
         int rc;
 
         if (p->failed != 0) {
             return;
         }
-        i = zpse_mt_claim(&p->next, p->count);
+        /* Same run-of-blocks claim as the frame decoder and the one-shot
+         * batch: decoding a block touches only its own output slot, so this
+         * trades atomics for load balance at the tail and nothing else. */
+        i = zpse_mt_claim_chunk(&p->next, p->count, ZPSE_MT_DEC_CHUNK);
         if (i == SIZE_MAX) {
             return;
         }
-        rc = zpse_mt_batch_one(p->in, p->offsets, p->lens, i, p->out,
-                               p->stride, p->out_lens, d);
-        if (rc != ZPSE_OK) {
-            if (p->failed == 0) {
-                p->failed = (rc < 0) ? rc : ZPSE_BAD_HEADER;
+        end = i + (size_t)ZPSE_MT_DEC_CHUNK;
+        if (end > p->count) {
+            end = p->count;
+        }
+        for (; i < end; i++) {
+            rc = zpse_mt_batch_one(p->in, p->offsets, p->lens, i, p->out,
+                                   p->stride, p->out_lens, d);
+            if (rc != ZPSE_OK) {
+                if (p->failed == 0) {
+                    p->failed = (rc < 0) ? rc : ZPSE_BAD_HEADER;
+                }
+                return;
             }
-            return;
         }
     }
 }
