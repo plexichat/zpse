@@ -1909,3 +1909,116 @@ the only input this gate accepts, and the other eleven keep their existing
 streams. The measurement came from a temporary harness and was never checked
 in as a script under `tests/benchmarks/`, so no figure from it is quoted in the
 README.
+
+## The ratio ceiling, and what it would cost to reach it
+
+The target that keeps resurfacing -- 4.28:1 on Silesia, about 49.5 MB from the
+211,938,580-byte corpus, at roughly 520 MB/s encode and better than 3.6 GB/s
+decode -- is not a tuning problem. It is a point on the frontier this codec's
+shape cannot occupy, and a campaign of measurements said why in several
+different ways.
+
+Start with the ratio in isolation. The best packing any general codec achieves
+on this corpus is 47.56 MB (4.456:1), and LZMA-9e alone reaches 48.46 MB
+(4.374:1), so 49.5 MB is physically reachable -- but only in the 5 to 30 MB/s
+encode band those codecs live in. The target is a ratio that belongs at the
+other end of the frontier. At the speed end, around 500 MB/s, the state of the
+art is zstd-3 at 3.20:1 (66.2 MB); zpse today writes about 2.14:1 (99.1 MB)
+with its text sample gate on. Closing that gap means cutting packed bytes by
+about 35 percent at constant speed, and none of the obvious levers found a
+third of the stream.
+
+Entropy coding the vendored LZ4 parse was first, because it keeps the parse and
+attacks only the bytes. Structural bytes are 55.7 percent of LZ4's output and
+the offset stream carries H0 = 12.18 and H1 = 6.76 bits of entropy, so there is
+real skew to exploit. The floors say how much: order-0 coding tops out at 2.48:1,
+a 16.6 percent saving, and order-1 at 2.87:1, a 27.9 percent saving -- both
+short of 35. The literals alone would have to reach 4.67:1 before the tokens
+stopped mattering, and that is a ceiling on the literal stream, not a result.
+A perfect entropy coder over the existing parse therefore cannot deliver the
+third that is needed.
+
+A word/token coder was the attempt to do better by modelling words rather than
+bytes. Its best measured rates were 2.73 bits per character on dickens (2.93:1)
+and 3.72 on webster (2.15:1). The ratio is attractive on the first file and
+ordinary on the second, but the decoder is the disqualifier: word-ID indirection
+is a serial chain of pointer chases, and it runs at 200 to 600 MB/s, six to
+eighteen times short of the 3.6 GB/s target. The ratio is bought with exactly
+the dependency structure the decode target forbids.
+
+Static and frozen context models failed from a different direction. They land
+between 1.5:1 and 3.4:1 depending on how well the frozen model matches the
+genre, so the good number is a property of the corpus, not of the model. The
+64K-context table that produces it is 32 MiB, which does not stay resident on
+this host; the ratio arrives with a table walk that misses at every level. A
+static dictionary of general English words was the cheap version of the same
+idea, and its net saving was 2.58 percent on dickens, 0.71 percent on webster
+and 0.19 percent on mozilla -- noise on all but the most prose-heavy file.
+
+The `sao` assumption deserves its own correction. It is sometimes treated as
+the JPEG-like entry in Silesia and assigned a 1.7 MB target. It is raw
+float-like data, not JPEG: its order-0 entropy is 7.525 bits per byte and the
+best LZMA result on it is 4.43 MB. It cannot reach 1.7 MB under any parse, and
+it is not the binding constraint on the corpus anyway. The honest conclusion
+is a trade, not a near miss: every mechanism that reaches 4.3:1 here is serial
+and cache-hostile and runs in the tens of MB/s, while the decode target wants a
+wide, branch-light kernel. They are different machines.
+
+## More byte-identical speed candidates, refused at the noise floor
+
+Four more candidates joined the file's existing record of changes that were
+correct and not worth keeping. Each left the stream identical; none cleared
+this host's run-to-run spread.
+
+`>>5` for the noise divisor was proposed as a cheaper stand-in for a divide by
+32. clang's interprocedural constant propagation had already folded that divide
+into a shift, so the emitted assembly was identical and there was nothing to
+win. The candidate was dropped at the assembly check rather than on the clock.
+
+`seg_prescreen` marked `always_inline` genuinely inlined at all four call sites,
+produced byte-identical output in 48 of 48 comparisons and passed the suite. It
+measured +1.4 percent encode, but the sign was mixed across ABBA quartets and
+the magnitude sits inside the host's noise; a change that needs a sign to be
+believed does not have one.
+
+Screen-sample dedup, reusing a sample encode already computed when the same
+sample came round again, hit only 196 of 3,164 sample encodes at level 6. The
++0.28 percent encode it bought is the arithmetic of that hit rate and nothing
+more; the other 2,968 samples still pay for their own encode.
+
+The 64-byte encoder staging stagger shifted where staging writes land to avoid
+a store conflict. Its deltas were inside the noise with inconsistent signs, and
+the decode rate -- which the change cannot touch, since it is encoder-side --
+moved by plus or minus 1.8 percent. That ±1.8 percent on a path the edit cannot
+reach is the host's noise, quoted here so the other ±1 to 2 percent figures in
+this file can be read against it.
+
+## The transform extension prototypes, verified but not integrated
+
+The one substantive deliverable of this campaign was a set of typed transforms,
+built and checked but never wired into the codec. Fourteen length-preserving
+transforms were implemented and assigned IDs 12 through 25: BITSHUFFLE at 16,
+32 and 64 bits, ZIGZAG at 16, 32 and 64, WORD_XOR at 32 and 64, DELTA2 at 32 and
+64, NIBBLE_TRANSPOSE, and BSWAP at 16, 32 and 64. Alongside them, six
+variable-length block-form prototypes were written: FOR, patched FOR, Gorilla
+float, front-coding, general RLE, and a combined zigzag-transpose form. Every
+one was verified byte-for-byte across the scalar, SSE2 and AVX2 paths under
+sanitizers, so the work is correct; it is also separate from the shipped codec.
+
+The artifacts live in the temp directory rather than the tree:
+`C:\Users\dboyn\AppData\Local\Temp\opencode\txf_*` for the length-preserving
+transforms and `C:\Users\dboyn\AppData\Local\Temp\opencode\proto_*` for the
+block-form prototypes. Each directory carries a `README.txt` recording the
+exact wire layout, the gate that decides when the form is offered, and the
+measured results, so a future implementer can integrate a form by reading its
+own directory instead of reconstructing the format from this file. They are not
+integrated: nothing in `src/` offers these IDs, and the frame format does not
+carry them.
+
+The reason they stayed out is the same reason the ratio ceiling above holds.
+These forms target typed integer, timestamp and float data, where a zigzag or a
+frame-of-reference step turns an awkward high-entropy stream into a narrow one.
+Silesia is text-heavy, and its files do not have that shape, so the transforms
+are unlikely to move the headline ratio even once integrated. Their value is
+conditional -- they are the right tools if a typed-data workload appears --
+which is a different bet from the one the README's tables measure.
