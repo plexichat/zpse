@@ -183,6 +183,15 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    void *const dec_arenas[],
                                    unsigned arena_count);
 
+/* Same, with decoder hints (ZPSE_DEC_*) handed to every worker's block
+ * decode. Workers still write only their own block's bytes. */
+int zpse_decompress_frame_parallel_ex(const uint8_t *in, size_t in_len,
+                                      uint8_t *output, size_t out_cap,
+                                      size_t *out_len_out, unsigned threads,
+                                      void *const dec_arenas[],
+                                      unsigned arena_count,
+                                      uint32_t dec_flags);
+
 /* Decode a batch of independent blocks on several workers.
  *
  * This is the read side a streaming caller needs. The frame call above needs

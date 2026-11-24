@@ -211,6 +211,14 @@ const char *zpse_version_string(void)
  * the level is the caller's own speed/size trade, so a codec that cannot
  * honour it must say so. Bits outside those fields are refused for the same
  * reason -- notably bit 11, which stays reserved. */
+/* Decoder hints are caller-only: anything outside the defined bits is a bad
+ * argument rather than a silently ignored typo. The same set is accepted by
+ * the block, frame, seek and parallel _ex entries. */
+static int dec_flags_ok(uint32_t dec_flags)
+{
+    return (dec_flags & ~(uint32_t)ZPSE_DEC_VALID_MASK) == 0u;
+}
+
 static int enc_flags_ok(uint32_t enc_flags)
 {
     uint32_t lvl;
@@ -275,10 +283,22 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint32_t *out_len_out,
                           void *dec_arena)
 {
+    return zpse_decompress_block_ex(in, in_len, output, out_cap, out_len_out,
+                                    0u, dec_arena);
+}
+
+int zpse_decompress_block_ex(const uint8_t *in, uint32_t in_len,
+                             uint8_t *output, uint32_t out_cap,
+                             uint32_t *out_len_out,
+                             uint32_t dec_flags, void *dec_arena)
+{
     ZpseDecoder dec;
     int rc;
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (!dec_flags_ok(dec_flags)) {
         return ZPSE_BAD_ARG;
     }
     /* A page's block is 16 bytes of header, so this floor is the short one:
@@ -290,7 +310,8 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
     if (rc != ZPSE_OK) {
         return rc;
     }
-    rc = zpse_block_decode(&dec, in, in_len, output, out_cap, out_len_out);
+    rc = zpse_block_decode_ex(&dec, in, in_len, output, out_cap, out_len_out,
+                              dec_flags);
     if (rc < 0) {
         return rc;
     }
@@ -482,10 +503,22 @@ int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
                     uint8_t *output, uint32_t out_cap, uint32_t *out_len_out,
                     void *dec_arena)
 {
+    return zpse_seek_frame_ex(in, in_len, block_index, output, out_cap,
+                              out_len_out, 0u, dec_arena);
+}
+
+int zpse_seek_frame_ex(const uint8_t *in, size_t in_len, uint32_t block_index,
+                       uint8_t *output, uint32_t out_cap,
+                       uint32_t *out_len_out,
+                       uint32_t dec_flags, void *dec_arena)
+{
     ZpseDecoder dec;
     int rc;
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (!dec_flags_ok(dec_flags)) {
         return ZPSE_BAD_ARG;
     }
     /* The whole-frame codecs carry no block index, so a block cannot be
@@ -507,8 +540,8 @@ int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
     if (rc != ZPSE_OK) {
         return rc;
     }
-    return zpse_frame_seek(&dec, in, in_len, block_index, output, out_cap,
-                           out_len_out);
+    return zpse_frame_seek_ex(&dec, in, in_len, block_index, output, out_cap,
+                              out_len_out, dec_flags);
 }
 
 int zpse_decompress_frame(const uint8_t *in, size_t in_len,
@@ -516,10 +549,22 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
                           size_t *out_len_out,
                           void *dec_arena)
 {
+    return zpse_decompress_frame_ex(in, in_len, output, out_cap, out_len_out,
+                                    0u, dec_arena);
+}
+
+int zpse_decompress_frame_ex(const uint8_t *in, size_t in_len,
+                             uint8_t *output, size_t out_cap,
+                             size_t *out_len_out,
+                             uint32_t dec_flags, void *dec_arena)
+{
     ZpseDecoder dec;
     int rc;
 
     if (in == 0 || output == 0 || out_len_out == 0 || dec_arena == 0) {
+        return ZPSE_BAD_ARG;
+    }
+    if (!dec_flags_ok(dec_flags)) {
         return ZPSE_BAD_ARG;
     }
     if (in_len == 0) {
@@ -659,7 +704,8 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
     if (rc != ZPSE_OK) {
         return rc;
     }
-    rc = zpse_frame_decode(&dec, in, in_len, output, out_cap, out_len_out);
+    rc = zpse_frame_decode_ex(&dec, in, in_len, output, out_cap, out_len_out,
+                              dec_flags);
     if (rc < 0) {
         return rc;
     }

@@ -32,6 +32,11 @@ int zpse_frame_header_read(ZpseFrameHeader *h, const uint8_t in[32]);
 int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                       uint8_t *output, size_t out_cap, size_t *out_len_out);
 
+/* Same, with decoder hints (ZPSE_DEC_*) threaded down to every block. */
+int zpse_frame_decode_ex(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                         uint8_t *output, size_t out_cap,
+                         size_t *out_len_out, uint32_t dec_flags);
+
 /* Streaming encode: split input into <= nominal_block_size blocks. */
 int zpse_frame_encode(ZpseEncoder *e, const uint8_t *in, size_t n,
                       uint32_t nominal_block_size,
@@ -72,6 +77,12 @@ int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                   uint32_t off, uint32_t size, uint32_t seq,
                   uint8_t *output, uint32_t out_cap, uint32_t *out_len_out);
 
+/* Same, with decoder hints (ZPSE_DEC_*). */
+int zpse_block_at_ex(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                     uint32_t off, uint32_t size, uint32_t seq,
+                     uint8_t *output, uint32_t out_cap,
+                     uint32_t *out_len_out, uint32_t dec_flags);
+
 /* Validate a FrameIndex a sequential reader has already read out of the file
  * at fh->frame_index_offset, against the blocks that reader walked: `count`
  * entries, with offsets[k] and sizes[k] the file offset and compressed size of
@@ -95,6 +106,12 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
 int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                     uint32_t block_index, uint8_t *output, uint32_t out_cap,
                     uint32_t *out_len_out);
+
+/* Same, with decoder hints (ZPSE_DEC_*). */
+int zpse_frame_seek_ex(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                       uint32_t block_index, uint8_t *output,
+                       uint32_t out_cap, uint32_t *out_len_out,
+                       uint32_t dec_flags);
 
 /* Finish a frame whose blocks are already written and end at `pos`: write
  * the header (sealed, carrying the index position) and append the

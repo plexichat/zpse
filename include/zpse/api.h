@@ -54,6 +54,14 @@ int zpse_decompress_block(const uint8_t *in, uint32_t in_len,
                           uint32_t *out_len_out,
                           void *dec_arena);
 
+/* Same, with decoder hints (ZPSE_DEC_*). A hint is a property of the call,
+ * not of the stream: compressed and decoded bytes are identical with and
+ * without it. Hints outside ZPSE_DEC_VALID_MASK are refused. */
+int zpse_decompress_block_ex(const uint8_t *in, uint32_t in_len,
+                             uint8_t *output, uint32_t out_cap,
+                             uint32_t *out_len_out,
+                             uint32_t dec_flags, void *dec_arena);
+
 /* The one-shot frame calls below always emit a normal PSE1 frame; they never
  * emit FLAT7 ("F7P1" magic), including the indexed form. FLAT7 frames are
  * produced only by the CLI's fast path for whole-ASCII inputs or by explicit
@@ -79,6 +87,12 @@ int zpse_decompress_frame(const uint8_t *in, size_t in_len,
                           size_t *out_len_out,
                           void *dec_arena);
 
+/* Same, with decoder hints (ZPSE_DEC_*). The hint never changes the stream. */
+int zpse_decompress_frame_ex(const uint8_t *in, size_t in_len,
+                             uint8_t *output, size_t out_cap,
+                             size_t *out_len_out,
+                             uint32_t dec_flags, void *dec_arena);
+
 /* Same as zpse_compress_frame_ex, with the FrameIndex appended so the
  * result can be read block by block in any order (zpse_frame_seek). The
  * index costs 16 + 8 bytes per block. */
@@ -94,6 +108,12 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
 int zpse_seek_frame(const uint8_t *in, size_t in_len, uint32_t block_index,
                     uint8_t *output, uint32_t out_cap, uint32_t *out_len_out,
                     void *dec_arena);
+
+/* Same, with decoder hints (ZPSE_DEC_*). The hint never changes the stream. */
+int zpse_seek_frame_ex(const uint8_t *in, size_t in_len, uint32_t block_index,
+                       uint8_t *output, uint32_t out_cap,
+                       uint32_t *out_len_out,
+                       uint32_t dec_flags, void *dec_arena);
 
 #ifdef __cplusplus
 }

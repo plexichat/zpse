@@ -2520,6 +2520,8 @@ static int cmd_bench(int argc, char **argv)
      * without -l kept writing level 5 and the header kept saying "balanced"
      * while the codec's default was a rung deeper. One source of truth. */
     uint32_t enc_flags = 0u;
+    /* -S sets ZPSE_DEC_STREAMING_OUTPUT for the timed decode calls only. */
+    uint32_t dec_flags = 0u;
     uint32_t block = ZPSE_MAX_BLOCK_SIZE;
     int indexed = 0;
     int quiet = 0;
@@ -2642,6 +2644,11 @@ static int cmd_bench(int argc, char **argv)
         case 'x':
             indexed = 1;
             break;
+        case 'S':
+            /* Streaming output hint: the caller will not reread the decoded
+             * bytes soon, so RAW/no-CRC blocks may use NT stores. */
+            dec_flags |= ZPSE_DEC_STREAMING_OUTPUT;
+            break;
         case 'q':
             quiet = 1;
             break;
@@ -2673,7 +2680,9 @@ static int cmd_bench(int argc, char **argv)
     if (files < 1) {
         fprintf(stderr, "usage: zpse_cli bench [-l LEVEL] [-F7|-7|-R] [-F] "
                         "[-c] [-b N] [-r N] [-t N] [-n N] "
-                        "[-x] [-q] FILE...\n"
+                        "[-x] [-q] [-S] FILE...\n"
+                       "  -S   hint that decoded output will not be "
+                       "reread soon (NT stores for RAW blocks)\n"
                         "  -F7  add a FLAT7 arm beside the block arm on "
                         "eligible whole-ASCII input and print both rates,\n"
                         "       ratios and the flat7/block encode speedup\n"
@@ -2915,9 +2924,10 @@ static int cmd_bench(int argc, char **argv)
         dec_ns = 0.0;
         for (r = 0; r < reps; r++) {
             t0 = now_ns();
-            if (zpse_decompress_frame_parallel(comp, comp_len, out, n,
-                                               &out_len, threads, dec_arenas,
-                                               threads) != 0) {
+            if (zpse_decompress_frame_parallel_ex(comp, comp_len, out, n,
+                                                  &out_len, threads,
+                                                  dec_arenas, threads,
+                                                  dec_flags) != 0) {
                 fprintf(stderr, "zpse_cli: decompress failed on %s\n", path);
                 ok = 0;
                 break;

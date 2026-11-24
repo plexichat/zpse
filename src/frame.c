@@ -244,8 +244,9 @@ int zpse_frame_header_read(ZpseFrameHeader *h, const uint8_t in[32])
     return ZPSE_OK;
 }
 
-int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
-                      uint8_t *output, size_t out_cap, size_t *out_len_out)
+int zpse_frame_decode_ex(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                         uint8_t *output, size_t out_cap,
+                         size_t *out_len_out, uint32_t dec_flags)
 {
     ZpseFrameHeader fh;
     size_t pos;
@@ -353,8 +354,9 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         }
         o_rem = out_cap - out_pos;
         o_cap = o_rem > (size_t)UINT32_MAX ? UINT32_MAX : (uint32_t)o_rem;
-        rc = zpse_block_decode(d, in + pos, comp_sz,
-                              output + out_pos, o_cap, &blk_out);
+        rc = zpse_block_decode_ex(d, in + pos, comp_sz,
+                                  output + out_pos, o_cap, &blk_out,
+                                  dec_flags);
         if (rc < 0) {
             return rc;
         }
@@ -403,6 +405,13 @@ int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
         return ZPSE_OK;
     }
     return (int)out_pos;
+}
+
+int zpse_frame_decode(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                      uint8_t *output, size_t out_cap, size_t *out_len_out)
+{
+    return zpse_frame_decode_ex(d, in, in_len, output, out_cap, out_len_out,
+                                0u);
 }
 
 /* Read and validate the index of a frame that declares one. On success
@@ -584,9 +593,10 @@ int zpse_frame_index_validate(const ZpseFrameHeader *fh, const uint8_t *idx,
  * header and identity checks, then the block decode. The parallel decoder
  * hands its workers entries resolved once by zpse_frame_index_resolve and
  * calls this directly, so the index CRC is not recomputed per block. */
-int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
-                  uint32_t off, uint32_t size, uint32_t seq,
-                  uint8_t *output, uint32_t out_cap, uint32_t *out_len_out)
+int zpse_block_at_ex(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                     uint32_t off, uint32_t size, uint32_t seq,
+                     uint8_t *output, uint32_t out_cap,
+                     uint32_t *out_len_out, uint32_t dec_flags)
 {
     uint32_t got = 0u;
     int rc;
@@ -617,7 +627,8 @@ int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
             return ZPSE_OUTPUT_OVERFLOW;
         }
     }
-    rc = zpse_block_decode(d, in + off, size, output, out_cap, &got);
+    rc = zpse_block_decode_ex(d, in + off, size, output, out_cap, &got,
+                              dec_flags);
     if (rc < 0) {
         return rc;
     }
@@ -627,9 +638,18 @@ int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
     return ZPSE_OK;
 }
 
-int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
-                    uint32_t block_index, uint8_t *output, uint32_t out_cap,
-                    uint32_t *out_len_out)
+int zpse_block_at(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                  uint32_t off, uint32_t size, uint32_t seq,
+                  uint8_t *output, uint32_t out_cap, uint32_t *out_len_out)
+{
+    return zpse_block_at_ex(d, in, in_len, off, size, seq, output, out_cap,
+                            out_len_out, 0u);
+}
+
+int zpse_frame_seek_ex(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                       uint32_t block_index, uint8_t *output,
+                       uint32_t out_cap, uint32_t *out_len_out,
+                       uint32_t dec_flags)
 {
     ZpseFrameHeader fh;
     const uint8_t *entries = 0;
@@ -658,8 +678,16 @@ int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
                                        (size_t)ZPSE_INDEX_ENTRY_SIZE);
     size = zpse_load_u32le(entries + (size_t)block_index *
                                         (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
-    return zpse_block_at(d, in, in_len, off, size, block_index, output,
-                         out_cap, out_len_out);
+    return zpse_block_at_ex(d, in, in_len, off, size, block_index, output,
+                            out_cap, out_len_out, dec_flags);
+}
+
+int zpse_frame_seek(ZpseDecoder *d, const uint8_t *in, size_t in_len,
+                    uint32_t block_index, uint8_t *output, uint32_t out_cap,
+                    uint32_t *out_len_out)
+{
+    return zpse_frame_seek_ex(d, in, in_len, block_index, output, out_cap,
+                              out_len_out, 0u);
 }
 
 int zpse_frame_write_index(uint8_t *out, size_t pos, size_t out_cap,

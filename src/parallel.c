@@ -841,6 +841,9 @@ typedef struct ZpseMtDecJob {
      * The caller needs it to size a frame that carries no content size, and
      * decoding that block a second time is pure duplication. */
     volatile uint32_t last_got;
+    /* Decoder hints (ZPSE_DEC_*) for this frame's blocks. Read-only across
+     * workers; the RAW/no-CRC copy uses it to choose a streaming store. */
+    uint32_t dec_flags;
 } ZpseMtDecJob;
 
 typedef struct ZpseMtDecArg {
@@ -908,9 +911,9 @@ static void zpse_mt_dec_worker(ZpseMtDecJob *j, void *arena)
                                       i * (size_t)ZPSE_INDEX_ENTRY_SIZE);
             blk_size = zpse_load_u32le(j->entries +
                                        i * (size_t)ZPSE_INDEX_ENTRY_SIZE + 4u);
-            rc = zpse_block_at(&d, j->in, j->in_len, blk_off, blk_size,
-                               (uint32_t)i, j->out + out_off, (uint32_t)room,
-                               &got);
+            rc = zpse_block_at_ex(&d, j->in, j->in_len, blk_off, blk_size,
+                                  (uint32_t)i, j->out + out_off,
+                                  (uint32_t)room, &got, j->dec_flags);
             if (rc != ZPSE_OK) {
                 zpse_mt_dec_fail(j, rc);
                 return;
@@ -956,7 +959,7 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len,
                            const uint8_t *entries, uint8_t *out,
                            size_t out_cap, size_t nblocks, size_t nominal,
                            size_t *last_len_out, unsigned threads,
-                           void *const arenas[])
+                           void *const arenas[], uint32_t dec_flags)
 {
     ZpseMtDecJob job;
     ZpseMtDecArg args[ZPSE_MT_MAX_THREADS];
@@ -978,6 +981,7 @@ static int zpse_mt_dec_run(const uint8_t *in, size_t in_len,
     job.next = 0;
     job.failed = 0;
     job.last_got = 0u;
+    job.dec_flags = dec_flags;
 
     for (w = 1u; w < threads; w++) {
         args[w].job = &job;
@@ -1093,10 +1097,11 @@ static int zpse_mt_run(const uint8_t *in, size_t n, uint8_t *out,
  * DCM1, MRD1), and default-encoded x-ray/mr frames are now DCM1/MRD1 streams. */
 static int zpse_mt_dec_serial(const uint8_t *in, size_t in_len,
                               uint8_t *output, size_t out_cap,
-                              size_t *out_len_out, void *arena)
+                              size_t *out_len_out, void *arena,
+                              uint32_t dec_flags)
 {
-    return zpse_decompress_frame(in, in_len, output, out_cap, out_len_out,
-                                 arena);
+    return zpse_decompress_frame_ex(in, in_len, output, out_cap, out_len_out,
+                                    dec_flags, arena);
 }
 
 int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
@@ -1104,6 +1109,18 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
                                    size_t *out_len_out, unsigned threads,
                                    void *const dec_arenas[],
                                    unsigned arena_count)
+{
+    return zpse_decompress_frame_parallel_ex(in, in_len, output, out_cap,
+                                             out_len_out, threads, dec_arenas,
+                                             arena_count, 0u);
+}
+
+int zpse_decompress_frame_parallel_ex(const uint8_t *in, size_t in_len,
+                                      uint8_t *output, size_t out_cap,
+                                      size_t *out_len_out, unsigned threads,
+                                      void *const dec_arenas[],
+                                      unsigned arena_count,
+                                      uint32_t dec_flags)
 {
     ZpseFrameHeader fh;
     const uint8_t *entries = 0;
@@ -1116,6 +1133,9 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
         return ZPSE_BAD_ARG;
     }
     if (arena_count == 0u) {
+        return ZPSE_BAD_ARG;
+    }
+    if ((dec_flags & ~(uint32_t)ZPSE_DEC_VALID_MASK) != 0u) {
         return ZPSE_BAD_ARG;
     }
     /* The magic sniff needs only four bytes. Whole-frame streams can be much
@@ -1140,7 +1160,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
      * TRUNCATED there. */
     if (in_len < (size_t)ZPSE_FRAME_HEADER_SIZE) {
         return zpse_mt_dec_serial(in, in_len, output, out_cap, out_len_out,
-                                  dec_arenas[0]);
+                                  dec_arenas[0], dec_flags);
     }
     /* The index is the whole reason a block can be found: a header carries
      * its size, not its offset. Validate header and index once here and hand
@@ -1154,7 +1174,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
          * F64F) has no block index, so hand it to the full serial dispatcher,
          * which sniffs the magic and decodes it directly on this thread. */
         return zpse_mt_dec_serial(in, in_len, output, out_cap, out_len_out,
-                                  dec_arenas[0]);
+                                  dec_arenas[0], dec_flags);
     }
     if (rc != ZPSE_OK) {
         return rc;
@@ -1197,7 +1217,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
             }
             rc = zpse_mt_dec_run(in, in_len, entries, output, out_cap,
                                  (size_t)count, nominal, &last_len, t,
-                                 dec_arenas);
+                                 dec_arenas, dec_flags);
             if (rc != ZPSE_OK) {
                 return rc;
             }
@@ -1223,7 +1243,7 @@ int zpse_decompress_frame_parallel(const uint8_t *in, size_t in_len,
     (void)nominal;
 #endif
     return zpse_mt_dec_serial(in, in_len, output, out_cap, out_len_out,
-                              dec_arenas[0]);
+                              dec_arenas[0], dec_flags);
 }
 
 int zpse_compress_frame_parallel(const uint8_t *in, size_t n,

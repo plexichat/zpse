@@ -187,6 +187,16 @@
 #define ZPSE_B_HUF              (UINT8_C(1) << 7)
 #define ZPSE_B_RESERVED_MASK    (UINT8_C(0x00))
 
+/* Decoder hints (ZPSE_DEC_*): in-process caller options, never stream bytes.
+ * Setting one changes no compressed byte and no decoded byte; it only tells
+ * the decoder something the caller knows about its own output buffer. Bit 0
+ * promises that the caller will not reread the output soon, which lets the
+ * RAW/no-CRC copy use streaming (non-temporal) stores on x86 for blocks big
+ * enough to pay for the fence. The hint lives in its own namespace: encoder
+ * option bit 0 (ZPSE_ENC_CHECKSUM) has a completely different meaning. */
+#define ZPSE_DEC_STREAMING_OUTPUT (UINT32_C(1) << 0)
+#define ZPSE_DEC_VALID_MASK       ZPSE_DEC_STREAMING_OUTPUT
+
 #define ZPSE_ENC_CHECKSUM       (UINT32_C(1) << 0)
 
 /* Write an LZ block and nothing else: no probe, no trial, no candidate list,
