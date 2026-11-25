@@ -17,5 +17,10 @@ int zpse_flat7_encode(const uint8_t *in, size_t n, uint8_t *out, size_t out_cap,
 int zpse_flat7_encode_stream(const uint8_t *in, size_t n, uint8_t *out,
                              size_t out_cap, size_t *out_len);
 int zpse_flat7_decode(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, size_t *out_len_out);
+/* Same, with decoder hints (ZPSE_DEC_*). The hint only redirects the RAW
+ * region's final copy; it never changes the decoded bytes. */
+int zpse_flat7_decode_ex(const uint8_t *in, size_t in_len, uint8_t *out,
+                         size_t out_cap, size_t *out_len_out,
+                         uint32_t dec_flags);
 int zpse_flat7_header_check(const uint8_t *in, size_t in_len, size_t *out_n, size_t *out_payload_off);
 #endif

@@ -6,6 +6,7 @@
 #include "zpse/hot.h"     /* ZPSE_AVX2_ABI_OK */
 #include "zpse/status.h"
 #include "zpse/vector.h"  /* ZPSE_CPU_CAPS_FAST, ZPSE_CPU_AVX2 */
+#include "ntout.h"
 
 /* ---- AVX2 target/ABI gates (same shape as src/dense.c) ---------------- *
  * The per-function target attribute lets these bodies compile in a TU
@@ -238,9 +239,9 @@ static void flat_sublane_scalar(const uint8_t *restrict sub,
 
 /* ---- decoder + validation -------------------------------------------- */
 
-int zpse_flat_decode(uint8_t codec, uint8_t param,
-                     const uint8_t *payload, uint32_t payload_len,
-                     uint8_t *out, uint32_t n)
+int zpse_flat_decode_ex(uint8_t codec, uint8_t param,
+                        const uint8_t *payload, uint32_t payload_len,
+                        uint8_t *out, uint32_t n, uint32_t dec_flags)
 {
     uint32_t expected;
 
@@ -276,7 +277,15 @@ int zpse_flat_decode(uint8_t codec, uint8_t param,
             return ZPSE_OK;
         }
 #endif
-        memcpy(out, payload, (size_t)n);
+        /* FLAT_RAW is a verbatim copy written once, forward, with no read
+         * back of the destination -- the same shape as the RAW block copy.
+         * The palette codecs below write every byte once in their kernels
+         * and have no final copy to redirect, so only this codec changes. */
+        if (zpse_ntout_ok(dec_flags, out, n)) {
+            zpse_ntout_copy(out, payload, n);
+        } else {
+            memcpy(out, payload, (size_t)n);
+        }
         return ZPSE_OK;
     }
     case ZPSE_FLAT_NIBBLE4: {
@@ -404,4 +413,11 @@ int zpse_flat_decode(uint8_t codec, uint8_t param,
         return ZPSE_OK;
     }
     }
+}
+
+int zpse_flat_decode(uint8_t codec, uint8_t param,
+                     const uint8_t *payload, uint32_t payload_len,
+                     uint8_t *out, uint32_t n)
+{
+    return zpse_flat_decode_ex(codec, param, payload, payload_len, out, n, 0u);
 }

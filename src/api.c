@@ -580,7 +580,8 @@ int zpse_decompress_frame_ex(const uint8_t *in, size_t in_len,
     }
     /* A FLAT7 frame is a separate magic with its own whole-frame decoder. */
     if (zpse_flat7_is_frame(in, in_len)) {
-        return zpse_flat7_decode(in, in_len, output, out_cap, out_len_out);
+        return zpse_flat7_decode_ex(in, in_len, output, out_cap, out_len_out,
+                                    dec_flags);
     }
     /* ZRPK and RLE1 are two more separate whole-frame magics with their own
      * decoders. Both formats spell their original length in a fixed header, so

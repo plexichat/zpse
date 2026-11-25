@@ -20,6 +20,8 @@
 
 #include "zpse/flat7.h"
 
+#include "ntout.h"
+
 #include <string.h>
 
 #include "zpse/bits.h"
@@ -636,8 +638,9 @@ int zpse_flat7_header_check(const uint8_t *in, size_t in_len,
     return ZPSE_OK;
 }
 
-int zpse_flat7_decode(const uint8_t *in, size_t in_len, uint8_t *out,
-                      size_t out_cap, size_t *out_len_out)
+int zpse_flat7_decode_ex(const uint8_t *in, size_t in_len, uint8_t *out,
+                         size_t out_cap, size_t *out_len_out,
+                         uint32_t dec_flags)
 {
     size_t n;
     size_t payload_off;
@@ -664,11 +667,27 @@ int zpse_flat7_decode(const uint8_t *in, size_t in_len, uint8_t *out,
     packed_len = zpse_load_u32le(in + FLAT7_REGION_OFF + FLAT7_R_PACKED);
     type = in[FLAT7_REGION_OFF + FLAT7_R_TYPE];
     if (type == (uint8_t)ZPSE_FLAT7_REGION_RAW) {
-        memcpy(out, in + payload_off, n);
+        /* One verbatim forward copy into the caller's output, with no read
+         * of those bytes before the frame completes: same shape as the RAW
+         * block copy, so the same opt-in gate applies. */
+        if (n >= (size_t)UINT32_MAX) {
+            return ZPSE_BAD_HEADER;
+        }
+        if (zpse_ntout_ok(dec_flags, out, (uint32_t)n)) {
+            zpse_ntout_copy(out, in + payload_off, (uint32_t)n);
+        } else {
+            memcpy(out, in + payload_off, n);
+        }
     } else {
         flat7_unpack(in + payload_off, packed_len, out, (uint32_t)n);
     }
 
     *out_len_out = n;
     return ZPSE_OK;
+}
+
+int zpse_flat7_decode(const uint8_t *in, size_t in_len, uint8_t *out,
+                      size_t out_cap, size_t *out_len_out)
+{
+    return zpse_flat7_decode_ex(in, in_len, out, out_cap, out_len_out, 0u);
 }

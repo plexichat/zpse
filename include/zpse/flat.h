@@ -66,6 +66,14 @@ int zpse_flat_decode(uint8_t codec, uint8_t param,
                      const uint8_t *payload, uint32_t payload_len,
                      uint8_t *out, uint32_t n);
 
+/* Same, with decoder hints (ZPSE_DEC_*). The hint is a property of the call,
+ * never of the stream, and only affects the RAW codec's final copy: the
+ * palette codecs write every output byte once in their own kernels and have
+ * no separate copy to redirect. */
+int zpse_flat_decode_ex(uint8_t codec, uint8_t param,
+                        const uint8_t *payload, uint32_t payload_len,
+                        uint8_t *out, uint32_t n, uint32_t dec_flags);
+
 #ifdef __cplusplus
 }
 #endif

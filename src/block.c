@@ -19,43 +19,15 @@
 #include <stdio.h>
 #endif
 
-/* The RAW/no-CRC fallback is a verbatim copy into the caller's output, and no
- * decoder path reads those bytes back inside the block. With
- * ZPSE_DEC_STREAMING_OUTPUT the caller says it will not reread them soon, so
- * streaming (non-temporal) stores skip the RFO for that destination and are
- * still byte-for-byte identical to memcpy. SSE2 is baseline on x86-64, so no
- * target attribute is needed; FORCE_SCALAR parity builds keep the plain
- * write-back copy. The kernel is only ever reached when the hint is set. */
-#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
-     defined(_M_IX86)) && !defined(ZPSE_FORCE_SCALAR)
-#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
-#define ZPSE_BLOCK_HAVE_NTSTORE 1
-#include <emmintrin.h>
-#endif
-#endif
-#ifndef ZPSE_BLOCK_HAVE_NTSTORE
-#define ZPSE_BLOCK_HAVE_NTSTORE 0
-#endif
-
-/* Below this length the sfence costs more than the RFO it avoids -- the same
- * measured cutoff text.c uses for its NT unpack. */
-#define ZPSE_BLOCK_NT_MIN 4096u
-
-#if ZPSE_BLOCK_HAVE_NTSTORE
-#if defined(_MSC_VER)
-#define ZPSE_BLOCK_NT_TLS __declspec(thread)
-#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
-#define ZPSE_BLOCK_NT_TLS _Thread_local
-#else
-#define ZPSE_BLOCK_NT_TLS
-#endif
-/* A caller that decodes successive blocks into the SAME output address has a
- * hot destination even when it set the hint (measured: 1.2 us memcpy against
- * 3.3 us NT for a reused 64 KiB buffer). Remember the last RAW destination per
- * thread and keep the write-back copy for it; a streaming caller that rotates
- * buffers sees a new address every block and gets the NT path. */
-static ZPSE_BLOCK_NT_TLS const uint8_t *block_raw_nt_last_out;
-#endif
+/* Non-temporal decode output for opt-in streaming callers lives in ntout.h.
+ * It is the exact mechanism shipped in f8447d1 for the RAW/no-CRC copy -- the
+ * same ZPSE_DEC_STREAMING_OUTPUT hint, the same cutoff and the same per-thread
+ * hot-destination guard -- lifted so every decode path that writes its output
+ * once, contiguously and without reading it back can use it too. A caller that
+ * decodes successive blocks into the SAME address has a hot destination
+ * whichever form those blocks used (measured: 1.2 us memcpy against 3.3 us NT
+ * for a reused 64 KiB buffer), so the guard is shared across paths. */
+#include "ntout.h"
 
 /* The FLAT page form (sync 0x50B9) is the ONE page path at every level. Its
  * sync and codec ids come from constants.h; the decoder lives in flat.h. Do
@@ -81,6 +53,9 @@ static ZPSE_BLOCK_NT_TLS const uint8_t *block_raw_nt_last_out;
 #endif
 int zpse_flat_decode(uint8_t codec, uint8_t param, const uint8_t *payload,
                      uint32_t payload_len, uint8_t *out, uint32_t n);
+int zpse_flat_decode_ex(uint8_t codec, uint8_t param, const uint8_t *payload,
+                        uint32_t payload_len, uint8_t *out, uint32_t n,
+                        uint32_t dec_flags);
 
 /* The TEXT page form (sync 0x50BA) keeps its codec in text.c. As with FLAT,
  * include no codec header: block.c declares only what it calls, so this file
@@ -469,51 +444,6 @@ int zpse_block_probe(const uint8_t *in, uint32_t in_len,
     return ZPSE_OK;
 }
 
-#if ZPSE_BLOCK_HAVE_NTSTORE
-/* Byte-identical memcpy replacement for the RAW/no-CRC payload only. The
- * caller's output alignment is arbitrary, so advance to the next 64-byte
- * boundary with a scalar head copy, then emit only whole cache lines with four
- * 16-byte streaming stores each; the final partial line is a scalar tail.
- * Because the head/tail lines are distinct from the streaming lines, the
- * sfence after the loop both drains the write-combining buffers for caller
- * visibility and keeps a write-back tail from resurrecting stale bytes in a
- * line that still has pending NT stores. */
-static void block_raw_nt_copy(uint8_t *dst, const uint8_t *src, uint32_t n)
-{
-    uintptr_t d = (uintptr_t)(void *)dst;
-    uint32_t head = (uint32_t)((64u - (d & (uintptr_t)63u)) & (uintptr_t)63u);
-    uint32_t body, lines, i;
-    const uint8_t *s;
-    uint8_t *p;
-
-    if (head > n) {
-        head = n;
-    }
-    if (head != 0u) {
-        memcpy(dst, src, head);
-    }
-    body = n - head;
-    lines = body & ~((uint32_t)63u);
-    s = src + head;
-    p = dst + head;
-    for (i = 0u; i < lines; i += 64u) {
-        __m128i v0 = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
-        __m128i v1 = _mm_loadu_si128((const __m128i *)(const void *)(s + i + 16u));
-        __m128i v2 = _mm_loadu_si128((const __m128i *)(const void *)(s + i + 32u));
-        __m128i v3 = _mm_loadu_si128((const __m128i *)(const void *)(s + i + 48u));
-
-        _mm_stream_si128((__m128i *)(void *)(p + i), v0);
-        _mm_stream_si128((__m128i *)(void *)(p + i + 16u), v1);
-        _mm_stream_si128((__m128i *)(void *)(p + i + 32u), v2);
-        _mm_stream_si128((__m128i *)(void *)(p + i + 48u), v3);
-    }
-    _mm_sfence();
-    if (lines != body) {
-        memcpy(p + lines, s + lines, body - lines);
-    }
-}
-#endif /* ZPSE_BLOCK_HAVE_NTSTORE */
-
 int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                       uint8_t *output, uint32_t out_cap,
                       uint32_t *out_len_out, uint32_t dec_flags)
@@ -521,9 +451,9 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
     ZpseBlockHeader h;
     ZpseTransformMeta meta;
     ZpseSegmentHeader sh0;
-    /* A hint, not stream data: unused in scalar builds and on every path
-     * other than the RAW/no-CRC copy. */
-    (void)dec_flags;
+    /* A hint, not stream data: threaded to every output path that writes its
+     * bytes once, contiguously, without reading them back. The shared gate in
+     * ntout.h is a no-op in scalar builds, so those keep the write-back path. */
     uint32_t n, c, meta_size, scount;
     uint64_t dir_end, area;
     const uint8_t *dir, *payloads;
@@ -579,7 +509,14 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (out_cap < n_tok) {
             return ZPSE_OUTPUT_OVERFLOW;
         }
-        memset(output, value, n_tok);
+        /* A one-value page fills the caller's output exactly once, with no
+         * read of those bytes before the token completes: the same shape as
+         * the RAW copy, so it gets the same gated non-temporal store. */
+        if (zpse_ntout_ok(dec_flags, output, n_tok)) {
+            zpse_ntout_fill(output, value, n_tok);
+        } else {
+            memset(output, value, n_tok);
+        }
         if (out_len_out != 0) {
             *out_len_out = n_tok;
         }
@@ -616,10 +553,10 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (out_cap < fh.uncompressed_size) {
             return ZPSE_OUTPUT_OVERFLOW;
         }
-        frc = zpse_flat_decode(fh.transform_id,
-                                (uint8_t)fh.transform_meta_size,
-                                in + ZPSE_BLOCK_HEADER_SIZE_SHORT, plen,
-                                output, fh.uncompressed_size);
+        frc = zpse_flat_decode_ex(fh.transform_id,
+                                  (uint8_t)fh.transform_meta_size,
+                                  in + ZPSE_BLOCK_HEADER_SIZE_SHORT, plen,
+                                  output, fh.uncompressed_size, dec_flags);
         if (frc != ZPSE_OK) {
             return frc;
         }
@@ -658,6 +595,10 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         if (out_cap < th.uncompressed_size) {
             return ZPSE_OUTPUT_OVERFLOW;
         }
+        /* TEXT keeps its own NT unpack in text.c. Measured on 4 KiB pages with
+         * a 64 MiB rotating destination, gating it on the hint made cold decode
+         * 4-8% SLOWER (the unpack is compute-bound and the fence costs more
+         * than the RFO it saves), so this path was left as shipped. */
         trc = zpse_text_decode(in + (uint32_t)ZPSE_BLOCK_HEADER_SIZE_SHORT,
                                plen, output, th.uncompressed_size);
         if (trc < 0) {
@@ -745,27 +686,15 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                 return ZPSE_BAD_PAYLOAD_CRC;
             }
         } else {
-#if ZPSE_BLOCK_HAVE_NTSTORE
             /* Only a caller that promises not to reread the output pays the
              * sfence, and only for a destination it has not just written.
              * With the hint clear this is the original memcpy, byte for byte
              * and timing for timing, so existing callers are unchanged. */
-            {
-                int use_nt =
-                    (dec_flags & (uint32_t)ZPSE_DEC_STREAMING_OUTPUT) != 0u &&
-                    n >= (uint32_t)ZPSE_BLOCK_NT_MIN &&
-                    output != block_raw_nt_last_out;
-
-                block_raw_nt_last_out = output;
-                if (use_nt) {
-                    block_raw_nt_copy(output, in + hdr, n);
-                } else {
-                    memcpy(output, in + hdr, n);
-                }
+            if (zpse_ntout_ok(dec_flags, output, n)) {
+                zpse_ntout_copy(output, in + hdr, n);
+            } else {
+                memcpy(output, in + hdr, n);
             }
-#else
-            memcpy(output, in + hdr, n);
-#endif
         }
         if (out_len_out != 0) {
             *out_len_out = n;
