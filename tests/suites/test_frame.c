@@ -752,13 +752,17 @@ static void whole_frame_defaults(void)
 
         for (li = 0u; li < 9u; li++) {
             uint32_t flags = levels[li] << ZPSE_ENC_SPEED_SHIFT;
+            /* From level 5 up the MRD-shaped input takes the one-shot
+             * BITSHUFFLE_16 block path; the cheap rungs keep MRD. */
+            const char *want = (shape == 1u && levels[li] >= 5u)
+                                   ? "PSE1" : want_magic[shape];
 
             CHECK(zpse_compress_frame_ex(in, n, comp, sizeof comp, &clen,
                                          BLK, flags, ea) == ZPSE_OK,
                   "whole-frame level %u encode", levels[li]);
-            CHECK(memcmp(comp, want_magic[shape], 4u) == 0,
+            CHECK(memcmp(comp, want, 4u) == 0,
                   "whole-frame level %u selected %s (got %.4s)", levels[li],
-                  want_magic[shape], (const char *)comp);
+                  want, (const char *)comp);
             memset(out, 0x5A, sizeof out);
             CHECK(zpse_decompress_frame(comp, clen, out, sizeof out, &olen,
                                         da) == ZPSE_OK,

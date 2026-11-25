@@ -14,6 +14,8 @@
 #include "zpse/status.h"
 
 #include "wf_internal.h"
+#include "txf/zpse_tx.h"
+#include "txf/bsm1.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -103,6 +105,12 @@ static int api_is_mrd1(const uint8_t *in, size_t in_len)
 {
     return in_len >= 4u && in[0] == 'M' && in[1] == 'R' &&
            in[2] == 'D' && in[3] == '1';
+}
+
+/* Eighth whole-frame magic: "BSM1", BITSHUFFLE_16 + one LZ4 block. */
+static int api_is_bsm1(const uint8_t *in, size_t in_len)
+{
+    return in_len >= 4u && api_load32le(in) == (uint32_t)ZPSE_BSM1_MAGIC;
 }
 
 /* ---- Combined cheap pre-gate for the whole-frame opt-ins --------------
@@ -416,6 +424,27 @@ int zpse_whole_frame_try(const uint8_t *in, size_t n, uint8_t *out,
             *out_len_out = (size_t)wf_len;
             return 1;
         }
+#if ZPSE_TX_SIGNAL == 1
+        /* The same cheap content probe the block selector uses says this is
+         * the 16-bit zero-heavy shape where BITSHUFFLE_16 beats MRD. Try the
+         * whole-frame BSM1 form first: it is one LZ4 pass over the shuffled
+         * bytes, and its decoder is one inverse plus one CRC. If even that
+         * cannot commit, still decline MRD so the block path can take the
+         * transform; the probe is a bounded sample, not a full second scan. */
+        if (zpse_enc_speed(enc_flags) >= 5u &&
+            zpse_tx_mr_probe(in, (uint32_t)n)) {
+            /* Keep the small-frame decision exactly as it was: a 64 KiB
+             * mr-shaped frame still falls through to the block path. Only a
+             * whole-frame-size input can take BSM1. */
+            if (n >= (size_t)(1u << 20) &&
+                zpse_bsm1_encode(in, (uint32_t)n, out, cap32, &wf_len) ==
+                    ZPSE_BSM1_COMMIT) {
+                *out_len_out = (size_t)wf_len;
+                return 1;
+            }
+            return 0;
+        }
+#endif
         if (zpse_mrd_encode(in, (uint32_t)n, out, cap32, &wf_len) ==
             ZPSE_MRD_COMMIT) {
             *out_len_out = (size_t)wf_len;
@@ -532,7 +561,8 @@ int zpse_seek_frame_ex(const uint8_t *in, size_t in_len, uint32_t block_index,
      * rather than being misreported as truncated. */
     if (zpse_flat7_is_frame(in, in_len) || api_is_zrpk(in, in_len) ||
         api_is_rle1(in, in_len) || api_is_f64f(in, in_len) ||
-        api_is_dcm1(in, in_len) || api_is_mrd1(in, in_len)) {
+        api_is_dcm1(in, in_len) || api_is_mrd1(in, in_len) ||
+        api_is_bsm1(in, in_len)) {
         return ZPSE_UNSUPPORTED_FEATURE;
     }
     if (in_len < 32u) {
@@ -701,6 +731,32 @@ int zpse_decompress_frame_ex(const uint8_t *in, size_t in_len,
             return ZPSE_BAD_HEADER;
         }
         *out_len_out = (size_t)n;
+        return ZPSE_OK;
+    }
+    /* BSM1 is the whole-frame BITSHUFFLE_16 + LZ4 form. Its decoder writes the
+     * inverse straight into the caller's buffer, so no decoder arena is needed
+     * on this path at all. */
+    if (api_is_bsm1(in, in_len)) {
+        int rc_bsm;
+        size_t got = 0u;
+
+        if (in_len > (size_t)UINT32_MAX) {
+            return ZPSE_TRUNCATED;
+        }
+        rc_bsm = zpse_bsm1_decode(in, in_len, output, out_cap, &got);
+        if (rc_bsm == ZPSE_BSM1_BAD_HEADER) {
+            return ZPSE_BAD_HEADER;
+        }
+        if (rc_bsm == ZPSE_BSM1_BAD_SIZE) {
+            return ZPSE_BAD_BLOCK_SIZE;
+        }
+        if (rc_bsm == ZPSE_BSM1_BAD_CRC) {
+            return ZPSE_BAD_PAYLOAD_CRC;
+        }
+        if (rc_bsm != ZPSE_BSM1_COMMIT) {
+            return ZPSE_BAD_HEADER;
+        }
+        *out_len_out = got;
         return ZPSE_OK;
     }
     rc = zpse_decoder_init(&dec, dec_arena, (size_t)ZPSE_DEC_ARENA_SIZE);

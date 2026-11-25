@@ -110,6 +110,24 @@ static int mrd_gate(const uint8_t *in, uint32_t prefix, uint32_t ns)
             zeros * 20u >= sample);
 }
 
+int zpse_mrd_gate_public(const uint8_t *in, uint32_t n)
+{
+    uint32_t prefix, ns;
+
+    if (in == 0 || n < 4u || (n & 1u) != 0u) {
+        return 0;
+    }
+    prefix = mrd_prefix(in, n);
+    if ((prefix & 1u) != 0u || prefix > n - 2u) {
+        return 0;
+    }
+    ns = n / 2u - prefix / 2u;
+    if (ns < 2u) {
+        return 0;
+    }
+    return mrd_gate(in, prefix, ns);
+}
+
 uint32_t zpse_mrd_bound(uint32_t n)
 {
     uint64_t ns, b;

@@ -426,7 +426,9 @@ int zpse_block_header_parse(ZpseBlockHeader *out, const uint8_t *buf, uint32_t l
     if (profile != 0) {
         return ZPSE_UNSUPPORTED_FEATURE;
     }
-    if (r0 != 0) {
+    /* reserved0 carries the one-shot whole-block transform tag (0 = none,
+     * 12..15 = the typed transforms); other values stay reserved. */
+    if (r0 != 0u && (r0 < 12u || r0 > 15u)) {
         return ZPSE_UNSUPPORTED_FEATURE;
     }
     /* ZpseTransformMeta holds at most 16 seed bytes and no legal transform

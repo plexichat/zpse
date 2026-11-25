@@ -7,6 +7,11 @@
 #include "repack.c"
 #include "rlefast.c"
 #include "arena.c"
+#include "txf/bitshuffle16.c"
+#include "txf/bitshuffle32.c"
+#include "txf/delta264.c"
+#include "txf/wordxor64.c"
+#include "txf/tx_integrate.c"
 #include "types.c"
 #include "transform.c"
 #include "predictor.c"
@@ -33,3 +38,7 @@
 #include "f64fast.c"
 #include "dpcm1.c"
 #include "mrd.c"
+/* The new whole-frame form goes last: it is not on any existing codec's hot
+ * path, so keeping it at the end of the unity TU leaves the established
+ * functions where they were. */
+#include "txf/bsm1.c"

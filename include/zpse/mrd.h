@@ -40,6 +40,11 @@ extern "C" {
 
 uint32_t zpse_mrd_bound(uint32_t n);
 
+/* The content gate used by zpse_mrd_encode, exposed so the one-shot transform
+ * selector can recognise the same 16-bit zero-heavy-delta shape without a
+ * second full scan. Returns 1 when MRD would accept, 0 otherwise. */
+int zpse_mrd_gate_public(const uint8_t *in, uint32_t n);
+
 int zpse_mrd_encode(const uint8_t *in, uint32_t n,
                      uint8_t *out, uint32_t out_cap, uint32_t *out_len);
 

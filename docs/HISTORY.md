@@ -2022,3 +2022,26 @@ Silesia is text-heavy, and its files do not have that shape, so the transforms
 are unlikely to move the headline ratio even once integrated. Their value is
 conditional -- they are the right tools if a typed-data workload appears --
 which is a different bet from the one the README's tables measure.
+
+## BSM1: one whole-frame bitshuffle form for the MR shape
+
+The block-level BITSHUFFLE_16 trial did lower mr's packed size, but it also
+forced the MR-shaped data away from its whole-frame codec and into a 64 KiB,
+256-tile block envelope. The envelope was the design choice, not a property of
+the transform, so the final form moves the transform to the frame level: an
+eighth whole-frame magic, BSM1, carries a 16-byte header and one LZ4 block of
+bitshuffled bytes, and decoding is one inverse straight into the caller's
+buffer. Its gate needs level 5 or above, the existing 16-bit zero-heavy delta
+probe, and a frame of at least 1 MiB, so the other eleven Silesia files keep
+their exact compressed streams and decoded bytes.
+
+The packed-size change is deterministic and does not depend on the clock: mr
+goes from 3,832,738 to 3,349,842 bytes (2.60:1 to 2.98:1), and the twelve-file
+total from 99,099,878 to 98,616,982 bytes. That is 482,896 bytes, or 0.487
+percent of the corpus. The README tables are deliberately left untouched by
+this change: every published rate has to come from a regeneration by
+`tests/benchmarks/silesia.sh` on an idle host, and this host is shared with
+other work, so the rates measured alongside the new form are not publishable.
+Byte identity was checked directly instead: 36 of 36 corpus round trips and
+all twelve decoded Silesia frames match, and eleven compressed streams are
+unchanged.
