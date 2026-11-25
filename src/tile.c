@@ -1197,7 +1197,23 @@ static unsigned tile_ctz32(uint32_t w)
 #endif
 }
 
+/* Generation-tagged presence array. Each classify stamps the values it
+ * sees with the current generation instead of clearing a 256-byte array;
+ * the fold reads "tag == gen" directly. Thread-local so parallel encodes
+ * cannot share the state. The array is cleared only on generation wrap.
+ *
+ * Why this shape: the pres[] memset + scattered stores + store-forwarding
+ * fold measured 265-514 cycles per dense tile, 45-60% of a tile's classify
+ * (the hottest sub-loop of the trial sweep on binary data). Register-
+ * resident alternatives were tried and LOST: four ymm bitmaps with a
+ * 64-entry mask table cost 827 cycles on nci L3 (broadcast + 4-way switch),
+ * four GPR bitmaps 690, and a local uint32_t[8] bitmap 920 (spills). Stamping
+ * a generation into a direct-indexed L1 array measures 137-317 cycles and
+ * lifts encode 5-13% at L1/L3 on mr/nci/mozilla in 12-16 round ABBA runs. */
 #if ZPSE_TILE_HAVE_AVX2
+static _Thread_local uint8_t tile_pres_tag[256];
+static _Thread_local uint8_t tile_pres_gen = 1u;
+
 #include <immintrin.h>
 
 /* The families whose prediction is a pure function of the plane bytes.
@@ -1547,39 +1563,6 @@ static ZPSE_TILE_AVX2 uint8_t tile_hmax_u8x32(__m256i v)
     return (uint8_t)_mm_cvtsi128_si32(m);
 }
 
-/* Fold the 256-byte residual-presence array into `seen`, returning how
- * many distinct values it holds -- stopping once that count reaches `cap`,
- * because the only consumer of the count (tile_res_len's palette branch)
- * rejects the palette above sixteen entries and so can never tell 17 from
- * 60. The words past the stop are zeroed, which keeps `seen` exactly the
- * set of values the returned count describes: the caller trims it to `cap`
- * bits, and every set bit it reports is a residual that was really seen.
- *
- * A dense tile of text, code or noise reaches seventeen distinct residuals
- * within the first handful of them, so this is two of the eight words on
- * the overwhelming majority of the tiles that get here. */
-static ZPSE_TILE_AVX2P unsigned tile_pres_fold(const uint8_t *pres,
-                                               uint32_t seen[8],
-                                               unsigned cap)
-{
-    const __m256i z = _mm256_setzero_si256();
-    unsigned i;
-    unsigned nu = 0u;
-
-    for (i = 0; i < 8u; i++) {
-        __m256i q;
-
-        if (nu >= cap) {
-            seen[i] = 0u;
-            continue;
-        }
-        q = _mm256_loadu_si256((const __m256i *)(const void *)(pres + i * 32u));
-        seen[i] = (uint32_t)~_mm256_movemask_epi8(_mm256_cmpeq_epi8(q, z));
-        nu += (unsigned)_mm_popcnt_u32(seen[i]);
-    }
-    return nu;
-}
-
 /* Number of set bits in eight 32-bit words, as one nibble lookup and one
  * SAD reduction instead of eight dependent SWAR popcounts. The classify
  * epilogue counts cl->seen on every tile it classifies (dense or not, any
@@ -1784,36 +1767,74 @@ static ZPSE_TILE_AVX2P uint16_t tile_dense_bk_avx2(
      * see all of its residuals anyway to size its palette, so its count
      * stays exact either way. */
     {
-        uint8_t pres[256];
         uint32_t nu;
         const uint32_t lim =
             ((uint32_t)k < (uint32_t)ZPSE_TILE_PROBE) ? (uint32_t)k
                                                       : (uint32_t)ZPSE_TILE_PROBE;
+        uint8_t gen = tile_pres_gen++;
 
-        memset(pres, 0, sizeof pres);
-        for (i = 0; i + 4u <= lim; i += 4u) {
-            pres[tr[i]] = 1u;
-            pres[tr[i + 1u]] = 1u;
-            pres[tr[i + 2u]] = 1u;
-            pres[tr[i + 3u]] = 1u;
+        if (gen == 0u) {
+            memset(tile_pres_tag, 0, sizeof tile_pres_tag);
+            gen = 2u;
+            tile_pres_gen = 3u;
         }
-        for (; i < lim; i++)
-            pres[tr[i]] = 1u;
-        nu = tile_pres_fold(pres, cl->seen, ZPSE_TILE_NU_CAP);
-        while (nu < ZPSE_TILE_NU_CAP && i < (uint32_t)k) {
+        {
+            const __m256i gv = _mm256_set1_epi8((char)gen);
+            unsigned g;
+
+            for (i = 0; i + 4u <= lim; i += 4u) {
+                tile_pres_tag[tr[i]] = gen;
+                tile_pres_tag[tr[i + 1u]] = gen;
+                tile_pres_tag[tr[i + 2u]] = gen;
+                tile_pres_tag[tr[i + 3u]] = gen;
+            }
+            for (; i < lim; i++)
+                tile_pres_tag[tr[i]] = gen;
+            nu = 0u;
+            for (g = 0u; g < 8u; g++) {
+                __m256i q = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(tile_pres_tag + g * 32u));
+
+                cl->seen[g] = (uint32_t)_mm256_movemask_epi8(
+                    _mm256_cmpeq_epi8(q, gv));
+                if (nu >= (uint32_t)ZPSE_TILE_NU_CAP) {
+                    cl->seen[g] = 0u;
+                    continue;
+                }
+                nu += (unsigned)_mm_popcnt_u32(cl->seen[g]);
+            }
+        }
+        while (nu < (uint32_t)ZPSE_TILE_NU_CAP && i < (uint32_t)k) {
             uint32_t end = i + (uint32_t)ZPSE_TILE_PROBE;
 
             if (end > (uint32_t)k)
                 end = (uint32_t)k;
             for (; i + 4u <= end; i += 4u) {
-                pres[tr[i]] = 1u;
-                pres[tr[i + 1u]] = 1u;
-                pres[tr[i + 2u]] = 1u;
-                pres[tr[i + 3u]] = 1u;
+                tile_pres_tag[tr[i]] = gen;
+                tile_pres_tag[tr[i + 1u]] = gen;
+                tile_pres_tag[tr[i + 2u]] = gen;
+                tile_pres_tag[tr[i + 3u]] = gen;
             }
             for (; i < end; i++)
-                pres[tr[i]] = 1u;
-            nu = tile_pres_fold(pres, cl->seen, ZPSE_TILE_NU_CAP);
+                tile_pres_tag[tr[i]] = gen;
+            {
+                const __m256i gv = _mm256_set1_epi8((char)gen);
+                unsigned g;
+
+                nu = 0u;
+                for (g = 0u; g < 8u; g++) {
+                    __m256i q = _mm256_loadu_si256(
+                        (const __m256i *)(const void *)(tile_pres_tag + g * 32u));
+
+                    cl->seen[g] = (uint32_t)_mm256_movemask_epi8(
+                        _mm256_cmpeq_epi8(q, gv));
+                    if (nu >= (uint32_t)ZPSE_TILE_NU_CAP) {
+                        cl->seen[g] = 0u;
+                        continue;
+                    }
+                    nu += (unsigned)_mm_popcnt_u32(cl->seen[g]);
+                }
+            }
         }
         /* The count is final here, so the epilogue does not have to recount
          * the bitmap it was just built from -- and the trim below is what
