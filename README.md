@@ -76,7 +76,7 @@ and the lz4 *CLI* are not the same encoder.
 
 | workload | codec | ratio | encode MB/s | decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Silesia, 202 MiB | zpse 6 (default) | 2.14:1 | 520 | 3578 |
+| Silesia, 202 MiB | zpse 6 (default) | 2.15:1 | 520 | 3578 |
 | | zpse 1 `FASTEST` | 1.27:1 | 814 | 3225 |
 | | zpse 9 `MAX` | 2.21:1 | 439 | 2439 |
 | 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.24:1 | 719 | 8562 |
@@ -118,7 +118,7 @@ compressed streams match a plain `-O2` build byte for byte.
 | --- | ---: | ---: | ---: | ---: |
 | `dickens` | 10,192,446 | 1.35:1 | 552 | 4236 |
 | `mozilla` | 51,220,480 | 1.92:1 | 498 | 3026 |
-| `mr` | 9,970,564 | 2.60:1 | 656 | 6104 |
+| `mr` | 9,970,564 | 2.98:1 | 656 | 6104 |
 | `nci` | 33,553,445 | 5.21:1 | 718 | 4675 |
 | `ooffice` | 6,152,192 | 1.47:1 | 396 | 3305 |
 | `osdb` | 10,085,684 | 1.90:1 | 490 | 4289 |
@@ -128,7 +128,7 @@ compressed streams match a plain `-O2` build byte for byte.
 | `webster` | 41,458,703 | 2.01:1 | 412 | 3339 |
 | `x-ray` | 8,474,240 | 1.93:1 | 1415 | 8644 |
 | `xml` | 5,345,280 | 3.91:1 | 725 | 4465 |
-| **total** | **211,938,580** | **2.14:1** | **520** | **3578** |
+| **total** | **211,938,580** | **2.15:1** | **520** | **3578** |
 
 Half of Silesia is English prose, the shape the tile model is weakest on.
 `sao` and `osdb` are close to the raw path doing a copy; `nci`, `samba` and
