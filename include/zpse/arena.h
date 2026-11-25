@@ -5,100 +5,83 @@
  * aligned, zeroed at context creation. No allocation afterwards.
  *
  * Both arenas open with a 4 KiB (0x01000) control block at base 0x00000.
- * The decoder's live regions end at 0x44800, and 0x0B800 bytes of guard
- * carry that to the 0x50000 start of the 64 KiB LZ body buffer. The
- * encoder's live regions end at 0x6D800, and 0x06800 bytes of guard carry
- * that to the 0x74000 arena end. The guards are only padding between named
- * regions, never part of the stream. */
+ * The block-sized staging regions are 0x50000 (320 KiB) each: a 256 KiB
+ * block plus the 64-byte-per-plane skew a 16-wide interleave needs.
+ * The gaps between named regions are only padding, never part of a stream. */
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define ZPSE_DEC_ARENA_SIZE (384u * 1024u) /* 0x60000 */
-#define ZPSE_ENC_ARENA_SIZE (464u * 1024u) /* 0x74000 */
+#define ZPSE_DEC_ARENA_SIZE (0x100000u) /* 1 MiB */
+#define ZPSE_ENC_ARENA_SIZE (0x150000u)
 #define ZPSE_ARENA_ALIGN    64u
 
-/* Decoder offsets. 0x21000..0x41800 is a reserved hole where the ORDER1
- * and ORDER2 tables used to live; the live regions keep their offsets. */
+/* Decoder offsets. */
 #define ZPSE_D_OFF_RECON    0x01000u
-#define ZPSE_D_OFF_OUT      0x11000u
-#define ZPSE_D_OFF_COMB     0x41800u
-#define ZPSE_D_OFF_SHUF     0x43800u
-/* Where a ZPSE_B_LZ_TILE block's body is unpacked: the tile path reads it
- * from here exactly as it would read it from the block, so the 64 KiB a
- * block body can take has to be its own region rather than borrowed from
- * recon/out_stage, which the segment decoder is using at the same time. */
-#define ZPSE_D_OFF_LZBUF    0x50000u
+#define ZPSE_D_OFF_OUT      0x51000u
+#define ZPSE_D_OFF_COMB     0xA1000u
+#define ZPSE_D_OFF_SHUF     0xA3000u
+/* Unpacked body of an LZ_TILE block: a 256 KiB block body needs its own
+ * region rather than borrowing from recon/out_stage. */
+#define ZPSE_D_OFF_LZBUF    0xA4000u
 
-#define ZPSE_D_SZ_RECON     0x10000u
-#define ZPSE_D_SZ_OUT       0x10000u
+#define ZPSE_D_SZ_RECON     0x50000u
+#define ZPSE_D_SZ_OUT       0x50000u
 /* 8 KiB generic scratch for dense/tile exception buffers. */
 #define ZPSE_D_SZ_COMB      0x02000u
 #define ZPSE_D_SZ_SHUF      0x01000u
-#define ZPSE_D_SZ_LZBUF     0x10000u
+#define ZPSE_D_SZ_LZBUF     0x50000u
 
 /* Padding block decode leaves between the segment planes it writes for a
  * 16-wide interleave, so that the inverse transpose can read them in
- * place instead of staging a copy of each. The L1 set index is
- * (address / 64) mod 64, so planes exactly 4096 bytes apart all land on
- * one set; 4096 + 64 is 65 lines, which advances the set by one per
- * plane, and -- what 16 bytes would not -- keeps every plane on a cache
- * line boundary, so the segment decoder's stores stay aligned. Purely a
- * placement inside recon/out_stage, never part of the stream. Eight
- * planes per region need 7 * 4160 + 4096 = 33216 bytes. */
+ * place instead of staging a copy of each. Purely a placement inside
+ * recon/out_stage, never part of the stream. */
 #define ZPSE_D_PLANE_SKEW   64u
 
 /* Encoder offsets. */
 #define ZPSE_E_OFF_INPUT    0x01000u
-#define ZPSE_E_OFF_TSTAGE   0x11000u
-#define ZPSE_E_OFF_CAND     0x21000u
-#define ZPSE_E_OFF_BEST     0x31000u
-/* 0x41000..0x61800 is a reserved hole (the old ORDER1/ORDER2 tables). */
-#define ZPSE_E_OFF_COMB     0x61800u
-#define ZPSE_E_OFF_HIST     0x63800u
-#define ZPSE_E_OFF_SHUF     0x64800u
-#define ZPSE_E_OFF_LZ       0x65800u
+#define ZPSE_E_OFF_TSTAGE   0x51000u
+#define ZPSE_E_OFF_CAND     0xA1000u
+#define ZPSE_E_OFF_BEST     0xF1000u
+#define ZPSE_E_OFF_COMB     0x141000u
+#define ZPSE_E_OFF_HIST     0x143000u
+#define ZPSE_E_OFF_SHUF     0x144000u
+#define ZPSE_E_OFF_LZ       0x145000u
 
-#define ZPSE_E_SZ_INPUT     0x10000u
-#define ZPSE_E_SZ_TSTAGE    0x10000u
-#define ZPSE_E_SZ_CAND      0x10000u
-#define ZPSE_E_SZ_BEST      0x10000u
+#define ZPSE_E_SZ_INPUT     0x50000u
+#define ZPSE_E_SZ_TSTAGE    0x50000u
+#define ZPSE_E_SZ_CAND      0x50000u
+#define ZPSE_E_SZ_BEST      0x50000u
 /* 8 KiB generic scratch, as in the decoder arena (see ZPSE_D_SZ_COMB). */
 #define ZPSE_E_SZ_COMB      0x02000u
 #define ZPSE_E_SZ_HIST      0x01000u
 #define ZPSE_E_SZ_SHUF      0x01000u
-/* 32 KiB of spare staging for the LZ4 pass. LZ4 owns its own match search
- * and ignores any caller-supplied table, so the old "2^14 direct-mapped
- * match-finder table" description is historical: this is just a scratch
- * region the pass borrows below 16 KiB (above that it borrows the 64 KiB
- * trials' tstage instead). Only the effort levels that write an LZ form
- * touch it, so only the encoder arena pays for it; the decoder never
- * carries it. */
+/* 32 KiB of spare staging for the LZ4 pass. */
 #define ZPSE_E_SZ_LZ        0x08000u
 
 typedef struct ZpseDecoder {
-    uint8_t *arena;       /* base, 64-B aligned, 384 KiB (incl. 64 KiB lzbuf) */
-    uint8_t *recon;       /* transformed reconstruction (64 KiB) */
-    uint8_t *out_stage;   /* output staging (64 KiB) */
+    uint8_t *arena;       /* base, 64-B aligned, 1 MiB (incl. 320 KiB lzbuf) */
+    uint8_t *recon;       /* transformed reconstruction (320 KiB) */
+    uint8_t *out_stage;   /* output staging (320 KiB) */
     uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *shuf;        /* 4 KiB shuffle/CRC consts */
-    uint8_t *lzbuf;       /* 64 KiB: unpacked body of an LZ_TILE block */
+    uint8_t *lzbuf;       /* 320 KiB: unpacked body of an LZ_TILE block */
     /* The plane the last zpse_segment_decode produced was one byte value
      * end to end, and which value. Set only by the dense constant form and
      * cleared by every segment decode, so a block whose single segment
      * reports it (the identity shape the encoder emits for a one-value
      * block) can checksum its output arithmetically instead of scanning
-     * 64 KiB the decoder just wrote. */
+     * 320 KiB the decoder just wrote. */
     uint8_t seg_const;
     uint8_t seg_const_byte;
 } ZpseDecoder;
 
 typedef struct ZpseEncoder {
-    uint8_t *arena;       /* base, 64-B aligned, 464 KiB */
-    uint8_t *input;       /* 64 KiB */
-    uint8_t *tstage;      /* 64 KiB */
-    uint8_t *cand;        /* 64 KiB candidate staging */
-    uint8_t *best;        /* 64 KiB best staging */
+    uint8_t *arena;       /* base, 64-B aligned, 0x150000 */
+    uint8_t *input;       /* 320 KiB */
+    uint8_t *tstage;      /* 320 KiB */
+    uint8_t *cand;        /* 320 KiB candidate staging */
+    uint8_t *best;        /* 320 KiB best staging */
     uint8_t *comb;        /* 8 KiB generic scratch (dense/tile exceptions) */
     uint8_t *hist;        /* 4 KiB histogram/palette scratch */
     uint8_t *shuf;        /* 4 KiB shuffle LUT + CRC consts */
@@ -115,7 +98,7 @@ typedef struct ZpseEncoder {
      * trial and reset by the caller per trial. */
     uint32_t flat_covered;
     uint32_t flat_paid;
-    /* The block input pointer, when        zpse_block_encode has proved that whole
+    /* The block input pointer, when zpse_block_encode has proved that whole
      * input is one byte value while choosing its CRC form. zpse_segment_encode
      * skips its own plane scan when it is handed this very pointer (the
      * identity trial's plane does not copy), so a constant block is scanned

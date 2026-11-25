@@ -259,7 +259,7 @@ int zpse_compress_block_ex(const uint8_t *in, uint32_t n,
     if (in == 0 || out == 0 || out_len_out == 0 || enc_arena == 0) {
         return ZPSE_BAD_ARG;
     }
-    if (n == 0 || n > 65536u) {
+    if (n == 0 || n > ZPSE_MAX_BLOCK_SIZE) {
         return ZPSE_BAD_BLOCK_SIZE;
     }
     if (!enc_flags_ok(enc_flags)) {
@@ -440,7 +440,8 @@ int zpse_compress_frame_ex(const uint8_t *in, size_t n,
     if (n == 0) {
         return ZPSE_BAD_ARG;
     }
-    if (nominal_block_size == 0 || nominal_block_size > 65536u) {
+    if (nominal_block_size == 0 ||
+        nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
         return ZPSE_BAD_ARG;
     }
     if (!enc_flags_ok(enc_flags)) {
@@ -480,7 +481,8 @@ int zpse_compress_frame_indexed(const uint8_t *in, size_t n,
     if (n == 0) {
         return ZPSE_BAD_ARG;
     }
-    if (nominal_block_size == 0 || nominal_block_size > 65536u) {
+    if (nominal_block_size == 0 ||
+        nominal_block_size > ZPSE_MAX_BLOCK_SIZE) {
         return ZPSE_BAD_ARG;
     }
     if (!enc_flags_ok(enc_flags)) {

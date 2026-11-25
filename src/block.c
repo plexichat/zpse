@@ -287,6 +287,16 @@ static int zpse_block_scount_valid(uint8_t sc)
     return sc == 1 || sc == 2 || sc == 4 || sc == 8 || sc == 16;
 }
 
+/* The arena's physical staging regions grew to 320 KiB so 256 KiB blocks fit.
+ * A 64 KiB block must still be priced against the ORIGINAL 64 KiB budget:
+ * cap-dependent decisions (which LZ candidate is kept, whether a trial result
+ * fits the best buffer) would otherwise change the published 64 KiB stream.
+ * Larger blocks use the full physical region. */
+static uint32_t blk_budget(uint32_t n, uint32_t physical)
+{
+    return n <= 65536u ? UINT32_C(65536) : physical;
+}
+
 static void zpse_block_fill_header(ZpseBlockHeader *h, uint8_t flags,
                                    uint32_t n, uint32_t c, uint8_t tid,
                                    uint8_t sc, uint16_t meta_len,
@@ -726,7 +736,7 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
             return ZPSE_BAD_ARG;
         }
         rc = zpse_huf_decode(in + hdr, c - hdr, d->lzbuf,
-                             (uint32_t)ZPSE_D_SZ_LZBUF, &ilen, &iform);
+                             blk_budget(n, ZPSE_D_SZ_LZBUF), &ilen, &iform);
         if (rc != ZPSE_OK) {
             return rc;
         }
@@ -800,7 +810,7 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
         }
         blen = zpse_load_u32le(in + hdr);
         if (blen < (uint32_t)ZPSE_SEG_DIR_ENTRY_SIZE ||
-            blen > (uint32_t)ZPSE_D_SZ_LZBUF) {
+            blen > blk_budget(n, ZPSE_D_SZ_LZBUF)) {
             return ZPSE_BAD_BLOCK_SIZE;
         }
         rc = zpse_lz4_decode(in + hdr + 4u, c - (hdr + 4u), d->lzbuf, blen);
@@ -2305,7 +2315,7 @@ static uint32_t zpse_block_prefix_price(ZpseEncoder *e, const uint8_t *in,
         }
     }
     pfront = 256u * w;
-    if (pfront > n || (uint64_t)sc * 256u > (uint64_t)ZPSE_E_SZ_TSTAGE) {
+    if (pfront > n || (uint64_t)sc * 256u > (uint64_t)blk_budget(n, ZPSE_E_SZ_TSTAGE)) {
         return ZPSE_PREFIX_NEED_FULL;
     }
     if (zpse_transform_meta_parse(&tm, tid, meta_bytes, meta_len, sc) != ZPSE_OK) {
@@ -3036,7 +3046,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * keeps this to full blocks, so the page branch below (short blocks) and
      * the ordinary corpus are untouched. With the flag off this whole arm is
      * compiled out and the sample is exactly as before. */
-    if (e->ascii_gate != 0u && n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+    if (e->ascii_gate != 0u && n >= 65536u /* full-block heuristic, pinned to the published 64 KiB size */) {
         sn = n < (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES
                  ? n
                  : (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES;
@@ -3081,7 +3091,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         tile_s = cache[1];
     } else {
         lz_s = zpse_lz4_encode_sample(in, sn, e->cand,
-                                      (uint32_t)ZPSE_E_SZ_CAND);
+                                      blk_budget(n, ZPSE_E_SZ_CAND));
         if (lz_s == 0u) {
             return 1;
         }
@@ -3134,7 +3144,7 @@ static int zpse_block_lz_screen(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         !zpse_block_lz_sample_can_win(lz_s, sn, n, best_total)) {
         uint32_t off = (n - sn) / 2u;
         uint32_t lz_m = zpse_lz4_encode_sample(in + off, sn, e->cand,
-                                               (uint32_t)ZPSE_E_SZ_CAND);
+                                               blk_budget(n, ZPSE_E_SZ_CAND));
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -3171,7 +3181,7 @@ static int zpse_block_lz_final_screen(ZpseEncoder *e, const uint8_t *in,
      * keeps this to full blocks, so the page branch below (short blocks) and
      * the ordinary corpus are untouched. With the flag off this whole arm is
      * compiled out and the sample is exactly as before. */
-    if (e->ascii_gate != 0u && n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+    if (e->ascii_gate != 0u && n >= 65536u /* full-block heuristic, pinned to the published 64 KiB size */) {
         sn = n < (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES
                  ? n
                  : (uint32_t)ZPSE_LZ_SCREEN_TEXT_BYTES;
@@ -3200,7 +3210,7 @@ static int zpse_block_lz_final_screen(ZpseEncoder *e, const uint8_t *in,
         num = num * (uint32_t)ZPSE_LZ_FINAL_SHORT_MARGIN_NUM /
               (uint32_t)ZPSE_LZ_FINAL_SHORT_MARGIN_DEN;
     }
-    lz_s = zpse_lz4_encode_sample(in, sn, e->cand, (uint32_t)ZPSE_E_SZ_CAND);
+    lz_s = zpse_lz4_encode_sample(in, sn, e->cand, blk_budget(n, ZPSE_E_SZ_CAND));
     if (lz_s == 0u) {
         return 1;
     }
@@ -3221,7 +3231,7 @@ static int zpse_block_lz_final_screen(ZpseEncoder *e, const uint8_t *in,
     if (ZPSE_LZ4_SCREEN_SAMPLES > 1u && have_best) {
         uint32_t off = (n - sn) / 2u;
         uint32_t lz_m = zpse_lz4_encode_sample(in + off, sn, e->cand,
-                                               (uint32_t)ZPSE_E_SZ_CAND);
+                                               blk_budget(n, ZPSE_E_SZ_CAND));
 
         if (lz_m != 0u &&
             !zpse_block_lz_sample_can_win(lz_m, sn, n, best_total)) {
@@ -3248,6 +3258,15 @@ static int zpse_block_lz_wins(uint32_t n, uint8_t *stream, uint32_t lz_total,
     uint32_t lz_cmds;
     uint32_t raw_len;
 
+    /* With the 320 KiB staging budget a large incompressible block can
+     * produce an LZ4 stream slightly larger than the RAW envelope. The old
+     * 64 KiB cap made that impossible, so the final envelope check never had
+     * to consider it. Keep the envelope here so no LZ form can ever win
+     * above RAW at any block size. */
+    if ((uint64_t)lz_total >=
+        (uint64_t)ZPSE_BLOCK_HEADER_SIZE + (uint64_t)n) {
+        return 0;
+    }
     if (have_best &&
         (lz_total >= best_total ||
          best_total - lz_total <
@@ -5285,7 +5304,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * first-sample part and only re-asks the best_total-dependent part. */
     uint32_t lz_cache[2] = {0u, UINT32_MAX};
     uint8_t *tdst = e->cand;
-    uint32_t tcap = (uint32_t)ZPSE_E_SZ_CAND;
+    uint32_t tcap = blk_budget(n, ZPSE_E_SZ_CAND);
     /* Per-slot floor, filled once before the trial loop (see there). */
     uint32_t fl[ZPSE_MAX_CAND];
     /* Suffix minima of fl[]/idx[] over the remaining candidate slots. The
@@ -5331,7 +5350,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (e->lz != 0 && atotal > lz_floor &&
             zpse_block_lz_level(lz_speed, e->ascii_gate)) {
             uint32_t lz_total = 0u;
-            uint32_t lz_cap = (uint32_t)ZPSE_E_SZ_CAND;
+            uint32_t lz_cap = blk_budget(n, ZPSE_E_SZ_CAND);
             uint32_t win = atotal / (uint32_t)ZPSE_LZ_MIN_WIN_DIV + 1u;
             int lz_screen_win;
 
@@ -5377,7 +5396,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             }
 
             if (lz_screen_win) {
-                if (atotal < (uint32_t)ZPSE_E_SZ_CAND && atotal > win) {
+                if (atotal < blk_budget(n, ZPSE_E_SZ_CAND) && atotal > win) {
                     lz_cap = atotal - win;
                 }
                 {
@@ -5550,7 +5569,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
      * this was accepted under (no case may grow by more than 1/64 of its
      * input) rather than the absolute "no case grows" it used to. */
     if (!direct_out && !lz_done && e->lz != 0 && ncand > 0 &&
-        n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE &&
+        n >= 65536u /* full-block heuristic, pinned to the published 64 KiB size */ &&
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         zpse_block_lz_screen(e, in, n, tids[0], scounts[0],
@@ -5566,7 +5585,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             uint64_t t_cyc = blk_rdtsc();
 
             lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                    (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
+                                    blk_budget(n, ZPSE_E_SZ_CAND), e->best, 15u,
                                     (uint32_t)ZPSE_BLOCK_SHORT_MAX,
                                     &lz_total, 0);
             zpse_block_lz_passes++;
@@ -5574,7 +5593,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         }
 #else
         lrc = zpse_block_try_lz(e, in, n, in_crc, is_last, seq, e->cand,
-                                (uint32_t)ZPSE_E_SZ_CAND, e->best, 15u,
+                                blk_budget(n, ZPSE_E_SZ_CAND), e->best, 15u,
                                 (uint32_t)ZPSE_BLOCK_SHORT_MAX, &lz_total, 0);
 #endif
 
@@ -5587,7 +5606,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * are cheap in absolute terms, so the guard does not cost the rate
          * this stage is for -- nci prices 5.3:1, dickens 1.6:1, both far
          * above it -- and it keeps the size suite's contract exact. */
-        if (lrc == ZPSE_OK && lz_total < (uint32_t)ZPSE_E_SZ_CAND &&
+        if (lrc == ZPSE_OK && lz_total < blk_budget(n, ZPSE_E_SZ_CAND) &&
             lz_total <= out_cap && lz_total >= n / 64u &&
             zpse_block_lz_wins(n, e->cand, lz_total, 0, 0u,
                                e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK)) {
@@ -5644,7 +5663,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
             tcap = out_cap;
         } else {
             tdst = e->cand;
-            tcap = (uint32_t)ZPSE_E_SZ_CAND;
+            tcap = blk_budget(n, ZPSE_E_SZ_CAND);
         }
 #if defined(ZPSE_BLOCK_STATS)
         zpse_block_trials++;
@@ -5717,7 +5736,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
          * the list, so the attempt order cannot change the winner. */
         if (!have_best || t < best_total ||
             (t == best_total && (uint32_t)idx[i] < best_idx)) {
-            if (!direct_out && t > (uint32_t)ZPSE_E_SZ_BEST) {
+            if (!direct_out && t > blk_budget(n, ZPSE_E_SZ_BEST)) {
                 /* The trial ran and its result cannot be kept: the block is
                  * bigger than the best buffer, so the RAW fallback will
                  * carry it. That is a whole block encode spent for nothing,
@@ -5762,7 +5781,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         if (!direct_out &&
             (cap_row->tie_field != 0u || ZPSE_TRIAL_CAP_TIEFREE != 0) &&
             ntried >= ZPSE_TRIAL_CAP_FULL &&
-            n >= (uint32_t)ZPSE_MAX_BLOCK_SIZE) {
+            n >= 65536u /* full-block heuristic, pinned to the published 64 KiB size */) {
             int clear = 1;
             int oj;
 
@@ -5924,9 +5943,9 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
              * wrong about the block): measured on the level-5 corpus,
              * uuid_mix 254 -> 289 MB/s (+13.7%) and json_rows +1.1%, every
              * stream unchanged. */
-            uint32_t lz_cap = (uint32_t)ZPSE_E_SZ_CAND;
+            uint32_t lz_cap = blk_budget(n, ZPSE_E_SZ_CAND);
 
-            if (have_best && best_total < (uint32_t)ZPSE_E_SZ_CAND) {
+            if (have_best && best_total < blk_budget(n, ZPSE_E_SZ_CAND)) {
                 uint32_t win = best_total / (uint32_t)ZPSE_LZ_MIN_WIN_DIV +
                                1u;
 
@@ -6012,7 +6031,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         zpse_block_lz_level(e->enc_flags & (uint32_t)ZPSE_ENC_SPEED_MASK,
                             e->ascii_gate) &&
         best_total > (uint32_t)(ZPSE_BLOCK_HEADER_SIZE + 4u + 64u) &&
-        best_total <= (uint32_t)ZPSE_E_SZ_TSTAGE) {
+        best_total <= blk_budget(n, ZPSE_E_SZ_TSTAGE)) {
         ZpseBlockHeader wh;
 
         if (zpse_block_header_parse(&wh, e->best, ZPSE_BLOCK_HEADER_SIZE) ==
@@ -6026,7 +6045,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
 #endif
             uint32_t pl = zpse_lz4_encode(e->best + ZPSE_BLOCK_HEADER_SIZE,
                                           blen, e->tstage,
-                                          (uint32_t)ZPSE_E_SZ_TSTAGE);
+                                          blk_budget(n, ZPSE_E_SZ_TSTAGE));
 #if defined(ZPSE_BLOCK_STATS)
             zpse_block_v2_cycles += blk_rdtsc() - t_v2;
 #endif
@@ -6131,7 +6150,7 @@ int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,
         uint32_t cmds2 = 0u;
 
         if (zpse_block_try_lz2(e, in, n, in_crc, is_last, seq, e->cand,
-                               (uint32_t)ZPSE_E_SZ_CAND, &t2, &cmds2) ==
+                               blk_budget(n, ZPSE_E_SZ_CAND), &t2, &cmds2) ==
                 ZPSE_OK &&
             t2 < best_total &&
             (!direct_out || t2 <= out_cap)) {
@@ -6190,7 +6209,7 @@ lz_final_done:
 #endif
                 uint32_t hl = zpse_huf_encode(win + ZPSE_BLOCK_HEADER_SIZE,
                                               plen, e->tstage,
-                                              (uint32_t)ZPSE_E_SZ_TSTAGE,
+                                              blk_budget(n, ZPSE_E_SZ_TSTAGE),
                                               form);
 #if defined(ZPSE_BLOCK_STATS)
                 zpse_block_huf_cycles += blk_rdtsc() - t_huf;
@@ -6238,7 +6257,7 @@ lz_final_done:
         text_total <= out_cap) {
         uint32_t tt = zpse_block_write_text(e, in, n, seq, is_last,
                                             e->cand,
-                                            (uint32_t)ZPSE_E_SZ_CAND,
+                                            blk_budget(n, ZPSE_E_SZ_CAND),
                                             text_total - 16u);
 
         if (tt != 0u) {

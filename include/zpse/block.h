@@ -20,7 +20,7 @@ int zpse_block_decode_ex(ZpseDecoder *d, const uint8_t *in, uint32_t in_len,
                          uint8_t *output, uint32_t out_cap,
                          uint32_t *out_len_out, uint32_t dec_flags);
 
-/* Encode one block (<= 65536 B). Selects transform + per-segment tiles,
+/* Encode one block (<= ZPSE_MAX_BLOCK_SIZE B). Selects transform + per-segment tiles,
  * falls back to RAW_BLOCK when compression does not pay. Returns block
  * bytes written or negative status. seq is block_sequence_number. */
 int zpse_block_encode(ZpseEncoder *e, const uint8_t *in, uint32_t n,

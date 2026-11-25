@@ -30,7 +30,7 @@
  *              given. c: try a ZRPK frame first, normal codec on decline;
  *              d: sniff ZRPK and call the repack decoder.
  *   -c         emit the per-block payload CRC32-C (verified on decode)
- *   -b N       nominal block size, 1..65536 (default 65536)
+ *   -b N       nominal block size, 1..ZPSE_MAX_BLOCK_SIZE (default 65536)
  *   -x         append the FrameIndex (random access); bench also seeks
  *   -t N       use N worker threads (default 1: the single-core path every
  *              figure in the README was measured on). On decode the blocks
@@ -2087,7 +2087,7 @@ static int cmd_codec(int argc, char **argv)
      * without -l kept writing level 5 and the header kept saying "balanced"
      * while the codec's default was a rung deeper. One source of truth. */
     uint32_t enc_flags = 0u;
-    uint32_t block = ZPSE_MAX_BLOCK_SIZE;
+    uint32_t block = ZPSE_DEFAULT_BLOCK_SIZE;
     int indexed = 0;
     int repack_opt = 0;
     unsigned threads = 1u;
@@ -2522,7 +2522,7 @@ static int cmd_bench(int argc, char **argv)
     uint32_t enc_flags = 0u;
     /* -S sets ZPSE_DEC_STREAMING_OUTPUT for the timed decode calls only. */
     uint32_t dec_flags = 0u;
-    uint32_t block = ZPSE_MAX_BLOCK_SIZE;
+    uint32_t block = ZPSE_DEFAULT_BLOCK_SIZE;
     int indexed = 0;
     int quiet = 0;
     int flat7_bench = 0;
@@ -3981,7 +3981,7 @@ static int col_decompress(const uint8_t *in, size_t in_len, uint8_t **out,
 static int cmd_col(int argc, char **argv)
 {
     uint32_t enc_flags = 0u;
-    uint32_t block = ZPSE_MAX_BLOCK_SIZE;
+    uint32_t block = ZPSE_DEFAULT_BLOCK_SIZE;
     uint8_t *csv;
     uint8_t *blob = NULL;
     uint8_t *packed = NULL;
@@ -4086,7 +4086,7 @@ static int cmd_uncol(int argc, char **argv)
 static int cmd_colcheck(int argc, char **argv)
 {
     uint32_t enc_flags = 0u;
-    uint32_t block = ZPSE_MAX_BLOCK_SIZE;
+    uint32_t block = ZPSE_DEFAULT_BLOCK_SIZE;
     uint8_t *csv;
     uint8_t *blob = NULL;
     uint8_t *packed = NULL;

@@ -29,11 +29,11 @@
 
 static unsigned char enc_arena[ZPSE_ENC_ARENA_SIZE] __attribute__((aligned(64)));
 static unsigned char dec_arena[ZPSE_DEC_ARENA_SIZE] __attribute__((aligned(64)));
-static uint8_t in[65536];
-static uint8_t comp[200000];
-static uint8_t out[65536];
-static uint8_t fcomp[300000];
-static uint8_t fout[65536];
+static uint8_t in[ZPSE_MAX_BLOCK_SIZE];
+static uint8_t comp[ZPSE_MAX_BLOCK_SIZE + 4096u];
+static uint8_t out[ZPSE_MAX_BLOCK_SIZE];
+static uint8_t fcomp[ZPSE_MAX_BLOCK_SIZE + 4096u];
+static uint8_t fout[ZPSE_MAX_BLOCK_SIZE];
 
 static int fails = 0;
 static uint64_t dig = 1469598103934665603ull; /* FNV-1a 64 */

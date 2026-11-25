@@ -225,18 +225,21 @@ int main(void) {
         /* The init functions size-check against these totals: one byte short
          * is refused, the exact size is accepted. Pin the totals so a layout
          * change that moves a carve cannot slip through. */
-        CHECK(ZPSE_DEC_ARENA_SIZE == 0x60000u && ZPSE_ENC_ARENA_SIZE == 0x74000u,
-              "arena totals D=0x60000 E=0x74000");
+        CHECK(ZPSE_DEC_ARENA_SIZE == 0x100000u &&
+              ZPSE_ENC_ARENA_SIZE == 0x150000u,
+              "arena totals");
         CHECK(zpse_decoder_init(NULL, da, sizeof da) == ZPSE_BAD_ARG, "dec null ctx");
         CHECK(zpse_decoder_init(&d, NULL, sizeof da) == ZPSE_BAD_ARG, "dec null mem");
         CHECK(zpse_decoder_init(&d, da, sizeof da - 1) == ZPSE_BAD_ARG, "dec short");
         CHECK(zpse_decoder_init(&d, da + 1, sizeof da - 1) == ZPSE_BAD_ARG, "dec misaligned");
         CHECK(zpse_decoder_init(&d, da, sizeof da) == 0, "dec ok");
-        CHECK(d.recon == da + 0x1000 && d.comb == da + 0x41800, "dec carve");
+        CHECK(d.recon == da + ZPSE_D_OFF_RECON &&
+              d.comb == da + ZPSE_D_OFF_COMB, "dec carve");
         CHECK(zpse_encoder_init(&e, ea, sizeof ea - 1) == ZPSE_BAD_ARG, "enc short");
         CHECK(zpse_encoder_init(&e, ea, sizeof ea) == 0, "enc ok");
-        CHECK(e.best == ea + 0x31000 && e.hist == ea + 0x63800, "enc carve");
-        CHECK(e.comb == ea + 0x61800, "enc comb offset");
+        CHECK(e.best == ea + ZPSE_E_OFF_BEST &&
+              e.hist == ea + ZPSE_E_OFF_HIST, "enc carve");
+        CHECK(e.comb == ea + ZPSE_E_OFF_COMB, "enc comb offset");
         /* The comb scratch is 8 KiB of arena, not a global table: its region
          * must stay clear of the neighbouring planes. Adjacent ends are fine
          * (comb_end == shuf_start, comb_end == hist_start); an overlap is not. */

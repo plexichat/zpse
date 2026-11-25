@@ -3110,7 +3110,7 @@ int zpse_segment_encode(ZpseEncoder *e, ZpseLaneState *lanes,
     if (e == 0 || lanes == 0 || plane == 0 || payload_out == 0) {
         return ZPSE_BAD_ARG;
     }
-    if (plane_len < 1u || plane_len > 65536u) {
+    if (plane_len < 1u || plane_len > ZPSE_MAX_BLOCK_SIZE) {
         return ZPSE_BAD_ARG;
     }
     if (e->hist == 0 || e->comb == 0 || e->input == 0) {

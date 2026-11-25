@@ -1,7 +1,8 @@
 # zpse
 
-A block-format compressor in C11. Fixed 64 KiB blocks, with a 4 KiB page mode
-for zram-style stores, caller-owned arenas, no allocation, no I/O and no global
+A block-format compressor in C11. 64 KiB blocks by default (up to 256 KiB via
+`-b`), with a 4 KiB page mode for zram-style stores, caller-owned arenas, no
+allocation, no I/O and no global
 state. A compressed block is a pure function of its own bytes: the output is
 byte-identical on every build, every compiler, every SIMD level and every
 worker count.
@@ -25,8 +26,11 @@ int rc = zpse_compress_block(in, sizeof in, comp, sizeof comp, &clen,
 rc = zpse_decompress_block(comp, clen, out, sizeof out, &olen, dec_arena);
 ```
 
+The buffers above size one default 64 KiB block. A caller using the full
+`ZPSE_MAX_BLOCK_SIZE` (256 KiB) sizes them to that instead.
+
 Both arenas are 64-byte aligned and owned by the caller; nothing inside the
-library allocates. They are 464 KiB (encode) and 384 KiB (decode), named
+library allocates. They are 1344 KiB (encode) and 1024 KiB (decode), named
 `ZPSE_ENC_ARENA_SIZE` and `ZPSE_DEC_ARENA_SIZE`. `rc` is negative on failure;
 every status in `include/zpse/status.h` is reachable from a corrupt stream and
 is tested that way.
@@ -41,8 +45,12 @@ ever disagree.
 
 All ratios are **uncompressed:compressed** (`x:1`); all rates are decimal MB/s
 of uncompressed bytes. Unless a table says otherwise: **one core**, 64 KiB
-blocks, default level 6, clang 22.1 (LLVM-MinGW) on a Ryzen 5 5600X under
-Windows 11. Every number here is single-core, on an otherwise idle host.
+blocks (the default; `-b` accepts up to 256 KiB), default level 6, clang 22.1
+(LLVM-MinGW) on a Ryzen 5 5600X under Windows 11. Every number here is
+single-core, on an otherwise idle host. Blocks larger than the default trade
+ratio against speed by an amount that depends on the host; these tables are
+the 64 KiB default, so changing it would require regenerating every one of
+them on an idle machine.
 
 Every corpus is generated or fetched by a script under `tests/benchmarks/`,
 and the harnesses stage it in memory and read the staged copy back before the
@@ -423,8 +431,9 @@ faster -- 4 KiB pages decode at 3.4 GB/s on one worker and 7.9 GB/s on six
 
 A **frame** is a 32-byte header (magic `PSE1`, version, content size, block
 count) followed by blocks, optionally ending in a 16-byte index header plus one
-`{offset, size}` pair per block. A **block** is at most 64 KiB of input: a
-32-byte header (16 bytes for a page-sized block), an optional transform record,
+`{offset, size}` pair per block. A **block** is at most 256 KiB of input
+(64 KiB by default): a 32-byte header (16 bytes for a page-sized block), an
+optional transform record,
 a segment directory, then one payload per segment.
 
 A **segment** is one plane of the block -- 1, 2, 4, 8 or 16 of them, split by a
@@ -588,9 +597,10 @@ zpse_cli dir FILE              print the frame's random-access directory
 zpse_cli x FILE BLOCK OUT      decode one block through the index
 ```
 
-Useful options: `-l N` selects a level, `-b BYTES` the block size (4096 for
-pages), `-t N` workers (encode streams through the worker ring; decode reads a
-batch of blocks on one thread, decodes them side by side and writes them in
+Useful options: `-l N` selects a level, `-b BYTES` the block size (default
+65536, up to 262144; 4096 for pages), `-t N` workers (encode streams through
+the worker ring; decode reads a batch of blocks on one thread, decodes them
+side by side and writes them in
 order on another, so a frame is still never resident whole), `-x` writes an
 index, `-F` requests `LZ_FAST`, `-F7` (or `-7`) adds an in-memory FLAT7 arm
 to `bench`, `-R` adds an in-memory ZRPK arm to

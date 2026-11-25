@@ -125,7 +125,17 @@
 #define ZPSE_TILE_HEADER_SIZE    8u
 #define ZPSE_SEG_DIR_ENTRY_SIZE  8u
 
-#define ZPSE_MAX_BLOCK_SIZE     UINT32_C(65536)
+#define ZPSE_DEFAULT_BLOCK_SIZE UINT32_C(65536) /* 64 KiB stays the default:
+                                                  * the README's published
+                                                  * tables were measured at
+                                                  * this size. Larger blocks
+                                                  * (up to ZPSE_MAX_BLOCK_SIZE)
+                                                  * are available via -b; the
+                                                  * gain is host-dependent. */
+#define ZPSE_MAX_BLOCK_SIZE     UINT32_C(262144) /* 256 KiB. Long block header
+                                                  * and frame header already
+                                                  * carry u32 sizes; this was
+                                                  * the only 64 KiB ceiling. */
 #define ZPSE_MIN_BLOCK_SIZE     UINT32_C(1)
 #define ZPSE_TILE_SIZE          256u
 #define ZPSE_MAX_TILE_LEN       256u
