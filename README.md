@@ -78,7 +78,7 @@ and the lz4 *CLI* are not the same encoder.
 | --- | --- | ---: | ---: | ---: |
 | Silesia, 202 MiB | zpse 6 (default) | 2.15:1 | 520 | 3578 |
 | | zpse 1 `FASTEST` | 1.27:1 | 814 | 3225 |
-| | zpse 9 `MAX` | 2.21:1 | 439 | 2439 |
+| | zpse 9 `MAX` | 2.22:1 | 439 | 2439 |
 | 25-case columnar matrix, 100 MiB | zpse 6 (default) | 5.24:1 | 719 | 8562 |
 | | zpse 1 `FASTEST` | 4.02:1 | 1716 | 14528 |
 | | zpse 9 `MAX` | 5.28:1 | 677 | 9128 |

@@ -278,7 +278,7 @@ static ZPSE_T_SSE2 void bs16_fwd_sse2_do(const uint8_t *in, uint32_t n,
     uint32_t groups = (count + 7u) >> 3;
     uint32_t g;
     const __m128i m00ff = _mm_set1_epi16(0x00FF);
-    const __m128i mff00 = _mm_set1_epi16(0xFF00);
+    const __m128i mff00 = _mm_set1_epi16((int16_t)0xFF00);
 
     memset(out, 0, (size_t)(16u * pb) + (size_t)(n & 1u));
 
@@ -432,7 +432,7 @@ static ZPSE_T_AVX2 void bs16_fwd_avx2_do(const uint8_t *in, uint32_t n,
         uint8_t buf[16];
         __m128i v, ev, od, lo8, hi8, tlo, thi;
         const __m128i m00ff = _mm_set1_epi16(0x00FF);
-        const __m128i mff00 = _mm_set1_epi16(0xFF00);
+        const __m128i mff00 = _mm_set1_epi16((int16_t)0xFF00);
         uint32_t base = 16u * g;
         uint32_t avail = (2u * count > base) ? (2u * count - base) : 0u;
         unsigned p;
