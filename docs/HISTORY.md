@@ -2045,3 +2045,27 @@ other work, so the rates measured alongside the new form are not publishable.
 Byte identity was checked directly instead: 36 of 36 corpus round trips and
 all twelve decoded Silesia frames match, and eleven compressed streams are
 unchanged.
+
+## The benchmark host cannot resolve small speed deltas
+
+A methodology check measured the A/A noise floor directly. The published
+`bench` path does not pin affinity -- `tests/benchmarks/bench.c` makes no
+affinity or priority call, and "single core" there means single-threaded. The
+shell scripts that do pin use `taskset` inside Git Bash or WSL, which pins the
+Linux task, not the native Windows codec process. With an explicit Windows
+affinity wrapper (`SetProcessAffinityMask` + `SetThreadAffinityMask` + HIGH
+priority) the A/A floor over 96 iterations x 5 reps stayed above 3 percent in
+every condition: median 4-8 percent, p95 10-116 percent, worst 17-180 percent,
+with both signs. Pinning narrows some encode spreads but cannot remove spikes
+from the shared L3, memory and DVFS; the "no load" runs were themselves
+contended, so those figures are lower bounds.
+
+The consequence for this campaign: a speed delta below roughly 5 percent
+measured on this host is not evidence either way. It explains the sign flips
+in several A/B trials (a screen-margin change read +3.4 percent then -3.5
+percent; decode-copy variants whose order changed the sign) and the
+contradictory decode PGO result. Packed-byte and byte-identity measurements are
+unaffected, because they are deterministic. Only claims about rates depend on
+the host, which is why the README's rates are regenerated on an idle machine
+and why sub-5-percent speed results from this host are recorded here rather
+than shipped.
